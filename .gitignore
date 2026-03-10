@@ -26,6 +26,9 @@ share/python-wheels/
 *.egg
 MANIFEST
 
+# Node (Tailwind build)
+node_modules/
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
@@ -74,6 +77,12 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
 
 # Jupyter Notebook
 .ipynb_checkpoints
@@ -182,11 +191,13 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#  Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore
 #  that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#  and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#  and can be added to the global gitignore or merged into this file. However, if you prefer,
 #  you could uncomment the following to ignore the entire vscode folder
 # .vscode/
+.vscode/
+.idea/
 
 # Ruff stuff:
 .ruff_cache/
@@ -201,7 +212,25 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Barca runtime state
+.barca/
+.barcafiles/
+tmp/
+
+# Rust vendored dependencies
+vendor/
+
+# macOS
+.DS_Store
+Thumbs.db
+
+# Editor swap files
+*.swp
+*.swo
+*~
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+*.dSYM/

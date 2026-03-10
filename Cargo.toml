@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "crates/barca-core",
+    "crates/barca-py",
+    "crates/barca-server",
+]
+resolver = "2"
