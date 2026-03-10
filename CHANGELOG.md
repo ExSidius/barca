@@ -41,4 +41,4 @@
 
 - Added `list_materializations_for_asset` and `list_recent_materializations` to store
 - Added `job_completion_tx` broadcast channel for SSE push
-- Extended TEMPLATES_ARCHITECTURE.md with Datastar Integration patterns
+- Extended `docs/templates-architecture.md` with Datastar Integration patterns
