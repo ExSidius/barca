@@ -1,0 +1,181 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build the `barca` CLI binary for each platform ──────────────────
+  build-cli:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: barca-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact: barca-linux-arm64
+          - target: x86_64-apple-darwin
+            os: macos-13
+            artifact: barca-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-14
+            artifact: barca-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build CLI
+        run: cargo build -p barca-cli --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package binary
+        run: |
+          cp target/${{ matrix.target }}/release/barca ${{ matrix.artifact }}
+          chmod +x ${{ matrix.artifact }}
+          tar czf ${{ matrix.artifact }}.tar.gz ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  # ── Build Python wheels (the `barca` package with @asset decorator) ─
+  build-wheels:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            name: linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64
+            name: linux-arm64
+          - os: macos-13
+            target: x86_64
+            name: macos-x86_64
+          - os: macos-14
+            target: aarch64
+            name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+          manifest-path: crates/barca-py/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist/
+
+  # ── Build source distribution ───────────────────────────────────────
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          manifest-path: crates/barca-py/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+
+  # ── Create GitHub Release ───────────────────────────────────────────
+  release:
+    needs: [build-cli, build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List artifacts
+        run: find artifacts/ -type f | sort
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release/
+          cp artifacts/barca-*/*.tar.gz release/
+          cp artifacts/wheels-*/*.whl release/
+          cp artifacts/sdist/*.tar.gz release/
+          ls -lh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'rc') }}
+          body: |
+            ## Installation
+
+            ### Python package (`@asset()` decorator)
+
+            ```bash
+            # Install from this release (pick the wheel for your platform + Python version)
+            uv pip install barca --find-links 'https://github.com/${{ github.repository }}/releases/expanded_assets/${{ github.ref_name }}'
+
+            # Or add to your project
+            uv add barca --find-links 'https://github.com/${{ github.repository }}/releases/expanded_assets/${{ github.ref_name }}'
+            ```
+
+            ### CLI binary
+
+            ```bash
+            # macOS (Apple Silicon)
+            curl -L 'https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/barca-macos-arm64.tar.gz' | tar xz
+            sudo mv barca-macos-arm64 /usr/local/bin/barca
+
+            # macOS (Intel)
+            curl -L 'https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/barca-macos-x86_64.tar.gz' | tar xz
+            sudo mv barca-macos-x86_64 /usr/local/bin/barca
+
+            # Linux (x86_64)
+            curl -L 'https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/barca-linux-x86_64.tar.gz' | tar xz
+            sudo mv barca-linux-x86_64 /usr/local/bin/barca
+
+            # Linux (ARM64)
+            curl -L 'https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/barca-linux-arm64.tar.gz' | tar xz
+            sudo mv barca-linux-arm64 /usr/local/bin/barca
+            ```
