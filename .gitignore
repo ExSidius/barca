@@ -26,6 +26,9 @@ bin/
 .barcafiles/
 tmp/
 
+# Staged CLI binary for wheel builds (created by CI / `just build-py`)
+crates/barca-py/data/scripts/
+
 # Vendored dependencies
 vendor/
 

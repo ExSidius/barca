@@ -48,6 +48,57 @@ Asset #3
   Status: #42 (success)
 ```
 
+## Install
+
+```bash
+uv pip install barca --find-links 'https://github.com/ExSidius/barca/releases/expanded_assets/latest'
+```
+
+This installs both the `barca` CLI and the Python `@asset()` decorator.
+
+## Quick Start
+
+Create a `barca.toml` in your project root:
+
+```toml
+[python]
+modules = ["my_project.assets"]
+```
+
+Write your assets:
+
+```python
+# my_project/assets.py
+from barca import asset
+
+@asset()
+def hello() -> dict:
+    return {"message": "Hello from barca!"}
+```
+
+Run:
+
+```bash
+barca reindex                    # discover assets from Python modules
+barca assets list                # list all indexed assets
+barca assets refresh 1           # materialize an asset
+barca                            # start the web UI at localhost:3000
+```
+
+### CLI Reference
+
+```
+barca                            Start the server (default)
+barca serve                      Start the server
+barca reindex                    Re-inspect Python modules
+barca assets list                List all indexed assets
+barca assets show <id>           Show asset detail
+barca assets refresh <id>        Trigger materialization and wait
+barca jobs list                  List recent jobs
+barca jobs show <id>             Show job detail
+barca reset [--db] [--artifacts] Clean generated files
+```
+
 ## Features
 
 **Implemented** (workflows 1–4):
@@ -72,67 +123,6 @@ Asset #3
 | 8 | Backfill and replay | Spec ready |
 | 9 | Execution controls (timeout, cancel, retry) | Spec ready |
 
-## Quick Start
-
-### Prerequisites
-
-- [Rust](https://rustup.rs/) (stable)
-- [uv](https://docs.astral.sh/uv/) (Python package manager)
-- Python >= 3.11
-
-### Run the example
-
-```bash
-# Build the Python extension
-just build-py
-
-# Start the server with the example project
-cd examples/basic_app
-uv sync
-cargo run -p barca-cli
-```
-
-Open [http://127.0.0.1:3000](http://127.0.0.1:3000).
-
-### CLI usage
-
-```bash
-cd examples/basic_app
-
-barca reindex                    # discover assets from Python modules
-barca assets list                # list all indexed assets
-barca assets show 1              # show asset detail
-barca assets refresh 1           # materialize an asset
-barca jobs list                  # list recent jobs
-barca jobs show 42               # show job detail
-barca reset --db --artifacts     # clean slate
-```
-
-### Start a new project
-
-Create a `barca.toml`:
-
-```toml
-[python]
-modules = ["my_project.assets"]
-```
-
-Create your assets:
-
-```python
-# my_project/assets.py
-from barca import asset
-
-@asset()
-def hello() -> dict:
-    return {"message": "Hello from barca!"}
-```
-
-```bash
-barca reindex
-barca assets refresh 1
-```
-
 ## Architecture
 
 ```
@@ -144,7 +134,7 @@ barca assets refresh 1
 │  │          │  │              │  │                   │  │
 │  │ CLI bin  │  │ axum routes  │  │ models, hashing   │  │
 │  │ (clap)   │  │ SSE/Datastar │  │ serialization     │  │
-│  │          │  │ store (SQLite│  │                   │  │
+│  │          │  │ store (Turso)│  │                   │  │
 │  │          │  │ templates    │  │                   │  │
 │  │          │  │ PythonBridge │  │                   │  │
 │  └────┬─────┘  └──────┬───────┘  └───────────────────┘  │
@@ -161,7 +151,7 @@ barca assets refresh 1
          │                              │
          ▼                              ▼
    .barca/metadata.db           .barcafiles/
-   (SQLite — assets,            (versioned artifacts:
+   (Turso — assets,             (versioned artifacts:
     definitions, jobs)           value.json, metadata.json)
 ```
 
@@ -183,26 +173,6 @@ barca assets refresh 1
 
 ## Asset Lifecycle
 
-```
- @asset()          reindex()         POST /materialize      Worker
-    │                  │                    │                  │
-    │   inspect ───►   │                    │                  │
-    │                  │  definition_hash   │                  │
-    │                  │  ──► upsert DB     │                  │
-    │                  │                    │                  │
-    │                  │                    │  enqueue ──►     │
-    │                  │                    │                  │
-    │                  │                    │     ┌── claim ◄──┤
-    │                  │                    │     │            │
-    │                  │                    │     │  inspect   │
-    │                  │                    │     │  verify    │
-    │                  │                    │     │  resolve   │
-    │   materialize ◄──┼────────────────────┼─────┘            │
-    │   ──► value.json │                    │                  │
-    │                  │                    │     store ──►    │
-    │                  │                    │     broadcast ─► │
-```
-
 1. **Index** — `reindex()` inspects Python modules, computes a `definition_hash` (SHA-256 of source + metadata + uv.lock + protocol version), upserts into the database
 2. **Enqueue** — checks for duplicate/active jobs, resolves the dependency DAG, enqueues upstream assets first, then inserts partition jobs in batch
 3. **Execute** — worker claims jobs, verifies definition hasn't changed, resolves upstream artifacts, spawns Python subprocess, stores artifact at `.barcafiles/{slug}/{hash}/value.json`
@@ -213,7 +183,7 @@ barca assets refresh 1
 | Layer | Technology |
 |-------|-----------|
 | Backend | Rust + [axum](https://github.com/tokio-rs/axum) 0.8 |
-| Database | SQLite via [Turso](https://turso.tech/) |
+| Database | [Turso](https://turso.tech/) (libSQL) |
 | Python FFI | [PyO3](https://pyo3.rs/) 0.25 + [maturin](https://www.maturin.rs/) |
 | Async | [tokio](https://tokio.rs/) 1.45 |
 | UI | [Datastar](https://data-star.dev/) (SSE-based DOM patching) + Tailwind CSS |
@@ -244,40 +214,21 @@ The 10,000-partition E2E test runs all partitions through real Python subprocess
 ## Development
 
 ```bash
-# Hot reload (requires cargo-watch)
+# Prerequisites
+cargo install cargo-watch    # optional, for hot reload
+uv tool install maturin      # for building the Python extension
+
+# Hot reload
 just dev
 
 # Build Tailwind CSS (after changing template classes)
 just build-css
 
-# Build the Python extension into the active venv
+# Build the Python extension + CLI into the active venv
 just build-py
 
 # Run the example app
-cd examples/basic_app && cargo run -p barca-cli
-```
-
-## Installation
-
-### From GitHub Releases
-
-```bash
-# Python package (for the @asset() decorator)
-uv pip install barca --find-links \
-  'https://github.com/ExSidius/barca/releases/expanded_assets/LATEST_TAG'
-
-# CLI binary (macOS Apple Silicon)
-curl -L 'https://github.com/ExSidius/barca/releases/download/TAG/barca-macos-arm64.tar.gz' \
-  | tar xz && sudo mv barca-macos-arm64 /usr/local/bin/barca
-```
-
-### From source
-
-```bash
-git clone https://github.com/ExSidius/barca.git
-cd barca
-cargo install --path crates/barca-cli
-just build-py
+cd examples/basic_app && uv sync && cargo run -p barca-cli
 ```
 
 ## Docs

@@ -12,3 +12,4 @@ build-backend = "maturin"
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "barca._barca"
+data = "data"

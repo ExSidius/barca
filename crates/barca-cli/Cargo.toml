@@ -3,6 +3,10 @@ name = "barca-cli"
 version = "0.0.1"
 edition = "2021"
 
+[lib]
+name = "barca_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "barca"
 path = "src/main.rs"

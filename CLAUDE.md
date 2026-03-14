@@ -51,7 +51,7 @@ This is a Cargo workspace with four crates:
 
 ### Startup flow (`crates/barca-server/src/main.rs`)
 1. Load `barca.toml` → resolve Python modules to index
-2. Open Turso (local SQLite) at `.barca/metadata.db`
+2. Open Turso (local libSQL) at `.barca/metadata.db`
 3. Call `reindex()` → inspect Python modules via `uv run python -m barca.inspect`, upsert into DB
 4. Spawn background worker (`run_refresh_queue_worker`) that processes the materialization queue
 5. Start axum server on port 3000
@@ -62,7 +62,7 @@ This is a Cargo workspace with four crates:
 | `lib.rs` | Orchestration: `reindex()`, `enqueue_refresh_request()`, `run_refresh_queue_worker()`, `execute_refresh_job()` |
 | `server.rs` | Axum routes and SSE response handlers; all rendering logic that needs request context |
 | `templates.rs` | All HTML generation as Rust string functions (no template engine) |
-| `store.rs` | Turso/SQLite layer — assets, definitions, materializations |
+| `store.rs` | Turso (libSQL) layer — assets, definitions, materializations |
 | `python_bridge.rs` | `PythonBridge` trait + `UvPythonBridge` impl (subprocess to `uv run python -m barca.inspect` / `barca.worker`) |
 | `config.rs` | Parses `barca.toml` |
 
