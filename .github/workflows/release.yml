@@ -29,11 +29,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             maturin-target: aarch64
             name: linux-arm64
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             maturin-target: x86_64
             name: macos-x86_64
-          - os: macos-14
+          - os: macos-latest
             target: aarch64-apple-darwin
             maturin-target: aarch64
             name: macos-arm64
