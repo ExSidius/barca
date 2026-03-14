@@ -1,6 +1,6 @@
 [package]
 name = "barca-cli"
-version = "0.0.3"
+version = "0.0.3-rc.1"
 edition = "2021"
 
 [lib]

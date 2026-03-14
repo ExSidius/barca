@@ -1,6 +1,6 @@
 [project]
 name = "barca"
-version = "0.0.3"
+version = "0.0.3rc1"
 description = "A modern, minimal orchestrator."
 requires-python = ">=3.11"
 
