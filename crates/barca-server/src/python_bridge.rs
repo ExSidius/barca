@@ -15,10 +15,7 @@ use tracing::{info, warn};
 use crate::{emit_log, JobLogEntry, JobLogLevel};
 
 /// Directories to skip when auto-discovering Python modules.
-const SKIP_DIRS: &[&str] = &[
-    ".venv", "__pycache__", ".git", ".barca", ".barcafiles",
-    "build", "dist", "node_modules", "target", "tmp",
-];
+const SKIP_DIRS: &[&str] = &[".venv", "__pycache__", ".git", ".barca", ".barcafiles", "build", "dist", "node_modules", "target", "tmp"];
 
 /// Walk `root` for `.py` files that reference `barca` and convert them to
 /// importable dotted module names.  Called automatically when no explicit
@@ -73,9 +70,7 @@ fn path_to_module(root: &Path, file: &Path) -> Option<String> {
     } else {
         without_ext
     };
-    let parts: Vec<&str> = module_path.components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .collect();
+    let parts: Vec<&str> = module_path.components().filter_map(|c| c.as_os_str().to_str()).collect();
     if parts.is_empty() {
         return None;
     }
@@ -114,11 +109,7 @@ impl UvPythonBridge {
 impl PythonBridge for UvPythonBridge {
     async fn inspect_modules(&self, modules: &[String]) -> anyhow::Result<Vec<InspectedAsset>> {
         // If no explicit modules given, auto-discover .py files that reference barca.
-        let effective: Vec<String> = if modules.is_empty() {
-            discover_barca_modules(&self.repo_root)
-        } else {
-            modules.to_vec()
-        };
+        let effective: Vec<String> = if modules.is_empty() { discover_barca_modules(&self.repo_root) } else { modules.to_vec() };
 
         // Nothing to inspect — return early without spawning a subprocess.
         if effective.is_empty() {

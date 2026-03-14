@@ -45,11 +45,7 @@ fn test_jobs_help() {
 fn test_assets_list_no_config() {
     // No barca.toml needed — commands work in any directory (may find zero assets)
     let tmp = tempfile::tempdir().unwrap();
-    barca_cmd()
-        .args(["assets", "list"])
-        .current_dir(tmp.path())
-        .assert()
-        .success();
+    barca_cmd().args(["assets", "list"]).current_dir(tmp.path()).assert().success();
 }
 
 #[test]
