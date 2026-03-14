@@ -56,11 +56,25 @@ jobs:
             3.12
             3.13
 
+      - name: Log environment
+        run: |
+          echo "=== Runner ==="
+          echo "OS: ${{ matrix.os }}"
+          echo "Target: ${{ matrix.target }}"
+          echo "Maturin target: ${{ matrix.maturin-target }}"
+          echo "=== Tool versions ==="
+          rustc --version
+          cargo --version
+          python3 --version
+          echo "=== Workspace ==="
+          ls -la crates/barca-py/
+
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "aarch64-linux-gnu-gcc version: $(aarch64-linux-gnu-gcc --version | head -1)"
 
       # Build the CLI binary first, then stage it for wheel inclusion
       - name: Build CLI binary
@@ -73,6 +87,9 @@ jobs:
           mkdir -p crates/barca-py/data/scripts
           cp target/${{ matrix.target }}/release/barca crates/barca-py/data/scripts/barca
           chmod +x crates/barca-py/data/scripts/barca
+          echo "Staged binary:"
+          ls -lh crates/barca-py/data/scripts/
+          file crates/barca-py/data/scripts/barca
 
       # Build wheels — includes both the Python extension and the CLI binary
       - name: Build wheels
@@ -83,6 +100,16 @@ jobs:
           manylinux: auto
           working-directory: crates/barca-py
 
+      - name: Verify wheel output
+        run: |
+          echo "=== Built wheels ==="
+          ls -lh crates/barca-py/dist/
+          echo "=== Wheel names ==="
+          for f in crates/barca-py/dist/*.whl; do
+            echo "  $f"
+            python3 -c "import zipfile, sys; z=zipfile.ZipFile('$f'); meta=[n for n in z.namelist() if 'METADATA' in n]; print('    METADATA:', meta[0] if meta else 'NOT FOUND')"
+          done
+
       - name: Clean staged data
         run: rm -rf crates/barca-py/data/scripts
 
@@ -92,6 +119,7 @@ jobs:
           cp target/${{ matrix.target }}/release/barca barca-${{ matrix.name }}
           chmod +x barca-${{ matrix.name }}
           tar czf barca-${{ matrix.name }}.tar.gz barca-${{ matrix.name }}
+          echo "CLI tarball: $(ls -lh barca-${{ matrix.name }}.tar.gz)"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -109,12 +137,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Log environment
+        run: |
+          echo "=== pyproject.toml package name/version ==="
+          grep -E '^(name|version)' crates/barca-py/pyproject.toml
+          echo "=== barca-py Cargo.toml version ==="
+          grep '^version' crates/barca-py/Cargo.toml
+
       - name: Build sdist
         uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
           working-directory: crates/barca-py
+
+      - name: Verify sdist output
+        run: |
+          echo "=== Built sdist ==="
+          ls -lh crates/barca-py/dist/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -136,6 +176,7 @@ jobs:
           cp artifacts/wheels-*/*.whl release/
           cp artifacts/cli-*/*.tar.gz release/
           cp artifacts/sdist/*.tar.gz release/
+          echo "=== Release assets ==="
           ls -lh release/
 
       - name: Create GitHub Release
@@ -169,9 +210,13 @@ jobs:
           mkdir -p dist/
           cp artifacts/wheels-*/*.whl dist/
           cp artifacts/sdist/*.tar.gz dist/
+          echo "=== Files to publish ==="
           ls -lh dist/
+          echo "=== Package names (must all start with 'barca-') ==="
+          ls dist/ | grep -v '^barca[-_]' && echo "WARNING: unexpected package name found above" || echo "OK: all files match expected name"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
+          verbose: true
