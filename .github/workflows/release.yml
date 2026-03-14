@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -81,7 +82,7 @@ jobs:
           target: ${{ matrix.maturin-target }}
           args: --release --out dist --find-interpreter
           manylinux: auto
-          manifest-path: crates/barca-py/Cargo.toml
+          working-directory: crates/barca-py
 
       - name: Clean staged data
         run: rm -rf crates/barca-py/data/scripts
@@ -96,7 +97,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-${{ matrix.name }}
-          path: dist/
+          path: crates/barca-py/dist/
 
       - uses: actions/upload-artifact@v4
         with:
@@ -114,12 +115,12 @@ jobs:
         with:
           command: sdist
           args: --out dist
-          manifest-path: crates/barca-py/Cargo.toml
+          working-directory: crates/barca-py
 
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
-          path: dist/
+          path: crates/barca-py/dist/
 
   # ── Create GitHub Release ───────────────────────────────────────────
   release:
@@ -154,3 +155,25 @@ jobs:
             This installs both the `barca` CLI and the Python `@asset()` decorator.
 
             See the [README](https://github.com/${{ github.repository }}#readme) for usage.
+
+  # ── Publish to PyPI ────────────────────────────────────────────────
+  publish-pypi:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/barca
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect wheels and sdist
+        run: |
+          mkdir -p dist/
+          cp artifacts/wheels-*/*.whl dist/
+          cp artifacts/sdist/*.tar.gz dist/
+          ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
