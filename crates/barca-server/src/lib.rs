@@ -9,7 +9,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
     time::Instant,
 };
 
@@ -326,25 +325,47 @@ pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, uv_lock_
 pub async fn run_refresh_queue_worker(state: AppState) {
     info!("refresh queue worker started");
 
-    loop {
-        let notified = state.job_queue_notify.notified();
-        let next_job = {
-            let store = state.store.lock().await;
-            store.claim_next_queued_materialization().await
-        };
+    let mut in_flight = tokio::task::JoinSet::new();
 
-        match next_job {
-            Ok(Some(job)) => {
-                execute_refresh_job(&state, job).await;
-                // Wake up again to process any re-queued downstream jobs
-                state.job_queue_notify.notify_one();
+    loop {
+        // Try to claim and spawn jobs while there are queued items
+        loop {
+            let next_job = {
+                let store = state.store.lock().await;
+                store.claim_next_queued_materialization().await
+            };
+
+            match next_job {
+                Ok(Some(job)) => {
+                    let job_state = state.clone();
+                    in_flight.spawn(async move {
+                        execute_refresh_job(&job_state, job).await;
+                    });
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    error!(error = %error, "refresh queue worker failed to claim the next job");
+                    break;
+                }
             }
-            Ok(None) => {
-                notified.await;
-            }
-            Err(error) => {
-                error!(error = %error, "refresh queue worker failed to claim the next job");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        if in_flight.is_empty() {
+            // Nothing in-flight, nothing queued — wait for a notification
+            state.job_queue_notify.notified().await;
+        } else {
+            // Wait for any in-flight job to finish, OR a new notification
+            tokio::select! {
+                Some(result) = in_flight.join_next() => {
+                    if let Err(e) = result {
+                        error!(error = %e, "job task panicked");
+                    }
+                    // A job finished — wake up to check for re-queued downstream jobs
+                    state.job_queue_notify.notify_one();
+                }
+                _ = state.job_queue_notify.notified() => {
+                    // New job was enqueued — loop back to claim it
+                }
             }
         }
     }
