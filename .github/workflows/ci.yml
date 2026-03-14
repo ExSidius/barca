@@ -40,3 +40,8 @@ jobs:
           args: --release --out dist
           manylinux: auto
           manifest-path: crates/barca-py/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/
