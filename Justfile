@@ -42,7 +42,8 @@ example name:
 setup:
     rustup target add x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
     cargo install cargo-zigbuild
-    pip install ziglang
+    uv tool install ziglang
+    ln -sf ~/.local/bin/python-zig ~/.local/bin/zig
     uv tool install maturin
     @echo "Setup complete. Set MATURIN_PYPI_TOKEN before running 'just release'."
 
