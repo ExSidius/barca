@@ -148,9 +148,30 @@ jobs:
             ## Install
 
             ```bash
-            uv pip install barca --find-links 'https://github.com/${{ github.repository }}/releases/expanded_assets/${{ github.ref_name }}'
+            uv add barca
             ```
 
             This installs both the `barca` CLI and the Python `@asset()` decorator.
 
             See the [README](https://github.com/${{ github.repository }}#readme) for usage.
+
+  # ── Publish to PyPI ────────────────────────────────────────────────
+  publish-pypi:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect wheels and sdist
+        run: |
+          mkdir -p dist/
+          cp artifacts/wheels-*/*.whl dist/
+          cp artifacts/sdist/*.tar.gz dist/
+          ls -lh dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
