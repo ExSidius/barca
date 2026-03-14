@@ -16,7 +16,14 @@ impl Partitions {
     }
 }
 
-/// `partitions(["AAPL", "MSFT", "GOOG"])` — declare a static partition universe.
+/// Declare a static partition universe for use with ``@asset(partitions=...)``.
+///
+/// Example::
+///
+///     from barca import asset, partitions
+///
+///     @asset(partitions={"ticker": partitions(["AAPL", "MSFT", "GOOG"])})
+///     def prices(ticker: str): ...
 #[pyfunction(name = "partitions")]
 fn py_partitions(py: Python<'_>, values: &Bound<'_, PyList>) -> PyResult<Partitions> {
     let json_mod = py.import("json")?;
@@ -161,14 +168,49 @@ fn resolve_input_ref(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Strin
     Err(pyo3::exceptions::PyTypeError::new_err("inputs values must be @asset-decorated functions or asset ref strings"))
 }
 
-/// The `@asset()` decorator factory.
+/// Decorator that registers a Python function as a barca asset.
 ///
-/// Usage:
-///   @asset()
-///   def my_func(): ...
+/// Usage
+/// -----
+///     from barca import asset
 ///
-///   @asset(name="custom_name", inputs={"x": other_asset})
-///   def my_func(x): ...
+///     @asset()
+///     def my_data():
+///         return {"value": 42}
+///
+/// Parameters
+/// ----------
+/// name : str, optional
+///     Override the asset's display name / continuity key.
+///     Defaults to ``"<file>:<function_name>"``.
+/// inputs : dict[str, asset], optional
+///     Declare upstream dependencies.  Map parameter names to other
+///     ``@asset``-decorated functions.  Barca will materialize upstream
+///     assets first and pass their values as keyword arguments.
+///
+///     Example::
+///
+///         @asset()
+///         def raw(): return [1, 2, 3]
+///
+///         @asset(inputs={"data": raw})
+///         def processed(data): return [x * 2 for x in data]
+///
+/// partitions : dict[str, partitions(...)], optional
+///     Declare a partitioned asset.  Each dimension maps to a
+///     ``partitions([...])`` call that enumerates the static partition keys.
+///     Barca will create one materialization job per partition combination.
+///
+///     Example::
+///
+///         from barca import asset, partitions
+///
+///         @asset(partitions={"ticker": partitions(["AAPL", "MSFT", "GOOG"])})
+///         def prices(ticker: str):
+///             return fetch_price(ticker)
+///
+/// serializer : str, optional
+///     Reserved for future use.  Leave unset.
 #[pyfunction]
 #[pyo3(signature = (*, name=None, inputs=None, partitions=None, serializer=None))]
 fn asset(name: Option<String>, inputs: Option<PyObject>, partitions: Option<PyObject>, serializer: Option<String>) -> PyResult<PyObject> {
@@ -260,7 +302,13 @@ fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
     let mut assets = Vec::new();
 
     for module_name in &modules {
-        let module = importlib.call_method1("import_module", (module_name.as_str(),))?;
+        let module = match importlib.call_method1("import_module", (module_name.as_str(),)) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("barca: skipping module '{}': {}", module_name, e);
+                continue;
+            }
+        };
 
         // Get normalized module source
         let module_source_raw = inspect_mod.call_method1("getsource", (&module,))?;

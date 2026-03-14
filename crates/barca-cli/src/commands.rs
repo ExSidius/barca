@@ -3,26 +3,19 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use barca_core::models::JobDetail;
-use barca_server::config::load_config;
 use barca_server::python_bridge::UvPythonBridge;
 use barca_server::store::MetadataStore;
 use barca_server::AppState;
 
 use crate::display;
 
-/// Load config from barca.toml or return a friendly error.
-fn load_project_config(repo_root: &Path) -> anyhow::Result<barca_server::config::BarcaConfig> {
-    load_config(&repo_root.join("barca.toml")).context("no barca.toml found — are you in a barca project directory?")
-}
-
 /// Create a full AppState and reindex. Called at the top of every command
 /// (except reset) so the DAG is always up to date.
 async fn init(repo_root: &Path) -> anyhow::Result<AppState> {
-    let config = load_project_config(repo_root)?;
     let db_path = repo_root.join(".barca").join("metadata.db");
     let store = MetadataStore::open(&db_path).await?;
     let python = Arc::new(UvPythonBridge::new(repo_root.to_path_buf()));
-    let state = AppState::new(repo_root.to_path_buf(), config, store, python);
+    let state = AppState::new(repo_root.to_path_buf(), store, python);
     barca_server::reindex(&state).await?;
     Ok(state)
 }
@@ -111,7 +104,6 @@ pub async fn assets_refresh(id: i64) -> anyhow::Result<()> {
     }
 
     // Wait for all pending jobs to complete by polling the store.
-    // This is reliable regardless of broadcast channel capacity.
     println!("Waiting for materialization of asset #{} ({} job{})...", id, pending_count, if pending_count == 1 { "" } else { "s" });
 
     let mut last_reported = 0;

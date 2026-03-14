@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use barca_core::models::{AssetDetail, AssetSummary, InspectedAsset, JobDetail, WorkerResponse};
-use barca_server::config::{BarcaConfig, PythonConfig};
 use barca_server::python_bridge::PythonBridge;
 use barca_server::store::MetadataStore;
 use barca_server::{AppState, JobLogEntry};
@@ -212,16 +211,11 @@ impl Scenario {
     async fn new(mock: DynamicMockPythonBridge) -> Self {
         let tmp_dir = tempfile::tempdir().unwrap();
         let repo_root = tmp_dir.path().to_path_buf();
-        let config = BarcaConfig {
-            python: PythonConfig {
-                modules: vec!["example.assets".into()],
-            },
-        };
         let db_dir = repo_root.join(".barca");
         std::fs::create_dir_all(&db_dir).unwrap();
         let db_path = db_dir.join("metadata.db");
         let store = MetadataStore::open(&db_path).await.unwrap();
-        let state = AppState::new(repo_root, config, store, Arc::new(mock.clone()));
+        let state = AppState::new(repo_root, store, Arc::new(mock.clone()));
         Self { state, _tmp: tmp_dir, mock }
     }
 
