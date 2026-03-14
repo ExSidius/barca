@@ -70,12 +70,15 @@ release version:
     [[ -n "${MATURIN_PYPI_TOKEN:-}" ]] || { echo "error: MATURIN_PYPI_TOKEN is not set" >&2; exit 1; }
 
     # ── Bump versions ───────────────────────────────────────────────────
-    echo "=== Bumping versions to {{version}} ==="
-    sed -i '' 's/^version = ".*"/version = "{{version}}"/' \
+    # Python PEP 440: 0.0.3rc1 — Cargo semver: 0.0.3-rc.1
+    cargo_version=$(echo "{{version}}" | sed 's/rc\([0-9]*\)$/-rc.\1/' | sed 's/a\([0-9]*\)$/-alpha.\1/' | sed 's/b\([0-9]*\)$/-beta.\1/')
+    echo "=== Bumping versions: pypi={{version}} cargo=${cargo_version} ==="
+    sed -i '' "s/^version = \".*\"/version = \"${cargo_version}\"/" \
         crates/barca-cli/Cargo.toml \
         crates/barca-core/Cargo.toml \
         crates/barca-py/Cargo.toml \
-        crates/barca-server/Cargo.toml \
+        crates/barca-server/Cargo.toml
+    sed -i '' 's/^version = ".*"/version = "{{version}}"/' \
         crates/barca-py/pyproject.toml
     cargo build -p barca-core -q  # update Cargo.lock
     git add crates/*/Cargo.toml crates/barca-py/pyproject.toml Cargo.lock
