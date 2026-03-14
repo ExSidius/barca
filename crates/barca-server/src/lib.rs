@@ -1,4 +1,5 @@
 pub mod config;
+pub mod display;
 pub mod python_bridge;
 pub mod server;
 pub mod store;
@@ -13,10 +14,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use barca_core::hashing::{
-    compute_definition_hash, optional_file_hash, relative_path, repo_child, sha256_hex, slugify,
-    DefinitionHashPayload, PROTOCOL_VERSION,
-};
+use barca_core::hashing::{compute_definition_hash, optional_file_hash, relative_path, repo_child, sha256_hex, slugify, DefinitionHashPayload, PROTOCOL_VERSION};
 use barca_core::models::{ArtifactMetadata, AssetDetail, IndexedAsset, InspectedAsset};
 use tokio::sync::{broadcast, Mutex, Notify};
 use tracing::{error, info};
@@ -51,13 +49,7 @@ impl JobLogLevel {
     }
 }
 
-fn emit_log(
-    tx: &broadcast::Sender<JobLogEntry>,
-    asset_id: i64,
-    job_id: i64,
-    level: JobLogLevel,
-    message: impl Into<String>,
-) {
+pub fn emit_log(tx: &broadcast::Sender<JobLogEntry>, asset_id: i64, job_id: i64, level: JobLogLevel, message: impl Into<String>) {
     let _ = tx.send(JobLogEntry {
         asset_id,
         job_id,
@@ -74,16 +66,11 @@ pub struct AppState {
     pub job_queue_notify: Arc<Notify>,
     pub job_completion_tx: broadcast::Sender<i64>,
     pub job_log_tx: broadcast::Sender<JobLogEntry>,
-    pub python: PythonBridge,
+    pub python: Arc<dyn PythonBridge>,
 }
 
 impl AppState {
-    pub fn new(
-        repo_root: PathBuf,
-        config: BarcaConfig,
-        store: MetadataStore,
-        python: PythonBridge,
-    ) -> Self {
+    pub fn new(repo_root: PathBuf, config: BarcaConfig, store: MetadataStore, python: Arc<dyn PythonBridge>) -> Self {
         let (job_completion_tx, _) = broadcast::channel(16);
         let (job_log_tx, _) = broadcast::channel(256);
         Self {
@@ -98,64 +85,175 @@ impl AppState {
     }
 }
 
+pub async fn run_log_persister(state: AppState) {
+    let mut rx = state.job_log_tx.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(entry) => {
+                if entry.job_id == 0 {
+                    continue;
+                }
+                let store = state.store.lock().await;
+                if let Err(e) = store.insert_job_log(entry.job_id, entry.asset_id, entry.level.as_str(), &entry.message).await {
+                    error!(job_id = entry.job_id, error = %e, "failed to persist job log");
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::warn!(skipped = n, "log persister lagged, some log entries were dropped");
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                break;
+            }
+        }
+    }
+}
+
+/// Resolve asset inputs: try the `asset_inputs` table first, fall back to
+/// parsing the decorator metadata JSON (the source of truth). Persists any
+/// newly resolved inputs back to the table for next time.
+async fn resolve_asset_inputs(store: &store::MetadataStore, detail: &AssetDetail, repo_root: &Path) -> anyhow::Result<Vec<barca_core::models::AssetInput>> {
+    let mut inputs = store.get_asset_inputs(detail.asset.definition_id).await?;
+
+    if !inputs.is_empty() {
+        return Ok(inputs);
+    }
+
+    // Fall back to decorator metadata
+    let meta: serde_json::Value = match serde_json::from_str(&detail.asset.decorator_metadata_json) {
+        Ok(v) => v,
+        Err(_) => return Ok(inputs),
+    };
+    let inputs_obj = match meta.get("inputs").and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return Ok(inputs),
+    };
+
+    for (param_name, ref_value) in inputs_obj {
+        if let Some(abs_ref) = ref_value.as_str() {
+            let canonical_ref = if let Some(colon_pos) = abs_ref.rfind(':') {
+                let abs_path = &abs_ref[..colon_pos];
+                let func_name = &abs_ref[colon_pos + 1..];
+                let rel = relative_path(repo_root, Path::new(abs_path));
+                format!("{rel}:{func_name}")
+            } else {
+                abs_ref.to_string()
+            };
+            let upstream_id = store.asset_id_by_logical_name(&canonical_ref).await?;
+            inputs.push(barca_core::models::AssetInput {
+                parameter_name: param_name.clone(),
+                upstream_asset_ref: canonical_ref,
+                upstream_asset_id: upstream_id,
+            });
+        }
+    }
+
+    if !inputs.is_empty() {
+        store.upsert_asset_inputs(detail.asset.definition_id, &inputs).await?;
+    }
+
+    Ok(inputs)
+}
+
+/// Extract partition values from decorator metadata. Returns a list of
+/// partition key objects, e.g. [{"ticker": "AAPL"}, {"ticker": "MSFT"}, ...].
+/// Returns empty vec for non-partitioned assets.
+fn resolve_partition_values(detail: &AssetDetail) -> Vec<serde_json::Value> {
+    let meta: serde_json::Value = match serde_json::from_str(&detail.asset.decorator_metadata_json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let partitions_obj = match meta.get("partitions").and_then(|v| v.as_object()) {
+        Some(obj) => obj,
+        None => return Vec::new(),
+    };
+
+    // For now, support single-dimension inline partitions.
+    // Each dimension has {"kind": "inline", "values_json": "[...]"}.
+    // With one dimension, each value becomes {"dim_name": value}.
+    let mut result = Vec::new();
+    for (dim_name, spec) in partitions_obj {
+        let spec_obj = match spec.as_object() {
+            Some(o) => o,
+            None => continue,
+        };
+        if spec_obj.get("kind").and_then(|v| v.as_str()) != Some("inline") {
+            continue;
+        }
+        let values_json = match spec_obj.get("values_json").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let values: Vec<serde_json::Value> = match serde_json::from_str(values_json) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for val in values {
+            let mut key = serde_json::Map::new();
+            key.insert(dim_name.clone(), val);
+            result.push(serde_json::Value::Object(key));
+        }
+    }
+    result
+}
+
 pub async fn reindex(state: &AppState) -> anyhow::Result<()> {
-    let inspected = state
-        .python
-        .inspect_modules(&state.config.python.modules)
-        .await?;
+    let inspected = state.python.inspect_modules(&state.config.python.modules).await?;
     let mut seen = std::collections::HashSet::new();
 
+    // First pass: upsert all assets and collect input declarations
     let uv_lock_hash = optional_file_hash(&state.repo_root.join("uv.lock"));
+    let mut assets_with_inputs: Vec<(String, Vec<barca_core::models::AssetInput>)> = Vec::new();
+
     for inspected_asset in inspected {
-        let indexed = build_indexed_asset(&state.repo_root, inspected_asset, uv_lock_hash.clone())?;
+        let (indexed, inputs) = build_indexed_asset(&state.repo_root, inspected_asset, uv_lock_hash.clone())?;
         if !seen.insert(indexed.continuity_key.clone()) {
-            return Err(anyhow!(
-                "duplicate continuity key detected: {}",
-                indexed.continuity_key
-            ));
+            return Err(anyhow!("duplicate continuity key detected: {}", indexed.continuity_key));
+        }
+        if !inputs.is_empty() {
+            assets_with_inputs.push((indexed.continuity_key.clone(), inputs));
         }
         let store = state.store.lock().await;
         store.upsert_indexed_asset(&indexed).await?;
         drop(store);
     }
+
+    // Second pass: resolve input upstream_asset_ids and persist
+    let store = state.store.lock().await;
+    for (continuity_key, mut inputs) in assets_with_inputs {
+        let asset_id = store
+            .asset_id_by_logical_name(&continuity_key)
+            .await?
+            .ok_or_else(|| anyhow!("asset {} not found after upsert", continuity_key))?;
+        let detail = store.asset_detail(asset_id).await?;
+
+        for input in &mut inputs {
+            let upstream_id = store
+                .asset_id_by_logical_name(&input.upstream_asset_ref)
+                .await?
+                .ok_or_else(|| anyhow!("input '{}' on asset '{}' references unknown asset '{}'", input.parameter_name, continuity_key, input.upstream_asset_ref,))?;
+            input.upstream_asset_id = Some(upstream_id);
+        }
+
+        store.upsert_asset_inputs(detail.asset.definition_id, &inputs).await?;
+    }
+    drop(store);
+
     Ok(())
 }
 
-pub fn build_indexed_asset(
-    repo_root: &Path,
-    inspected: InspectedAsset,
-    uv_lock_hash: Option<String>,
-) -> anyhow::Result<IndexedAsset> {
+pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, uv_lock_hash: Option<String>) -> anyhow::Result<(IndexedAsset, Vec<barca_core::models::AssetInput>)> {
     if inspected.kind != "asset" {
         return Err(anyhow!("unsupported node kind: {}", inspected.kind));
     }
 
     let file_path = PathBuf::from(&inspected.file_path);
     let relative_file = relative_path(repo_root, &file_path);
-    let explicit_name = inspected
-        .decorator_metadata
-        .get("name")
-        .and_then(|value| value.as_str())
-        .map(ToOwned::to_owned);
-    let continuity_key = explicit_name
-        .clone()
-        .unwrap_or_else(|| format!("{relative_file}:{}", inspected.function_name));
+    let explicit_name = inspected.decorator_metadata.get("name").and_then(|value| value.as_str()).map(ToOwned::to_owned);
+    let continuity_key = explicit_name.clone().unwrap_or_else(|| format!("{relative_file}:{}", inspected.function_name));
     let logical_name = continuity_key.clone();
-    let filename = file_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("asset.py");
-    let asset_slug = slugify(&[
-        relative_file.as_str(),
-        filename,
-        inspected.function_name.as_str(),
-    ]);
-    let serializer_kind = inspected
-        .decorator_metadata
-        .get("serializer")
-        .and_then(|value| value.as_str())
-        .unwrap_or("json")
-        .to_string();
+    let filename = file_path.file_name().and_then(|name| name.to_str()).unwrap_or("asset.py");
+    let asset_slug = slugify(&[relative_file.as_str(), filename, inspected.function_name.as_str()]);
+    let serializer_kind = inspected.decorator_metadata.get("serializer").and_then(|value| value.as_str()).unwrap_or("json").to_string();
     let decorator_json = serde_json::to_string(&inspected.decorator_metadata)?;
     let definition_hash = compute_definition_hash(&DefinitionHashPayload {
         module_source: &inspected.module_source,
@@ -167,25 +265,62 @@ pub fn build_indexed_asset(
         protocol_version: PROTOCOL_VERSION,
     })?;
 
-    Ok(IndexedAsset {
-        asset_id: 0,
-        logical_name,
-        continuity_key,
-        module_path: inspected.module_path,
-        file_path: relative_file,
-        function_name: inspected.function_name,
-        asset_slug,
-        definition_id: 0,
-        definition_hash: definition_hash.clone(),
-        run_hash: definition_hash,
-        source_text: inspected.function_source,
-        module_source_text: inspected.module_source,
-        decorator_metadata_json: decorator_json,
-        return_type: inspected.return_type,
-        serializer_kind,
-        python_version: inspected.python_version,
-        uv_lock_hash,
-    })
+    // Extract inputs from decorator metadata and relativize absolute paths
+    let mut inputs = Vec::new();
+    if let Some(inputs_map) = inspected.decorator_metadata.get("inputs") {
+        if let Some(obj) = inputs_map.as_object() {
+            for (param_name, ref_value) in obj {
+                if let Some(abs_ref) = ref_value.as_str() {
+                    // Refs come as "{abs_file_path}:{function_name}" from the decorator.
+                    // Relativize: split on last ":", relativize the path portion.
+                    let canonical_ref = if let Some(colon_pos) = abs_ref.rfind(':') {
+                        let abs_path = &abs_ref[..colon_pos];
+                        let func_name = &abs_ref[colon_pos + 1..];
+                        let rel = relative_path(repo_root, Path::new(abs_path));
+                        format!("{rel}:{func_name}")
+                    } else {
+                        abs_ref.to_string()
+                    };
+                    inputs.push(barca_core::models::AssetInput {
+                        parameter_name: param_name.clone(),
+                        upstream_asset_ref: canonical_ref,
+                        upstream_asset_id: None,
+                    });
+                }
+            }
+        }
+    }
+
+    let has_inputs = !inputs.is_empty();
+    let run_hash = if has_inputs {
+        // run_hash computed at materialization time for assets with inputs
+        String::new()
+    } else {
+        definition_hash.clone()
+    };
+
+    Ok((
+        IndexedAsset {
+            asset_id: 0,
+            logical_name,
+            continuity_key,
+            module_path: inspected.module_path,
+            file_path: relative_file,
+            function_name: inspected.function_name,
+            asset_slug,
+            definition_id: 0,
+            definition_hash,
+            run_hash,
+            source_text: inspected.function_source,
+            module_source_text: inspected.module_source,
+            decorator_metadata_json: decorator_json,
+            return_type: inspected.return_type,
+            serializer_kind,
+            python_version: inspected.python_version,
+            uv_lock_hash,
+        },
+        inputs,
+    ))
 }
 
 pub async fn run_refresh_queue_worker(state: AppState) {
@@ -201,6 +336,8 @@ pub async fn run_refresh_queue_worker(state: AppState) {
         match next_job {
             Ok(Some(job)) => {
                 execute_refresh_job(&state, job).await;
+                // Wake up again to process any re-queued downstream jobs
+                state.job_queue_notify.notify_one();
             }
             Ok(None) => {
                 notified.await;
@@ -213,10 +350,11 @@ pub async fn run_refresh_queue_worker(state: AppState) {
     }
 }
 
-pub async fn enqueue_refresh_request(
-    state: &AppState,
-    asset_id: i64,
-) -> anyhow::Result<AssetDetail> {
+pub fn enqueue_refresh_request(state: &AppState, asset_id: i64) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<AssetDetail>> + Send + '_>> {
+    Box::pin(enqueue_refresh_request_inner(state, asset_id))
+}
+
+async fn enqueue_refresh_request_inner(state: &AppState, asset_id: i64) -> anyhow::Result<AssetDetail> {
     let detail = {
         let store = state.store.lock().await;
         store.asset_detail(asset_id).await?
@@ -231,10 +369,7 @@ pub async fn enqueue_refresh_request(
         asset_id,
         0,
         JobLogLevel::Info,
-        format!(
-            "Refresh request received for {}",
-            detail.asset.function_name
-        ),
+        format!("Refresh request received for {}", detail.asset.function_name),
     );
 
     let current_inspected = state
@@ -243,95 +378,122 @@ pub async fn enqueue_refresh_request(
         .await?
         .into_iter()
         .find(|asset| asset.function_name == detail.asset.function_name)
-        .ok_or_else(|| {
-            anyhow!(
-                "asset {} could not be re-inspected",
-                detail.asset.logical_name
-            )
-        })?;
-    let current_indexed = build_indexed_asset(
-        &state.repo_root,
-        current_inspected,
-        optional_file_hash(&state.repo_root.join("uv.lock")),
-    )?;
+        .ok_or_else(|| anyhow!("asset {} could not be re-inspected", detail.asset.logical_name))?;
+    let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, optional_file_hash(&state.repo_root.join("uv.lock")))?;
 
     if current_indexed.definition_hash != detail.asset.definition_hash {
-        let msg = format!(
-            "Definition changed since indexing for {}. Reindex first.",
-            detail.asset.logical_name
-        );
+        let msg = format!("Definition changed since indexing for {}. Reindex first.", detail.asset.logical_name);
         emit_log(&state.job_log_tx, asset_id, 0, JobLogLevel::Error, &msg);
         return Err(anyhow!(msg));
     }
 
+    // For assets without inputs, check for existing fresh materialization
+    let has_inputs = !detail.asset.run_hash.is_empty() && detail.asset.run_hash != detail.asset.definition_hash;
+    let skip_run_hash_check = has_inputs || detail.asset.run_hash.is_empty();
+
     let store = state.store.lock().await;
-    if let Some(existing) = store
-        .successful_materialization_for_run(asset_id, &detail.asset.run_hash)
-        .await?
-    {
-        info!(
-            asset_id = detail.asset.asset_id,
-            job_id = existing.materialization_id,
-            "resolved from existing successful materialization",
-        );
-        emit_log(
-            &state.job_log_tx,
-            asset_id,
-            existing.materialization_id,
-            JobLogLevel::Info,
-            "Resolved from existing successful materialization (already fresh)",
-        );
-        return store.asset_detail(asset_id).await;
+    if !skip_run_hash_check {
+        if let Some(existing) = store.successful_materialization_for_run(asset_id, &detail.asset.run_hash).await? {
+            info!(
+                asset_id = detail.asset.asset_id,
+                job_id = existing.materialization_id,
+                "resolved from existing successful materialization",
+            );
+            emit_log(
+                &state.job_log_tx,
+                asset_id,
+                existing.materialization_id,
+                JobLogLevel::Info,
+                "Resolved from existing successful materialization (already fresh)",
+            );
+            return store.asset_detail(asset_id).await;
+        }
+
+        if let Some(existing) = store.active_materialization_for_run(asset_id, &detail.asset.run_hash).await? {
+            let msg = if existing.status == "running" {
+                format!("Job {} already running — request joined", existing.materialization_id)
+            } else {
+                format!("Job {} already queued — request joined", existing.materialization_id)
+            };
+            info!(asset_id = detail.asset.asset_id, job_id = existing.materialization_id, "{msg}");
+            emit_log(&state.job_log_tx, asset_id, existing.materialization_id, JobLogLevel::Info, &msg);
+            return store.asset_detail(asset_id).await;
+        }
     }
 
-    if let Some(existing) = store
-        .active_materialization_for_run(asset_id, &detail.asset.run_hash)
-        .await?
-    {
-        let msg = if existing.status == "running" {
-            format!(
-                "Job {} already running — request joined",
-                existing.materialization_id
-            )
-        } else {
-            format!(
-                "Job {} already queued — request joined",
-                existing.materialization_id
-            )
-        };
-        info!(
-            asset_id = detail.asset.asset_id,
-            job_id = existing.materialization_id,
-            "{msg}"
-        );
-        emit_log(
-            &state.job_log_tx,
-            asset_id,
-            existing.materialization_id,
-            JobLogLevel::Info,
-            &msg,
-        );
-        return store.asset_detail(asset_id).await;
+    // For assets with inputs, check if there's already an active job for this asset
+    if skip_run_hash_check {
+        if let Some(existing) = store.active_materialization_for_asset(asset_id).await? {
+            let msg = format!("Job {} already {} — request joined", existing.materialization_id, existing.status);
+            info!(asset_id, job_id = existing.materialization_id, "{msg}");
+            emit_log(&state.job_log_tx, asset_id, existing.materialization_id, JobLogLevel::Info, &msg);
+            return store.asset_detail(asset_id).await;
+        }
     }
 
-    let materialization_id = store
-        .insert_queued_materialization(asset_id, detail.asset.definition_id, &detail.asset.run_hash)
-        .await?;
+    // Recursively enqueue upstream deps first (before the current asset)
+    let asset_inputs = resolve_asset_inputs(&store, &detail, &state.repo_root).await?;
+    drop(store);
+
+    for input in &asset_inputs {
+        let upstream_asset_id = input.upstream_asset_id.unwrap_or(-1);
+        let store = state.store.lock().await;
+        let has_successful = store.latest_successful_materialization(upstream_asset_id).await?.is_some();
+        drop(store);
+
+        if !has_successful {
+            info!(
+                asset_id,
+                upstream_asset_id,
+                param = %input.parameter_name,
+                "enqueuing upstream dependency"
+            );
+            // Recursive call — enqueues the upstream (and its upstreams) first
+            enqueue_refresh_request(state, upstream_asset_id).await?;
+        }
+    }
+
+    // Resolve partition values from decorator metadata (if any)
+    let partition_values = resolve_partition_values(&detail);
+
+    // Now enqueue the current asset — one job per partition (or one job if no partitions)
+    let store = state.store.lock().await;
+    let run_hash = if has_inputs { detail.asset.definition_hash.clone() } else { detail.asset.run_hash.clone() };
+
+    if partition_values.is_empty() {
+        // Non-partitioned asset: single job
+        let materialization_id = store.insert_queued_materialization(asset_id, detail.asset.definition_id, &run_hash, None).await?;
+        info!(
+            asset_id = detail.asset.asset_id,
+            job_id = materialization_id,
+            asset = %detail.asset.logical_name,
+            "queued",
+        );
+        emit_log(&state.job_log_tx, asset_id, materialization_id, JobLogLevel::Info, format!("Job {} queued", materialization_id));
+    } else {
+        // Partitioned asset: one job per partition value
+        for pv in &partition_values {
+            let pk_json = serde_json::to_string(pv).unwrap_or_default();
+            let materialization_id = store.insert_queued_materialization(asset_id, detail.asset.definition_id, &run_hash, Some(&pk_json)).await?;
+            info!(
+                asset_id = detail.asset.asset_id,
+                job_id = materialization_id,
+                partition = %pk_json,
+                asset = %detail.asset.logical_name,
+                "queued partition",
+            );
+            emit_log(
+                &state.job_log_tx,
+                asset_id,
+                materialization_id,
+                JobLogLevel::Info,
+                format!("Job {} queued (partition {})", materialization_id, pk_json),
+            );
+        }
+    }
+
     let queued_detail = store.asset_detail(asset_id).await?;
     drop(store);
-    info!(
-        asset_id = detail.asset.asset_id,
-        job_id = materialization_id,
-        asset = %detail.asset.logical_name,
-        "queued",
-    );
-    emit_log(
-        &state.job_log_tx,
-        asset_id,
-        materialization_id,
-        JobLogLevel::Info,
-        format!("Job {} queued", materialization_id),
-    );
     state.job_queue_notify.notify_one();
     Ok(queued_detail)
 }
@@ -349,9 +511,7 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
             Err(error) => {
                 let error_message = error.to_string();
                 emit_log(log, aid, jid, JobLogLevel::Error, &error_message);
-                if let Err(mark_error) =
-                    fail_refresh_job(state, &job, None, started_at, &error_message).await
-                {
+                if let Err(mark_error) = fail_refresh_job(state, &job, None, started_at, &error_message).await {
                     error!(job_id = jid, error = %mark_error, "failed to persist failure");
                 }
                 return;
@@ -364,24 +524,11 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
         asset = %detail.asset.logical_name,
         "started",
     );
-    emit_log(
-        log,
-        aid,
-        jid,
-        JobLogLevel::Info,
-        format!(
-            "Job {} started — executing {}",
-            jid, detail.asset.function_name
-        ),
-    );
+    emit_log(log, aid, jid, JobLogLevel::Info, format!("Job {} started — executing {}", jid, detail.asset.function_name));
 
     let result: anyhow::Result<()> = async {
-        if detail.asset.definition_id != job.definition_id || detail.asset.run_hash != job.run_hash
-        {
-            return Err(anyhow!(
-                "definition changed since this job was queued for {}. Trigger a new refresh.",
-                detail.asset.logical_name
-            ));
+        if detail.asset.definition_id != job.definition_id || detail.asset.run_hash != job.run_hash {
+            return Err(anyhow!("definition changed since this job was queued for {}. Trigger a new refresh.", detail.asset.logical_name));
         }
 
         emit_log(log, aid, jid, JobLogLevel::Info, "Verifying definition...");
@@ -392,40 +539,134 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
             .await?
             .into_iter()
             .find(|asset| asset.function_name == detail.asset.function_name)
-            .ok_or_else(|| {
-                anyhow!(
-                    "asset {} could not be re-inspected",
-                    detail.asset.logical_name
-                )
-            })?;
-        let current_indexed = build_indexed_asset(
-            &state.repo_root,
-            current_inspected,
-            optional_file_hash(&state.repo_root.join("uv.lock")),
-        )?;
+            .ok_or_else(|| anyhow!("asset {} could not be re-inspected", detail.asset.logical_name))?;
+        let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, optional_file_hash(&state.repo_root.join("uv.lock")))?;
 
         if current_indexed.definition_hash != detail.asset.definition_hash {
-            return Err(anyhow!(
-                "definition changed since indexing for {}. Reindex first.",
-                detail.asset.logical_name
-            ));
+            return Err(anyhow!("definition changed since indexing for {}. Reindex first.", detail.asset.logical_name));
         }
 
-        emit_log(
-            log,
-            aid,
-            jid,
-            JobLogLevel::Info,
-            "Spawning Python worker...",
-        );
+        // Resolve upstream inputs (table first, falls back to decorator metadata)
+        let asset_inputs = {
+            let store = state.store.lock().await;
+            resolve_asset_inputs(&store, &detail, &state.repo_root).await?
+        };
 
-        let staging_dir = repo_child(
-            &state.repo_root,
-            PathBuf::from("tmp").join(format!(
-                "asset-{}-{}",
-                detail.asset.asset_id, job.materialization_id
-            )),
-        );
+        let mut input_kwargs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        let mut upstream_mat_ids: Vec<i64> = Vec::new();
+        let mut mat_inputs: Vec<barca_core::models::MaterializationInput> = Vec::new();
+        let mut provenance_entries: Vec<serde_json::Value> = Vec::new();
+
+        for input in &asset_inputs {
+            let upstream_asset_id = input.upstream_asset_id.unwrap_or(-1);
+            emit_log(
+                log,
+                aid,
+                jid,
+                JobLogLevel::Info,
+                format!("Resolving upstream input '{}' (asset #{})", input.parameter_name, upstream_asset_id),
+            );
+
+            // Check upstream has a successful materialization — if not, re-queue this job
+            let upstream_mat = {
+                let store = state.store.lock().await;
+                store.latest_successful_materialization(upstream_asset_id).await?
+            };
+            let Some(upstream_mat) = upstream_mat else {
+                info!(asset_id = aid, job_id = jid, upstream_asset_id, "upstream not ready — re-queuing job");
+                emit_log(log, aid, jid, JobLogLevel::Info, format!("Upstream asset #{} not ready — re-queuing", upstream_asset_id));
+                let store = state.store.lock().await;
+                store.requeue_materialization(jid).await?;
+                // Notify worker to pick up next job (which should be the upstream)
+                drop(store);
+                state.job_queue_notify.notify_one();
+                return Ok(());
+            };
+
+            // Load the upstream artifact value
+            let artifact_path = upstream_mat
+                .artifact_path
+                .as_ref()
+                .ok_or_else(|| anyhow!("upstream asset #{} has no artifact path", upstream_asset_id))?;
+            let full_path = state.repo_root.join(artifact_path);
+            let value_bytes = fs::read(&full_path).with_context(|| format!("failed to read upstream artifact at {}", full_path.display()))?;
+            let value: serde_json::Value = serde_json::from_slice(&value_bytes)?;
+
+            input_kwargs.insert(input.parameter_name.clone(), value);
+            upstream_mat_ids.push(upstream_mat.materialization_id);
+            mat_inputs.push(barca_core::models::MaterializationInput {
+                parameter_name: input.parameter_name.clone(),
+                upstream_materialization_id: upstream_mat.materialization_id,
+                upstream_asset_id,
+            });
+            provenance_entries.push(serde_json::json!({
+                "parameter_name": input.parameter_name,
+                "asset_ref": input.upstream_asset_ref,
+                "materialization_id": upstream_mat.materialization_id,
+            }));
+        }
+
+        // Compute run_hash (includes upstream mat IDs + partition key)
+        let has_inputs_or_partition = !asset_inputs.is_empty() || job.partition_key_json.is_some();
+        let run_hash = if !has_inputs_or_partition {
+            detail.asset.definition_hash.clone()
+        } else {
+            upstream_mat_ids.sort();
+            barca_core::hashing::compute_run_hash(&detail.asset.definition_hash, &upstream_mat_ids, job.partition_key_json.as_deref())
+        };
+
+        // Check for existing successful materialization with this run_hash
+        {
+            let store = state.store.lock().await;
+            if let Some(existing) = store.successful_materialization_for_run(aid, &run_hash).await? {
+                info!(
+                    asset_id = aid,
+                    job_id = jid,
+                    existing_job = existing.materialization_id,
+                    "reusing cached materialization (run_hash match)",
+                );
+                emit_log(log, aid, jid, JobLogLevel::Info, "Reusing cached materialization");
+                // Update this job's run_hash and mark success with same artifact
+                store.update_materialization_run_hash(jid, &run_hash).await?;
+                store
+                    .mark_materialization_success(
+                        jid,
+                        existing.artifact_path.as_deref().unwrap_or(""),
+                        existing.artifact_format.as_deref().unwrap_or("json"),
+                        existing.artifact_checksum.as_deref().unwrap_or(""),
+                    )
+                    .await?;
+                if !mat_inputs.is_empty() {
+                    store.insert_materialization_inputs(jid, &mat_inputs).await?;
+                }
+                let elapsed = started_at.elapsed().as_millis();
+                emit_log(log, aid, jid, JobLogLevel::Info, format!("Job {} completed (cached) in {}ms", jid, elapsed));
+                return Ok(());
+            }
+            // Update the run_hash on the queued job
+            store.update_materialization_run_hash(jid, &run_hash).await?;
+        }
+
+        // Merge partition key into kwargs if present
+        if let Some(ref pk_json) = job.partition_key_json {
+            if let Ok(pk) = serde_json::from_str::<serde_json::Value>(pk_json) {
+                if let Some(obj) = pk.as_object() {
+                    for (k, v) in obj {
+                        input_kwargs.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+
+        let input_kwargs_json = if input_kwargs.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&serde_json::Value::Object(input_kwargs))?)
+        };
+
+        emit_log(log, aid, jid, JobLogLevel::Info, "Spawning Python worker...");
+
+        let staging_dir = repo_child(&state.repo_root, PathBuf::from("tmp").join(format!("asset-{}-{}", detail.asset.asset_id, job.materialization_id)));
         if staging_dir.exists() {
             fs::remove_dir_all(&staging_dir).ok();
         }
@@ -440,21 +681,33 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
                 jid,
                 log.clone(),
                 aid,
+                input_kwargs_json.as_deref(),
             )
             .await?;
-        let artifact_dir = repo_child(
-            &state.repo_root,
-            PathBuf::from(".barcafiles")
-                .join(&detail.asset.asset_slug)
-                .join(&detail.asset.definition_hash),
-        );
+        let mut artifact_base = PathBuf::from(".barcafiles").join(&detail.asset.asset_slug).join(&detail.asset.definition_hash);
+        // For partitioned assets, nest under partitions/<key=value>/
+        if let Some(ref pk_json) = job.partition_key_json {
+            if let Ok(pk) = serde_json::from_str::<serde_json::Value>(pk_json) {
+                if let Some(obj) = pk.as_object() {
+                    let mut parts: Vec<String> = obj
+                        .iter()
+                        .map(|(k, v)| {
+                            let val = match v {
+                                serde_json::Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            format!("{k}={val}")
+                        })
+                        .collect();
+                    parts.sort();
+                    artifact_base = artifact_base.join("partitions").join(parts.join(","));
+                }
+            }
+        }
+        let artifact_dir = repo_child(&state.repo_root, &artifact_base);
         fs::create_dir_all(&artifact_dir)?;
 
-        let value_path = PathBuf::from(
-            worker
-                .value_path
-                .context("worker did not return value path")?,
-        );
+        let value_path = PathBuf::from(worker.value_path.context("worker did not return value path")?);
         let value_bytes = fs::read(&value_path)?;
         let artifact_checksum = sha256_hex(&value_bytes);
         let final_value_path = artifact_dir.join("value.json");
@@ -469,41 +722,23 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
             file_path: &detail.asset.file_path,
             function_name: &detail.asset.function_name,
             definition_hash: &detail.asset.definition_hash,
-            run_hash: &detail.asset.run_hash,
+            run_hash: &run_hash,
             serializer_kind: &detail.asset.serializer_kind,
             python_version: &detail.asset.python_version,
             return_type: detail.asset.return_type.as_deref(),
-            inputs: Vec::new(),
+            inputs: provenance_entries,
             barca_version: PROTOCOL_VERSION,
         };
-        fs::write(
-            artifact_dir.join("metadata.json"),
-            serde_json::to_vec_pretty(&metadata)?,
-        )?;
+        fs::write(artifact_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata)?)?;
 
         let store = state.store.lock().await;
-        store
-            .mark_materialization_success(
-                job.materialization_id,
-                &artifact_path,
-                artifact_format,
-                &artifact_checksum,
-            )
-            .await?;
+        store.mark_materialization_success(job.materialization_id, &artifact_path, artifact_format, &artifact_checksum).await?;
+        if !mat_inputs.is_empty() {
+            store.insert_materialization_inputs(jid, &mat_inputs).await?;
+        }
         let elapsed = started_at.elapsed().as_millis();
-        info!(
-            asset_id = aid,
-            job_id = jid,
-            duration_ms = elapsed,
-            "completed",
-        );
-        emit_log(
-            log,
-            aid,
-            jid,
-            JobLogLevel::Info,
-            format!("Job {} completed successfully in {}ms", jid, elapsed),
-        );
+        info!(asset_id = aid, job_id = jid, duration_ms = elapsed, "completed",);
+        emit_log(log, aid, jid, JobLogLevel::Info, format!("Job {} completed successfully in {}ms", jid, elapsed));
         Ok(())
     }
     .await;
@@ -511,15 +746,7 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
     if let Err(error) = result {
         let error_message = error.to_string();
         emit_log(log, aid, jid, JobLogLevel::Error, &error_message);
-        if let Err(mark_error) = fail_refresh_job(
-            state,
-            &job,
-            Some(&detail.asset.logical_name),
-            started_at,
-            &error_message,
-        )
-        .await
-        {
+        if let Err(mark_error) = fail_refresh_job(state, &job, Some(&detail.asset.logical_name), started_at, &error_message).await {
             error!(
                 asset_id = aid, job_id = jid,
                 error = %mark_error,
@@ -531,18 +758,10 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
     }
 }
 
-async fn fail_refresh_job(
-    state: &AppState,
-    job: &barca_core::models::MaterializationRecord,
-    asset_name: Option<&str>,
-    started_at: Instant,
-    error_message: &str,
-) -> anyhow::Result<()> {
+async fn fail_refresh_job(state: &AppState, job: &barca_core::models::MaterializationRecord, asset_name: Option<&str>, started_at: Instant, error_message: &str) -> anyhow::Result<()> {
     let jid = job.materialization_id;
     let store = state.store.lock().await;
-    store
-        .mark_materialization_failed(job.materialization_id, error_message)
-        .await?;
+    store.mark_materialization_failed(job.materialization_id, error_message).await?;
     error!(
         asset_id = job.asset_id,
         asset = %asset_name.unwrap_or("unknown"),
@@ -557,11 +776,7 @@ async fn fail_refresh_job(
 }
 
 /// Directories that `barca reset` can remove.
-const RESET_TARGETS: &[(&str, &str)] = &[
-    (".barca", "db"),
-    (".barcafiles", "artifacts"),
-    ("tmp", "tmp"),
-];
+const RESET_TARGETS: &[(&str, &str)] = &[(".barca", "db"), (".barcafiles", "artifacts"), ("tmp", "tmp")];
 
 /// Remove generated files and caches from the repo root.
 ///

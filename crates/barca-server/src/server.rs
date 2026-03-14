@@ -9,30 +9,45 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use barca_core::models::{AssetDetail, AssetSummary, MaterializationRecord};
+use barca_core::models::{AssetDetail, AssetSummary, JobDetail, MaterializationRecord};
 use datastar::consts::ElementPatchMode;
 use datastar::prelude::PatchElements;
 use time::{Month, OffsetDateTime};
 use tokio::select;
+use utoipa::OpenApi;
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::templates;
 use crate::AppState;
 
+#[derive(OpenApi)]
+#[openapi(
+    info(title = "Barca API", version = "0.1.0"),
+    components(schemas(AssetSummary, AssetDetail, MaterializationRecord, JobDetail, barca_core::models::IndexedAsset,))
+)]
+struct ApiDoc;
+
 pub fn router() -> Router<AppState> {
+    // Build the OpenAPI router for /api/* routes
+    let (api_router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(utoipa_axum::routes!(api_list_assets))
+        .routes(utoipa_axum::routes!(api_get_asset))
+        .routes(utoipa_axum::routes!(api_materialize_asset))
+        .routes(utoipa_axum::routes!(api_reindex))
+        .routes(utoipa_axum::routes!(api_list_jobs))
+        .routes(utoipa_axum::routes!(api_get_job))
+        .split_for_parts();
+
     Router::new()
         .route("/", get(index_page))
         .route("/reindex", post(reindex_action))
         .route("/assets/{asset_id}/materialize", post(materialize_action))
         .route("/assets/{asset_id}/panel", get(asset_panel))
         .route("/assets/{asset_id}/panel/stream", get(asset_panel_stream))
-        // JSON API
-        .route("/api/assets", get(api_list_assets))
-        .route("/api/assets/{asset_id}", get(api_get_asset))
-        .route(
-            "/api/assets/{asset_id}/materialize",
-            post(api_materialize_asset),
-        )
-        .route("/api/reindex", post(api_reindex))
+        .route("/jobs/{job_id}/panel/stream", get(job_panel_stream))
+        .merge(api_router)
+        .merge(SwaggerUi::new("/api/docs").url("/api/openapi.json", api))
         .layer(middleware::from_fn(request_logger))
 }
 
@@ -48,19 +63,13 @@ pub struct IndexQuery {
     pub view: Option<String>,
 }
 
-async fn index_page(
-    Query(query): Query<IndexQuery>,
-    State(state): State<AppState>,
-) -> axum::response::Result<Html<String>> {
+async fn index_page(Query(query): Query<IndexQuery>, State(state): State<AppState>) -> axum::response::Result<Html<String>> {
     let view = query.view.as_deref().unwrap_or("assets");
     let store = state.store.lock().await;
 
     let body = match view {
         "jobs" => {
-            let jobs = store
-                .list_recent_materializations(50)
-                .await
-                .map_err(internal_error)?;
+            let jobs = store.list_recent_materializations(50).await.map_err(internal_error)?;
             drop(store);
             format!(
                 r#"
@@ -140,10 +149,7 @@ async fn reindex_action(State(state): State<AppState>) -> impl IntoResponse {
     Sse::new(stream).into_response()
 }
 
-async fn materialize_action(
-    AxumPath(asset_id): AxumPath<i64>,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn materialize_action(AxumPath(asset_id): AxumPath<i64>, State(state): State<AppState>) -> impl IntoResponse {
     let stream = stream! {
         match crate::enqueue_refresh_request(&state, asset_id).await {
             Ok(detail) => {
@@ -194,36 +200,36 @@ async fn materialize_action(
     Sse::new(stream).into_response()
 }
 
-async fn asset_panel(
-    AxumPath(asset_id): AxumPath<i64>,
-    State(state): State<AppState>,
-) -> axum::response::Result<Html<String>> {
+async fn asset_panel(AxumPath(asset_id): AxumPath<i64>, State(state): State<AppState>) -> axum::response::Result<Html<String>> {
     let store = state.store.lock().await;
     let detail = store.asset_detail(asset_id).await.map_err(internal_error)?;
-    let materializations = store
-        .list_materializations_for_asset(asset_id, 20)
-        .await
-        .map_err(internal_error)?;
+    let materializations = store.list_materializations_for_asset(asset_id, 20).await.map_err(internal_error)?;
+    let persisted_logs = load_latest_terminal_logs(&store, &detail).await;
     drop(store);
 
-    Ok(Html(render_asset_panel(&detail, &materializations)))
+    Ok(Html(render_asset_panel(&detail, &materializations, &persisted_logs)))
 }
 
-async fn asset_panel_stream(
-    AxumPath(asset_id): AxumPath<i64>,
-    State(state): State<AppState>,
-) -> axum::response::Result<impl IntoResponse> {
+#[derive(Debug, serde::Deserialize)]
+struct PanelStreamQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+async fn asset_panel_stream(AxumPath(asset_id): AxumPath<i64>, Query(params): Query<PanelStreamQuery>, State(state): State<AppState>) -> axum::response::Result<impl IntoResponse> {
     let mut job_completion_rx = state.job_completion_tx.subscribe();
     let mut job_log_rx = state.job_log_tx.subscribe();
 
     let stream = stream! {
+        // Send initial panel HTML
         let panel_html = {
             let store = state.store.lock().await;
             match store.asset_detail(asset_id).await {
                 Ok(detail) => {
                     let materializations = store.list_materializations_for_asset(asset_id, 20).await.unwrap_or_default();
+                    let logs = load_latest_terminal_logs(&store, &detail).await;
                     drop(store);
-                    render_asset_panel(&detail, &materializations)
+                    render_asset_panel(&detail, &materializations, &logs)
                 }
                 Err(_) => {
                     drop(store);
@@ -232,9 +238,23 @@ async fn asset_panel_stream(
             }
         };
 
-        let patch = PatchElements::new(panel_html.clone())
-            .selector("#asset-panel");
+        let patch = PatchElements::new(panel_html).selector("#panel-content");
         yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+
+        // If refresh requested, enqueue materialization now (after SSE is established)
+        if params.refresh {
+            match crate::enqueue_refresh_request(&state, asset_id).await {
+                Ok(detail) => {
+                    // Update the asset card on the main page too
+                    let card_html = render_asset_card_from_detail(&detail).replace('\n', "");
+                    let patch = PatchElements::new(card_html);
+                    yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                }
+                Err(e) => {
+                    tracing::error!(asset_id, error = %e, "failed to enqueue refresh from panel");
+                }
+            }
+        }
 
         loop {
             let recv_completion = job_completion_rx.recv();
@@ -257,19 +277,31 @@ async fn asset_panel_stream(
                 result = recv_completion => {
                     match result {
                         Ok(completed_asset_id) if completed_asset_id == asset_id => {
+                            // Re-render panel with updated state
                             let panel_html = {
                                 let store = state.store.lock().await;
                                 match store.asset_detail(asset_id).await {
                                     Ok(detail) => {
                                         let materializations = store.list_materializations_for_asset(asset_id, 20).await.unwrap_or_default();
+                                        let logs = load_latest_terminal_logs(&store, &detail).await;
                                         drop(store);
-                                        render_asset_panel(&detail, &materializations)
+                                        render_asset_panel(&detail, &materializations, &logs)
                                     }
                                     Err(_) => continue,
                                 }
                             };
-                            let patch = PatchElements::new(panel_html)
-                                .selector("#asset-panel");
+                            let patch = PatchElements::new(panel_html).selector("#panel-content");
+                            yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+
+                            // Also update the asset card on the main page
+                            let card_html = {
+                                let store = state.store.lock().await;
+                                match store.asset_detail(asset_id).await {
+                                    Ok(detail) => render_asset_card_from_detail(&detail).replace('\n', ""),
+                                    Err(_) => continue,
+                                }
+                            };
+                            let patch = PatchElements::new(card_html);
                             yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
                         }
                         Ok(_) => continue,
@@ -277,7 +309,7 @@ async fn asset_panel_stream(
                     }
                 }
                 _ = timeout => {
-                    let patch = PatchElements::new("").selector("#asset-panel");
+                    let patch = PatchElements::new("").selector("#panel-content");
                     yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
                 }
             }
@@ -287,28 +319,106 @@ async fn asset_panel_stream(
     Ok(Sse::new(stream).into_response())
 }
 
-fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationRecord]) -> String {
+async fn job_panel_stream(AxumPath(job_id): AxumPath<i64>, State(state): State<AppState>) -> axum::response::Result<impl IntoResponse> {
+    let mut job_completion_rx = state.job_completion_tx.subscribe();
+    let mut job_log_rx = state.job_log_tx.subscribe();
+
+    // Look up the asset_id for this job so we can filter events
+    let asset_id = {
+        let store = state.store.lock().await;
+        let (mat, _) = store.get_materialization_with_asset(job_id).await.map_err(internal_error)?;
+        mat.asset_id
+    };
+
+    let stream = stream! {
+        let panel_html = {
+            let store = state.store.lock().await;
+            match store.get_materialization_with_asset(job_id).await {
+                Ok((mat, summary)) => {
+                    let logs = store.get_job_logs(job_id).await.unwrap_or_default();
+                    templates::job_panel(&mat, &summary, &logs)
+                }
+                Err(_) => String::new(),
+            }
+        };
+
+        let patch = PatchElements::new(panel_html).selector("#panel-content");
+        yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+
+        loop {
+            let recv_completion = job_completion_rx.recv();
+            let recv_log = job_log_rx.recv();
+            let timeout = tokio::time::sleep(Duration::from_secs(30));
+            select! {
+                result = recv_log => {
+                    match result {
+                        Ok(entry) if entry.asset_id == asset_id && entry.job_id == job_id => {
+                            let log_line = templates::job_log_line(&entry.message, entry.level.as_str());
+                            let patch = PatchElements::new(log_line)
+                                .selector("#job-log-entries")
+                                .mode(ElementPatchMode::Append);
+                            yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                result = recv_completion => {
+                    match result {
+                        Ok(completed_asset_id) if completed_asset_id == asset_id => {
+                            let panel_html = {
+                                let store = state.store.lock().await;
+                                match store.get_materialization_with_asset(job_id).await {
+                                    Ok((mat, summary)) => {
+                                        let logs = store.get_job_logs(job_id).await.unwrap_or_default();
+                                        templates::job_panel(&mat, &summary, &logs)
+                                    }
+                                    Err(_) => continue,
+                                }
+                            };
+                            let patch = PatchElements::new(panel_html).selector("#panel-content");
+                            yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                        }
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                _ = timeout => {
+                    let patch = PatchElements::new("").selector("#panel-content");
+                    yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                }
+            }
+        }
+    };
+
+    Ok(Sse::new(stream).into_response())
+}
+
+async fn load_latest_terminal_logs(store: &crate::store::MetadataStore, detail: &AssetDetail) -> Vec<barca_core::models::JobLogRecord> {
+    if let Some(mat) = &detail.latest_materialization {
+        if mat.status == "success" || mat.status == "failed" {
+            return store.get_job_logs(mat.materialization_id).await.unwrap_or_default();
+        }
+    }
+    Vec::new()
+}
+
+fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationRecord], persisted_logs: &[barca_core::models::JobLogRecord]) -> String {
     let (status_label, status_tone) = classify_asset_state(
-        detail
-            .latest_materialization
-            .as_ref()
-            .map(|m| m.status.as_str()),
-        detail
-            .latest_materialization
-            .as_ref()
-            .map(|m| m.run_hash.as_str()),
+        detail.latest_materialization.as_ref().map(|m| m.status.as_str()),
+        detail.latest_materialization.as_ref().map(|m| m.run_hash.as_str()),
         &detail.asset.definition_hash,
     );
     let is_fresh = status_tone == "fresh";
 
     let refresh_button = if is_fresh {
         format!(
-            r#"<button type="button" data-on-click="$confirmAssetId = {}; $confirmModalOpen = true" class="inline-flex items-center justify-center rounded-lg px-3 py-1.5 text-sm font-medium btn-primary bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100">Refresh</button>"#,
+            r#"<button type="button" data-on:click="$confirmAssetId = {}; $confirmModalOpen = true" class="inline-flex items-center justify-center rounded-lg px-3 py-1.5 text-sm font-medium btn-primary bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100">Refresh</button>"#,
             detail.asset.asset_id
         )
     } else {
         format!(
-            r#"<button type="button" data-on-click="@post('/assets/{}/materialize')" class="inline-flex items-center justify-center rounded-lg px-3 py-1.5 text-sm font-medium btn-primary bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100">Refresh</button>"#,
+            r#"<button type="button" data-on:click="@get('/assets/{}/panel/stream?refresh=true')" class="inline-flex items-center justify-center rounded-lg px-3 py-1.5 text-sm font-medium btn-primary bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100">Refresh</button>"#,
             detail.asset.asset_id
         )
     };
@@ -317,28 +427,30 @@ fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationR
         .iter()
         .map(|m| {
             format!(
-                r#"<div class="flex items-center gap-3 py-2 border-b border-gray-100 dark:border-gray-800 last:border-0">
+                r#"<div class="flex items-center gap-3 py-2 border-b border-gray-100 dark:border-gray-800 last:border-0 cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 rounded-lg px-2 -mx-2 transition-colors" data-on:click="@get('/jobs/{}/panel/stream')">
                   <span class="flex h-6 w-6 shrink-0 items-center justify-center">{}</span>
                   <div class="min-w-0 flex-1">
-                    <p class="truncate text-sm font-mono text-gray-600 dark:text-gray-400">{}</p>
+                    <p class="truncate text-sm font-mono text-gray-600 dark:text-gray-400">Job #{} · {}</p>
                     <p class="text-xs text-gray-500 dark:text-gray-500">{}</p>
                   </div>
                 </div>"#,
+                m.materialization_id,
                 templates::job_status_icon(&m.status),
+                m.materialization_id,
                 templates::escape_html(&m.run_hash.chars().take(12).collect::<String>()),
                 format_timestamp(m.created_at)
             )
         })
         .collect();
 
-    let content = format!(
-        r#"<div id="asset-panel-content" class="p-6" data-asset-id="{}">
-          <div class="flex items-center justify-between border-b border-gray-200 dark:border-gray-800 pb-4">
-            <div class="flex items-center gap-3">
-              <h2 class="text-xl font-semibold text-gray-900 dark:text-white">{}</h2>
+    format!(
+        r#"<div id="panel-content" class="p-6" data-asset-id="{}">
+          <div class="flex items-center justify-between gap-3 border-b border-gray-200 dark:border-gray-800 pb-4">
+            <div class="flex items-center gap-3 min-w-0">
+              <h2 class="text-xl font-semibold text-gray-900 dark:text-white truncate">{}</h2>
               <asset-status-badge label="{}" tone="{}"></asset-status-badge>
             </div>
-            {}
+            <div class="shrink-0">{}</div>
           </div>
           {}
           <section class="mt-6 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5">
@@ -354,7 +466,7 @@ fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationR
               </div>
               <div class="sm:col-span-2">
                 <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Definition hash</dt>
-                <dd class="mt-1 overflow-x-auto text-sm text-gray-700 dark:text-gray-300"><code class="bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded">{}</code></dd>
+                <dd class="mt-1 text-sm text-gray-700 dark:text-gray-300 break-all"><code class="bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded">{}</code></dd>
               </div>
             </dl>
           </section>
@@ -368,7 +480,11 @@ fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationR
         templates::escape_html(status_label),
         status_tone,
         refresh_button,
-        templates::job_log_viewer(),
+        if !persisted_logs.is_empty() {
+            templates::job_log_viewer_with_logs(persisted_logs)
+        } else {
+            templates::job_log_viewer().to_string()
+        },
         templates::escape_html(&detail.asset.module_path),
         templates::escape_html(&detail.asset.file_path),
         templates::escape_html(&detail.asset.definition_hash),
@@ -377,16 +493,12 @@ fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationR
         } else {
             job_history
         }
-    );
-
-    format!(r#"<div id="asset-panel">{}</div>"#, content)
+    )
 }
 
 fn render_asset_list(assets: &[AssetSummary]) -> String {
     let mut items = String::new();
-    items.push_str(
-        r#"<section id="asset-list" class="mt-8 max-h-[calc(100vh-15rem)] space-y-4 overflow-y-auto scrollbar-custom pr-1">"#,
-    );
+    items.push_str(r#"<section id="asset-list" class="mt-8 max-h-[calc(100vh-15rem)] space-y-4 overflow-y-auto scrollbar-custom pr-1">"#);
     for asset in assets {
         items.push_str(&render_asset_card_from_summary(asset));
     }
@@ -397,120 +509,13 @@ fn render_asset_list(assets: &[AssetSummary]) -> String {
     items
 }
 
-#[allow(dead_code)]
-fn render_status_fragment(detail: &AssetDetail) -> String {
-    let body = match &detail.latest_materialization {
-        Some(materialization) => {
-            let (status_label, status_tone) = classify_asset_state(
-                Some(materialization.status.as_str()),
-                Some(materialization.run_hash.as_str()),
-                &detail.asset.definition_hash,
-            );
-            let error_html = materialization
-                .last_error
-                .as_deref()
-                .map(|error| {
-                    format!(
-                        r#"<div class="sm:col-span-2">
-                              <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Error</dt>
-                              <dd class="mt-2 text-sm leading-6 text-rose-700 dark:text-rose-400">{}</dd>
-                            </div>"#,
-                        templates::escape_html(error)
-                    )
-                })
-                .unwrap_or_default();
-            format!(
-                r#"
-                <div class="flex items-center justify-between gap-4">
-                  <h2 class="text-2xl font-semibold tracking-tight text-gray-900 dark:text-white">Latest run</h2>
-                  <asset-status-badge label="{}" tone="{}"></asset-status-badge>
-                </div>
-                <dl class="mt-5 grid gap-5 sm:grid-cols-2">
-                  <div>
-                    <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Last updated</dt>
-                    <dd class="mt-2 text-sm text-gray-700 dark:text-gray-300">{}</dd>
-                  </div>
-                  <div>
-                    <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Raw status</dt>
-                    <dd class="mt-2 text-sm text-gray-700 dark:text-gray-300">{}</dd>
-                  </div>
-                  <div>
-                    <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Run hash</dt>
-                    <dd class="mt-2 overflow-x-auto text-sm text-gray-700 dark:text-gray-300"><code class="bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded">{}</code></dd>
-                  </div>
-                  <div>
-                    <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Artifact</dt>
-                    <dd class="mt-2 text-sm text-gray-700 dark:text-gray-300">{}</dd>
-                  </div>
-                  {}
-                </dl>
-                "#,
-                templates::escape_html(status_label),
-                status_tone,
-                templates::escape_html(&format_last_updated(
-                    Some(materialization.created_at),
-                    Some(materialization.status.as_str()),
-                )),
-                templates::escape_html(&materialization.status),
-                templates::escape_html(&materialization.run_hash),
-                templates::escape_html(
-                    materialization
-                        .artifact_path
-                        .as_deref()
-                        .unwrap_or("Not published"),
-                ),
-                error_html
-            )
-        }
-        None => r#"
-            <div class="flex items-center justify-between gap-4">
-              <h2 class="text-2xl font-semibold tracking-tight text-gray-900 dark:text-white">Latest run</h2>
-              <asset-status-badge label="Stale" tone="stale"></asset-status-badge>
-            </div>
-            <p class="mt-6 text-sm leading-6 text-gray-600 dark:text-gray-400">This asset has not been materialized yet.</p>
-          "#
-        .to_string(),
-    };
-    format!(
-        r#"<section id="asset-status" class="mt-4 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5">{}</section>"#,
-        body
-    )
-}
-
-#[allow(dead_code)]
-fn render_run_error_status(logical_name: &str, message: &str) -> String {
-    format!(
-        r#"
-        <section id="asset-status" class="mt-4 rounded-xl border border-rose-200 dark:border-rose-900 bg-rose-50 dark:bg-rose-950/30 px-5 py-5">
-          <div class="flex items-center justify-between gap-4">
-            <h2 class="text-2xl font-semibold tracking-tight text-gray-900 dark:text-white">Latest run</h2>
-            <asset-status-badge label="Failed" tone="failed"></asset-status-badge>
-          </div>
-          <p class="mt-6 text-sm leading-6 text-gray-700 dark:text-gray-300">
-            Refreshing <span class="font-medium text-gray-900 dark:text-white">{}</span> failed.
-          </p>
-          <p class="mt-3 text-sm leading-6 text-rose-700 dark:text-rose-400">{}</p>
-        </section>
-        "#,
-        templates::escape_html(logical_name),
-        templates::escape_html(message)
-    )
-}
-
 fn render_asset_card_from_summary(asset: &AssetSummary) -> String {
-    let (status_label, status_tone) = classify_asset_state(
-        asset.materialization_status.as_deref(),
-        asset.materialization_run_hash.as_deref(),
-        &asset.definition_hash,
-    );
+    let (status_label, status_tone) = classify_asset_state(asset.materialization_status.as_deref(), asset.materialization_run_hash.as_deref(), &asset.definition_hash);
     templates::asset_card(
         asset.asset_id,
         &asset.function_name,
         &asset.file_path,
-        &format_last_updated(
-            asset.materialization_created_at,
-            asset.materialization_status.as_deref(),
-        ),
+        &format_last_updated(asset.materialization_created_at, asset.materialization_status.as_deref()),
         status_label,
         status_tone,
         status_tone == "fresh",
@@ -519,14 +524,8 @@ fn render_asset_card_from_summary(asset: &AssetSummary) -> String {
 
 fn render_asset_card_from_detail(detail: &AssetDetail) -> String {
     let (status_label, status_tone) = classify_asset_state(
-        detail
-            .latest_materialization
-            .as_ref()
-            .map(|item| item.status.as_str()),
-        detail
-            .latest_materialization
-            .as_ref()
-            .map(|item| item.run_hash.as_str()),
+        detail.latest_materialization.as_ref().map(|item| item.status.as_str()),
+        detail.latest_materialization.as_ref().map(|item| item.run_hash.as_str()),
         &detail.asset.definition_hash,
     );
     templates::asset_card(
@@ -534,14 +533,8 @@ fn render_asset_card_from_detail(detail: &AssetDetail) -> String {
         &detail.asset.function_name,
         &detail.asset.file_path,
         &format_last_updated(
-            detail
-                .latest_materialization
-                .as_ref()
-                .map(|item| item.created_at),
-            detail
-                .latest_materialization
-                .as_ref()
-                .map(|item| item.status.as_str()),
+            detail.latest_materialization.as_ref().map(|item| item.created_at),
+            detail.latest_materialization.as_ref().map(|item| item.status.as_str()),
         ),
         status_label,
         status_tone,
@@ -549,11 +542,7 @@ fn render_asset_card_from_detail(detail: &AssetDetail) -> String {
     )
 }
 
-fn classify_asset_state(
-    latest_status: Option<&str>,
-    latest_run_hash: Option<&str>,
-    definition_hash: &str,
-) -> (&'static str, &'static str) {
+fn classify_asset_state(latest_status: Option<&str>, latest_run_hash: Option<&str>, definition_hash: &str) -> (&'static str, &'static str) {
     match latest_status {
         Some("queued") => ("Queued", "running"),
         Some("running") => ("Running", "running"),
@@ -580,8 +569,7 @@ fn format_last_updated(timestamp: Option<i64>, status: Option<&str>) -> String {
 }
 
 fn format_timestamp(timestamp: i64) -> String {
-    let datetime =
-        OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or(OffsetDateTime::UNIX_EPOCH);
+    let datetime = OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or(OffsetDateTime::UNIX_EPOCH);
     let month = match datetime.month() {
         Month::January => "Jan",
         Month::February => "Feb",
@@ -603,61 +591,110 @@ fn format_timestamp(timestamp: i64) -> String {
         value => value,
     };
 
-    format!(
-        "{} {}, {} at {}:{:02} {} UTC",
-        month,
-        datetime.day(),
-        datetime.year(),
-        display_hour,
-        datetime.minute(),
-        meridiem
-    )
+    format!("{} {}, {} at {}:{:02} {} UTC", month, datetime.day(), datetime.year(), display_hour, datetime.minute(), meridiem)
 }
 
 // ---------------------------------------------------------------------------
 // JSON API handlers
 // ---------------------------------------------------------------------------
 
-async fn api_list_assets(
-    State(state): State<AppState>,
-) -> axum::response::Result<Json<Vec<AssetSummary>>> {
+/// List all assets
+#[utoipa::path(
+    get,
+    path = "/api/assets",
+    responses(
+        (status = 200, description = "List of all indexed assets", body = Vec<AssetSummary>)
+    ),
+    tag = "assets"
+)]
+async fn api_list_assets(State(state): State<AppState>) -> axum::response::Result<Json<Vec<AssetSummary>>> {
     let store = state.store.lock().await;
     let assets = store.list_assets().await.map_err(internal_error)?;
     Ok(Json(assets))
 }
 
-async fn api_get_asset(
-    AxumPath(asset_id): AxumPath<i64>,
-    State(state): State<AppState>,
-) -> axum::response::Result<Json<AssetDetail>> {
+/// Get asset details by ID
+#[utoipa::path(
+    get,
+    path = "/api/assets/{asset_id}",
+    params(("asset_id" = i64, Path, description = "Asset ID")),
+    responses(
+        (status = 200, description = "Asset details", body = AssetDetail),
+        (status = 500, description = "Asset not found")
+    ),
+    tag = "assets"
+)]
+async fn api_get_asset(AxumPath(asset_id): AxumPath<i64>, State(state): State<AppState>) -> axum::response::Result<Json<AssetDetail>> {
     let store = state.store.lock().await;
     let detail = store.asset_detail(asset_id).await.map_err(internal_error)?;
     Ok(Json(detail))
 }
 
-async fn api_materialize_asset(
-    AxumPath(asset_id): AxumPath<i64>,
-    State(state): State<AppState>,
-) -> axum::response::Result<Json<AssetDetail>> {
-    let detail = crate::enqueue_refresh_request(&state, asset_id)
-        .await
-        .map_err(internal_error)?;
+/// Trigger materialization for an asset
+#[utoipa::path(
+    post,
+    path = "/api/assets/{asset_id}/materialize",
+    params(("asset_id" = i64, Path, description = "Asset ID")),
+    responses(
+        (status = 200, description = "Asset detail after enqueueing", body = AssetDetail),
+        (status = 500, description = "Failed to enqueue")
+    ),
+    tag = "assets"
+)]
+async fn api_materialize_asset(AxumPath(asset_id): AxumPath<i64>, State(state): State<AppState>) -> axum::response::Result<Json<AssetDetail>> {
+    let detail = crate::enqueue_refresh_request(&state, asset_id).await.map_err(internal_error)?;
     Ok(Json(detail))
 }
 
-async fn api_reindex(
-    State(state): State<AppState>,
-) -> axum::response::Result<Json<Vec<AssetSummary>>> {
+/// Re-inspect Python modules and update asset index
+#[utoipa::path(
+    post,
+    path = "/api/reindex",
+    responses(
+        (status = 200, description = "Assets after reindex", body = Vec<AssetSummary>)
+    ),
+    tag = "system"
+)]
+async fn api_reindex(State(state): State<AppState>) -> axum::response::Result<Json<Vec<AssetSummary>>> {
     crate::reindex(&state).await.map_err(internal_error)?;
     let store = state.store.lock().await;
     let assets = store.list_assets().await.map_err(internal_error)?;
     Ok(Json(assets))
 }
 
+/// List recent materialization jobs
+#[utoipa::path(
+    get,
+    path = "/api/jobs",
+    responses(
+        (status = 200, description = "Recent jobs", body = Vec<JobDetail>)
+    ),
+    tag = "jobs"
+)]
+async fn api_list_jobs(State(state): State<AppState>) -> axum::response::Result<Json<Vec<JobDetail>>> {
+    let store = state.store.lock().await;
+    let pairs = store.list_recent_materializations(50).await.map_err(internal_error)?;
+    let jobs: Vec<JobDetail> = pairs.into_iter().map(|(mat, asset)| JobDetail { job: mat, asset }).collect();
+    Ok(Json(jobs))
+}
+
+/// Get job details by ID
+#[utoipa::path(
+    get,
+    path = "/api/jobs/{job_id}",
+    params(("job_id" = i64, Path, description = "Materialization job ID")),
+    responses(
+        (status = 200, description = "Job details", body = JobDetail),
+        (status = 500, description = "Job not found")
+    ),
+    tag = "jobs"
+)]
+async fn api_get_job(AxumPath(job_id): AxumPath<i64>, State(state): State<AppState>) -> axum::response::Result<Json<JobDetail>> {
+    let store = state.store.lock().await;
+    let (mat, asset) = store.get_materialization_with_asset(job_id).await.map_err(internal_error)?;
+    Ok(Json(JobDetail { job: mat, asset }))
+}
+
 fn internal_error(error: anyhow::Error) -> axum::response::Response {
-    (
-        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        format!("internal error: {error:#}"),
-    )
-        .into_response()
+    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, format!("internal error: {error:#}")).into_response()
 }

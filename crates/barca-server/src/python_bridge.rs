@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
+use async_trait::async_trait;
 use barca_core::models::{InspectResponse, InspectedAsset, WorkerResponse};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
@@ -13,50 +14,12 @@ use tracing::{info, warn};
 
 use crate::{emit_log, JobLogEntry, JobLogLevel};
 
-#[derive(Clone)]
-pub struct PythonBridge {
-    repo_root: PathBuf,
-}
+#[async_trait]
+#[allow(clippy::too_many_arguments)]
+pub trait PythonBridge: Send + Sync {
+    async fn inspect_modules(&self, modules: &[String]) -> anyhow::Result<Vec<InspectedAsset>>;
 
-impl PythonBridge {
-    pub fn new(repo_root: PathBuf) -> Self {
-        Self { repo_root }
-    }
-
-    pub async fn inspect_modules(&self, modules: &[String]) -> anyhow::Result<Vec<InspectedAsset>> {
-        if modules.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut command = Command::new("uv");
-        command.current_dir(&self.repo_root);
-        command
-            .arg("run")
-            .arg("python")
-            .arg("-m")
-            .arg("barca.inspect");
-        for module in modules {
-            command.arg("--module").arg(module);
-        }
-        command.env("PYTHONPATH", self.repo_root.display().to_string());
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-        let output = command
-            .output()
-            .await
-            .context("failed to run python inspector")?;
-        if !output.status.success() {
-            return Err(anyhow!(
-                "python inspector failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let response: InspectResponse =
-            serde_json::from_slice(&output.stdout).context("failed to decode inspector output")?;
-        Ok(response.assets)
-    }
-
-    pub async fn materialize_asset(
+    async fn materialize_asset(
         &self,
         module_path: &str,
         function_name: &str,
@@ -64,6 +27,54 @@ impl PythonBridge {
         job_id: i64,
         log_tx: broadcast::Sender<JobLogEntry>,
         asset_id: i64,
+        input_kwargs_json: Option<&str>,
+    ) -> anyhow::Result<WorkerResponse>;
+}
+
+#[derive(Clone)]
+pub struct UvPythonBridge {
+    repo_root: PathBuf,
+}
+
+impl UvPythonBridge {
+    pub fn new(repo_root: PathBuf) -> Self {
+        Self { repo_root }
+    }
+}
+
+#[async_trait]
+impl PythonBridge for UvPythonBridge {
+    async fn inspect_modules(&self, modules: &[String]) -> anyhow::Result<Vec<InspectedAsset>> {
+        if modules.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut command = Command::new("uv");
+        command.current_dir(&self.repo_root);
+        command.arg("run").arg("python").arg("-m").arg("barca.inspect");
+        for module in modules {
+            command.arg("--module").arg(module);
+        }
+        command.env("PYTHONPATH", self.repo_root.display().to_string());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = command.output().await.context("failed to run python inspector")?;
+        if !output.status.success() {
+            return Err(anyhow!("python inspector failed: {}", String::from_utf8_lossy(&output.stderr)));
+        }
+
+        let response: InspectResponse = serde_json::from_slice(&output.stdout).context("failed to decode inspector output")?;
+        Ok(response.assets)
+    }
+
+    async fn materialize_asset(
+        &self,
+        module_path: &str,
+        function_name: &str,
+        output_dir: &Path,
+        job_id: i64,
+        log_tx: broadcast::Sender<JobLogEntry>,
+        asset_id: i64,
+        input_kwargs_json: Option<&str>,
     ) -> anyhow::Result<WorkerResponse> {
         let mut command = Command::new("uv");
         command.current_dir(&self.repo_root);
@@ -78,19 +89,16 @@ impl PythonBridge {
             .arg(function_name)
             .arg("--output-dir")
             .arg(output_dir);
+        if let Some(kwargs) = input_kwargs_json {
+            command.arg("--input-kwargs").arg(kwargs);
+        }
         command.env("PYTHONPATH", self.repo_root.display().to_string());
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = command.spawn().context("failed to spawn python worker")?;
         let pid = child.id().unwrap_or(0);
         info!(job_id, pid, "python worker started");
-        emit_log(
-            &log_tx,
-            asset_id,
-            job_id,
-            JobLogLevel::Info,
-            format!("Python worker started (pid:{pid})"),
-        );
+        emit_log(&log_tx, asset_id, job_id, JobLogLevel::Info, format!("Python worker started (pid:{pid})"));
 
         // Stream stdout line-by-line.
         let stdout = child.stdout.take().expect("stdout was piped");
@@ -114,25 +122,16 @@ impl PythonBridge {
             }
         });
 
-        let status = child
-            .wait()
-            .await
-            .context("failed to wait for python worker")?;
+        let status = child.wait().await.context("failed to wait for python worker")?;
         let _ = stdout_task.await;
         let _ = stderr_task.await;
 
         let result_path = output_dir.join("result.json");
-        let result_bytes = fs::read(&result_path).with_context(|| {
-            format!("worker did not produce result.json (exit status: {status})")
-        })?;
-        let response: WorkerResponse =
-            serde_json::from_slice(&result_bytes).context("failed to decode worker result")?;
+        let result_bytes = fs::read(&result_path).with_context(|| format!("worker did not produce result.json (exit status: {status})"))?;
+        let response: WorkerResponse = serde_json::from_slice(&result_bytes).context("failed to decode worker result")?;
 
         if !status.success() || !response.ok {
-            let error = response
-                .error
-                .clone()
-                .unwrap_or_else(|| format!("worker exited with {status}"));
+            let error = response.error.clone().unwrap_or_else(|| format!("worker exited with {status}"));
             return Err(anyhow!(error));
         }
 

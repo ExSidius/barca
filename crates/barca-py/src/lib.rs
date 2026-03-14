@@ -1,5 +1,39 @@
 use pyo3::prelude::*;
-use pyo3::types::{PyCFunction, PyDict, PyTuple};
+use pyo3::types::{PyCFunction, PyDict, PyList, PyTuple};
+use std::collections::HashMap;
+
+/// Marker type returned by `partitions([...])`. Stores the static values.
+#[pyclass(name = "Partitions")]
+#[derive(Clone)]
+struct Partitions {
+    values: Vec<serde_json::Value>,
+}
+
+#[pymethods]
+impl Partitions {
+    fn __repr__(&self) -> String {
+        format!("Partitions({} values)", self.values.len())
+    }
+}
+
+/// `partitions(["AAPL", "MSFT", "GOOG"])` — declare a static partition universe.
+#[pyfunction(name = "partitions")]
+fn py_partitions(py: Python<'_>, values: &Bound<'_, PyList>) -> PyResult<Partitions> {
+    let json_mod = py.import("json")?;
+    let mut vals = Vec::new();
+    for item in values.iter() {
+        let json_str: String = json_mod.call_method1("dumps", (&item,))?.extract()?;
+        let val: serde_json::Value = serde_json::from_str(&json_str).map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("invalid partition value: {e}")))?;
+        vals.push(val);
+    }
+    Ok(Partitions { values: vals })
+}
+
+/// Resolved partition spec for one dimension: either inline values or an asset ref.
+#[derive(Clone)]
+enum PartitionSpec {
+    Inline(Vec<serde_json::Value>),
+}
 
 /// The `@asset()` decorator wrapper. Stores the original function and metadata.
 #[pyclass(name = "AssetWrapper")]
@@ -7,17 +41,16 @@ struct AssetWrapper {
     original: PyObject,
     name: Option<String>,
     serializer: Option<String>,
+    /// Resolved inputs: param_name -> "{abs_file_path}:{function_name}"
+    inputs: Option<HashMap<String, String>>,
+    /// Resolved partitions: dim_name -> spec
+    partitions: Option<HashMap<String, PartitionSpec>>,
 }
 
 #[pymethods]
 impl AssetWrapper {
     #[pyo3(signature = (*args, **kwargs))]
-    fn __call__<'py>(
-        &self,
-        py: Python<'py>,
-        args: &Bound<'py, PyTuple>,
-        kwargs: Option<&Bound<'py, PyDict>>,
-    ) -> PyResult<PyObject> {
+    fn __call__<'py>(&self, py: Python<'py>, args: &Bound<'py, PyTuple>, kwargs: Option<&Bound<'py, PyDict>>) -> PyResult<PyObject> {
         self.original.call(py, args, kwargs)
     }
 
@@ -27,6 +60,32 @@ impl AssetWrapper {
         dict.set_item("kind", "asset")?;
         dict.set_item("name", self.name.as_deref())?;
         dict.set_item("serializer", self.serializer.as_deref())?;
+        if let Some(ref inputs) = self.inputs {
+            let inputs_dict = PyDict::new(py);
+            for (k, v) in inputs {
+                inputs_dict.set_item(k, v)?;
+            }
+            dict.set_item("inputs", inputs_dict)?;
+        } else {
+            dict.set_item("inputs", py.None())?;
+        }
+        if let Some(ref parts) = self.partitions {
+            let parts_dict = PyDict::new(py);
+            for (dim, spec) in parts {
+                match spec {
+                    PartitionSpec::Inline(values) => {
+                        let json_str = serde_json::to_string(values).unwrap();
+                        let inner = PyDict::new(py);
+                        inner.set_item("kind", "inline")?;
+                        inner.set_item("values_json", &json_str)?;
+                        parts_dict.set_item(dim, inner)?;
+                    }
+                }
+            }
+            dict.set_item("partitions", parts_dict)?;
+        } else {
+            dict.set_item("partitions", py.None())?;
+        }
         Ok(dict.into_any().unbind())
     }
 
@@ -40,11 +99,7 @@ impl AssetWrapper {
         self.original.clone_ref(py)
     }
 
-    fn __get__<'py>(
-        slf: &Bound<'py, Self>,
-        _obj: &Bound<'py, PyAny>,
-        _objtype: Option<&Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, Self>> {
+    fn __get__<'py>(slf: &Bound<'py, Self>, _obj: &Bound<'py, PyAny>, _objtype: Option<&Bound<'py, PyAny>>) -> PyResult<Bound<'py, Self>> {
         Ok(slf.clone())
     }
 
@@ -74,33 +129,97 @@ impl AssetWrapper {
     }
 }
 
+/// Resolve an input value (function object or string ref) to a canonical
+/// asset reference string: "{absolute_file_path}:{function_name}".
+fn resolve_input_ref(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<String> {
+    // If it's an AssetWrapper, extract the original function's file + name
+    let kind_attr = value.getattr("__barca_kind__");
+    if let Ok(kind) = kind_attr {
+        if let Ok(k) = kind.extract::<String>() {
+            if k == "asset" {
+                let original = match value.getattr("__barca_original__") {
+                    Ok(orig) => orig,
+                    Err(_) => value.clone(),
+                };
+                let inspect_mod = py.import("inspect")?;
+                let pathlib = py.import("pathlib")?;
+                let sf = inspect_mod.call_method1("getsourcefile", (&original,))?;
+                let path = pathlib.call_method1("Path", (&sf,))?;
+                let resolved = path.call_method0("resolve")?;
+                let file_path: String = resolved.str()?.extract()?;
+                let func_name: String = original.getattr("__name__")?.extract()?;
+                return Ok(format!("{file_path}:{func_name}"));
+            }
+        }
+    }
+
+    // If it's a string, treat as an explicit asset ref
+    if let Ok(s) = value.extract::<String>() {
+        return Ok(s);
+    }
+
+    Err(pyo3::exceptions::PyTypeError::new_err("inputs values must be @asset-decorated functions or asset ref strings"))
+}
+
 /// The `@asset()` decorator factory.
 ///
 /// Usage:
 ///   @asset()
 ///   def my_func(): ...
 ///
-///   @asset(name="custom_name", serializer="json")
-///   def my_func(): ...
+///   @asset(name="custom_name", inputs={"x": other_asset})
+///   def my_func(x): ...
 #[pyfunction]
-#[pyo3(signature = (*, name=None, serializer=None))]
-fn asset(name: Option<String>, serializer: Option<String>) -> PyResult<PyObject> {
+#[pyo3(signature = (*, name=None, inputs=None, partitions=None, serializer=None))]
+fn asset(name: Option<String>, inputs: Option<PyObject>, partitions: Option<PyObject>, serializer: Option<String>) -> PyResult<PyObject> {
     Python::with_gil(|py| {
+        // Resolve inputs eagerly at decoration time
+        let resolved_inputs: Option<HashMap<String, String>> = match inputs {
+            Some(ref obj) => {
+                let dict: &Bound<'_, PyDict> = obj.bind(py).downcast()?;
+                let mut map = HashMap::new();
+                for (k, v) in dict.iter() {
+                    let param_name: String = k.extract()?;
+                    let ref_str = resolve_input_ref(py, &v)?;
+                    map.insert(param_name, ref_str);
+                }
+                Some(map)
+            }
+            None => None,
+        };
+
+        // Resolve partitions eagerly at decoration time
+        let resolved_partitions: Option<HashMap<String, PartitionSpec>> = match partitions {
+            Some(ref obj) => {
+                let dict: &Bound<'_, PyDict> = obj.bind(py).downcast()?;
+                let mut map = HashMap::new();
+                for (k, v) in dict.iter() {
+                    let dim_name: String = k.extract()?;
+                    // Check if it's a Partitions instance (inline values)
+                    if let Ok(p) = v.extract::<Partitions>() {
+                        map.insert(dim_name, PartitionSpec::Inline(p.values));
+                    } else {
+                        return Err(pyo3::exceptions::PyTypeError::new_err("partition values must be partitions([...]) instances"));
+                    }
+                }
+                Some(map)
+            }
+            None => None,
+        };
+
         let name_clone = name.clone();
         let serializer_clone = serializer.clone();
+        let inputs_clone = resolved_inputs.clone();
+        let partitions_clone = resolved_partitions.clone();
 
         let decorator = PyCFunction::new_closure(
             py,
             Some(c"asset_decorator"),
             None,
-            move |args: &Bound<'_, PyTuple>,
-                  _kwargs: Option<&Bound<'_, PyDict>>|
-                  -> PyResult<PyObject> {
+            move |args: &Bound<'_, PyTuple>, _kwargs: Option<&Bound<'_, PyDict>>| -> PyResult<PyObject> {
                 let py = args.py();
                 if args.len() != 1 {
-                    return Err(pyo3::exceptions::PyTypeError::new_err(
-                        "asset() decorator expects exactly one argument (the function)",
-                    ));
+                    return Err(pyo3::exceptions::PyTypeError::new_err("asset() decorator expects exactly one argument (the function)"));
                 }
                 let func = args.get_item(0)?;
 
@@ -108,6 +227,8 @@ fn asset(name: Option<String>, serializer: Option<String>) -> PyResult<PyObject>
                     original: func.unbind(),
                     name: name_clone.clone(),
                     serializer: serializer_clone.clone(),
+                    inputs: inputs_clone.clone(),
+                    partitions: partitions_clone.clone(),
                 };
 
                 Ok(Py::new(py, wrapper)?.into_any())
@@ -144,10 +265,7 @@ fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
         // Get normalized module source
         let module_source_raw = inspect_mod.call_method1("getsource", (&module,))?;
         let module_source_dedented = textwrap.call_method1("dedent", (&module_source_raw,))?;
-        let module_source: String = module_source_dedented
-            .call_method0("strip")?
-            .extract::<String>()
-            .map(|s| s + "\n")?;
+        let module_source: String = module_source_dedented.call_method0("strip")?.extract::<String>().map(|s| s + "\n")?;
 
         let members = inspect_mod.call_method1("getmembers", (&module,))?;
 
@@ -179,10 +297,7 @@ fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
             // Get function source
             let func_source_raw = inspect_mod.call_method1("getsource", (&original,))?;
             let func_source_dedented = textwrap.call_method1("dedent", (&func_source_raw,))?;
-            let function_source: String = func_source_dedented
-                .call_method0("strip")?
-                .extract::<String>()
-                .map(|s| s + "\n")?;
+            let function_source: String = func_source_dedented.call_method0("strip")?.extract::<String>().map(|s| s + "\n")?;
 
             let function_name: String = original.getattr("__name__")?.extract()?;
 
@@ -206,10 +321,7 @@ fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
             } else {
                 let is_type: bool = py
                     .import("builtins")?
-                    .call_method1(
-                        "isinstance",
-                        (&return_annotation, py.get_type::<pyo3::types::PyType>()),
-                    )?
+                    .call_method1("isinstance", (&return_annotation, py.get_type::<pyo3::types::PyType>()))?
                     .extract()?;
                 if is_type {
                     Some(return_annotation.getattr("__name__")?.extract()?)
@@ -234,32 +346,29 @@ fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
     }
 
     let output = serde_json::json!({ "assets": assets });
-    serde_json::to_string(&output).map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("JSON serialization error: {e}"))
-    })
+    serde_json::to_string(&output).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON serialization error: {e}")))
 }
 
 /// Materialize a single asset function. Called by the `python -m barca.worker` CLI stub.
 ///
 /// Imports the module, finds the function, calls the unwrapped original,
 /// serializes the result to JSON, writes value.json and result.json.
+///
+/// If `input_kwargs_json` is provided, it is parsed as a JSON dict and
+/// passed as keyword arguments to the function.
 #[pyfunction]
-fn materialize_asset(
-    py: Python<'_>,
-    module_name: String,
-    function_name: String,
-    output_dir: String,
-) -> PyResult<()> {
+#[pyo3(signature = (module_name, function_name, output_dir, input_kwargs_json=None))]
+fn materialize_asset(py: Python<'_>, module_name: String, function_name: String, output_dir: String, input_kwargs_json: Option<String>) -> PyResult<()> {
     let importlib = py.import("importlib")?;
     let inspect_mod = py.import("inspect")?;
     let json_mod = py.import("json")?;
     let pathlib = py.import("pathlib")?;
 
     let output_path = pathlib.call_method1("Path", (output_dir.as_str(),))?;
-    let kwargs = PyDict::new(py);
-    kwargs.set_item("parents", true)?;
-    kwargs.set_item("exist_ok", true)?;
-    output_path.call_method("mkdir", (), Some(&kwargs))?;
+    let mkdir_kwargs = PyDict::new(py);
+    mkdir_kwargs.set_item("parents", true)?;
+    mkdir_kwargs.set_item("exist_ok", true)?;
+    output_path.call_method("mkdir", (), Some(&mkdir_kwargs))?;
 
     let result_path = output_path.call_method1("__truediv__", ("result.json",))?;
 
@@ -272,7 +381,14 @@ fn materialize_asset(
             Err(_) => func.clone(),
         };
 
-        let result_value = original.call0()?;
+        // Call with or without kwargs
+        let result_value = if let Some(ref kwargs_json) = input_kwargs_json {
+            let kwargs_obj = json_mod.call_method1("loads", (kwargs_json.as_str(),))?;
+            let kwargs_dict: &Bound<'_, PyDict> = kwargs_obj.downcast()?;
+            original.call((), Some(kwargs_dict))?
+        } else {
+            original.call0()?
+        };
 
         let value_path = output_path.call_method1("__truediv__", ("value.json",))?;
 
@@ -297,8 +413,7 @@ fn materialize_asset(
             "signature": sig_str,
         });
 
-        let payload_str = serde_json::to_string(&payload)
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON error: {e}")))?;
+        let payload_str = serde_json::to_string(&payload).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON error: {e}")))?;
         result_path.call_method1("write_text", (payload_str, "utf-8"))?;
 
         Ok(())
@@ -313,8 +428,7 @@ fn materialize_asset(
             "error": error_str,
             "error_type": error_type,
         });
-        let payload_str = serde_json::to_string(&payload)
-            .map_err(|e2| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON error: {e2}")))?;
+        let payload_str = serde_json::to_string(&payload).map_err(|e2| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON error: {e2}")))?;
         result_path.call_method1("write_text", (payload_str, "utf-8"))?;
 
         // Exit with code 1 like the original Python worker
@@ -325,114 +439,21 @@ fn materialize_asset(
     Ok(())
 }
 
-/// Start the barca server. Called by the `barca` CLI entry point.
-///
-/// Releases the GIL and runs the full axum server (reindex, worker, HTTP)
-/// on the current working directory.
-#[pyfunction]
-fn run_server(py: Python<'_>) -> PyResult<()> {
-    // Spawn a dedicated thread that waits for SIGINT and terminates the process.
-    // Python's SIGINT handler swallows the signal when the GIL is released,
-    // so we need to catch it ourselves at the OS level.
-    std::thread::spawn(|| {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static RECEIVED: AtomicBool = AtomicBool::new(false);
-
-        unsafe {
-            // Install a minimal signal handler that sets a flag
-            extern "C" fn handler(_: libc::c_int) {
-                RECEIVED.store(true, Ordering::SeqCst);
-            }
-            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
-        }
-
-        // Busy-wait would be wasteful; use sigwait instead
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if RECEIVED.load(std::sync::atomic::Ordering::SeqCst) {
-                eprintln!(); // newline after ^C
-                std::process::exit(130); // 128 + SIGINT(2)
-            }
-        }
-    });
-
-    py.allow_threads(|| {
-        let rt = tokio::runtime::Runtime::new().map_err(|e| {
-            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to create runtime: {e}"))
-        })?;
-
-        rt.block_on(async {
-            run_server_async()
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
-        })
-    })
-}
-
-async fn run_server_async() -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    tracing_subscriber::fmt().with_env_filter("info").init();
-
-    let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let config = barca_server::config::load_config(&repo_root.join("barca.toml"))?;
-    let store =
-        barca_server::store::MetadataStore::open(&repo_root.join(".barca").join("metadata.db"))
-            .await?;
-    let python = barca_server::python_bridge::PythonBridge::new(repo_root.clone());
-
-    let state = barca_server::AppState::new(repo_root, config, store, python);
-
-    barca_server::reindex(&state).await?;
-    {
-        let store = state.store.lock().await;
-        store.requeue_running_materializations().await?;
-    }
-    tracing::info!("refresh queue recovery complete");
-    tokio::spawn(barca_server::run_refresh_queue_worker(state.clone()));
-
-    let app = barca_server::server::router().with_state(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000").await?;
-    tracing::info!("barca listening on http://127.0.0.1:3000");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to listen for ctrl-c");
-            tracing::info!("shutting down");
-        })
-        .await?;
-    Ok(())
-}
-
 /// Convert a Python dict (or any object) to serde_json::Value
 fn python_dict_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     let json_mod = py.import("json")?;
     let json_str: String = json_mod.call_method1("dumps", (obj,))?.extract()?;
-    serde_json::from_str(&json_str)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON parse error: {e}")))
-}
-
-/// Run `barca reset` — remove generated files and caches.
-#[pyfunction]
-#[pyo3(signature = (*, db=false, artifacts=false, tmp=false))]
-fn run_reset(db: bool, artifacts: bool, tmp: bool) -> PyResult<String> {
-    let repo_root = std::env::current_dir().map_err(|e| {
-        pyo3::exceptions::PyRuntimeError::new_err(format!("failed to resolve current dir: {e}"))
-    })?;
-    barca_server::reset(&repo_root, db, artifacts, tmp)
-        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("{e}")))
+    serde_json::from_str(&json_str).map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(format!("JSON parse error: {e}")))
 }
 
 /// The native `_barca` module.
 #[pymodule]
 fn _barca(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<AssetWrapper>()?;
+    m.add_class::<Partitions>()?;
     m.add_function(wrap_pyfunction!(asset, m)?)?;
+    m.add_function(wrap_pyfunction!(py_partitions, m)?)?;
     m.add_function(wrap_pyfunction!(inspect_modules, m)?)?;
     m.add_function(wrap_pyfunction!(materialize_asset, m)?)?;
-    m.add_function(wrap_pyfunction!(run_server, m)?)?;
-    m.add_function(wrap_pyfunction!(run_reset, m)?)?;
     Ok(())
 }

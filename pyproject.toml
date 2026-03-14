@@ -14,6 +14,9 @@ barca = { path = "crates/barca-py", editable = true }
 requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
+[tool.ruff]
+line-length = 200
+
 [tool.maturin]
 manifest-path = "crates/barca-py/Cargo.toml"
 features = ["pyo3/extension-module"]

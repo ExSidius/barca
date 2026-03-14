@@ -48,10 +48,8 @@ async fn serve() -> anyhow::Result<()> {
 
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
     let config = load_config(&repo_root.join("barca.toml"))?;
-    let store =
-        barca_server::store::MetadataStore::open(&repo_root.join(".barca").join("metadata.db"))
-            .await?;
-    let python = barca_server::python_bridge::PythonBridge::new(repo_root.clone());
+    let store = barca_server::store::MetadataStore::open(&repo_root.join(".barca").join("metadata.db")).await?;
+    let python = std::sync::Arc::new(barca_server::python_bridge::UvPythonBridge::new(repo_root.clone()));
 
     let state = AppState::new(repo_root, config, store, python);
 
@@ -62,6 +60,7 @@ async fn serve() -> anyhow::Result<()> {
     }
     tracing::info!("refresh queue recovery complete");
     tokio::spawn(barca_server::run_refresh_queue_worker(state.clone()));
+    tokio::spawn(barca_server::run_log_persister(state.clone()));
 
     let app = server::router().with_state(state);
 
@@ -69,9 +68,7 @@ async fn serve() -> anyhow::Result<()> {
     tracing::info!("barca listening on http://127.0.0.1:3000");
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("failed to listen for ctrl-c");
+            tokio::signal::ctrl_c().await.expect("failed to listen for ctrl-c");
             tracing::info!("shutting down");
         })
         .await?;

@@ -5,22 +5,34 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Run the server (reads barca.toml, starts on http://127.0.0.1:3000)
-cargo run -p barca-server
+# Run the server using the basic_app example (cd into it for barca.toml + venv)
+cd examples/basic_app && cargo run -p barca-cli
+# or: cd examples/basic_app && cargo run -p barca-cli -- serve
+
+# CLI commands (open DB directly, no server needed)
+cargo run -p barca-cli -- assets list
+cargo run -p barca-cli -- assets show <id>
+cargo run -p barca-cli -- assets refresh <id>
+cargo run -p barca-cli -- jobs list
+cargo run -p barca-cli -- jobs show <id>
+cargo run -p barca-cli -- reindex
+cargo run -p barca-cli -- reset [--db] [--artifacts] [--tmp]
 
 # Run with hot reload (requires: cargo install cargo-watch)
 just dev
 
 # Build Tailwind CSS (run after changing Tailwind classes in templates)
 just build-css
-# or: npm run build:css
 
 # Build and install the barca Python extension into the active venv
 just build-py
 # or: cd crates/barca-py && maturin develop
+
+# Run tests
+cargo test -p barca-server -p barca-cli
 ```
 
-There are no automated tests yet. Logging uses `tracing` with `RUST_LOG=info` by default.
+Logging uses `tracing` with `RUST_LOG=info` by default.
 
 ## Architecture
 
@@ -28,12 +40,13 @@ Barca is a minimal asset orchestrator: a Rust (axum) backend that discovers Pyth
 
 ### Workspace structure
 
-This is a Cargo workspace with three crates:
+This is a Cargo workspace with four crates:
 
 | Crate | Purpose |
 |---|---|
+| `crates/barca-cli` | Unified CLI (`barca` binary) — clap subcommands, table formatting, serve entry point |
 | `crates/barca-core` | Shared Rust library — models, hashing, serialization types |
-| `crates/barca-server` | Axum server binary — routes, SSE, templates, store, python bridge |
+| `crates/barca-server` | Axum server library — routes, SSE, templates, store, python bridge trait |
 | `crates/barca-py` | PyO3 native extension — `@asset()` decorator, inspect CLI, worker CLI |
 
 ### Startup flow (`crates/barca-server/src/main.rs`)
@@ -50,7 +63,7 @@ This is a Cargo workspace with three crates:
 | `server.rs` | Axum routes and SSE response handlers; all rendering logic that needs request context |
 | `templates.rs` | All HTML generation as Rust string functions (no template engine) |
 | `store.rs` | Turso/SQLite layer — assets, definitions, materializations |
-| `python_bridge.rs` | Shells out to `uv run python -m barca.inspect` / `barca.worker` |
+| `python_bridge.rs` | `PythonBridge` trait + `UvPythonBridge` impl (subprocess to `uv run python -m barca.inspect` / `barca.worker`) |
 | `config.rs` | Parses `barca.toml` |
 
 ### Shared library (`crates/barca-core/src/`)
@@ -75,12 +88,38 @@ Users install the extension with `maturin develop` (dev) or `pip install barca` 
 4. **Serve**: SSE streams in `server.rs` subscribe to the broadcast channel and push `PatchElements` updates to the client
 
 ### UI stack
-- **Datastar** (v1.0.0-RC.1 protocol): SSE-based DOM patching. Use `PatchElements::new(html).selector("#id").write_as_axum_sse_event()` for all patches. Attribute syntax: `data-on-click="@post('/url')"` (hyphen, not colon; `@` prefix).
-- **Tailwind CSS**: Built via `npm run build:css`, embedded via `include_str!("../../../static/css/output.css")`. Dark mode is class-based. Run `just build-css` after touching any Tailwind classes.
+- **Datastar** (v1.0.0-RC.8): SSE-based DOM patching. Use `PatchElements::new(html).selector("#id").write_as_axum_sse_event()` for all patches. Attribute syntax: `data-on:click="@post('/url')"` (colon separator; `@` prefix). Signals: `data-signals='{mySignal: false}'` (JS object notation, not JSON). Event variable: `evt` (not `$event`). Panel open/close uses `$_panelOpen` signal with `data-class:open`; all panel content loaded via `@get` (no custom JS EventSource management).
+- **Tailwind CSS**: Built via `just build-css` (standalone Tailwind CLI in `bin/`), embedded via `include_str!("../../../static/css/output.css")`. Dark mode is class-based. Run `just build-css` after touching any Tailwind classes.
 - **Web Components**: `<asset-status-badge label="..." tone="...">` defined inline in `templates::web_components()`.
-- **Asset panel**: Opens via vanilla JS `openAssetPanel(assetId)` which creates its own `EventSource` to `/assets/{id}/panel/stream`. SSE events are manually parsed via `applyDatastarPatch()` — this does NOT go through the Datastar JS library.
+- **Asset panel**: Opens via pure Datastar — `$_panelOpen = true; @get('/assets/{id}/panel/stream')`. No custom JavaScript. SSE events processed natively by Datastar, patching `#panel-content`.
+
+### CLI architecture (`crates/barca-cli/src/`)
+| File | Responsibility |
+|---|---|
+| `main.rs` | Clap Parser + subcommand dispatch |
+| `commands.rs` | Command implementations — each opens DB directly via the same store/lib.rs functions |
+| `display.rs` | Table formatters using `comfy-table` |
+
+The CLI does NOT call the HTTP API. It opens `.barca/metadata.db` and uses the same `MetadataStore` + `lib.rs` orchestration as the server. For write operations (refresh/reindex), it creates a full `AppState` with a real `UvPythonBridge` and spawns the worker in-process.
+
+### PythonBridge trait
+`python_bridge::PythonBridge` is an async trait (`async_trait`). `AppState.python` is `Arc<dyn PythonBridge>`.
+- `UvPythonBridge` — real impl, shells out to `uv run python -m barca.*`
+- `MockPythonBridge` — used in API tests, returns canned data without Python
+
+### JSON API + OpenAPI
+All `/api/*` endpoints are annotated with `#[utoipa::path(...)]`. OpenAPI spec at `/api/openapi.json`, Swagger UI at `/api/docs`.
+
+Available endpoints:
+- `GET /api/assets` — list all assets
+- `GET /api/assets/{id}` — asset detail
+- `POST /api/assets/{id}/materialize` — enqueue refresh
+- `POST /api/reindex` — re-inspect Python modules
+- `GET /api/jobs` — list recent jobs
+- `GET /api/jobs/{id}` — job detail
 
 ### Key constraints
+- **Minimize custom JavaScript** — use Datastar attributes (`data-on:click`, `@get`, `@post`, signals, `data-class:`) instead of writing JavaScript. Only use JS when Datastar genuinely cannot handle the interaction.
 - All HTML templates live in `crates/barca-server/src/templates.rs` as Rust functions — no external template files.
 - No file should exceed ~500 lines; split further if needed.
 - No polling: use server-push SSE via broadcast channels.

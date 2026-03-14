@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
 use barca_core::hashing::now_ts;
-use barca_core::models::{AssetDetail, AssetSummary, IndexedAsset, MaterializationRecord};
+use barca_core::models::{AssetDetail, AssetInput, AssetSummary, IndexedAsset, JobLogRecord, MaterializationInput, MaterializationRecord};
 use turso::{Builder, Connection, Value};
 
 pub struct MetadataStore {
@@ -13,22 +13,14 @@ pub struct MetadataStore {
 impl MetadataStore {
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!(
-                    "failed to create metadata directory for turso database at {}",
-                    parent.display()
-                )
-            })?;
+            std::fs::create_dir_all(parent).with_context(|| format!("failed to create metadata directory for turso database at {}", parent.display()))?;
         }
         let db = Builder::new_local(path.to_string_lossy().as_ref())
             .build()
             .await
             .with_context(|| format!("failed to open turso database at {}", path.display()))?;
         let conn = db.connect().map_err(|err| anyhow!(err.to_string()))?;
-        let store = Self {
-            conn,
-            _db_path: path.to_path_buf(),
-        };
+        let store = Self { conn, _db_path: path.to_path_buf() };
         store.init_schema().await?;
         Ok(store)
     }
@@ -72,7 +64,30 @@ impl MetadataStore {
                     artifact_format TEXT,
                     artifact_checksum TEXT,
                     last_error TEXT,
+                    partition_key_json TEXT,
                     created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS job_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    materialization_id INTEGER NOT NULL,
+                    asset_id INTEGER NOT NULL,
+                    level TEXT NOT NULL,
+                    message TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS asset_inputs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    definition_id INTEGER NOT NULL,
+                    parameter_name TEXT NOT NULL,
+                    upstream_asset_ref TEXT NOT NULL,
+                    upstream_asset_id INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS materialization_inputs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    materialization_id INTEGER NOT NULL,
+                    parameter_name TEXT NOT NULL,
+                    upstream_materialization_id INTEGER NOT NULL,
+                    upstream_asset_id INTEGER NOT NULL
                 );
                 "#,
             )
@@ -82,10 +97,7 @@ impl MetadataStore {
     }
 
     pub async fn upsert_indexed_asset(&self, asset: &IndexedAsset) -> anyhow::Result<()> {
-        let existing_asset_id = self
-            .asset_id_by_continuity_key(&asset.continuity_key)
-            .await?
-            .unwrap_or(-1);
+        let existing_asset_id = self.asset_id_by_continuity_key(&asset.continuity_key).await?.unwrap_or(-1);
         let created_at = now_ts();
 
         let asset_id = if existing_asset_id == -1 {
@@ -125,23 +137,15 @@ impl MetadataStore {
         };
 
         self.conn
-            .execute(
-                "UPDATE asset_definitions SET status = 'historical' WHERE asset_id = ?1",
-                (asset_id,),
-            )
+            .execute("UPDATE asset_definitions SET status = 'historical' WHERE asset_id = ?1", (asset_id,))
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
 
-        let existing_definition_id = self
-            .definition_id_by_hash(asset_id, &asset.definition_hash)
-            .await?;
+        let existing_definition_id = self.definition_id_by_hash(asset_id, &asset.definition_hash).await?;
 
         if let Some(definition_id) = existing_definition_id {
             self.conn
-                .execute(
-                    "UPDATE asset_definitions SET status = 'current' WHERE id = ?1",
-                    (definition_id,),
-                )
+                .execute("UPDATE asset_definitions SET status = 'current' WHERE id = ?1", (definition_id,))
                 .await
                 .map_err(|err| anyhow!(err.to_string()))?;
             return Ok(());
@@ -243,11 +247,7 @@ impl MetadataStore {
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
 
-        let row = rows
-            .next()
-            .await
-            .map_err(|err| anyhow!(err.to_string()))?
-            .ok_or_else(|| anyhow!("asset {asset_id} not found"))?;
+        let row = rows.next().await.map_err(|err| anyhow!(err.to_string()))?.ok_or_else(|| anyhow!("asset {asset_id} not found"))?;
 
         Ok(AssetDetail {
             asset: IndexedAsset {
@@ -273,16 +273,12 @@ impl MetadataStore {
         })
     }
 
-    pub async fn successful_materialization_for_run(
-        &self,
-        asset_id: i64,
-        run_hash: &str,
-    ) -> anyhow::Result<Option<MaterializationRecord>> {
+    pub async fn successful_materialization_for_run(&self, asset_id: i64, run_hash: &str) -> anyhow::Result<Option<MaterializationRecord>> {
         let mut rows = self
             .conn
             .query(
                 r#"
-                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, created_at
+                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at
                 FROM materializations
                 WHERE asset_id = ?1 AND run_hash = ?2 AND status = 'success'
                 ORDER BY created_at DESC
@@ -298,16 +294,12 @@ impl MetadataStore {
         Ok(None)
     }
 
-    pub async fn active_materialization_for_run(
-        &self,
-        asset_id: i64,
-        run_hash: &str,
-    ) -> anyhow::Result<Option<MaterializationRecord>> {
+    pub async fn active_materialization_for_run(&self, asset_id: i64, run_hash: &str) -> anyhow::Result<Option<MaterializationRecord>> {
         let mut rows = self
             .conn
             .query(
                 r#"
-                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, created_at
+                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at
                 FROM materializations
                 WHERE asset_id = ?1 AND run_hash = ?2 AND status IN ('queued', 'running')
                 ORDER BY created_at DESC
@@ -323,30 +315,23 @@ impl MetadataStore {
         Ok(None)
     }
 
-    pub async fn insert_queued_materialization(
-        &self,
-        asset_id: i64,
-        definition_id: i64,
-        run_hash: &str,
-    ) -> anyhow::Result<i64> {
+    pub async fn insert_queued_materialization(&self, asset_id: i64, definition_id: i64, run_hash: &str, partition_key_json: Option<&str>) -> anyhow::Result<i64> {
         self.conn
             .execute(
-                "INSERT INTO materializations (asset_id, definition_id, run_hash, status, created_at) VALUES (?1, ?2, ?3, 'queued', ?4)",
-                (asset_id, definition_id, run_hash, now_ts()),
+                "INSERT INTO materializations (asset_id, definition_id, run_hash, status, partition_key_json, created_at) VALUES (?1, ?2, ?3, 'queued', ?4, ?5)",
+                (asset_id, definition_id, run_hash, partition_key_json, now_ts()),
             )
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
         Ok(self.conn.last_insert_rowid())
     }
 
-    pub async fn claim_next_queued_materialization(
-        &self,
-    ) -> anyhow::Result<Option<MaterializationRecord>> {
+    pub async fn claim_next_queued_materialization(&self) -> anyhow::Result<Option<MaterializationRecord>> {
         let mut rows = self
             .conn
             .query(
                 r#"
-                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, created_at
+                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at
                 FROM materializations
                 WHERE status = 'queued'
                 ORDER BY created_at ASC, id ASC
@@ -363,10 +348,7 @@ impl MetadataStore {
 
         let record = materialization_from_row(&row)?;
         self.conn
-            .execute(
-                "UPDATE materializations SET status = 'running' WHERE id = ?1",
-                (record.materialization_id,),
-            )
+            .execute("UPDATE materializations SET status = 'running' WHERE id = ?1", (record.materialization_id,))
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
         Ok(Some(MaterializationRecord {
@@ -377,22 +359,13 @@ impl MetadataStore {
 
     pub async fn requeue_running_materializations(&self) -> anyhow::Result<()> {
         self.conn
-            .execute(
-                "UPDATE materializations SET status = 'queued' WHERE status = 'running'",
-                (),
-            )
+            .execute("UPDATE materializations SET status = 'queued' WHERE status = 'running'", ())
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
         Ok(())
     }
 
-    pub async fn mark_materialization_success(
-        &self,
-        materialization_id: i64,
-        artifact_path: &str,
-        artifact_format: &str,
-        artifact_checksum: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn mark_materialization_success(&self, materialization_id: i64, artifact_path: &str, artifact_format: &str, artifact_checksum: &str) -> anyhow::Result<()> {
         self.conn
             .execute(
                 "UPDATE materializations SET status = 'success', artifact_path = ?1, artifact_format = ?2, artifact_checksum = ?3 WHERE id = ?4",
@@ -403,32 +376,21 @@ impl MetadataStore {
         Ok(())
     }
 
-    pub async fn mark_materialization_failed(
-        &self,
-        materialization_id: i64,
-        error: &str,
-    ) -> anyhow::Result<()> {
+    pub async fn mark_materialization_failed(&self, materialization_id: i64, error: &str) -> anyhow::Result<()> {
         self.conn
-            .execute(
-                "UPDATE materializations SET status = 'failed', last_error = ?1 WHERE id = ?2",
-                (error, materialization_id),
-            )
+            .execute("UPDATE materializations SET status = 'failed', last_error = ?1 WHERE id = ?2", (error, materialization_id))
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
         Ok(())
     }
 
-    pub async fn list_materializations_for_asset(
-        &self,
-        asset_id: i64,
-        limit: u32,
-    ) -> anyhow::Result<Vec<MaterializationRecord>> {
+    pub async fn list_materializations_for_asset(&self, asset_id: i64, limit: u32) -> anyhow::Result<Vec<MaterializationRecord>> {
         let limit = limit.min(100) as i64;
         let mut rows = self
             .conn
             .query(
                 r#"
-                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, created_at
+                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at
                 FROM materializations
                 WHERE asset_id = ?1
                 ORDER BY created_at DESC
@@ -446,10 +408,7 @@ impl MetadataStore {
         Ok(result)
     }
 
-    pub async fn list_recent_materializations(
-        &self,
-        limit: u32,
-    ) -> anyhow::Result<Vec<(MaterializationRecord, AssetSummary)>> {
+    pub async fn list_recent_materializations(&self, limit: u32) -> anyhow::Result<Vec<(MaterializationRecord, AssetSummary)>> {
         let limit = limit.min(100) as i64;
         let mut rows = self
             .conn
@@ -457,7 +416,7 @@ impl MetadataStore {
                 r#"
                 SELECT
                     m.id, m.asset_id, m.definition_id, m.run_hash, m.status,
-                    m.artifact_path, m.artifact_format, m.artifact_checksum, m.last_error, m.created_at,
+                    m.artifact_path, m.artifact_format, m.artifact_checksum, m.last_error, m.partition_key_json, m.created_at,
                     a.id, a.logical_name, a.module_path, a.file_path, a.function_name, d.definition_hash
                 FROM materializations m
                 JOIN assets a ON a.id = m.asset_id
@@ -482,17 +441,18 @@ impl MetadataStore {
                 artifact_format: opt_text_col(&row, 6)?,
                 artifact_checksum: opt_text_col(&row, 7)?,
                 last_error: opt_text_col(&row, 8)?,
-                created_at: int_col(&row, 9)?,
+                partition_key_json: opt_text_col(&row, 9)?,
+                created_at: int_col(&row, 10)?,
             };
-            let asset_id = int_col(&row, 10)?;
+            let asset_id = int_col(&row, 11)?;
             let latest = self.latest_materialization(asset_id).await?;
             let summary = AssetSummary {
                 asset_id,
-                logical_name: text_col(&row, 11)?,
-                module_path: text_col(&row, 12)?,
-                file_path: text_col(&row, 13)?,
-                function_name: text_col(&row, 14)?,
-                definition_hash: text_col(&row, 15)?,
+                logical_name: text_col(&row, 12)?,
+                module_path: text_col(&row, 13)?,
+                file_path: text_col(&row, 14)?,
+                function_name: text_col(&row, 15)?,
+                definition_hash: text_col(&row, 16)?,
                 materialization_status: latest.as_ref().map(|item| item.status.clone()),
                 materialization_run_hash: latest.as_ref().map(|item| item.run_hash.clone()),
                 materialization_created_at: latest.as_ref().map(|item| item.created_at),
@@ -502,15 +462,101 @@ impl MetadataStore {
         Ok(result)
     }
 
-    async fn latest_materialization(
-        &self,
-        asset_id: i64,
-    ) -> anyhow::Result<Option<MaterializationRecord>> {
+    pub async fn get_materialization_with_asset(&self, materialization_id: i64) -> anyhow::Result<(MaterializationRecord, AssetSummary)> {
         let mut rows = self
             .conn
             .query(
                 r#"
-                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, created_at
+                SELECT
+                    m.id, m.asset_id, m.definition_id, m.run_hash, m.status,
+                    m.artifact_path, m.artifact_format, m.artifact_checksum, m.last_error, m.partition_key_json, m.created_at,
+                    a.id, a.logical_name, a.module_path, a.file_path, a.function_name, d.definition_hash
+                FROM materializations m
+                JOIN assets a ON a.id = m.asset_id
+                JOIN asset_definitions d ON d.asset_id = a.id AND d.status = 'current'
+                WHERE m.id = ?1
+                "#,
+                (materialization_id,),
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        let row = rows
+            .next()
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?
+            .ok_or_else(|| anyhow!("job {materialization_id} not found"))?;
+
+        let mat = MaterializationRecord {
+            materialization_id: int_col(&row, 0)?,
+            asset_id: int_col(&row, 1)?,
+            definition_id: int_col(&row, 2)?,
+            run_hash: text_col(&row, 3)?,
+            status: text_col(&row, 4)?,
+            artifact_path: opt_text_col(&row, 5)?,
+            artifact_format: opt_text_col(&row, 6)?,
+            artifact_checksum: opt_text_col(&row, 7)?,
+            last_error: opt_text_col(&row, 8)?,
+            partition_key_json: opt_text_col(&row, 9)?,
+            created_at: int_col(&row, 10)?,
+        };
+        let asset_id = int_col(&row, 11)?;
+        let latest = self.latest_materialization(asset_id).await?;
+        let summary = AssetSummary {
+            asset_id,
+            logical_name: text_col(&row, 12)?,
+            module_path: text_col(&row, 13)?,
+            file_path: text_col(&row, 14)?,
+            function_name: text_col(&row, 15)?,
+            definition_hash: text_col(&row, 16)?,
+            materialization_status: latest.as_ref().map(|item| item.status.clone()),
+            materialization_run_hash: latest.as_ref().map(|item| item.run_hash.clone()),
+            materialization_created_at: latest.as_ref().map(|item| item.created_at),
+        };
+        Ok((mat, summary))
+    }
+
+    pub async fn insert_job_log(&self, materialization_id: i64, asset_id: i64, level: &str, message: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO job_logs (materialization_id, asset_id, level, message, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (materialization_id, asset_id, level, message, now_ts()),
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn get_job_logs(&self, materialization_id: i64) -> anyhow::Result<Vec<JobLogRecord>> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, materialization_id, asset_id, level, message, created_at FROM job_logs WHERE materialization_id = ?1 ORDER BY id ASC",
+                (materialization_id,),
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
+            result.push(JobLogRecord {
+                id: int_col(&row, 0)?,
+                materialization_id: int_col(&row, 1)?,
+                asset_id: int_col(&row, 2)?,
+                level: text_col(&row, 3)?,
+                message: text_col(&row, 4)?,
+                created_at: int_col(&row, 5)?,
+            });
+        }
+        Ok(result)
+    }
+
+    async fn latest_materialization(&self, asset_id: i64) -> anyhow::Result<Option<MaterializationRecord>> {
+        let mut rows = self
+            .conn
+            .query(
+                r#"
+                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at
                 FROM materializations
                 WHERE asset_id = ?1
                 ORDER BY created_at DESC
@@ -526,16 +572,10 @@ impl MetadataStore {
         Ok(None)
     }
 
-    async fn asset_id_by_continuity_key(
-        &self,
-        continuity_key: &str,
-    ) -> anyhow::Result<Option<i64>> {
+    async fn asset_id_by_continuity_key(&self, continuity_key: &str) -> anyhow::Result<Option<i64>> {
         let mut rows = self
             .conn
-            .query(
-                "SELECT id FROM assets WHERE continuity_key = ?1 LIMIT 1",
-                (continuity_key,),
-            )
+            .query("SELECT id FROM assets WHERE continuity_key = ?1 LIMIT 1", (continuity_key,))
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
         if let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
@@ -544,17 +584,131 @@ impl MetadataStore {
         Ok(None)
     }
 
-    async fn definition_id_by_hash(
-        &self,
-        asset_id: i64,
-        definition_hash: &str,
-    ) -> anyhow::Result<Option<i64>> {
+    pub async fn asset_id_by_logical_name(&self, logical_name: &str) -> anyhow::Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query("SELECT id FROM assets WHERE logical_name = ?1 LIMIT 1", (logical_name,))
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        if let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
+            return Ok(Some(int_col(&row, 0)?));
+        }
+        Ok(None)
+    }
+
+    pub async fn upsert_asset_inputs(&self, definition_id: i64, inputs: &[AssetInput]) -> anyhow::Result<()> {
+        self.conn
+            .execute("DELETE FROM asset_inputs WHERE definition_id = ?1", (definition_id,))
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        for input in inputs {
+            let upstream_id = input.upstream_asset_id.unwrap_or(-1);
+            self.conn
+                .execute(
+                    "INSERT INTO asset_inputs (definition_id, parameter_name, upstream_asset_ref, upstream_asset_id) VALUES (?1, ?2, ?3, ?4)",
+                    (definition_id, input.parameter_name.as_str(), input.upstream_asset_ref.as_str(), upstream_id),
+                )
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_asset_inputs(&self, definition_id: i64) -> anyhow::Result<Vec<AssetInput>> {
         let mut rows = self
             .conn
             .query(
-                "SELECT id FROM asset_definitions WHERE asset_id = ?1 AND definition_hash = ?2 LIMIT 1",
-                (asset_id, definition_hash),
+                "SELECT parameter_name, upstream_asset_ref, upstream_asset_id FROM asset_inputs WHERE definition_id = ?1 ORDER BY parameter_name",
+                (definition_id,),
             )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
+            result.push(AssetInput {
+                parameter_name: text_col(&row, 0)?,
+                upstream_asset_ref: text_col(&row, 1)?,
+                upstream_asset_id: Some(int_col(&row, 2)?),
+            });
+        }
+        Ok(result)
+    }
+
+    pub async fn insert_materialization_inputs(&self, materialization_id: i64, inputs: &[MaterializationInput]) -> anyhow::Result<()> {
+        for input in inputs {
+            self.conn
+                .execute(
+                    "INSERT INTO materialization_inputs (materialization_id, parameter_name, upstream_materialization_id, upstream_asset_id) VALUES (?1, ?2, ?3, ?4)",
+                    (materialization_id, input.parameter_name.as_str(), input.upstream_materialization_id, input.upstream_asset_id),
+                )
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub async fn latest_successful_materialization(&self, asset_id: i64) -> anyhow::Result<Option<MaterializationRecord>> {
+        let mut rows = self
+            .conn
+            .query(
+                r#"
+                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at
+                FROM materializations
+                WHERE asset_id = ?1 AND status = 'success'
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                (asset_id,),
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        if let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
+            return Ok(Some(materialization_from_row(&row)?));
+        }
+        Ok(None)
+    }
+
+    pub async fn requeue_materialization(&self, materialization_id: i64) -> anyhow::Result<()> {
+        self.conn
+            .execute("UPDATE materializations SET status = 'queued' WHERE id = ?1", (materialization_id,))
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
+    pub async fn active_materialization_for_asset(&self, asset_id: i64) -> anyhow::Result<Option<MaterializationRecord>> {
+        let mut rows = self
+            .conn
+            .query(
+                r#"
+                SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at
+                FROM materializations
+                WHERE asset_id = ?1 AND status IN ('queued', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                "#,
+                (asset_id,),
+            )
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        if let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
+            return Ok(Some(materialization_from_row(&row)?));
+        }
+        Ok(None)
+    }
+
+    pub async fn update_materialization_run_hash(&self, materialization_id: i64, run_hash: &str) -> anyhow::Result<()> {
+        self.conn
+            .execute("UPDATE materializations SET run_hash = ?1 WHERE id = ?2", (run_hash, materialization_id))
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        Ok(())
+    }
+
+    async fn definition_id_by_hash(&self, asset_id: i64, definition_hash: &str) -> anyhow::Result<Option<i64>> {
+        let mut rows = self
+            .conn
+            .query("SELECT id FROM asset_definitions WHERE asset_id = ?1 AND definition_hash = ?2 LIMIT 1", (asset_id, definition_hash))
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
         if let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
@@ -575,7 +729,8 @@ fn materialization_from_row(row: &turso::Row) -> anyhow::Result<MaterializationR
         artifact_format: opt_text_col(row, 6)?,
         artifact_checksum: opt_text_col(row, 7)?,
         last_error: opt_text_col(row, 8)?,
-        created_at: int_col(row, 9)?,
+        partition_key_json: opt_text_col(row, 9)?,
+        created_at: int_col(row, 10)?,
     })
 }
 

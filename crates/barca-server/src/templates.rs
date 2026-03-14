@@ -13,20 +13,23 @@ pub fn page(title: &str, body: &str) -> String {
             <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
             <style>{}</style>
-            <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.0-RC.1/bundles/datastar.js"></script>
+            <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.8/bundles/datastar.js"></script>
             {}
             {}
           </head>
-          <body class="min-h-screen flex flex-col bg-white dark:bg-[#0a0a0a] text-gray-900 dark:text-gray-100 antialiased" data-signals='{{"confirmModalOpen": false, "confirmAssetId": 0}}'>{}
-            <div id="panel-backdrop" onclick="closeAssetPanel()"></div>
-            <div id="panel-wrapper"><div id="asset-panel"></div></div>
-            <div data-show="$confirmModalOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/25" data-on-click="$confirmModalOpen = false">
-              <div data-on-click__stop="" class="w-[400px] max-w-[90vw] rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-[#0f1117] p-6 shadow-[0_20px_60px_rgba(0,0,0,0.15)] dark:shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
+          <body class="min-h-screen flex flex-col bg-white dark:bg-[#0a0a0a] text-gray-900 dark:text-gray-100 antialiased" data-signals='{{confirmModalOpen: false, confirmAssetId: 0, _panelOpen: false}}'>{}
+            <div id="panel-backdrop" data-class:open="$_panelOpen" data-on:click="$_panelOpen = false"></div>
+            <div id="panel-wrapper" data-class:open="$_panelOpen">
+              <div id="panel-content"></div>
+            </div>
+            <div data-on:keydown__window="evt.key === 'Escape' && ($_panelOpen = false)"></div>
+            <div data-show="$confirmModalOpen" class="fixed inset-0 z-50 flex items-center justify-center bg-black/25" data-on:click="$confirmModalOpen = false">
+              <div data-on:click__stop="void 0" class="w-[400px] max-w-[90vw] rounded-2xl border border-gray-200 dark:border-gray-700 bg-white dark:bg-[#0f1117] p-6 shadow-[0_20px_60px_rgba(0,0,0,0.15)] dark:shadow-[0_20px_60px_rgba(0,0,0,0.5)]">
                 <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Re-materialize?</h3>
                 <p class="mt-2 text-sm text-gray-600 dark:text-gray-400">This asset is already fresh. Are you sure you want to run it again?</p>
                 <div class="mt-5 flex justify-end gap-3">
-                  <button type="button" data-on-click="$confirmModalOpen = false" class="rounded-lg px-3.5 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">Cancel</button>
-                  <button type="button" data-on-click="@post(`/assets/${{$confirmAssetId}}/materialize`); $confirmModalOpen = false" class="rounded-lg px-3.5 py-2 text-sm font-medium bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100 transition-colors">Refresh anyway</button>
+                  <button type="button" data-on:click="$confirmModalOpen = false" class="rounded-lg px-3.5 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800 transition-colors">Cancel</button>
+                  <button type="button" data-on:click="$_panelOpen = true; $confirmModalOpen = false; @get(`/assets/${{$confirmAssetId}}/panel/stream?refresh=true`)" class="rounded-lg px-3.5 py-2 text-sm font-medium bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100 transition-colors">Refresh anyway</button>
                 </div>
               </div>
             </div>
@@ -94,65 +97,6 @@ fn web_components() -> &'static str {
                 localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
               }
 
-              function applyDatastarPatch(data) {
-                let selector = '#asset-panel';
-                let mergeMode = 'morph';
-                let html = '';
-                const lines = (data || '').split('\n');
-                for (const line of lines) {
-                  if (line.startsWith('selector ')) selector = line.slice(9).trim();
-                  else if (line.startsWith('mode ')) mergeMode = line.slice(5).trim();
-                  else if (line.startsWith('elements ')) html += line.slice(9) + '\n';
-                }
-                html = html.trim();
-                const el = document.querySelector(selector);
-                if (!el || !html) return;
-                if (mergeMode === 'append') {
-                  el.insertAdjacentHTML('beforeend', html);
-                  el.scrollTop = el.scrollHeight;
-                } else {
-                  el.outerHTML = html;
-                }
-              }
-
-              function openAssetPanel(assetId) {
-                if (window._assetPanelOpenId === assetId) {
-                  closeAssetPanel();
-                  return;
-                }
-                if (window._assetPanelEventSource) {
-                  window._assetPanelEventSource.close();
-                  window._assetPanelEventSource = null;
-                }
-                window._assetPanelOpenId = assetId;
-                document.getElementById('panel-wrapper').classList.add('open');
-                document.getElementById('panel-backdrop').classList.add('open');
-                const es = new EventSource('/assets/' + assetId + '/panel/stream');
-                window._assetPanelEventSource = es;
-                es.addEventListener('datastar-patch-elements', function(e) {
-                  applyDatastarPatch(e.data);
-                });
-                es.onerror = function() { es.close(); };
-              }
-
-              function closeAssetPanel() {
-                window._assetPanelOpenId = null;
-                if (window._assetPanelEventSource) {
-                  window._assetPanelEventSource.close();
-                  window._assetPanelEventSource = null;
-                }
-                document.getElementById('panel-wrapper').classList.remove('open');
-                document.getElementById('panel-backdrop').classList.remove('open');
-              }
-
-              document.addEventListener('click', function(e) {
-                if (e.target.closest('button[data-on-click]')) return;
-                const btn = e.target.closest('[data-open-asset-panel]');
-                if (btn) {
-                  e.preventDefault();
-                  openAssetPanel(btn.dataset.openAssetPanel);
-                }
-              });
             </script>"#
 }
 
@@ -246,9 +190,11 @@ fn styles() -> &'static str {
                 bottom: 0;
                 z-index: 40;
                 width: 440px;
+                max-width: 90vw;
                 transform: translateX(100%);
                 transition: transform 0.32s cubic-bezier(0.4, 0, 0.2, 1);
                 overflow-y: auto;
+                overflow-x: hidden;
                 background: #ffffff;
                 border-left: 1px solid #e5e7eb;
                 box-shadow: -8px 0 32px rgba(0,0,0,0.06);
@@ -348,12 +294,7 @@ pub fn job_status_icon(status: &str) -> String {
 }
 
 /// Jobs list for the Jobs view
-pub fn jobs_list(
-    jobs: &[(
-        barca_core::models::MaterializationRecord,
-        barca_core::models::AssetSummary,
-    )],
-) -> String {
+pub fn jobs_list(jobs: &[(barca_core::models::MaterializationRecord, barca_core::models::AssetSummary)]) -> String {
     if jobs.is_empty() {
         return r#"<section class="mt-8"><p class="text-gray-500 dark:text-gray-400">No jobs yet.</p></section>"#.to_string();
     }
@@ -361,16 +302,18 @@ pub fn jobs_list(
         .iter()
         .map(|(mat, summary)| {
             format!(
-                r#"<div class="flex items-center gap-4 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-4">
+                r#"<div class="card flex items-center gap-4 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-4 cursor-pointer hover:border-gray-400 dark:hover:border-gray-600 transition-colors" data-on:click="$_panelOpen = true; @get('/jobs/{}/panel/stream')">
                   <span class="flex shrink-0">{}</span>
                   <div class="min-w-0 flex-1">
                     <p class="font-medium text-gray-900 dark:text-white">{}</p>
-                    <p class="text-xs text-gray-500 dark:text-gray-400">{}</p>
+                    <p class="text-xs text-gray-500 dark:text-gray-400">Job #{} · {}</p>
                   </div>
                   <p class="text-xs text-gray-500 dark:text-gray-400">{}</p>
                 </div>"#,
+                mat.materialization_id,
                 job_status_icon(&mat.status),
                 escape_html(&summary.function_name),
+                mat.materialization_id,
                 escape_html(&mat.run_hash.chars().take(12).collect::<String>()),
                 format_job_timestamp(mat.created_at)
             )
@@ -383,8 +326,7 @@ pub fn jobs_list(
 }
 
 fn format_job_timestamp(timestamp: i64) -> String {
-    let datetime = time::OffsetDateTime::from_unix_timestamp(timestamp)
-        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+    let datetime = time::OffsetDateTime::from_unix_timestamp(timestamp).unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
     let month = match datetime.month() {
         time::Month::January => "Jan",
         time::Month::February => "Feb",
@@ -405,14 +347,7 @@ fn format_job_timestamp(timestamp: i64) -> String {
         0 => 12,
         value => value,
     };
-    format!(
-        "{} {}, {}:{:02} {}",
-        month,
-        datetime.day(),
-        display_hour,
-        datetime.minute(),
-        meridiem
-    )
+    format!("{} {}, {}:{:02} {}", month, datetime.day(), display_hour, datetime.minute(), meridiem)
 }
 
 /// Navigation bar for detail pages
@@ -423,31 +358,17 @@ pub fn detail_nav() -> &'static str {
 }
 
 /// Asset card component
-pub fn asset_card(
-    asset_id: i64,
-    function_name: &str,
-    file_path: &str,
-    last_updated: &str,
-    status_label: &str,
-    status_tone: &str,
-    is_fresh: bool,
-) -> String {
+pub fn asset_card(asset_id: i64, function_name: &str, file_path: &str, last_updated: &str, status_label: &str, status_tone: &str, is_fresh: bool) -> String {
     let button_classes = "btn-primary bg-gray-900 dark:bg-white text-white dark:text-gray-900 hover:bg-gray-800 dark:hover:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-gray-900 dark:focus:ring-white focus:ring-offset-2";
 
     let button_action = if is_fresh {
-        format!(
-            r#"data-on-click="$confirmAssetId = {}; $confirmModalOpen = true""#,
-            asset_id
-        )
+        format!(r#"data-on:click__stop="$confirmAssetId = {}; $confirmModalOpen = true""#, asset_id)
     } else {
-        format!(
-            r#"data-on-click="@post('/assets/{}/materialize')""#,
-            asset_id
-        )
+        format!(r#"data-on:click__stop="$_panelOpen = true; @get('/assets/{}/panel/stream?refresh=true')""#, asset_id)
     };
 
     format!(
-        r#"<article id="asset-card-{}" class="card rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5 cursor-pointer hover:border-gray-400 dark:hover:border-gray-600 transition-colors" data-open-asset-panel="{}">
+        r#"<article id="asset-card-{}" class="card rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5 cursor-pointer hover:border-gray-400 dark:hover:border-gray-600 transition-colors" data-on:click="$_panelOpen = true; @get('/assets/{}/panel/stream')">
           <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div class="min-w-0 flex-1">
               <p class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">{}</p>
@@ -494,7 +415,7 @@ pub fn definition_section(module_path: &str, file_path: &str, definition_hash: &
                   </div>
                   <div class="sm:col-span-2">
                     <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Definition hash</dt>
-                    <dd class="mt-2 overflow-x-auto text-sm text-gray-700 dark:text-gray-300"><code class="bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded">{}</code></dd>
+                    <dd class="mt-2 text-sm text-gray-700 dark:text-gray-300 break-all"><code class="bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded">{}</code></dd>
                   </div>
                 </dl>
               </section>"#,
@@ -541,11 +462,122 @@ pub fn job_log_viewer() -> &'static str {
           </section>"#
 }
 
+/// Log viewer section, optionally pre-populated with persisted logs
+pub fn job_log_viewer_with_logs(logs: &[barca_core::models::JobLogRecord]) -> String {
+    let entries: String = logs.iter().map(|log| job_log_line(&log.message, &log.level)).collect();
+    format!(
+        r#"<section class="mt-6 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Logs</h3>
+            <div id="job-log-entries" class="mt-3 max-h-64 overflow-y-auto scrollbar-custom rounded-lg bg-gray-50 dark:bg-gray-950 px-3 py-2 text-xs">
+              {}
+            </div>
+          </section>"#,
+        entries
+    )
+}
+
+/// Job panel content rendered inside the sliding panel
+pub fn job_panel(mat: &barca_core::models::MaterializationRecord, asset: &barca_core::models::AssetSummary, persisted_logs: &[barca_core::models::JobLogRecord]) -> String {
+    let status_tone = match mat.status.as_str() {
+        "success" => "fresh",
+        "failed" => "failed",
+        "running" | "queued" => "running",
+        _ => "stale",
+    };
+
+    let error_section = mat
+        .last_error
+        .as_deref()
+        .map(|err| {
+            format!(
+                r#"<section class="mt-6 rounded-xl border border-rose-200 dark:border-rose-900 bg-rose-50 dark:bg-rose-950/30 px-5 py-5">
+                  <h3 class="text-lg font-semibold text-rose-700 dark:text-rose-400">Error</h3>
+                  <pre class="mt-3 whitespace-pre-wrap break-all text-xs text-rose-700 dark:text-rose-400">{}</pre>
+                </section>"#,
+                escape_html(err)
+            )
+        })
+        .unwrap_or_default();
+
+    let artifact_section = mat
+        .artifact_path
+        .as_deref()
+        .map(|path| {
+            format!(
+                r#"<div>
+                    <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Artifact</dt>
+                    <dd class="mt-1 text-sm text-gray-700 dark:text-gray-300 break-all"><code class="bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded">{}</code></dd>
+                  </div>"#,
+                escape_html(path)
+            )
+        })
+        .unwrap_or_default();
+
+    let is_terminal = mat.status == "success" || mat.status == "failed";
+    let log_section = if is_terminal && !persisted_logs.is_empty() {
+        job_log_viewer_with_logs(persisted_logs)
+    } else {
+        job_log_viewer().to_string()
+    };
+
+    format!(
+        r#"<div id="panel-content" class="p-6">
+          <div class="flex items-center justify-between gap-3 border-b border-gray-200 dark:border-gray-800 pb-4">
+            <div class="flex items-center gap-3 min-w-0">
+              <h2 class="text-xl font-semibold text-gray-900 dark:text-white truncate">Job #{}</h2>
+              <asset-status-badge label="{}" tone="{}"></asset-status-badge>
+            </div>
+          </div>
+          <section class="mt-6 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Asset</h3>
+            <div class="mt-3 flex items-center gap-3 cursor-pointer group" data-on:click="@get('/assets/{}/panel/stream')">
+              <div class="min-w-0 flex-1">
+                <p class="font-medium text-gray-900 dark:text-white group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">{}</p>
+                <p class="text-xs text-gray-500 dark:text-gray-400">{}</p>
+              </div>
+              <svg class="h-4 w-4 shrink-0 text-gray-400 group-hover:text-blue-500 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 5l7 7-7 7"/></svg>
+            </div>
+          </section>
+          {}
+          {}
+          <section class="mt-6 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5">
+            <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Details</h3>
+            <dl class="mt-4 grid gap-4 sm:grid-cols-2">
+              <div>
+                <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Created</dt>
+                <dd class="mt-1 text-sm text-gray-700 dark:text-gray-300">{}</dd>
+              </div>
+              <div>
+                <dt class="text-[10px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Run hash</dt>
+                <dd class="mt-1 text-sm text-gray-700 dark:text-gray-300 break-all"><code class="bg-gray-50 dark:bg-gray-800 px-2 py-1 rounded">{}</code></dd>
+              </div>
+              {}
+            </dl>
+          </section>
+        </div>"#,
+        mat.materialization_id,
+        escape_html(&capitalize(&mat.status)),
+        status_tone,
+        asset.asset_id,
+        escape_html(&asset.function_name),
+        escape_html(&asset.file_path),
+        log_section,
+        error_section,
+        format_job_timestamp(mat.created_at),
+        escape_html(&mat.run_hash),
+        artifact_section,
+    )
+}
+
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(first) => first.to_uppercase().to_string() + chars.as_str(),
+    }
+}
+
 /// Helper function to escape HTML
 pub fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
 }

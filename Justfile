@@ -4,9 +4,8 @@ dev:
     cargo watch -x 'run -p barca-server'
 
 # Build Tailwind CSS for production (run after changing templates or Tailwind classes).
-# Requires: Node.js and npm
 build-css:
-    npm run build:css
+    ./bin/tailwindcss -i ./static/css/input.css -o ./static/css/output.css --minify
 
 # Build and install the barca Python extension into the active venv.
 # Requires: maturin (uv tool install maturin)

@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/barca-cli",
     "crates/barca-core",
     "crates/barca-py",
     "crates/barca-server",

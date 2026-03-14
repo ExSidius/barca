@@ -13,8 +13,8 @@ build/
 **/*.rs.bk
 *.pdb
 
-# Node (Tailwind build)
-node_modules/
+# Tailwind standalone binary (platform-specific)
+bin/
 
 # Environments
 .env
@@ -49,3 +49,6 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 *.dSYM/
+
+node_modules
+test-results

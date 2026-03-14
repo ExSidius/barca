@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct InspectResponse {
     pub assets: Vec<InspectedAsset>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InspectedAsset {
     pub kind: String,
     pub module_path: String,
@@ -19,7 +20,7 @@ pub struct InspectedAsset {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WorkerResponse {
     pub ok: bool,
     pub artifact_format: Option<String>,
@@ -32,7 +33,7 @@ pub struct WorkerResponse {
     pub error_type: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct IndexedAsset {
     pub asset_id: i64,
     pub logical_name: String,
@@ -53,7 +54,7 @@ pub struct IndexedAsset {
     pub uv_lock_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AssetSummary {
     pub asset_id: i64,
     pub logical_name: String,
@@ -66,7 +67,7 @@ pub struct AssetSummary {
     pub materialization_created_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct MaterializationRecord {
     pub materialization_id: i64,
     pub asset_id: i64,
@@ -77,13 +78,44 @@ pub struct MaterializationRecord {
     pub artifact_format: Option<String>,
     pub artifact_checksum: Option<String>,
     pub last_error: Option<String>,
+    pub partition_key_json: Option<String>,
     pub created_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AssetDetail {
     pub asset: IndexedAsset,
     pub latest_materialization: Option<MaterializationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobDetail {
+    pub job: MaterializationRecord,
+    pub asset: AssetSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobLogRecord {
+    pub id: i64,
+    pub materialization_id: i64,
+    pub asset_id: i64,
+    pub level: String,
+    pub message: String,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetInput {
+    pub parameter_name: String,
+    pub upstream_asset_ref: String,
+    pub upstream_asset_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializationInput {
+    pub parameter_name: String,
+    pub upstream_materialization_id: i64,
+    pub upstream_asset_id: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
