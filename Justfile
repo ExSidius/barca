@@ -41,6 +41,7 @@ example name:
 # Run once after cloning.
 setup:
     rustup target add x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu
+    cargo install cross
     cargo install cargo-zigbuild
     uv tool install ziglang
     ln -sf ~/.local/bin/python-zig ~/.local/bin/zig
@@ -50,11 +51,13 @@ setup:
 # Publish a new release to PyPI and GitHub.
 #
 # Bumps all crate versions, builds wheels for all 4 platforms (macOS arm64/x86_64
-# and Linux arm64/x86_64 via cargo-zigbuild), uploads to PyPI, then tags and
-# creates a GitHub release with the wheels as assets.
+# and Linux arm64/x86_64), uploads to PyPI, then tags and creates a GitHub release.
+#
+# Linux CLI binaries are built via `cross` (Docker) to handle C dependencies.
+# Linux Python extensions are built via maturin --zig (no C deps in barca-py).
 #
 # Usage:   just release 0.0.4
-# Requires: just setup (run once), MATURIN_PYPI_TOKEN env var
+# Requires: just setup (run once), Docker (for Linux builds), MATURIN_PYPI_TOKEN env var
 release version:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -64,7 +67,7 @@ release version:
         echo "error: working tree is dirty — commit or stash changes first" >&2
         exit 1
     fi
-    for tool in cargo maturin gh; do
+    for tool in cargo maturin gh cross; do
         command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool not found (run 'just setup')" >&2; exit 1; }
     done
     command -v cargo-zigbuild >/dev/null 2>&1 || { echo "error: cargo-zigbuild not found (run 'just setup')" >&2; exit 1; }
@@ -93,9 +96,11 @@ release version:
     for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
         echo "--- $target ---"
 
-        # Build the CLI binary (zigbuild for Linux to target glibc 2.17)
+        # Build the CLI binary.
+        # Linux: use `cross` (Docker) — handles C deps (e.g. aegis) that cargo-zigbuild can't.
+        # macOS: native cargo build (cross-compiling x86_64 from arm64 via macOS SDK).
         if [[ "$target" == *linux* ]]; then
-            cargo zigbuild -p barca-cli --release --target "${target}.2.17"
+            cross build -p barca-cli --release --target "$target"
         else
             cargo build -p barca-cli --release --target "$target"
         fi
@@ -105,11 +110,15 @@ release version:
         cp "target/$target/release/barca" crates/barca-py/data/scripts/barca
         chmod +x crates/barca-py/data/scripts/barca
 
-        # Build the maturin wheel (--zig for Linux to cross-compile the .so)
+        # Build the maturin wheel.
+        # Linux: --zig for cross-compilation (barca-py has no C deps, so zig works fine).
+        #        Explicit -i required when cross-compiling — --find-interpreter doesn't work.
+        # macOS: --find-interpreter discovers all installed Python versions.
         if [[ "$target" == *linux* ]]; then
             maturin build --release --target "$target" --zig \
                 --manifest-path crates/barca-py/Cargo.toml \
-                --out dist/
+                --out dist/ \
+                -i python3.11 python3.12 python3.13
         else
             maturin build --release --target "$target" \
                 --manifest-path crates/barca-py/Cargo.toml \
