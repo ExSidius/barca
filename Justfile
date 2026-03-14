@@ -67,7 +67,7 @@ release version:
     for tool in cargo maturin gh; do
         command -v "$tool" >/dev/null 2>&1 || { echo "error: $tool not found (run 'just setup')" >&2; exit 1; }
     done
-    cargo zigbuild --version >/dev/null 2>&1 || { echo "error: cargo-zigbuild not found (run 'just setup')" >&2; exit 1; }
+    command -v cargo-zigbuild >/dev/null 2>&1 || { echo "error: cargo-zigbuild not found (run 'just setup')" >&2; exit 1; }
     [[ -n "${MATURIN_PYPI_TOKEN:-}" ]] || { echo "error: MATURIN_PYPI_TOKEN is not set" >&2; exit 1; }
 
     # ── Bump versions ───────────────────────────────────────────────────
