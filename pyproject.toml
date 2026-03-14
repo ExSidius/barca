@@ -1,0 +1,24 @@
+[project]
+name = "barca-workspace"
+version = "0.0.1"
+description = "Barca workspace root"
+requires-python = ">=3.11"
+dependencies = [
+    "barca",
+]
+
+[tool.uv.sources]
+barca = { path = "crates/barca-py", editable = true }
+
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[tool.ruff]
+line-length = 200
+
+[tool.maturin]
+manifest-path = "crates/barca-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+python-source = "crates/barca-py/python"
+module-name = "barca._barca"

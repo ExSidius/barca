@@ -1,0 +1,19 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "barca"
+version = "0.0.1"
+source = { directory = "../../crates/barca-py" }
+
+[[package]]
+name = "barca-basic-app"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "barca" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "barca", directory = "../../crates/barca-py" }]

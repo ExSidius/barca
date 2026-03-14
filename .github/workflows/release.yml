@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Build wheels (Python package + bundled CLI binary) ──────────────
+  #
+  # Each wheel contains:
+  #   - The `barca` Python package (@asset decorator, inspect, worker)
+  #   - The `barca` CLI binary (installed to bin/ on `uv pip install`)
+  #
+  build-wheels:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            maturin-target: x86_64
+            name: linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            maturin-target: aarch64
+            name: linux-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            maturin-target: x86_64
+            name: macos-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            maturin-target: aarch64
+            name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: |
+            3.11
+            3.12
+            3.13
+
+      - name: Log environment
+        run: |
+          echo "=== Runner ==="
+          echo "OS: ${{ matrix.os }}"
+          echo "Target: ${{ matrix.target }}"
+          echo "Maturin target: ${{ matrix.maturin-target }}"
+          echo "=== Tool versions ==="
+          rustc --version
+          cargo --version
+          python3 --version
+          echo "=== Workspace ==="
+          ls -la crates/barca-py/
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "aarch64-linux-gnu-gcc version: $(aarch64-linux-gnu-gcc --version | head -1)"
+
+      # Build the CLI binary first, then stage it for wheel inclusion
+      - name: Build CLI binary
+        run: cargo build -p barca-cli --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Stage CLI binary for wheel
+        run: |
+          mkdir -p crates/barca-py/data/scripts
+          cp target/${{ matrix.target }}/release/barca crates/barca-py/data/scripts/barca
+          chmod +x crates/barca-py/data/scripts/barca
+          echo "Staged binary:"
+          ls -lh crates/barca-py/data/scripts/
+          file crates/barca-py/data/scripts/barca
+
+      # Build wheels — includes both the Python extension and the CLI binary
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.maturin-target }}
+          args: --release --out dist --find-interpreter
+          manylinux: auto
+          working-directory: crates/barca-py
+
+      - name: Verify wheel output
+        run: |
+          echo "=== Built wheels ==="
+          ls -lh crates/barca-py/dist/
+          echo "=== Wheel names ==="
+          for f in crates/barca-py/dist/*.whl; do
+            echo "  $f"
+            python3 -c "import zipfile, sys; z=zipfile.ZipFile('$f'); meta=[n for n in z.namelist() if 'METADATA' in n]; print('    METADATA:', meta[0] if meta else 'NOT FOUND')"
+          done
+
+      - name: Clean staged data
+        run: rm -rf crates/barca-py/data/scripts
+
+      # Also upload the standalone CLI binary
+      - name: Package standalone CLI binary
+        run: |
+          cp target/${{ matrix.target }}/release/barca barca-${{ matrix.name }}
+          chmod +x barca-${{ matrix.name }}
+          tar czf barca-${{ matrix.name }}.tar.gz barca-${{ matrix.name }}
+          echo "CLI tarball: $(ls -lh barca-${{ matrix.name }}.tar.gz)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: crates/barca-py/dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.name }}
+          path: barca-${{ matrix.name }}.tar.gz
+
+  # ── Build source distribution ───────────────────────────────────────
+  build-sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log environment
+        run: |
+          echo "=== pyproject.toml package name/version ==="
+          grep -E '^(name|version)' crates/barca-py/pyproject.toml
+          echo "=== barca-py Cargo.toml version ==="
+          grep '^version' crates/barca-py/Cargo.toml
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+          working-directory: crates/barca-py
+
+      - name: Verify sdist output
+        run: |
+          echo "=== Built sdist ==="
+          ls -lh crates/barca-py/dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: crates/barca-py/dist/
+
+  # ── Create GitHub Release ───────────────────────────────────────────
+  release:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release/
+          cp artifacts/wheels-*/*.whl release/
+          cp artifacts/cli-*/*.tar.gz release/
+          cp artifacts/sdist/*.tar.gz release/
+          echo "=== Release assets ==="
+          ls -lh release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref, 'rc') }}
+          body: |
+            ## Install
+
+            ```bash
+            uv add barca
+            ```
+
+            This installs both the `barca` CLI and the Python `@asset()` decorator.
+
+            See the [README](https://github.com/${{ github.repository }}#readme) for usage.
+
+  # ── Publish to PyPI ────────────────────────────────────────────────
+  publish-pypi:
+    needs: [build-wheels, build-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect wheels and sdist
+        run: |
+          mkdir -p dist/
+          cp artifacts/wheels-*/*.whl dist/
+          cp artifacts/sdist/*.tar.gz dist/
+          echo "=== Files to publish ==="
+          ls -lh dist/
+          echo "=== Package names (must all start with 'barca-') ==="
+          ls dist/ | grep -v '^barca[-_]' && echo "WARNING: unexpected package name found above" || echo "OK: all files match expected name"
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          verbose: true

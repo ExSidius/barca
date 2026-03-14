@@ -1,0 +1,12 @@
+[package]
+name = "barca-py"
+version = "0.0.2"
+edition = "2021"
+
+[lib]
+name = "_barca"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.25", features = ["extension-module"] }
+serde_json = "1.0"
