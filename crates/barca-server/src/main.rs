@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 
-use barca_server::{config::load_config, server, AppState};
+use barca_server::{server, AppState};
 
 #[derive(Parser)]
 #[command(name = "barca", about = "Minimal asset orchestrator")]
@@ -47,11 +47,10 @@ async fn serve() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let config = load_config(&repo_root.join("barca.toml"))?;
     let store = barca_server::store::MetadataStore::open(&repo_root.join(".barca").join("metadata.db")).await?;
     let python = std::sync::Arc::new(barca_server::python_bridge::UvPythonBridge::new(repo_root.clone()));
 
-    let state = AppState::new(repo_root, config, store, python);
+    let state = AppState::new(repo_root, store, python);
 
     barca_server::reindex(&state).await?;
     {

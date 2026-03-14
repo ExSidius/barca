@@ -58,17 +58,16 @@ This installs both the `barca` CLI and the Python `@asset()` decorator.
 
 ## Quick Start
 
-Create a `barca.toml` in your project root:
-
-```toml
-[python]
-modules = ["my_project.assets"]
+```bash
+uv init my-project
+cd my-project
+uv add barca --find-links 'https://github.com/ExSidius/barca/releases/expanded_assets/latest'
 ```
 
-Write your assets:
+Write your assets anywhere in your project — barca discovers them automatically:
 
 ```python
-# my_project/assets.py
+# main.py (or any .py file)
 from barca import asset
 
 @asset()
@@ -79,11 +78,13 @@ def hello() -> dict:
 Run:
 
 ```bash
-barca reindex                    # discover assets from Python modules
+barca reindex                    # discover assets from Python files
 barca assets list                # list all indexed assets
 barca assets refresh 1           # materialize an asset
 barca                            # start the web UI at localhost:3000
 ```
+
+No config file needed. Barca scans your project for `@asset()`-decorated functions automatically.
 
 ### CLI Reference
 

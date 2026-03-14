@@ -43,18 +43,17 @@ fn test_jobs_help() {
 
 #[test]
 fn test_assets_list_no_config() {
-    // All commands (except reset) now require barca.toml since they reindex first
+    // No barca.toml needed — commands work in any directory (may find zero assets)
     let tmp = tempfile::tempdir().unwrap();
     barca_cmd()
         .args(["assets", "list"])
         .current_dir(tmp.path())
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("barca.toml"));
+        .success();
 }
 
 #[test]
 fn test_reindex_no_config() {
     let tmp = tempfile::tempdir().unwrap();
-    barca_cmd().arg("reindex").current_dir(tmp.path()).assert().failure().stderr(predicate::str::contains("barca.toml"));
+    barca_cmd().arg("reindex").current_dir(tmp.path()).assert().success();
 }
