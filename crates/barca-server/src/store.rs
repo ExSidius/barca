@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context};
@@ -326,7 +327,54 @@ impl MetadataStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Batch-insert queued materializations for partitioned assets.
+    /// Each entry is a partition_key_json string. Returns the number of rows inserted.
+    pub async fn insert_queued_materializations_batch(&self, asset_id: i64, definition_id: i64, run_hash: &str, partition_keys: &[String]) -> anyhow::Result<usize> {
+        let created_at = now_ts();
+        // Build a single batch SQL statement with multiple INSERTs
+        let mut sql = String::with_capacity(partition_keys.len() * 128);
+        sql.push_str("BEGIN;\n");
+        for pk in partition_keys {
+            // Escape single quotes in partition key JSON
+            let escaped = pk.replace('\'', "''");
+            sql.push_str(&format!(
+                "INSERT INTO materializations (asset_id, definition_id, run_hash, status, partition_key_json, created_at) VALUES ({asset_id}, {definition_id}, '{run_hash}', 'queued', '{escaped}', {created_at});\n"
+            ));
+        }
+        sql.push_str("COMMIT;\n");
+        self.conn.execute_batch(&sql).await.map_err(|err| anyhow!(err.to_string()))?;
+        Ok(partition_keys.len())
+    }
+
+    /// Count terminal (success or failed) materializations for an asset.
+    pub async fn count_terminal_materializations(&self, asset_id: i64) -> anyhow::Result<usize> {
+        let mut rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM materializations WHERE asset_id = ?1 AND status IN ('success', 'failed')", (asset_id,))
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let row = rows.next().await.map_err(|err| anyhow!(err.to_string()))?.unwrap();
+        Ok(int_col(&row, 0)? as usize)
+    }
+
+    /// Count pending (queued or running) materializations for an asset.
+    pub async fn count_pending_materializations(&self, asset_id: i64) -> anyhow::Result<usize> {
+        let mut rows = self
+            .conn
+            .query("SELECT COUNT(*) FROM materializations WHERE asset_id = ?1 AND status IN ('queued', 'running')", (asset_id,))
+            .await
+            .map_err(|err| anyhow!(err.to_string()))?;
+        let row = rows.next().await.map_err(|err| anyhow!(err.to_string()))?.unwrap();
+        Ok(int_col(&row, 0)? as usize)
+    }
+
     pub async fn claim_next_queued_materialization(&self) -> anyhow::Result<Option<MaterializationRecord>> {
+        let batch = self.claim_queued_materializations(1).await?;
+        Ok(batch.into_iter().next())
+    }
+
+    /// Claim up to `limit` queued materializations atomically, marking them as 'running'.
+    pub async fn claim_queued_materializations(&self, limit: usize) -> anyhow::Result<Vec<MaterializationRecord>> {
         let mut rows = self
             .conn
             .query(
@@ -335,26 +383,29 @@ impl MetadataStore {
                 FROM materializations
                 WHERE status = 'queued'
                 ORDER BY created_at ASC, id ASC
-                LIMIT 1
+                LIMIT ?1
                 "#,
-                (),
+                (limit as i64,),
             )
             .await
             .map_err(|err| anyhow!(err.to_string()))?;
 
-        let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? else {
-            return Ok(None);
-        };
+        let mut records = Vec::new();
+        while let Some(row) = rows.next().await.map_err(|err| anyhow!(err.to_string()))? {
+            records.push(materialization_from_row(&row)?);
+        }
 
-        let record = materialization_from_row(&row)?;
-        self.conn
-            .execute("UPDATE materializations SET status = 'running' WHERE id = ?1", (record.materialization_id,))
-            .await
-            .map_err(|err| anyhow!(err.to_string()))?;
-        Ok(Some(MaterializationRecord {
-            status: "running".to_string(),
-            ..record
-        }))
+        // Mark all claimed jobs as running in one batch
+        if !records.is_empty() {
+            let ids: Vec<String> = records.iter().map(|r| r.materialization_id.to_string()).collect();
+            let id_list = ids.join(",");
+            self.conn
+                .execute_batch(&format!("UPDATE materializations SET status = 'running' WHERE id IN ({id_list})"))
+                .await
+                .map_err(|err| anyhow!(err.to_string()))?;
+        }
+
+        Ok(records.into_iter().map(|r| MaterializationRecord { status: "running".to_string(), ..r }).collect())
     }
 
     pub async fn requeue_running_materializations(&self) -> anyhow::Result<()> {
@@ -385,7 +436,7 @@ impl MetadataStore {
     }
 
     pub async fn list_materializations_for_asset(&self, asset_id: i64, limit: u32) -> anyhow::Result<Vec<MaterializationRecord>> {
-        let limit = limit.min(100) as i64;
+        let limit = limit as i64;
         let mut rows = self
             .conn
             .query(
@@ -409,7 +460,7 @@ impl MetadataStore {
     }
 
     pub async fn list_recent_materializations(&self, limit: u32) -> anyhow::Result<Vec<(MaterializationRecord, AssetSummary)>> {
-        let limit = limit.min(100) as i64;
+        let limit = limit as i64;
         let mut rows = self
             .conn
             .query(
@@ -695,6 +746,51 @@ impl MetadataStore {
             return Ok(Some(materialization_from_row(&row)?));
         }
         Ok(None)
+    }
+
+    /// Check which run_hashes already have successful materializations for a given asset.
+    /// Returns a map from run_hash to the existing MaterializationRecord.
+    pub async fn batch_check_cached_materializations(&self, asset_id: i64, run_hashes: &[String]) -> anyhow::Result<HashMap<String, MaterializationRecord>> {
+        if run_hashes.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = run_hashes.iter().map(|h| format!("'{}'", h.replace('\'', "''"))).collect();
+        let in_clause = placeholders.join(",");
+        let sql = format!(
+            "SELECT id, asset_id, definition_id, run_hash, status, artifact_path, artifact_format, artifact_checksum, last_error, partition_key_json, created_at \
+             FROM materializations \
+             WHERE asset_id = {} AND status = 'success' AND run_hash IN ({})",
+            asset_id, in_clause
+        );
+        let mut rows = self.conn.query(&sql, ()).await.map_err(|e| anyhow!(e.to_string()))?;
+        let mut result = HashMap::new();
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!(e.to_string()))? {
+            let record = materialization_from_row(&row)?;
+            result.insert(record.run_hash.clone(), record);
+        }
+        Ok(result)
+    }
+
+    /// Batch-update multiple materializations as successful in a single transaction.
+    /// Each tuple: (materialization_id, run_hash, artifact_path, artifact_format, artifact_checksum).
+    pub async fn batch_mark_materialization_success(&self, results: &[(i64, String, String, String, String)]) -> anyhow::Result<()> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let mut sql = String::from("BEGIN;\n");
+        for (mid, run_hash, path, format, checksum) in results {
+            sql.push_str(&format!(
+                "UPDATE materializations SET status = 'success', run_hash = '{}', artifact_path = '{}', artifact_format = '{}', artifact_checksum = '{}' WHERE id = {};\n",
+                run_hash.replace('\'', "''"),
+                path.replace('\'', "''"),
+                format.replace('\'', "''"),
+                checksum.replace('\'', "''"),
+                mid
+            ));
+        }
+        sql.push_str("COMMIT;\n");
+        self.conn.execute_batch(&sql).await.map_err(|e| anyhow!(e.to_string()))?;
+        Ok(())
     }
 
     pub async fn update_materialization_run_hash(&self, materialization_id: i64, run_hash: &str) -> anyhow::Result<()> {

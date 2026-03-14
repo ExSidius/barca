@@ -41,3 +41,11 @@ def uppercased(fruit: str) -> str:
 @asset(partitions={"ticker": partitions(["AAPL", "MSFT", "GOOG"])})
 def fetch_prices(ticker: str) -> dict:
     return {"ticker": ticker, "price": len(ticker) * 100}
+
+
+# --- Workflow 3b: Large partition set (100 partitions) ---
+
+
+@asset(partitions={"key": partitions([f"p{i:05d}" for i in range(10000)])})
+def wide_asset(key: str) -> dict:
+    return {"key": key, "index": int(key[1:])}

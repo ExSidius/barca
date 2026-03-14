@@ -6,6 +6,7 @@ pub mod store;
 pub mod templates;
 
 use std::{
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -57,6 +58,11 @@ pub fn emit_log(tx: &broadcast::Sender<JobLogEntry>, asset_id: i64, job_id: i64,
     });
 }
 
+/// Cache of definition-hash verifications so we don't re-inspect for every
+/// partition job of the same asset.  Key = (module_path, function_name),
+/// value = verified definition_hash.
+type DefinitionCache = Arc<Mutex<HashMap<(String, String), String>>>;
+
 #[derive(Clone)]
 pub struct AppState {
     pub repo_root: PathBuf,
@@ -66,12 +72,13 @@ pub struct AppState {
     pub job_completion_tx: broadcast::Sender<i64>,
     pub job_log_tx: broadcast::Sender<JobLogEntry>,
     pub python: Arc<dyn PythonBridge>,
+    pub definition_cache: DefinitionCache,
 }
 
 impl AppState {
     pub fn new(repo_root: PathBuf, config: BarcaConfig, store: MetadataStore, python: Arc<dyn PythonBridge>) -> Self {
-        let (job_completion_tx, _) = broadcast::channel(16);
-        let (job_log_tx, _) = broadcast::channel(256);
+        let (job_completion_tx, _) = broadcast::channel(16384);
+        let (job_log_tx, _) = broadcast::channel(4096);
         Self {
             repo_root: repo_root.clone(),
             config,
@@ -80,6 +87,7 @@ impl AppState {
             job_completion_tx,
             job_log_tx,
             python,
+            definition_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -196,6 +204,11 @@ fn resolve_partition_values(detail: &AssetDetail) -> Vec<serde_json::Value> {
 }
 
 pub async fn reindex(state: &AppState) -> anyhow::Result<()> {
+    // Clear the definition cache — code may have changed
+    {
+        let mut cache = state.definition_cache.lock().await;
+        cache.clear();
+    }
     let inspected = state.python.inspect_modules(&state.config.python.modules).await?;
     let mut seen = std::collections::HashSet::new();
 
@@ -322,32 +335,60 @@ pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, uv_lock_
     ))
 }
 
-pub async fn run_refresh_queue_worker(state: AppState) {
-    info!("refresh queue worker started");
+/// Maximum number of concurrent Python worker subprocesses.
+const MAX_CONCURRENT_JOBS: usize = 64;
 
+/// How many jobs to claim from the queue in one batch.
+const CLAIM_BATCH_SIZE: usize = 256;
+
+pub async fn run_refresh_queue_worker(state: AppState) {
+    info!("refresh queue worker started (max_concurrent={})", MAX_CONCURRENT_JOBS);
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS));
     let mut in_flight = tokio::task::JoinSet::new();
 
     loop {
-        // Try to claim and spawn jobs while there are queued items
-        loop {
-            let next_job = {
-                let store = state.store.lock().await;
-                store.claim_next_queued_materialization().await
-            };
-
-            match next_job {
-                Ok(Some(job)) => {
-                    let job_state = state.clone();
-                    in_flight.spawn(async move {
-                        execute_refresh_job(&job_state, job).await;
-                    });
-                }
-                Ok(None) => break,
+        // Batch-claim queued jobs (up to CLAIM_BATCH_SIZE at once)
+        let claimed = {
+            let store = state.store.lock().await;
+            match store.claim_queued_materializations(CLAIM_BATCH_SIZE).await {
+                Ok(jobs) => jobs,
                 Err(error) => {
-                    error!(error = %error, "refresh queue worker failed to claim the next job");
-                    break;
+                    error!(error = %error, "refresh queue worker failed to claim jobs");
+                    Vec::new()
                 }
             }
+        };
+
+        // Group partition jobs by asset_id for batch execution
+        let mut partition_groups: HashMap<i64, Vec<barca_core::models::MaterializationRecord>> = HashMap::new();
+        let mut standalone_jobs: Vec<barca_core::models::MaterializationRecord> = Vec::new();
+
+        for job in claimed {
+            if job.partition_key_json.is_some() {
+                partition_groups.entry(job.asset_id).or_default().push(job);
+            } else {
+                standalone_jobs.push(job);
+            }
+        }
+
+        // Dispatch partition groups as batches (one pre-fetch, N parallel workers)
+        for (_asset_id, group) in partition_groups {
+            let job_state = state.clone();
+            let sem = semaphore.clone();
+            in_flight.spawn(async move {
+                execute_partition_batch(&job_state, group, sem).await;
+            });
+        }
+
+        // Dispatch standalone jobs individually (existing path)
+        for job in standalone_jobs {
+            let job_state = state.clone();
+            let sem = semaphore.clone();
+            in_flight.spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                execute_refresh_job(&job_state, job).await;
+            });
         }
 
         if in_flight.is_empty() {
@@ -492,31 +533,436 @@ async fn enqueue_refresh_request_inner(state: &AppState, asset_id: i64) -> anyho
         );
         emit_log(&state.job_log_tx, asset_id, materialization_id, JobLogLevel::Info, format!("Job {} queued", materialization_id));
     } else {
-        // Partitioned asset: one job per partition value
-        for pv in &partition_values {
-            let pk_json = serde_json::to_string(pv).unwrap_or_default();
-            let materialization_id = store.insert_queued_materialization(asset_id, detail.asset.definition_id, &run_hash, Some(&pk_json)).await?;
-            info!(
-                asset_id = detail.asset.asset_id,
-                job_id = materialization_id,
-                partition = %pk_json,
-                asset = %detail.asset.logical_name,
-                "queued partition",
-            );
-            emit_log(
-                &state.job_log_tx,
-                asset_id,
-                materialization_id,
-                JobLogLevel::Info,
-                format!("Job {} queued (partition {})", materialization_id, pk_json),
-            );
-        }
+        // Partitioned asset: batch-insert all partition jobs at once
+        let partition_keys: Vec<String> = partition_values.iter().map(|pv| serde_json::to_string(pv).unwrap_or_default()).collect();
+        let count = store.insert_queued_materializations_batch(asset_id, detail.asset.definition_id, &run_hash, &partition_keys).await?;
+        info!(
+            asset_id = detail.asset.asset_id,
+            count,
+            asset = %detail.asset.logical_name,
+            "queued partitions (batch)",
+        );
+        emit_log(
+            &state.job_log_tx,
+            asset_id,
+            0,
+            JobLogLevel::Info,
+            format!("Queued {} partition jobs for {}", count, detail.asset.logical_name),
+        );
     }
 
     let queued_detail = store.asset_detail(asset_id).await?;
     drop(store);
     state.job_queue_notify.notify_one();
     Ok(queued_detail)
+}
+
+/// Execute a batch of partition jobs for the same asset in parallel.
+/// Pre-fetches all shared data once (asset detail, definition verification,
+/// upstream inputs), then dispatches N Python workers concurrently with
+/// minimal lock contention.
+async fn execute_partition_batch(state: &AppState, jobs: Vec<barca_core::models::MaterializationRecord>, semaphore: Arc<tokio::sync::Semaphore>) {
+    let started_at = Instant::now();
+    let aid = jobs[0].asset_id;
+    let log = &state.job_log_tx;
+
+    info!(asset_id = aid, count = jobs.len(), "partition batch started");
+
+    // Helper: fail all jobs with a shared error message and return early.
+    macro_rules! fail_all {
+        ($jobs:expr, $name:expr, $msg:expr) => {{
+            let msg: String = $msg;
+            for job in $jobs {
+                emit_log(log, aid, job.materialization_id, JobLogLevel::Error, &msg);
+                let _ = fail_refresh_job(state, job, $name, started_at, &msg).await;
+            }
+            return;
+        }};
+    }
+
+    // --- Phase 1: Shared setup (one lock acquisition per step) ---
+
+    // 1. Fetch asset detail (ONE lock)
+    let detail = {
+        let store = state.store.lock().await;
+        match store.asset_detail(aid).await {
+            Ok(d) => d,
+            Err(e) => fail_all!(&jobs, None, e.to_string()),
+        }
+    };
+    let asset_name = detail.asset.logical_name.clone();
+
+    // Verify all jobs match current definition
+    for job in &jobs {
+        if job.definition_id != detail.asset.definition_id {
+            fail_all!(
+                &jobs,
+                Some(asset_name.as_str()),
+                format!("definition changed since batch was queued for {}. Trigger a new refresh.", asset_name)
+            );
+        }
+    }
+
+    // 2. Verify definition (ONE cache check or ONE inspect call)
+    let cache_key = (detail.asset.module_path.clone(), detail.asset.function_name.clone());
+    let cached = {
+        let cache = state.definition_cache.lock().await;
+        cache.get(&cache_key).cloned()
+    };
+    match cached {
+        Some(ref hash) if hash == &detail.asset.definition_hash => { /* already verified */ }
+        Some(_) => {
+            fail_all!(&jobs, Some(asset_name.as_str()), format!("definition changed since indexing for {}. Reindex first.", asset_name));
+        }
+        None => {
+            let inspected = match state.python.inspect_modules(std::slice::from_ref(&detail.asset.module_path)).await {
+                Ok(i) => i,
+                Err(e) => fail_all!(&jobs, Some(asset_name.as_str()), e.to_string()),
+            };
+            let current_inspected = match inspected.into_iter().find(|a| a.function_name == detail.asset.function_name) {
+                Some(i) => i,
+                None => fail_all!(&jobs, Some(asset_name.as_str()), format!("asset {} could not be re-inspected", asset_name)),
+            };
+            let (current_indexed, _) = match build_indexed_asset(&state.repo_root, current_inspected, barca_core::hashing::optional_file_hash(&state.repo_root.join("uv.lock"))) {
+                Ok(r) => r,
+                Err(e) => fail_all!(&jobs, Some(asset_name.as_str()), e.to_string()),
+            };
+            {
+                let mut cache = state.definition_cache.lock().await;
+                cache.insert(cache_key, current_indexed.definition_hash.clone());
+            }
+            if current_indexed.definition_hash != detail.asset.definition_hash {
+                fail_all!(&jobs, Some(asset_name.as_str()), format!("definition changed since indexing for {}. Reindex first.", asset_name));
+            }
+        }
+    }
+
+    // 3. Resolve inputs + load upstream artifacts (ONE lock for entire block)
+    let mut base_input_kwargs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut upstream_mat_ids: Vec<i64> = Vec::new();
+    let mut mat_inputs: Vec<barca_core::models::MaterializationInput> = Vec::new();
+    let mut provenance_entries: Vec<serde_json::Value> = Vec::new();
+
+    {
+        let store = state.store.lock().await;
+        let asset_inputs = match resolve_asset_inputs(&store, &detail, &state.repo_root).await {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                drop(store);
+                fail_all!(&jobs, Some(asset_name.as_str()), e.to_string());
+            }
+        };
+
+        for input in &asset_inputs {
+            let upstream_asset_id = input.upstream_asset_id.unwrap_or(-1);
+            let upstream_mat = match store.latest_successful_materialization(upstream_asset_id).await {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    info!(asset_id = aid, upstream_asset_id, "upstream not ready — re-queuing partition batch");
+                    for job in &jobs {
+                        emit_log(
+                            log,
+                            aid,
+                            job.materialization_id,
+                            JobLogLevel::Info,
+                            format!("Upstream asset #{} not ready — re-queuing", upstream_asset_id),
+                        );
+                        let _ = store.requeue_materialization(job.materialization_id).await;
+                    }
+                    drop(store);
+                    state.job_queue_notify.notify_one();
+                    return;
+                }
+                Err(e) => {
+                    drop(store);
+                    fail_all!(&jobs, Some(asset_name.as_str()), e.to_string());
+                }
+            };
+
+            let artifact_path = match upstream_mat.artifact_path.as_ref() {
+                Some(p) => p.clone(),
+                None => {
+                    drop(store);
+                    fail_all!(&jobs, Some(asset_name.as_str()), format!("upstream asset #{} has no artifact path", upstream_asset_id));
+                }
+            };
+            let full_path = state.repo_root.join(&artifact_path);
+            let value_bytes = match fs::read(&full_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    drop(store);
+                    fail_all!(&jobs, Some(asset_name.as_str()), format!("failed to read upstream artifact at {}: {}", full_path.display(), e));
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_slice(&value_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    drop(store);
+                    fail_all!(&jobs, Some(asset_name.as_str()), e.to_string());
+                }
+            };
+
+            base_input_kwargs.insert(input.parameter_name.clone(), value);
+            upstream_mat_ids.push(upstream_mat.materialization_id);
+            mat_inputs.push(barca_core::models::MaterializationInput {
+                parameter_name: input.parameter_name.clone(),
+                upstream_materialization_id: upstream_mat.materialization_id,
+                upstream_asset_id,
+            });
+            provenance_entries.push(serde_json::json!({
+                "parameter_name": input.parameter_name,
+                "asset_ref": input.upstream_asset_ref,
+                "materialization_id": upstream_mat.materialization_id,
+            }));
+        }
+    }
+
+    upstream_mat_ids.sort();
+
+    // 4. Compute run_hash per partition (pure computation, no lock)
+    struct PartitionWork {
+        job: barca_core::models::MaterializationRecord,
+        run_hash: String,
+    }
+    let partition_work: Vec<PartitionWork> = jobs
+        .into_iter()
+        .map(|job| {
+            let run_hash = barca_core::hashing::compute_run_hash(&detail.asset.definition_hash, &upstream_mat_ids, job.partition_key_json.as_deref());
+            PartitionWork { job, run_hash }
+        })
+        .collect();
+
+    // 5. Batch check cache + update run_hashes (ONE lock)
+    let cached_mats;
+    {
+        let store = state.store.lock().await;
+        let all_run_hashes: Vec<String> = partition_work.iter().map(|pw| pw.run_hash.clone()).collect();
+        cached_mats = match store.batch_check_cached_materializations(aid, &all_run_hashes).await {
+            Ok(c) => c,
+            Err(e) => {
+                drop(store);
+                let msg = e.to_string();
+                for pw in &partition_work {
+                    emit_log(log, aid, pw.job.materialization_id, JobLogLevel::Error, &msg);
+                    let _ = fail_refresh_job(state, &pw.job, Some(&asset_name), started_at, &msg).await;
+                }
+                return;
+            }
+        };
+        // Update run_hashes for all jobs in the same lock
+        for pw in &partition_work {
+            if let Err(e) = store.update_materialization_run_hash(pw.job.materialization_id, &pw.run_hash).await {
+                error!(job_id = pw.job.materialization_id, error = %e, "failed to update run_hash");
+            }
+        }
+    }
+
+    // 6. Separate cached vs needs-work
+    let mut cached_successes: Vec<(i64, String, String, String, String)> = Vec::new();
+    let mut needs_work: Vec<PartitionWork> = Vec::new();
+
+    for pw in partition_work {
+        if let Some(existing) = cached_mats.get(&pw.run_hash) {
+            info!(
+                asset_id = aid,
+                job_id = pw.job.materialization_id,
+                existing_job = existing.materialization_id,
+                "reusing cached materialization (run_hash match)",
+            );
+            emit_log(log, aid, pw.job.materialization_id, JobLogLevel::Info, "Reusing cached materialization");
+            cached_successes.push((
+                pw.job.materialization_id,
+                pw.run_hash,
+                existing.artifact_path.clone().unwrap_or_default(),
+                existing.artifact_format.clone().unwrap_or_else(|| "json".to_string()),
+                existing.artifact_checksum.clone().unwrap_or_default(),
+            ));
+        } else {
+            needs_work.push(pw);
+        }
+    }
+
+    // Batch mark cached successes (ONE lock)
+    if !cached_successes.is_empty() {
+        let store = state.store.lock().await;
+        if let Err(e) = store.batch_mark_materialization_success(&cached_successes).await {
+            error!(asset_id = aid, error = %e, "failed to batch-mark cached successes");
+        }
+        if !mat_inputs.is_empty() {
+            for &(jid, _, _, _, _) in &cached_successes {
+                if let Err(e) = store.insert_materialization_inputs(jid, &mat_inputs).await {
+                    error!(job_id = jid, error = %e, "failed to insert materialization inputs");
+                }
+            }
+        }
+        drop(store);
+        let elapsed = started_at.elapsed().as_millis();
+        for &(jid, _, _, _, _) in &cached_successes {
+            emit_log(log, aid, jid, JobLogLevel::Info, format!("Job {} completed (cached) in {}ms", jid, elapsed));
+        }
+    }
+
+    if needs_work.is_empty() {
+        let _ = state.job_completion_tx.send(aid);
+        return;
+    }
+
+    // --- Phase 2: Dispatch non-cached partitions in parallel ---
+
+    type PartitionResult = Result<
+        (i64, String, String, String, String),               // (job_id, run_hash, artifact_path, format, checksum)
+        (barca_core::models::MaterializationRecord, String), // (job, error_msg)
+    >;
+
+    let mut handles = tokio::task::JoinSet::<PartitionResult>::new();
+
+    for pw in needs_work {
+        let sem = semaphore.clone();
+        let state_clone = state.clone();
+        let detail_clone = detail.clone();
+        let base_kwargs = base_input_kwargs.clone();
+        let provenance_clone = provenance_entries.clone();
+        let run_hash = pw.run_hash;
+        let job = pw.job;
+
+        handles.spawn(async move {
+            let _permit = sem.acquire().await.expect("semaphore closed");
+            let jid = job.materialization_id;
+            let log = &state_clone.job_log_tx;
+
+            emit_log(log, aid, jid, JobLogLevel::Info, format!("Job {} started — executing {}", jid, detail_clone.asset.function_name));
+
+            // Merge partition key into kwargs
+            let mut input_kwargs = base_kwargs;
+            if let Some(ref pk_json) = job.partition_key_json {
+                if let Ok(pk) = serde_json::from_str::<serde_json::Value>(pk_json) {
+                    if let Some(obj) = pk.as_object() {
+                        for (k, v) in obj {
+                            input_kwargs.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+
+            let input_kwargs_json = if input_kwargs.is_empty() {
+                None
+            } else {
+                Some(serde_json::to_string(&serde_json::Value::Object(input_kwargs)).map_err(|e| (job.clone(), e.to_string()))?)
+            };
+
+            emit_log(log, aid, jid, JobLogLevel::Info, "Spawning Python worker...");
+
+            let staging_dir = barca_core::hashing::repo_child(&state_clone.repo_root, PathBuf::from("tmp").join(format!("asset-{}-{}", aid, jid)));
+            if staging_dir.exists() {
+                fs::remove_dir_all(&staging_dir).ok();
+            }
+            fs::create_dir_all(&staging_dir).map_err(|e| (job.clone(), e.to_string()))?;
+
+            let worker = state_clone
+                .python
+                .materialize_asset(
+                    &detail_clone.asset.module_path,
+                    &detail_clone.asset.function_name,
+                    &staging_dir,
+                    jid,
+                    log.clone(),
+                    aid,
+                    input_kwargs_json.as_deref(),
+                )
+                .await
+                .map_err(|e| (job.clone(), e.to_string()))?;
+
+            // Build artifact path with partition subdirectory
+            let mut artifact_base = PathBuf::from(".barcafiles").join(&detail_clone.asset.asset_slug).join(&detail_clone.asset.definition_hash);
+            if let Some(ref pk_json) = job.partition_key_json {
+                if let Ok(pk) = serde_json::from_str::<serde_json::Value>(pk_json) {
+                    if let Some(obj) = pk.as_object() {
+                        let mut parts: Vec<String> = obj
+                            .iter()
+                            .map(|(k, v)| {
+                                let val = match v {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                format!("{k}={val}")
+                            })
+                            .collect();
+                        parts.sort();
+                        artifact_base = artifact_base.join("partitions").join(parts.join(","));
+                    }
+                }
+            }
+            let artifact_dir = barca_core::hashing::repo_child(&state_clone.repo_root, &artifact_base);
+            fs::create_dir_all(&artifact_dir).map_err(|e| (job.clone(), e.to_string()))?;
+
+            let value_path_str = worker.value_path.ok_or_else(|| (job.clone(), "worker did not return value path".to_string()))?;
+            let value_path = PathBuf::from(value_path_str);
+            let value_bytes = fs::read(&value_path).map_err(|e| (job.clone(), e.to_string()))?;
+            let artifact_checksum = barca_core::hashing::sha256_hex(&value_bytes);
+            let final_value_path = artifact_dir.join("value.json");
+            fs::copy(&value_path, &final_value_path).map_err(|e| (job.clone(), e.to_string()))?;
+            let artifact_path = barca_core::hashing::relative_path(&state_clone.repo_root, &final_value_path);
+            let artifact_format = worker.artifact_format.unwrap_or_else(|| "json".to_string());
+
+            // Write metadata files (filesystem only, no lock)
+            let _ = fs::write(artifact_dir.join("code.txt"), &detail_clone.asset.source_text);
+            let metadata = ArtifactMetadata {
+                asset_name: &detail_clone.asset.logical_name,
+                module_path: &detail_clone.asset.module_path,
+                file_path: &detail_clone.asset.file_path,
+                function_name: &detail_clone.asset.function_name,
+                definition_hash: &detail_clone.asset.definition_hash,
+                run_hash: &run_hash,
+                serializer_kind: &detail_clone.asset.serializer_kind,
+                python_version: &detail_clone.asset.python_version,
+                return_type: detail_clone.asset.return_type.as_deref(),
+                inputs: provenance_clone,
+                barca_version: PROTOCOL_VERSION,
+            };
+            let _ = fs::write(artifact_dir.join("metadata.json"), serde_json::to_vec_pretty(&metadata).unwrap_or_default());
+
+            let elapsed = started_at.elapsed().as_millis();
+            emit_log(log, aid, jid, JobLogLevel::Info, format!("Job {} completed successfully in {}ms", jid, elapsed));
+
+            Ok((jid, run_hash, artifact_path, artifact_format, artifact_checksum))
+        });
+    }
+
+    // 8. Collect results
+    let mut successes: Vec<(i64, String, String, String, String)> = Vec::new();
+
+    while let Some(result) = handles.join_next().await {
+        match result {
+            Ok(Ok(success_data)) => {
+                successes.push(success_data);
+            }
+            Ok(Err((job, error_msg))) => {
+                emit_log(log, aid, job.materialization_id, JobLogLevel::Error, &error_msg);
+                let _ = fail_refresh_job(state, &job, Some(&asset_name), started_at, &error_msg).await;
+            }
+            Err(e) => {
+                error!(asset_id = aid, error = %e, "partition task panicked");
+            }
+        }
+    }
+
+    // 9. Batch mark successes (ONE lock)
+    if !successes.is_empty() {
+        let store = state.store.lock().await;
+        if let Err(e) = store.batch_mark_materialization_success(&successes).await {
+            error!(asset_id = aid, error = %e, "failed to batch-mark successes");
+        }
+        if !mat_inputs.is_empty() {
+            for &(jid, _, _, _, _) in &successes {
+                if let Err(e) = store.insert_materialization_inputs(jid, &mat_inputs).await {
+                    error!(job_id = jid, error = %e, "failed to insert materialization inputs");
+                }
+            }
+        }
+    }
+
+    // 10. Signal completion
+    let _ = state.job_completion_tx.send(aid);
 }
 
 async fn execute_refresh_job(state: &AppState, job: barca_core::models::MaterializationRecord) {
@@ -554,17 +1000,39 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
 
         emit_log(log, aid, jid, JobLogLevel::Info, "Verifying definition...");
 
-        let current_inspected = state
-            .python
-            .inspect_modules(std::slice::from_ref(&detail.asset.module_path))
-            .await?
-            .into_iter()
-            .find(|asset| asset.function_name == detail.asset.function_name)
-            .ok_or_else(|| anyhow!("asset {} could not be re-inspected", detail.asset.logical_name))?;
-        let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, optional_file_hash(&state.repo_root.join("uv.lock")))?;
+        // Check the definition cache first — all partitions of the same asset
+        // share the same definition, so we only need to inspect once.
+        let cache_key = (detail.asset.module_path.clone(), detail.asset.function_name.clone());
+        let cached = {
+            let cache = state.definition_cache.lock().await;
+            cache.get(&cache_key).cloned()
+        };
 
-        if current_indexed.definition_hash != detail.asset.definition_hash {
-            return Err(anyhow!("definition changed since indexing for {}. Reindex first.", detail.asset.logical_name));
+        match cached {
+            Some(ref hash) if hash == &detail.asset.definition_hash => {
+                // Already verified — skip the subprocess call
+            }
+            Some(_) => {
+                return Err(anyhow!("definition changed since indexing for {}. Reindex first.", detail.asset.logical_name));
+            }
+            None => {
+                // First time seeing this asset — inspect and cache
+                let current_inspected = state
+                    .python
+                    .inspect_modules(std::slice::from_ref(&detail.asset.module_path))
+                    .await?
+                    .into_iter()
+                    .find(|asset| asset.function_name == detail.asset.function_name)
+                    .ok_or_else(|| anyhow!("asset {} could not be re-inspected", detail.asset.logical_name))?;
+                let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, optional_file_hash(&state.repo_root.join("uv.lock")))?;
+
+                let mut cache = state.definition_cache.lock().await;
+                cache.insert(cache_key, current_indexed.definition_hash.clone());
+
+                if current_indexed.definition_hash != detail.asset.definition_hash {
+                    return Err(anyhow!("definition changed since indexing for {}. Reindex first.", detail.asset.logical_name));
+                }
+            }
         }
 
         // Resolve upstream inputs (table first, falls back to decorator metadata)

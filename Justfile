@@ -16,6 +16,13 @@ build-py:
 build:
     cargo build -p barca-server
 
+# Run end-to-end integration tests against real Python projects.
+# Builds the Python extension and runs the w1/w2/w3 test suites.
+test-e2e:
+    just build-py
+    cd examples/basic_app && uv sync
+    cargo test -p barca-cli --test 'w*' -- --test-threads=1
+
 # Run the server against an example app (uses Python entry point).
 # Usage: just example basic_app
 example name:
