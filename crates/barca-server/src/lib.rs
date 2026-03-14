@@ -1,4 +1,3 @@
-pub mod config;
 pub mod display;
 pub mod python_bridge;
 pub mod server;
@@ -19,7 +18,7 @@ use barca_core::models::{ArtifactMetadata, AssetDetail, IndexedAsset, InspectedA
 use tokio::sync::{broadcast, Mutex, Notify};
 use tracing::{error, info};
 
-use crate::{config::BarcaConfig, python_bridge::PythonBridge, store::MetadataStore};
+use crate::{python_bridge::PythonBridge, store::MetadataStore};
 
 /// A log entry emitted during job lifecycle, streamed to the UI in real time.
 #[derive(Clone, Debug)]
@@ -66,7 +65,6 @@ type DefinitionCache = Arc<Mutex<HashMap<(String, String), String>>>;
 #[derive(Clone)]
 pub struct AppState {
     pub repo_root: PathBuf,
-    pub config: BarcaConfig,
     pub store: Arc<Mutex<MetadataStore>>,
     pub job_queue_notify: Arc<Notify>,
     pub job_completion_tx: broadcast::Sender<i64>,
@@ -76,12 +74,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(repo_root: PathBuf, config: BarcaConfig, store: MetadataStore, python: Arc<dyn PythonBridge>) -> Self {
+    pub fn new(repo_root: PathBuf, store: MetadataStore, python: Arc<dyn PythonBridge>) -> Self {
         let (job_completion_tx, _) = broadcast::channel(16384);
         let (job_log_tx, _) = broadcast::channel(4096);
         Self {
             repo_root: repo_root.clone(),
-            config,
             store: Arc::new(Mutex::new(store)),
             job_queue_notify: Arc::new(Notify::new()),
             job_completion_tx,
@@ -209,7 +206,7 @@ pub async fn reindex(state: &AppState) -> anyhow::Result<()> {
         let mut cache = state.definition_cache.lock().await;
         cache.clear();
     }
-    let inspected = state.python.inspect_modules(&state.config.python.modules).await?;
+    let inspected = state.python.inspect_modules(&[]).await?;
     let mut seen = std::collections::HashSet::new();
 
     // First pass: upsert all assets and collect input declarations

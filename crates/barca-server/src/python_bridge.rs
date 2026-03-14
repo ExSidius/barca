@@ -14,6 +14,69 @@ use tracing::{info, warn};
 
 use crate::{emit_log, JobLogEntry, JobLogLevel};
 
+/// Directories to skip when auto-discovering Python modules.
+const SKIP_DIRS: &[&str] = &[".venv", "__pycache__", ".git", ".barca", ".barcafiles", "build", "dist", "node_modules", "target", "tmp"];
+
+/// Walk `root` for `.py` files that reference `barca` and convert them to
+/// importable dotted module names.  Called automatically when no explicit
+/// modules are passed to `inspect_modules`.
+fn discover_barca_modules(root: &Path) -> Vec<String> {
+    let mut modules = Vec::new();
+    walk_py_files(root, root, &mut modules);
+    modules.sort();
+    modules
+}
+
+fn walk_py_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Skip hidden dirs and known non-project dirs
+        if name.starts_with('.') || SKIP_DIRS.contains(&name) {
+            continue;
+        }
+        if path.is_dir() {
+            walk_py_files(root, &path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            // Only consider files whose content references barca
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if !content.contains("barca") {
+                continue;
+            }
+            // Convert path to dotted module name relative to root
+            if let Some(module_name) = path_to_module(root, &path) {
+                out.push(module_name);
+            }
+        }
+    }
+}
+
+fn path_to_module(root: &Path, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let without_ext = rel.with_extension("");
+    // __init__.py -> parent package name
+    let module_path = if without_ext.file_name()?.to_str()? == "__init__" {
+        without_ext.parent()?.to_path_buf()
+    } else {
+        without_ext
+    };
+    let parts: Vec<&str> = module_path.components().filter_map(|c| c.as_os_str().to_str()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join("."))
+}
+
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait PythonBridge: Send + Sync {
@@ -45,13 +108,18 @@ impl UvPythonBridge {
 #[async_trait]
 impl PythonBridge for UvPythonBridge {
     async fn inspect_modules(&self, modules: &[String]) -> anyhow::Result<Vec<InspectedAsset>> {
-        if modules.is_empty() {
+        // If no explicit modules given, auto-discover .py files that reference barca.
+        let effective: Vec<String> = if modules.is_empty() { discover_barca_modules(&self.repo_root) } else { modules.to_vec() };
+
+        // Nothing to inspect — return early without spawning a subprocess.
+        if effective.is_empty() {
             return Ok(Vec::new());
         }
+
         let mut command = Command::new("uv");
         command.current_dir(&self.repo_root);
         command.arg("run").arg("python").arg("-m").arg("barca.inspect");
-        for module in modules {
+        for module in &effective {
             command.arg("--module").arg(module);
         }
         command.env("PYTHONPATH", self.repo_root.display().to_string());
