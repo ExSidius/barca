@@ -51,7 +51,7 @@ Asset #3
 ## Install
 
 ```bash
-uv pip install barca --find-links 'https://github.com/ExSidius/barca/releases/expanded_assets/latest'
+uv add barca
 ```
 
 This installs both the `barca` CLI and the Python `@asset()` decorator.
@@ -61,7 +61,7 @@ This installs both the `barca` CLI and the Python `@asset()` decorator.
 ```bash
 uv init my-project
 cd my-project
-uv add barca --find-links 'https://github.com/ExSidius/barca/releases/expanded_assets/latest'
+uv add barca
 ```
 
 Write your assets anywhere in your project — barca discovers them automatically:
