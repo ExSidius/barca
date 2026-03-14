@@ -17,6 +17,10 @@ jobs:
   #   - The `barca` Python package (@asset decorator, inspect, worker)
   #   - The `barca` CLI binary (installed to bin/ on `uv pip install`)
   #
+  # The CLI binary is built separately and staged to data/scripts/ before
+  # maturin packages the wheel. On Linux, cargo-zigbuild targets glibc 2.17
+  # for manylinux2014 compatibility. On macOS, native cargo is used.
+  #
   build-wheels:
     strategy:
       matrix:
@@ -24,18 +28,22 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             maturin-target: x86_64
+            zig-target: x86_64-unknown-linux-gnu.2.17
             name: linux-x86_64
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             maturin-target: aarch64
+            zig-target: aarch64-unknown-linux-gnu.2.17
             name: linux-arm64
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
             maturin-target: x86_64
+            zig-target: ""
             name: macos-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
             maturin-target: aarch64
+            zig-target: ""
             name: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
@@ -69,20 +77,24 @@ jobs:
           echo "=== Workspace ==="
           ls -la crates/barca-py/
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "aarch64-linux-gnu-gcc version: $(aarch64-linux-gnu-gcc --version | head -1)"
+      # On Linux, use cargo-zigbuild to produce a glibc 2.17-compatible binary
+      # (manylinux2014), matching the portability level of the maturin .so wheel.
+      - name: Install cargo-zigbuild (Linux)
+        if: runner.os == 'Linux'
+        run: pip install ziglang cargo-zigbuild
 
-      # Build the CLI binary first, then stage it for wheel inclusion
+      # Build the CLI binary for the target platform
       - name: Build CLI binary
-        run: cargo build -p barca-cli --release --target ${{ matrix.target }}
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.zig-target }}" ]; then
+            cargo zigbuild -p barca-cli --release --target ${{ matrix.zig-target }}
+          else
+            cargo build -p barca-cli --release --target ${{ matrix.target }}
+          fi
 
       - name: Stage CLI binary for wheel
+        shell: bash
         run: |
           mkdir -p crates/barca-py/data/scripts
           cp target/${{ matrix.target }}/release/barca crates/barca-py/data/scripts/barca
@@ -100,6 +112,10 @@ jobs:
           manylinux: auto
           working-directory: crates/barca-py
 
+      - name: Clean staged data
+        shell: bash
+        run: rm -rf crates/barca-py/data/scripts
+
       - name: Verify wheel output
         run: |
           echo "=== Built wheels ==="
@@ -107,14 +123,12 @@ jobs:
           echo "=== Wheel names ==="
           for f in crates/barca-py/dist/*.whl; do
             echo "  $f"
-            python3 -c "import zipfile, sys; z=zipfile.ZipFile('$f'); meta=[n for n in z.namelist() if 'METADATA' in n]; print('    METADATA:', meta[0] if meta else 'NOT FOUND')"
+            python3 -c "import zipfile; z=zipfile.ZipFile('$f'); scripts=[n for n in z.namelist() if '/scripts/' in n]; print('    scripts:', scripts if scripts else 'NONE — barca binary missing from wheel')"
           done
 
-      - name: Clean staged data
-        run: rm -rf crates/barca-py/data/scripts
-
-      # Also upload the standalone CLI binary
+      # Also upload the standalone CLI binary as a release asset
       - name: Package standalone CLI binary
+        shell: bash
         run: |
           cp target/${{ matrix.target }}/release/barca barca-${{ matrix.name }}
           chmod +x barca-${{ matrix.name }}
