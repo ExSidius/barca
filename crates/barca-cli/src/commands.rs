@@ -96,16 +96,12 @@ pub async fn assets_refresh(id: i64) -> anyhow::Result<()> {
     });
     tokio::spawn(barca_server::run_log_persister(state.clone()));
 
-    // Subscribe to completions before enqueueing
-    let mut completion_rx = state.job_completion_tx.subscribe();
-
     let _detail = barca_server::enqueue_refresh_request(&state, id).await?;
 
-    // Count how many queued/running jobs exist for this asset
+    // Count pending jobs using a proper COUNT query (no cap)
     let pending_count = {
         let store = state.store.lock().await;
-        let jobs = store.list_materializations_for_asset(id, 100).await?;
-        jobs.iter().filter(|j| j.status == "queued" || j.status == "running").count()
+        store.count_pending_materializations(id).await?
     };
 
     if pending_count == 0 {
@@ -114,20 +110,25 @@ pub async fn assets_refresh(id: i64) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Wait for all pending jobs to complete
+    // Wait for all pending jobs to complete by polling the store.
+    // This is reliable regardless of broadcast channel capacity.
     println!("Waiting for materialization of asset #{} ({} job{})...", id, pending_count, if pending_count == 1 { "" } else { "s" });
-    let mut completed = 0;
+
+    let mut last_reported = 0;
     loop {
-        match completion_rx.recv().await {
-            Ok(completed_id) if completed_id == id => {
-                completed += 1;
-                if completed >= pending_count {
-                    break;
-                }
-            }
-            Ok(_) => continue,
-            Err(e) => anyhow::bail!("job completion channel error: {}", e),
+        let remaining = {
+            let store = state.store.lock().await;
+            store.count_pending_materializations(id).await?
+        };
+        if remaining == 0 {
+            break;
         }
+        let done = pending_count - remaining;
+        if done / 100 > last_reported / 100 && pending_count > 10 {
+            eprintln!("  progress: {}/{} jobs completed", done, pending_count);
+            last_reported = done;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
     // Show final status
