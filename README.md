@@ -32,7 +32,7 @@ def prices(ticker: str) -> dict:
 ```
 
 ```
-$ barca reindex
+$ uv run barca reindex
 ┌────┬─────────┬────────────┬──────────┬───────────┐
 │ ID ┆ Name    ┆ Module     ┆ Function ┆ Status    │
 ╞════╪═════════╪════════════╪══════════╪═══════════╡
@@ -41,7 +41,7 @@ $ barca reindex
 │ 3  ┆ prices  ┆ my_project ┆ prices   ┆ never run │
 └────┴─────────┴────────────┴──────────┴───────────┘
 
-$ barca assets refresh 3
+$ uv run barca assets refresh 3
 Waiting for materialization of asset #3 (3 jobs)...
 Asset #3
   Name:   prices
@@ -54,20 +54,20 @@ Asset #3
 uv add barca
 ```
 
-This installs both the `barca` CLI and the Python `@asset()` decorator.
+This installs the Python `@asset()` decorator and the `barca` CLI into your project's virtualenv.
 
 ## Quick Start
 
 ```bash
-uv init my-project
+uv init --app my-project
 cd my-project
 uv add barca
 ```
 
-Write your assets anywhere in your project — barca discovers them automatically:
+Write your first asset:
 
 ```python
-# main.py (or any .py file)
+# assets.py
 from barca import asset
 
 @asset()
@@ -78,26 +78,42 @@ def hello() -> dict:
 Run:
 
 ```bash
-barca reindex                    # discover assets from Python files
-barca assets list                # list all indexed assets
-barca assets refresh 1           # materialize an asset
-barca                            # start the web UI at localhost:3000
+uv run barca reindex             # discover @asset() functions
+uv run barca assets list         # list all indexed assets
+uv run barca assets refresh 1    # materialize an asset
+uv run barca                     # start the web UI at localhost:3000
 ```
 
 No config file needed. Barca scans your project for `@asset()`-decorated functions automatically.
 
+<details>
+<summary>Prefer bare <code>barca</code> commands?</summary>
+
+Activate your virtualenv first:
+
+```bash
+source .venv/bin/activate    # or: . .venv/bin/activate.fish
+barca reindex
+barca assets list
+barca assets refresh 1
+barca
+```
+</details>
+
 ### CLI Reference
 
+All commands below use `uv run` prefix. If you've activated your virtualenv, you can omit it.
+
 ```
-barca                            Start the server (default)
-barca serve                      Start the server
-barca reindex                    Re-inspect Python modules
-barca assets list                List all indexed assets
-barca assets show <id>           Show asset detail
-barca assets refresh <id>        Trigger materialization and wait
-barca jobs list                  List recent jobs
-barca jobs show <id>             Show job detail
-barca reset [--db] [--artifacts] Clean generated files
+uv run barca                            Start the server (default)
+uv run barca serve                      Start the server
+uv run barca reindex                    Re-inspect Python modules
+uv run barca assets list                List all indexed assets
+uv run barca assets show <id>           Show asset detail
+uv run barca assets refresh <id>        Trigger materialization and wait
+uv run barca jobs list                  List recent jobs
+uv run barca jobs show <id>             Show job detail
+uv run barca reset [--db] [--artifacts] Clean generated files
 ```
 
 ## Features
