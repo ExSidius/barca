@@ -416,19 +416,21 @@ async fn asset_panel_stream(AxumPath(asset_id): AxumPath<i64>, Query(params): Qu
                                 let store = state.store.lock().await;
                                 match store.asset_detail(asset_id).await {
                                     Ok(detail) => render_asset_card_from_detail(&detail).replace('\n', ""),
-                                    Err(_) => continue,
+                                    Err(_) => break,
                                 }
                             };
                             let patch = PatchElements::new(card_html);
                             yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                            // Job is done; close the stream so stale events don't clobber a new panel
+                            break;
                         }
                         Ok(_) => continue,
                         Err(_) => break,
                     }
                 }
                 _ = timeout => {
-                    let patch = PatchElements::new("").selector("#panel-content");
-                    yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                    // No activity for 30 s — close the stream rather than patching with empty HTML
+                    break;
                 }
             }
         }
@@ -496,14 +498,16 @@ async fn job_panel_stream(AxumPath(job_id): AxumPath<i64>, State(state): State<A
                             };
                             let patch = PatchElements::new(panel_html).selector("#panel-content");
                             yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                            // Job is done; close the stream so stale events don't clobber a new panel
+                            break;
                         }
                         Ok(_) => continue,
                         Err(_) => break,
                     }
                 }
                 _ = timeout => {
-                    let patch = PatchElements::new("").selector("#panel-content");
-                    yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                    // No activity for 30 s — close the stream rather than patching with empty HTML
+                    break;
                 }
             }
         }
@@ -566,7 +570,7 @@ fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationR
           <div class="flex items-center justify-between gap-3 border-b border-gray-200 dark:border-gray-800 pb-4">
             <div class="flex items-center gap-3 min-w-0">
               <h2 class="text-xl font-semibold text-gray-900 dark:text-white truncate">{}</h2>
-              <asset-status-badge label="{}" tone="{}"></asset-status-badge>
+              {}
             </div>
             <div class="shrink-0">{}</div>
           </div>
@@ -595,8 +599,7 @@ fn render_asset_panel(detail: &AssetDetail, materializations: &[MaterializationR
         </div>"#,
         detail.asset.asset_id,
         templates::escape_html(&detail.asset.logical_name),
-        templates::escape_html(status_label),
-        status_tone,
+        templates::status_badge(status_label, status_tone),
         refresh_button,
         if !persisted_logs.is_empty() {
             templates::job_log_viewer_with_logs(persisted_logs)
