@@ -11,7 +11,6 @@ fn test_reindex_discovers_all_assets() {
     helpers::ensure_python_ready();
     helpers::reset();
     let output = helpers::reindex();
-    // basic_app has 7 assets
     assert!(output.contains("hello_world"), "should discover hello_world");
     assert!(output.contains("greeting"), "should discover greeting");
     assert!(output.contains("slow_computation"), "should discover slow_computation");
@@ -19,6 +18,26 @@ fn test_reindex_discovers_all_assets() {
     assert!(output.contains("uppercased"), "should discover uppercased");
     assert!(output.contains("fetch_prices"), "should discover fetch_prices");
     assert!(output.contains("wide_asset"), "should discover wide_asset");
+    assert!(output.contains("bare_asset"), "should discover bare_asset");
+}
+
+#[test]
+#[serial]
+fn test_bare_asset_decorator_is_indexed() {
+    // Regression test: @asset (no parentheses) must be indexed the same as @asset().
+    helpers::ensure_python_ready();
+    helpers::reset();
+    let output = helpers::reindex();
+    assert!(
+        output.contains("bare_asset"),
+        "bare @asset decorator (no parentheses) should be discovered during reindex; got:\n{}",
+        output
+    );
+    // Confirm it can be shown and refreshed like any other asset.
+    let id = helpers::find_asset_id("bare_asset");
+    let show = helpers::barca(&["assets", "show", &id.to_string()]).assert().success().get_output().stdout.clone();
+    let show = String::from_utf8(show).unwrap();
+    assert!(show.contains("bare_asset"), "show should display bare_asset");
 }
 
 #[test]
