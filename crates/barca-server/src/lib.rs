@@ -69,6 +69,9 @@ pub struct AppState {
     pub job_queue_notify: Arc<Notify>,
     pub job_completion_tx: broadcast::Sender<i64>,
     pub job_log_tx: broadcast::Sender<JobLogEntry>,
+    /// Fired whenever the global asset list changes (reindex, reset) so all
+    /// connected main-page streams can re-render `#main-content`.
+    pub state_tx: broadcast::Sender<()>,
     pub python: Arc<dyn PythonBridge>,
     pub definition_cache: DefinitionCache,
 }
@@ -77,12 +80,14 @@ impl AppState {
     pub fn new(repo_root: PathBuf, store: MetadataStore, python: Arc<dyn PythonBridge>) -> Self {
         let (job_completion_tx, _) = broadcast::channel(16384);
         let (job_log_tx, _) = broadcast::channel(4096);
+        let (state_tx, _) = broadcast::channel(16);
         Self {
             repo_root: repo_root.clone(),
             store: Arc::new(Mutex::new(store)),
             job_queue_notify: Arc::new(Notify::new()),
             job_completion_tx,
             job_log_tx,
+            state_tx,
             python,
             definition_cache: Arc::new(Mutex::new(HashMap::new())),
         }

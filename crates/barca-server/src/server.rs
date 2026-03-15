@@ -18,6 +18,7 @@ use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_swagger_ui::SwaggerUi;
 
+use crate::store::MetadataStore;
 use crate::templates;
 use crate::AppState;
 
@@ -35,13 +36,16 @@ pub fn router() -> Router<AppState> {
         .routes(utoipa_axum::routes!(api_get_asset))
         .routes(utoipa_axum::routes!(api_materialize_asset))
         .routes(utoipa_axum::routes!(api_reindex))
+        .routes(utoipa_axum::routes!(api_reset))
         .routes(utoipa_axum::routes!(api_list_jobs))
         .routes(utoipa_axum::routes!(api_get_job))
         .split_for_parts();
 
     Router::new()
         .route("/", get(index_page))
+        .route("/stream", get(main_stream))
         .route("/reindex", post(reindex_action))
+        .route("/reset", post(reset_action))
         .route("/assets/{asset_id}/materialize", post(materialize_action))
         .route("/assets/{asset_id}/panel", get(asset_panel))
         .route("/assets/{asset_id}/panel/stream", get(asset_panel_stream))
@@ -115,6 +119,8 @@ async fn index_page(Query(query): Query<IndexQuery>, State(state): State<AppStat
         &format!(
             r#"
             {}
+            <div data-on:load__window="@get('/stream')" style="display:none" id="stream-init"></div>
+            <div id="stream-ping" style="display:none"></div>
             <main class="mx-auto max-w-6xl flex flex-1 px-6 py-8 sm:px-10">
               {}
             </main>
@@ -129,11 +135,15 @@ async fn reindex_action(State(state): State<AppState>) -> impl IntoResponse {
     let stream = stream! {
         match crate::reindex(&state).await {
             Ok(()) => {
-                let store = state.store.lock().await;
-                let assets = store.list_assets().await.unwrap_or_default();
+                let assets = {
+                    let store = state.store.lock().await;
+                    store.list_assets().await.unwrap_or_default()
+                };
                 let html = render_asset_list(&assets).replace('\n', "");
                 let patch = PatchElements::new(html).selector("#main-content");
                 yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                // Notify all connected main-page streams to also refresh
+                let _ = state.state_tx.send(());
             }
             Err(error) => {
                 let html = format!(
@@ -195,6 +205,114 @@ async fn materialize_action(AxumPath(asset_id): AxumPath<i64>, State(state): Sta
                 yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
             }
         }
+    };
+
+    Sse::new(stream).into_response()
+}
+
+/// Persistent SSE stream for the main asset list page.
+///
+/// Listens on two channels:
+/// - `job_completion_tx`: patches the individual asset card when a job finishes
+/// - `state_tx`: re-renders the full `#main-content` (fired after reindex/reset)
+async fn main_stream(State(state): State<AppState>) -> impl IntoResponse {
+    let mut job_completion_rx = state.job_completion_tx.subscribe();
+    let mut state_rx = state.state_tx.subscribe();
+
+    let stream = stream! {
+        loop {
+            let recv_completion = job_completion_rx.recv();
+            let recv_state = state_rx.recv();
+            let timeout = tokio::time::sleep(Duration::from_secs(30));
+            select! {
+                result = recv_completion => {
+                    match result {
+                        Ok(asset_id) => {
+                            let store = state.store.lock().await;
+                            if let Ok(detail) = store.asset_detail(asset_id).await {
+                                drop(store);
+                                let html = render_asset_card_from_detail(&detail).replace('\n', "");
+                                let patch = PatchElements::new(html);
+                                yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                result = recv_state => {
+                    match result {
+                        Ok(()) => {
+                            let assets = {
+                                let store = state.store.lock().await;
+                                store.list_assets().await.unwrap_or_default()
+                            };
+                            let html = render_asset_list(&assets).replace('\n', "");
+                            let patch = PatchElements::new(html).selector("#main-content");
+                            yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = timeout => {
+                    // keepalive — patch the hidden ping element so the connection stays alive
+                    let patch = PatchElements::new(r#"<div id="stream-ping"></div>"#);
+                    yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).into_response()
+}
+
+/// Reset all barca state (db, artifacts, tmp), reinitialise the store, and
+/// broadcast a full UI refresh.  Intended for the sidebar Reset button.
+async fn reset_action(State(state): State<AppState>) -> impl IntoResponse {
+    let stream = stream! {
+        let db_path = state.repo_root.join(".barca").join("metadata.db");
+
+        if let Err(e) = crate::reset(&state.repo_root, false, false, false) {
+            let html = format!(
+                r#"<section id="asset-list" class="mt-8"><article class="rounded-[28px] border border-rose-200 bg-rose-50/70 px-6 py-6"><p class="text-2xl text-zinc-950">Reset failed</p><p class="mt-3 text-sm text-rose-700">{}</p></article></section>"#,
+                templates::escape_html(&e.to_string())
+            );
+            let patch = PatchElements::new(html).selector("#main-content");
+            yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+            return;
+        }
+
+        // Swap in a fresh store so the server doesn't keep the old (deleted) DB.
+        match MetadataStore::open(&db_path).await {
+            Ok(new_store) => {
+                let mut guard = state.store.lock().await;
+                *guard = new_store;
+                drop(guard);
+                state.definition_cache.lock().await.clear();
+            }
+            Err(e) => {
+                let html = format!(
+                    r#"<section id="asset-list" class="mt-8"><article class="rounded-[28px] border border-rose-200 bg-rose-50/70 px-6 py-6"><p class="text-2xl text-zinc-950">Reset failed</p><p class="mt-3 text-sm text-rose-700">{}</p></article></section>"#,
+                    templates::escape_html(&e.to_string())
+                );
+                let patch = PatchElements::new(html).selector("#main-content");
+                yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+                return;
+            }
+        }
+
+        // Re-inspect Python modules so the empty store is repopulated.
+        let _ = crate::reindex(&state).await;
+
+        let assets = {
+            let store = state.store.lock().await;
+            store.list_assets().await.unwrap_or_default()
+        };
+        let html = render_asset_list(&assets).replace('\n', "");
+        let patch = PatchElements::new(html).selector("#main-content");
+        yield Ok::<_, Infallible>(patch.write_as_axum_sse_event());
+
+        // Tell all other connected main-page streams to refresh too.
+        let _ = state.state_tx.send(());
     };
 
     Sse::new(stream).into_response()
@@ -659,6 +777,32 @@ async fn api_reindex(State(state): State<AppState>) -> axum::response::Result<Js
     crate::reindex(&state).await.map_err(internal_error)?;
     let store = state.store.lock().await;
     let assets = store.list_assets().await.map_err(internal_error)?;
+    Ok(Json(assets))
+}
+
+/// Reset all barca state and re-inspect Python modules
+#[utoipa::path(
+    post,
+    path = "/api/reset",
+    responses(
+        (status = 200, description = "Assets after reset and reindex", body = Vec<AssetSummary>)
+    ),
+    tag = "system"
+)]
+async fn api_reset(State(state): State<AppState>) -> axum::response::Result<Json<Vec<AssetSummary>>> {
+    let db_path = state.repo_root.join(".barca").join("metadata.db");
+    crate::reset(&state.repo_root, false, false, false).map_err(internal_error)?;
+    let new_store = MetadataStore::open(&db_path).await.map_err(internal_error)?;
+    {
+        let mut guard = state.store.lock().await;
+        *guard = new_store;
+        state.definition_cache.lock().await.clear();
+    }
+    crate::reindex(&state).await.map_err(internal_error)?;
+    let store = state.store.lock().await;
+    let assets = store.list_assets().await.map_err(internal_error)?;
+    drop(store);
+    let _ = state.state_tx.send(());
     Ok(Json(assets))
 }
 
