@@ -277,6 +277,10 @@ pub fn sidebar(active: &str) -> String {
         r#"<nav class="flex w-48 shrink-0 flex-col gap-1 border-r border-gray-200 dark:border-gray-800 pr-4">
           <a href="/?view=assets"{}>Assets</a>
           <a href="/?view=jobs"{}>Jobs</a>
+          <div class="mt-4 border-t border-gray-200 dark:border-gray-800 pt-4 flex flex-col gap-1">
+            <button type="button" data-on:click="@post('/reindex')" class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-gray-900 dark:hover:text-white text-left">Reindex</button>
+            <button type="button" data-on:click="@post('/reset')" class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-rose-600 dark:hover:text-rose-400 text-left">Reset</button>
+          </div>
         </nav>"#,
         assets_active, jobs_active
     )
