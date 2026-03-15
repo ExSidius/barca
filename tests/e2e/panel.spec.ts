@@ -122,7 +122,7 @@ test.describe("Asset panel", () => {
 
       // Wait for panel to show completion (status badge changes to "Fresh")
       await expect(
-        page.locator("#panel-content asset-status-badge[tone='fresh']")
+        page.locator("#panel-content [data-tone='fresh']")
       ).toBeVisible({ timeout: 20000 });
 
       // Close the panel by clicking the backdrop

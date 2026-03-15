@@ -4,7 +4,7 @@
 pub fn page(title: &str, body: &str) -> String {
     format!(
         r##"<!doctype html>
-        <html lang="en">
+        <html lang="en" data-signals='{{confirmModalOpen: false, confirmAssetId: 0, _panelOpen: false, darkMode: false}}' data-persist="{{include: /darkMode/}}" data-class:dark="$darkMode">
           <head>
             <meta charset="utf-8" />
             <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -13,11 +13,25 @@ pub fn page(title: &str, body: &str) -> String {
             <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
             <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
             <style>{}</style>
+            <script>
+              // Apply dark class before first paint to prevent FOUC.
+              // Reads from data-persist's storage key (__ds__), falls back to prefers-color-scheme.
+              (function() {{
+                try {{
+                  var s = JSON.parse(localStorage.getItem('__ds__') || '{{}}');
+                  var dark = 'darkMode' in s ? s.darkMode : window.matchMedia('(prefers-color-scheme: dark)').matches;
+                  if (dark) {{
+                    document.documentElement.classList.add('dark');
+                    document.documentElement.setAttribute('data-signals',
+                      document.documentElement.getAttribute('data-signals').replace('darkMode: false', 'darkMode: true'));
+                  }}
+                }} catch(e) {{}}
+              }})();
+            </script>
             <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@1.0.0-RC.8/bundles/datastar.js"></script>
             {}
-            {}
           </head>
-          <body class="min-h-screen flex flex-col bg-white dark:bg-[#0a0a0a] text-gray-900 dark:text-gray-100 antialiased" data-signals='{{confirmModalOpen: false, confirmAssetId: 0, _panelOpen: false}}'>{}
+          <body class="min-h-screen flex flex-col bg-white dark:bg-[#0a0a0a] text-gray-900 dark:text-gray-100 antialiased">{}
             <div id="panel-backdrop" data-class:open="$_panelOpen" data-on:click="$_panelOpen = false"></div>
             <div id="panel-wrapper" data-class:open="$_panelOpen">
               <div id="panel-content"></div>
@@ -37,67 +51,25 @@ pub fn page(title: &str, body: &str) -> String {
         </html>"##,
         escape_html(title),
         include_str!("../../../static/css/output.css"),
-        web_components(),
         styles(),
         body
     )
 }
 
-/// Web component definitions (AssetStatusBadge)
-fn web_components() -> &'static str {
-    r#"<script>
-              class AssetStatusBadge extends HTMLElement {
-                static get observedAttributes() {
-                  return ["label", "tone"];
-                }
-
-                connectedCallback() {
-                  this.render();
-                }
-
-                attributeChangedCallback() {
-                  this.render();
-                }
-
-                render() {
-                  const label = this.getAttribute("label") || "Stale";
-                  const tone = this.getAttribute("tone") || "stale";
-                  const tones = {
-                    fresh: "bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 ring-emerald-600/20 dark:ring-emerald-500/30",
-                    stale: "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 ring-gray-300/30 dark:ring-gray-600/30",
-                    running: "bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 ring-amber-600/20 dark:ring-amber-500/30",
-                    failed: "bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-400 ring-rose-600/20 dark:ring-rose-500/30"
-                  };
-                  const classes = tones[tone] || tones.stale;
-                  this.innerHTML =
-                    `<span class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset ${classes}">${escapeHtml(label)}</span>`;
-                }
-              }
-
-              function escapeHtml(value) {
-                return value
-                  .replaceAll("&", "&amp;")
-                  .replaceAll("<", "&lt;")
-                  .replaceAll(">", "&gt;")
-                  .replaceAll('"', "&quot;");
-              }
-
-              customElements.define("asset-status-badge", AssetStatusBadge);
-
-              // Dark mode initialization
-              const savedTheme = localStorage.getItem('theme');
-              const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-              if (savedTheme === 'dark' || (!savedTheme && prefersDark)) {
-                document.documentElement.classList.add('dark');
-              }
-
-              function toggleTheme() {
-                const html = document.documentElement;
-                html.classList.toggle('dark');
-                localStorage.setItem('theme', html.classList.contains('dark') ? 'dark' : 'light');
-              }
-
-            </script>"#
+/// Server-rendered status badge (replaces the former AssetStatusBadge web component)
+pub fn status_badge(label: &str, tone: &str) -> String {
+    let classes = match tone {
+        "fresh" => "bg-emerald-50 dark:bg-emerald-950/30 text-emerald-700 dark:text-emerald-400 ring-emerald-600/20 dark:ring-emerald-500/30",
+        "running" => "bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400 ring-amber-600/20 dark:ring-amber-500/30",
+        "failed" => "bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-400 ring-rose-600/20 dark:ring-rose-500/30",
+        _ => "bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400 ring-gray-300/30 dark:ring-gray-600/30",
+    };
+    format!(
+        r#"<span class="inline-flex items-center rounded-full px-2.5 py-1 text-xs font-medium ring-1 ring-inset {}" data-tone="{}">{}</span>"#,
+        classes,
+        tone,
+        escape_html(label)
+    )
 }
 
 /// CSS styles for the application
@@ -230,7 +202,7 @@ fn styles() -> &'static str {
 pub fn theme_toggle() -> &'static str {
     r#"<div class="fixed bottom-4 left-4 z-50">
               <button
-                onclick="toggleTheme()"
+                data-on:click="$darkMode = !$darkMode"
                 class="p-2.5 rounded-lg bg-gray-100 dark:bg-gray-800 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors"
                 aria-label="Toggle theme"
               >
@@ -376,7 +348,7 @@ pub fn asset_card(asset_id: i64, function_name: &str, file_path: &str, last_upda
               <p class="mt-2 text-sm text-gray-500 dark:text-gray-400">{}</p>
             </div>
             <div class="flex shrink-0 items-center gap-3">
-              <asset-status-badge label="{}" tone="{}"></asset-status-badge>
+              {}
               <button type="button"
                 class="inline-flex items-center justify-center rounded-lg px-3.5 py-2 text-sm font-medium {}"
                 {}>Refresh</button>
@@ -391,8 +363,7 @@ pub fn asset_card(asset_id: i64, function_name: &str, file_path: &str, last_upda
         escape_html(function_name),
         escape_html(function_name),
         escape_html(last_updated),
-        escape_html(status_label),
-        status_tone,
+        status_badge(status_label, status_tone),
         button_classes,
         button_action,
         escape_html(file_path)
@@ -525,7 +496,7 @@ pub fn job_panel(mat: &barca_core::models::MaterializationRecord, asset: &barca_
           <div class="flex items-center justify-between gap-3 border-b border-gray-200 dark:border-gray-800 pb-4">
             <div class="flex items-center gap-3 min-w-0">
               <h2 class="text-xl font-semibold text-gray-900 dark:text-white truncate">Job #{}</h2>
-              <asset-status-badge label="{}" tone="{}"></asset-status-badge>
+              {}
             </div>
           </div>
           <section class="mt-6 rounded-xl border border-gray-200 dark:border-gray-800 bg-white dark:bg-gray-900 px-5 py-5">
@@ -556,8 +527,7 @@ pub fn job_panel(mat: &barca_core::models::MaterializationRecord, asset: &barca_
           </section>
         </div>"#,
         mat.materialization_id,
-        escape_html(&capitalize(&mat.status)),
-        status_tone,
+        status_badge(&capitalize(&mat.status), status_tone),
         asset.asset_id,
         escape_html(&asset.function_name),
         escape_html(&asset.file_path),
