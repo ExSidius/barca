@@ -30,11 +30,11 @@ Datastar is a ~11KB hypermedia framework that combines:
 
 **Three layers:**
 1. **Browser** — `datastar.js` processes `data-*` attributes, manages reactive signals, handles SSE events
-2. **Server** — Emits SSE events (`datastar-patch-elements`, `datastar-patch-signals`, `datastar-execute-script`)
+2. **Server** — Emits SSE events (`datastar-patch-elements`, `datastar-patch-signals`; scripts via `<script>` tags in patch-elements)
 3. **Plugins** — Attribute plugins (`data-*`), Action plugins (`@action()`), Watcher plugins (SSE event handlers)
 
 **Request-response cycle:**
-1. User clicks `<button data-on-click="@post('/handler')">`
+1. User clicks `<button data-on:click="@post('/handler')">`
 2. Browser serializes current signals as JSON, sends HTTP request
 3. Server reads signals, processes request
 4. Server streams SSE events: HTML fragments to morph, signal patches to update state
@@ -141,15 +141,30 @@ data: signals {"theme": "dark", "sidebarOpen": true}
 
 ```
 
-### Event Type 3: `datastar-execute-script`
+### Script Execution (no dedicated SSE event type)
 
-Executes JavaScript in the browser.
-
-```
-event: datastar-execute-script
-data: script console.log('Job completed')
+Scripts are executed by including `<script>` tags inside a `datastar-patch-elements` event.
+There is **no** `datastar-execute-script` event — use `append` mode to `body`:
 
 ```
+event: datastar-patch-elements
+data: mode append
+data: selector body
+data: elements <script>console.log('Job completed')</script>
+
+```
+
+Or embed a `<script>` inside a patched element (scripts inside patched elements are re-executed):
+
+```
+event: datastar-patch-elements
+data: elements <div id="hal">
+data: elements   <script>alert('Done')</script>
+data: elements </div>
+
+```
+
+For `text/javascript` responses (non-SSE), the body is executed directly as JavaScript.
 
 ### Non-SSE Response Shortcuts
 
@@ -287,37 +302,37 @@ All application state lives in a global `root` object — a deeply reactive prox
 
 #### `data-on` — Event listeners
 
-**Syntax:** `data-on-eventname[__modifier1[__modifier2]]="expression"`
+**Syntax:** `data-on:eventname[__modifier1[__modifier2[__sub]]]="expression"`
 
 ```html
 <!-- Click -->
-<button data-on-click="@post('/api/save')">Save</button>
-<button data-on-click="$count++">Increment</button>
-<button data-on-click="$panelOpen = !$panelOpen">Toggle Panel</button>
+<button data-on:click="@post('/api/save')">Save</button>
+<button data-on:click="$count++">Increment</button>
+<button data-on:click="$panelOpen = !$panelOpen">Toggle Panel</button>
 
 <!-- Multiple statements -->
-<button data-on-click="$loading = true; @post('/api/run')">Run</button>
+<button data-on:click="$loading = true; @post('/api/run')">Run</button>
 
 <!-- Conditional action -->
-<button data-on-click="$isValid && @post('/api/submit')">Submit</button>
+<button data-on:click="$isValid && @post('/api/submit')">Submit</button>
 
 <!-- Form submission -->
-<form data-on-submit="@post('/api/create')">...</form>
+<form data-on:submit="@post('/api/create')">...</form>
 
 <!-- Input events -->
-<input data-on-input="$search = $event.target.value" />
-<input data-on-keydown="$event.key === 'Enter' && @post('/api/search')" />
+<input data-on:input="$search = evt.target.value" />
+<input data-on:keydown="evt.key === 'Enter' && @post('/api/search')" />
 
 <!-- Window-level events -->
-<div data-on-keydown__window="$event.key === 'Escape' && ($panelOpen = false)"></div>
+<div data-on:keydown__window="evt.key === 'Escape' && ($panelOpen = false)"></div>
 ```
 
 **All modifiers:**
 
 | Modifier | Effect |
 |---|---|
-| `__debounce.500ms` | Delays firing by 500ms (resets on new events) |
-| `__throttle.300ms` | Limits to once per 300ms |
+| `__debounce:500ms` | Delays firing by 500ms (resets on new events). Sub-modifiers: `__leading` (fire on leading edge), `__notrailing` (suppress trailing). |
+| `__throttle:300ms` | Limits to once per 300ms. Sub-modifiers: `__noleading` (suppress leading), `__trailing` (fire trailing). |
 | `__once` | Fire only once, then remove listener |
 | `__prevent` | `event.preventDefault()` |
 | `__stop` | `event.stopPropagation()` |
@@ -325,26 +340,26 @@ All application state lives in a global `root` object — a deeply reactive prox
 | `__passive` | Mark as passive |
 | `__outside` | Fire only for events outside this element |
 | `__window` | Listen on `window` instead of element |
-| `__delay.200ms` | Delay execution by 200ms |
+| `__delay:200ms` | Delay callback execution by 200ms |
 | `__leading` | Fire on leading edge (with debounce/throttle) |
 | `__notrailing` | Don't fire on trailing edge |
 | `__viewtransition` | Wrap callback in `document.startViewTransition()` |
 
 ```html
 <!-- Debounced search -->
-<input data-on-input__debounce.300ms="@get(`/search?q=${$query}`)" />
+<input data-on:input__debounce:300ms="@get(`/search?q=${$query}`)" />
 
 <!-- Click outside to close -->
-<div data-on-click__outside="$menuOpen = false">Dropdown</div>
+<div data-on:click__outside="$menuOpen = false">Dropdown</div>
 
 <!-- One-time init -->
-<div data-on-click__once="$initialized = true">Init</div>
+<div data-on:click__once="$initialized = true">Init</div>
 
 <!-- Escape key (window) -->
-<div data-on-keydown__window="$event.key === 'Escape' && ($modalOpen = false)"></div>
+<div data-on:keydown__window="evt.key === 'Escape' && ($modalOpen = false)"></div>
 
 <!-- View transition on nav -->
-<button data-on-click__viewtransition="@get('/next-page')">Navigate</button>
+<button data-on:click__viewtransition="@get('/next-page')">Navigate</button>
 ```
 
 ### Lifecycle & DOM
@@ -352,7 +367,7 @@ All application state lives in a global `root` object — a deeply reactive prox
 #### `data-init` — Run on element load
 ```html
 <div data-init="@get('/api/initial-data')"></div>
-<div data-init__delay.500ms="@get('/api/deferred-content')"></div>
+<div data-init__delay:500ms="@get('/api/deferred-content')"></div>
 ```
 
 #### `data-effect` — Reactive side effects
@@ -370,13 +385,17 @@ All application state lives in a global `root` object — a deeply reactive prox
 #### `data-on-interval` — Periodic execution
 ```html
 <!-- Poll every 5 seconds -->
-<div data-on-interval.5s="@get('/api/status')"></div>
+<div data-on-interval__duration:5s="@get('/api/status')"></div>
+<!-- Default interval: 1000ms -->
+<div data-on-interval="@get('/api/status')"></div>
+<!-- With leading (also runs immediately on init) -->
+<div data-on-interval__duration:5s__leading="@get('/api/status')"></div>
 ```
 
 #### `data-indicator` — Track fetch request status
 ```html
 <button
-  data-on-click="@post('/api/run')"
+  data-on:click="@post('/api/run')"
   data-indicator:fetching
   data-attr:disabled="$fetching"
 >
@@ -431,7 +450,7 @@ All follow `@method(url, options?)`. Response must be SSE (`text/event-stream`),
 **Options object:**
 
 ```html
-<button data-on-click="@post('/api', {
+<button data-on:click="@post('/api', {
   contentType: 'json',                         // 'json' (default) or 'form'
   headers: {'X-Custom': 'value'},              // Custom headers
   filterSignals: {include: /^(name|email)$/},  // Which signals to send
@@ -473,9 +492,9 @@ No client-side router needed. The server drives navigation via SSE patches + URL
 ```html
 <!-- Navigation bar -->
 <nav>
-  <button data-on-click__viewtransition="@get('/page/overview')">Overview</button>
-  <button data-on-click__viewtransition="@get('/page/runs')">Runs</button>
-  <button data-on-click__viewtransition="@get('/page/assets')">Assets</button>
+  <button data-on:click__viewtransition="@get('/page/overview')">Overview</button>
+  <button data-on:click__viewtransition="@get('/page/runs')">Runs</button>
+  <button data-on:click__viewtransition="@get('/page/assets')">Assets</button>
 </nav>
 
 <!-- Main content area (server replaces this) -->
@@ -505,12 +524,12 @@ data: elements </div>
 ```html
 <nav class="flex gap-2">
   <button
-    data-on-click="@get('/page/overview')"
+    data-on:click="@get('/page/overview')"
     data-class:bg-blue-600="$activePage === 'overview'"
     data-class:bg-gray-700="$activePage !== 'overview'"
   >Overview</button>
   <button
-    data-on-click="@get('/page/runs')"
+    data-on:click="@get('/page/runs')"
     data-class:bg-blue-600="$activePage === 'runs'"
     data-class:bg-gray-700="$activePage !== 'runs'"
   >Runs</button>
@@ -522,13 +541,13 @@ data: elements </div>
 ```html
 <div class="border-b border-gray-700 flex">
   <button
-    data-on-click="@get(`/assets/${$assetId}/tab/overview`)"
+    data-on:click="@get(`/assets/${$assetId}/tab/overview`)"
     data-class:border-blue-500="$activeTab === 'overview'"
     data-class:border-transparent="$activeTab !== 'overview'"
     class="px-4 py-2 border-b-2"
   >Overview</button>
   <button
-    data-on-click="@get(`/assets/${$assetId}/tab/runs`)"
+    data-on:click="@get(`/assets/${$assetId}/tab/runs`)"
     data-class:border-blue-500="$activeTab === 'runs'"
     data-class:border-transparent="$activeTab !== 'runs'"
     class="px-4 py-2 border-b-2"
@@ -549,7 +568,7 @@ data: elements </div>
 <!-- Overlay backdrop -->
 <div
   data-show="$panelOpen"
-  data-on-click="$panelOpen = false"
+  data-on:click="$panelOpen = false"
   class="fixed inset-0 bg-black/50 z-40 transition-opacity"
   data-class:opacity-0="!$panelOpen"
   data-class:opacity-100="$panelOpen"
@@ -563,7 +582,7 @@ data: elements </div>
 >
   <div class="flex items-center justify-between p-4 border-b border-gray-700">
     <h2 id="panel-title" class="text-lg font-semibold" data-text="$panelTitle"></h2>
-    <button data-on-click="$panelOpen = false" class="text-gray-400 hover:text-white">
+    <button data-on:click="$panelOpen = false" class="text-gray-400 hover:text-white">
       &times;
     </button>
   </div>
@@ -573,12 +592,12 @@ data: elements </div>
 </div>
 
 <!-- Escape to close -->
-<div data-on-keydown__window="$event.key === 'Escape' && ($panelOpen = false)"></div>
+<div data-on:keydown__window="evt.key === 'Escape' && ($panelOpen = false)"></div>
 ```
 
 **Opening the panel from a button:**
 ```html
-<button data-on-click="$panelOpen = true; $panelTitle = 'Asset Details'; @get(`/panel/asset/${assetId}`)">
+<button data-on:click="$panelOpen = true; $panelTitle = 'Asset Details'; @get(`/panel/asset/${assetId}`)">
   View Details
 </button>
 ```
@@ -590,27 +609,27 @@ data: elements </div>
 <div
   data-show="$modalOpen"
   class="fixed inset-0 bg-black/60 z-50 flex items-center justify-center"
-  data-on-click="$modalOpen = false"
+  data-on:click="$modalOpen = false"
 >
   <!-- Modal content (stop propagation so clicking inside doesn't close) -->
   <div
-    data-on-click__stop=""
+    data-on:click__stop=""
     class="bg-gray-800 rounded-lg shadow-2xl w-full max-w-lg mx-4 overflow-hidden"
   >
     <div class="px-6 py-4 border-b border-gray-700 flex justify-between items-center">
       <h3 class="text-lg font-semibold" data-text="$modalTitle"></h3>
-      <button data-on-click="$modalOpen = false" class="text-gray-400 hover:text-white">&times;</button>
+      <button data-on:click="$modalOpen = false" class="text-gray-400 hover:text-white">&times;</button>
     </div>
     <div id="modal-body" class="px-6 py-4">
       <!-- Server patches this -->
     </div>
     <div class="px-6 py-4 border-t border-gray-700 flex justify-end gap-3">
-      <button data-on-click="$modalOpen = false" class="px-4 py-2 bg-gray-700 rounded hover:bg-gray-600">
+      <button data-on:click="$modalOpen = false" class="px-4 py-2 bg-gray-700 rounded hover:bg-gray-600">
         Cancel
       </button>
       <button
         id="modal-confirm-btn"
-        data-on-click="@post($modalAction)"
+        data-on:click="@post($modalAction)"
         data-indicator:modalLoading
         data-attr:disabled="$modalLoading"
         class="px-4 py-2 bg-blue-600 rounded hover:bg-blue-500"
@@ -628,21 +647,21 @@ data: elements </div>
 ```html
 <div class="relative">
   <button
-    data-on-click="$dropdownOpen = !$dropdownOpen"
+    data-on:click="$dropdownOpen = !$dropdownOpen"
     class="px-3 py-2 bg-gray-700 rounded hover:bg-gray-600"
   >
     Actions &#9662;
   </button>
   <div
     data-show="$dropdownOpen"
-    data-on-click__outside="$dropdownOpen = false"
+    data-on:click__outside="$dropdownOpen = false"
     class="absolute right-0 mt-1 w-48 bg-gray-800 border border-gray-700 rounded-lg shadow-xl z-30"
   >
-    <button data-on-click="$dropdownOpen = false; @post('/api/run')"
+    <button data-on:click="$dropdownOpen = false; @post('/api/run')"
       class="w-full text-left px-4 py-2 hover:bg-gray-700">
       Run
     </button>
-    <button data-on-click="$dropdownOpen = false; @post('/api/cancel')"
+    <button data-on:click="$dropdownOpen = false; @post('/api/cancel')"
       class="w-full text-left px-4 py-2 hover:bg-gray-700 text-red-400">
       Cancel
     </button>
@@ -664,9 +683,9 @@ data: elements </div>
 event: datastar-patch-elements
 data: mode append
 data: selector #toast-container
-data: elements <div id="toast-123" class="px-4 py-3 bg-green-800 text-white rounded-lg shadow-lg flex items-center gap-3" data-init__delay.4000ms="@delete('/toast/123')">
+data: elements <div id="toast-123" class="px-4 py-3 bg-green-800 text-white rounded-lg shadow-lg flex items-center gap-3" data-init__delay:4000ms="@delete('/toast/123')">
 data: elements   <span>Asset materialized successfully</span>
-data: elements   <button data-on-click="@delete('/toast/123')" class="text-green-300 hover:text-white">&times;</button>
+data: elements   <button data-on:click="@delete('/toast/123')" class="text-green-300 hover:text-white">&times;</button>
 data: elements </div>
 
 ```
@@ -683,7 +702,7 @@ data: mode remove
 
 ```html
 <button
-  data-on-click="@post('/api/materialize')"
+  data-on:click="@post('/api/materialize')"
   data-indicator:isMaterializing
   data-attr:disabled="$isMaterializing"
   class="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 rounded-lg hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -707,7 +726,7 @@ data: mode remove
       <tr class="border-b border-gray-700">
         <th class="p-3">
           <input type="checkbox" data-bind:checked="$selectAll"
-            data-on-change="@post('/api/select-all')" />
+            data-on:change="@post('/api/select-all')" />
         </th>
         <th class="p-3 text-left">Name</th>
         <th class="p-3 text-left">Status</th>
@@ -729,7 +748,7 @@ data: mode remove
     <input
       type="text"
       data-bind:value="$searchQuery"
-      data-on-input__debounce.300ms="@get('/api/search')"
+      data-on:input__debounce:300ms="@get('/api/search')"
       placeholder="Search assets..."
       class="w-full px-4 py-2 pl-10 bg-gray-800 border border-gray-700 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
     />
@@ -750,7 +769,7 @@ data: mode remove
   <!-- Section 1 -->
   <div class="border border-gray-700 rounded-lg mb-2">
     <button
-      data-on-click="$section1Open = !$section1Open"
+      data-on:click="$section1Open = !$section1Open"
       class="w-full flex justify-between items-center p-4 hover:bg-gray-800"
     >
       <span class="font-medium">Configuration</span>
@@ -807,8 +826,8 @@ data: elements </div>
   <!-- Drag handle -->
   <div
     class="w-1 bg-gray-700 hover:bg-blue-500 cursor-col-resize flex-shrink-0"
-    data-on-mousedown="
-      const startX = $event.clientX;
+    data-on:mousedown="
+      const startX = evt.clientX;
       const startW = $leftWidth;
       const onMove = (e) => { $leftWidth = Math.max(200, Math.min(600, startW + e.clientX - startX)); };
       const onUp = () => { window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
@@ -834,13 +853,13 @@ A searchable command palette like Dagster's or VS Code's:
 ```html
 <div data-signals='{"_cmdOpen": false, "_cmdQuery": "", "_cmdResults": []}'>
   <!-- Trigger: Cmd+K / Ctrl+K -->
-  <div data-on-keydown__window="($event.metaKey || $event.ctrlKey) && $event.key === 'k' && ($event.preventDefault(), $_cmdOpen = !$_cmdOpen)"></div>
+  <div data-on:keydown__window="(evt.metaKey || evt.ctrlKey) && evt.key === 'k' && (evt.preventDefault(), $_cmdOpen = !$_cmdOpen)"></div>
 
   <!-- Palette overlay -->
   <div data-show="$_cmdOpen" class="fixed inset-0 z-50 flex items-start justify-center pt-[20vh] bg-black/60"
-       data-on-click="$_cmdOpen = false"
-       data-on-keydown__window="$event.key === 'Escape' && ($_cmdOpen = false)">
-    <div data-on-click__stop="" class="w-full max-w-xl bg-gray-900 rounded-xl shadow-2xl border border-gray-700 overflow-hidden">
+       data-on:click="$_cmdOpen = false"
+       data-on:keydown__window="evt.key === 'Escape' && ($_cmdOpen = false)">
+    <div data-on:click__stop="" class="w-full max-w-xl bg-gray-900 rounded-xl shadow-2xl border border-gray-700 overflow-hidden">
       <!-- Search input -->
       <div class="flex items-center px-4 border-b border-gray-700">
         <svg class="h-5 w-5 text-gray-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -849,7 +868,7 @@ A searchable command palette like Dagster's or VS Code's:
         <input
           type="text"
           data-bind:value="$_cmdQuery"
-          data-on-input__debounce.150ms="@get('/api/command-search')"
+          data-on:input__debounce:150ms="@get('/api/command-search')"
           placeholder="Search assets, runs, commands..."
           class="w-full px-3 py-4 bg-transparent text-white placeholder-gray-500 focus:outline-none"
           autofocus
@@ -875,7 +894,7 @@ A searchable command palette like Dagster's or VS Code's:
 fn render_cmd_result(name: &str, kind: &str, action_url: &str) -> String {
     format!(
         r#"<button
-          data-on-click="$_cmdOpen = false; @get('{action_url}')"
+          data-on:click="$_cmdOpen = false; @get('{action_url}')"
           class="w-full flex items-center gap-3 px-4 py-3 hover:bg-gray-800 text-left"
         >
           <span class="text-xs font-medium uppercase tracking-wider text-gray-500 w-16">{kind}</span>
@@ -899,7 +918,7 @@ fn render_cmd_result(name: &str, kind: &str, action_url: &str) -> String {
 // 1) breadcrumb
 yield Ok(PatchElements::new(
     r#"<nav id="breadcrumb" class="flex items-center gap-1.5 text-sm text-gray-500">
-        <a data-on-click="@get('/page/assets')" class="hover:text-gray-300 cursor-pointer">Assets</a>
+        <a data-on:click="@get('/page/assets')" class="hover:text-gray-300 cursor-pointer">Assets</a>
         <span class="text-gray-600">/</span>
         <span class="text-gray-300">my_asset</span>
     </nav>"#
@@ -1012,7 +1031,7 @@ Pure CSS + Tailwind, no JS needed:
 ```html
 <div class="relative" data-signals='{"_popOpen": false}'>
   <button
-    data-on-click="$_popOpen = !$_popOpen"
+    data-on:click="$_popOpen = !$_popOpen"
     class="inline-flex items-center gap-1 text-sm text-blue-400 hover:text-blue-300"
   >
     Details
@@ -1022,7 +1041,7 @@ Pure CSS + Tailwind, no JS needed:
   </button>
   <div
     data-show="$_popOpen"
-    data-on-click__outside="$_popOpen = false"
+    data-on:click__outside="$_popOpen = false"
     class="absolute left-0 mt-2 w-72 bg-gray-800 border border-gray-700 rounded-xl shadow-xl z-20 p-4"
   >
     <div class="text-sm text-gray-300 space-y-2">
@@ -1062,7 +1081,7 @@ Pure CSS + Tailwind, no JS needed:
 <!-- Tag/chip with remove -->
 <span class="inline-flex items-center gap-1 rounded-md bg-gray-100 dark:bg-gray-800 px-2 py-1 text-xs text-gray-600 dark:text-gray-400">
   python
-  <button data-on-click="@delete('/api/tags/python')" class="hover:text-gray-900 dark:hover:text-white">
+  <button data-on:click="@delete('/api/tags/python')" class="hover:text-gray-900 dark:hover:text-white">
     <svg class="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
   </button>
 </span>
@@ -1081,7 +1100,7 @@ Pure CSS + Tailwind, no JS needed:
     Materialize an asset to see its run history here.
   </p>
   <button
-    data-on-click="@get('/page/assets')"
+    data-on:click="@get('/page/assets')"
     class="mt-6 inline-flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-500"
   >
     View Assets
@@ -1098,7 +1117,7 @@ Instead of a full modal, an inline "are you sure?" pattern:
   <!-- Normal state -->
   <button
     data-show="!$_confirmDelete"
-    data-on-click="$_confirmDelete = true"
+    data-on:click="$_confirmDelete = true"
     class="text-sm text-red-400 hover:text-red-300"
   >
     Delete
@@ -1108,13 +1127,13 @@ Instead of a full modal, an inline "are you sure?" pattern:
   <div data-show="$_confirmDelete" class="inline-flex items-center gap-2">
     <span class="text-sm text-gray-400">Are you sure?</span>
     <button
-      data-on-click="$_confirmDelete = false; @delete('/api/asset/123')"
+      data-on:click="$_confirmDelete = false; @delete('/api/asset/123')"
       class="text-sm font-medium text-red-400 hover:text-red-300"
     >
       Yes, delete
     </button>
     <button
-      data-on-click="$_confirmDelete = false"
+      data-on:click="$_confirmDelete = false"
       class="text-sm text-gray-500 hover:text-gray-300"
     >
       Cancel
@@ -1164,7 +1183,7 @@ while let Some(line) = log_rx.recv().await {
      data-signals='{"_navAssets": true, "_navJobs": true, "_navSettings": false}'>
 
   <!-- Group: Assets -->
-  <button data-on-click="$_navAssets = !$_navAssets"
+  <button data-on:click="$_navAssets = !$_navAssets"
     class="flex items-center justify-between px-2 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200">
     Assets
     <svg class="h-3.5 w-3.5 transition-transform" data-class:rotate-180="$_navAssets" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1172,7 +1191,7 @@ while let Some(line) = log_rx.recv().await {
     </svg>
   </button>
   <div data-show="$_navAssets" class="flex flex-col gap-0.5 ml-2">
-    <a data-on-click="@get('/page/assets')"
+    <a data-on:click="@get('/page/assets')"
        data-class:bg-blue-50="$activePage === 'assets'"
        data-class:dark:bg-blue-950/30="$activePage === 'assets'"
        data-class:text-blue-700="$activePage === 'assets'"
@@ -1180,7 +1199,7 @@ while let Some(line) = log_rx.recv().await {
        class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer">
       All assets
     </a>
-    <a data-on-click="@get('/page/assets?filter=stale')"
+    <a data-on:click="@get('/page/assets?filter=stale')"
        class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer">
       Stale
       <span class="ml-auto text-xs text-gray-500 bg-gray-100 dark:bg-gray-800 rounded-full px-1.5">3</span>
@@ -1188,7 +1207,7 @@ while let Some(line) = log_rx.recv().await {
   </div>
 
   <!-- Group: Jobs -->
-  <button data-on-click="$_navJobs = !$_navJobs"
+  <button data-on:click="$_navJobs = !$_navJobs"
     class="flex items-center justify-between px-2 py-1.5 mt-2 text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-200">
     Jobs
     <svg class="h-3.5 w-3.5 transition-transform" data-class:rotate-180="$_navJobs" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -1196,11 +1215,11 @@ while let Some(line) = log_rx.recv().await {
     </svg>
   </button>
   <div data-show="$_navJobs" class="flex flex-col gap-0.5 ml-2">
-    <a data-on-click="@get('/page/runs')"
+    <a data-on:click="@get('/page/runs')"
        class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer">
       All runs
     </a>
-    <a data-on-click="@get('/page/runs?status=running')"
+    <a data-on:click="@get('/page/runs?status=running')"
        class="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800 cursor-pointer">
       Active
       <span class="ml-auto h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
@@ -1291,7 +1310,7 @@ while let Some(line) = log_rx.recv().await {
     <p class="text-[11px] font-medium uppercase tracking-[0.15em] text-gray-500 dark:text-gray-400">Last Refresh</p>
     <p class="mt-2 text-lg font-medium text-gray-900 dark:text-white" data-text="$lastRefresh">—</p>
     <button
-      data-on-click="@post('/reindex')"
+      data-on:click="@post('/reindex')"
       data-indicator:_reindexing
       class="mt-2 text-xs text-blue-600 dark:text-blue-400 hover:underline"
     >
@@ -1318,7 +1337,7 @@ while let Some(line) = log_rx.recv().await {
 
 ```html
 <!-- Attach to buttons -->
-<button data-on-click="@post('/api/run')"
+<button data-on:click="@post('/api/run')"
   class="inline-flex items-center gap-2 px-4 py-2 bg-gray-900 dark:bg-white text-white dark:text-gray-900 rounded-lg text-sm font-medium">
   Run
   <kbd class="hidden sm:inline-flex items-center gap-0.5 rounded border border-gray-600 dark:border-gray-300 px-1.5 py-0.5 text-[10px] font-mono text-gray-400 dark:text-gray-500">
@@ -1327,7 +1346,7 @@ while let Some(line) = log_rx.recv().await {
 </button>
 
 <!-- Global listener -->
-<div data-on-keydown__window="$event.metaKey && $event.key === 'r' && ($event.preventDefault(), @post('/api/run'))"></div>
+<div data-on:keydown__window="evt.metaKey && evt.key === 'r' && (evt.preventDefault(), @post('/api/run'))"></div>
 ```
 
 ### Multi-Select Filter Bar
@@ -1335,7 +1354,7 @@ while let Some(line) = log_rx.recv().await {
 ```html
 <div data-signals='{"_filterStatus": "all"}' class="flex items-center gap-1 p-1 bg-gray-100 dark:bg-gray-800 rounded-lg">
   <button
-    data-on-click="$_filterStatus = 'all'; @get('/api/assets')"
+    data-on:click="$_filterStatus = 'all'; @get('/api/assets')"
     data-class:bg-white="$_filterStatus === 'all'"
     data-class:dark:bg-gray-700="$_filterStatus === 'all'"
     data-class:shadow-sm="$_filterStatus === 'all'"
@@ -1344,7 +1363,7 @@ while let Some(line) = log_rx.recv().await {
     class="px-3 py-1.5 text-sm rounded-md text-gray-500 dark:text-gray-400 transition-all"
   >All</button>
   <button
-    data-on-click="$_filterStatus = 'fresh'; @get('/api/assets?status=fresh')"
+    data-on:click="$_filterStatus = 'fresh'; @get('/api/assets?status=fresh')"
     data-class:bg-white="$_filterStatus === 'fresh'"
     data-class:dark:bg-gray-700="$_filterStatus === 'fresh'"
     data-class:shadow-sm="$_filterStatus === 'fresh'"
@@ -1352,7 +1371,7 @@ while let Some(line) = log_rx.recv().await {
     class="px-3 py-1.5 text-sm rounded-md text-gray-500 dark:text-gray-400 transition-all"
   >Fresh</button>
   <button
-    data-on-click="$_filterStatus = 'stale'; @get('/api/assets?status=stale')"
+    data-on:click="$_filterStatus = 'stale'; @get('/api/assets?status=stale')"
     data-class:bg-white="$_filterStatus === 'stale'"
     data-class:dark:bg-gray-700="$_filterStatus === 'stale'"
     data-class:shadow-sm="$_filterStatus === 'stale'"
@@ -1360,7 +1379,7 @@ while let Some(line) = log_rx.recv().await {
     class="px-3 py-1.5 text-sm rounded-md text-gray-500 dark:text-gray-400 transition-all"
   >Stale</button>
   <button
-    data-on-click="$_filterStatus = 'failed'; @get('/api/assets?status=failed')"
+    data-on:click="$_filterStatus = 'failed'; @get('/api/assets?status=failed')"
     data-class:bg-white="$_filterStatus === 'failed'"
     data-class:dark:bg-gray-700="$_filterStatus === 'failed'"
     data-class:shadow-sm="$_filterStatus === 'failed'"
@@ -1396,15 +1415,18 @@ event: datastar-patch-signals
 data: signals {"_currentUrl": "/assets/42"}
 ```
 
-**Option B:** If you want `pushState` for back-button support, use `data-execute-script`:
+**Option B:** If you want `pushState` for back-button support, execute a script via `datastar-patch-elements`:
 ```
-event: datastar-execute-script
-data: script window.history.pushState({}, '', '/assets/42')
+event: datastar-patch-elements
+data: mode append
+data: selector body
+data: elements <script>window.history.pushState({}, '', '/assets/42')</script>
+
 ```
 
 And handle popstate to re-fetch content:
 ```html
-<div data-on-popstate__window="@get(window.location.pathname)"></div>
+<div data-on:popstate__window="@get(window.location.pathname)"></div>
 ```
 
 ### View Transitions (replaces `data-view-transition`)
@@ -1416,7 +1438,7 @@ The plugin just sets `el.style.viewTransitionName`. Two options:
 <div data-style:view-transition-name="'panel-content'">...</div>
 
 <!-- Option B: use the __viewtransition modifier on data-on (already built in!) -->
-<button data-on-click__viewtransition="@get('/next-page')">Navigate</button>
+<button data-on:click__viewtransition="@get('/next-page')">Navigate</button>
 ```
 
 The `__viewtransition` modifier wraps the entire fetch+morph in `document.startViewTransition()`,
@@ -1478,7 +1500,7 @@ Or for newly-appended elements (e.g., scroll to new log entry):
 | Capability | Built into vanilla Datastar? | Reimplementation |
 |---|---|---|
 | URL replacement | No | `data-effect` + `history.replaceState` (1 line) |
-| Push state + back button | No | `data-execute-script` + `data-on-popstate__window` |
+| Push state + back button | No | `datastar-patch-elements` script append + `data-on:popstate__window` |
 | View transitions on nav | **Yes** (`__viewtransition` modifier) | Already works |
 | View transition names | No | `data-style:view-transition-name` (1 line) |
 | Persist to localStorage | No | `data-effect` + `localStorage.setItem` (1 line per signal) |
@@ -1662,14 +1684,15 @@ async fn navigate_to(
 
 | Topic | Correct | Wrong |
 |---|---|---|
-| Event attribute | `data-on-click` (hyphen) | `data-on:click` (colon) |
-| Modifiers | `data-on-click__debounce.500ms` | `data-on-click.debounce-500ms` |
+| Event attribute | `data-on:click` (colon separator) | `data-on-click` (hyphen) |
+| Modifiers | `data-on:click__debounce:500ms` | `data-on:click.debounce-500ms` |
+| Event variable | `evt.key` | `$event.key` |
 | Action prefix | `@post('/url')` | `$post('/url')` |
 | Signal access | `$count` | `count` or `this.count` |
 
-> **Note:** The official Datastar docs use colon syntax (`data-on:click`). The version used
-> in this project (v1.0.0-RC.1 via CDN) uses **hyphen syntax** (`data-on-click`).
-> Always verify which syntax your bundle expects.
+> **Version note:** This project uses Datastar v1.0.0-RC.8. RC.8 uses **colon** syntax for event
+> attributes (`data-on:click`) and colon for modifier params (`__debounce:300ms`). Older versions
+> used hyphens and dots respectively — ignore any examples showing the old style.
 
 ### Morphing Behavior
 
@@ -1685,7 +1708,7 @@ async fn navigate_to(
 - `null` values in `datastar-patch-signals` **delete** the signal (RFC 7386)
 - Kebab-case attribute keys are converted to camelCase signal names
 - Multiple signal updates in one expression are batched (effects fire once)
-- `$event` is available in `data-on` handlers (the DOM event object)
+- `evt` is available in `data-on` handlers (the DOM event object)
 
 ### SSE
 
