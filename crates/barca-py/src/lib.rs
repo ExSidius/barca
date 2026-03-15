@@ -174,9 +174,12 @@ fn resolve_input_ref(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Strin
 /// -----
 ///     from barca import asset
 ///
+///     # Both forms are supported:
+///     @asset
+///     def my_data(): ...
+///
 ///     @asset()
-///     def my_data():
-///         return {"value": 42}
+///     def my_data(): ...
 ///
 /// Parameters
 /// ----------
@@ -212,8 +215,8 @@ fn resolve_input_ref(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Strin
 /// serializer : str, optional
 ///     Reserved for future use.  Leave unset.
 #[pyfunction]
-#[pyo3(signature = (*, name=None, inputs=None, partitions=None, serializer=None))]
-fn asset(name: Option<String>, inputs: Option<PyObject>, partitions: Option<PyObject>, serializer: Option<String>) -> PyResult<PyObject> {
+#[pyo3(signature = (func=None, *, name=None, inputs=None, partitions=None, serializer=None))]
+fn asset(func: Option<PyObject>, name: Option<String>, inputs: Option<PyObject>, partitions: Option<PyObject>, serializer: Option<String>) -> PyResult<PyObject> {
     Python::with_gil(|py| {
         // Resolve inputs eagerly at decoration time
         let resolved_inputs: Option<HashMap<String, String>> = match inputs {
@@ -249,6 +252,20 @@ fn asset(name: Option<String>, inputs: Option<PyObject>, partitions: Option<PyOb
             None => None,
         };
 
+        // @asset (no parentheses): func is the decorated function directly.
+        // Wrap it immediately and return the AssetWrapper.
+        if let Some(f) = func {
+            let wrapper = AssetWrapper {
+                original: f,
+                name,
+                serializer,
+                inputs: resolved_inputs,
+                partitions: resolved_partitions,
+            };
+            return Ok(Py::new(py, wrapper)?.into_any());
+        }
+
+        // @asset() or @asset(name=...) etc.: return a one-argument decorator closure.
         let name_clone = name.clone();
         let serializer_clone = serializer.clone();
         let inputs_clone = resolved_inputs.clone();

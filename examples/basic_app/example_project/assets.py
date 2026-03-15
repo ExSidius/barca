@@ -6,6 +6,11 @@ from barca import asset, partitions
 # --- Workflow 1: Single assets, no inputs ---
 
 
+@asset
+def bare_asset() -> dict:
+    return {"bare": True}
+
+
 @asset()
 def hello_world() -> dict:
     return {"message": "Hello from barca!"}
