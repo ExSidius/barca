@@ -51,7 +51,7 @@ pub struct IndexedAsset {
     pub return_type: Option<String>,
     pub serializer_kind: String,
     pub python_version: String,
-    pub uv_lock_hash: Option<String>,
+    pub codebase_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

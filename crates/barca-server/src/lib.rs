@@ -1,6 +1,7 @@
 pub mod display;
 pub mod python_bridge;
 pub mod server;
+pub mod snapshot;
 pub mod store;
 pub mod templates;
 
@@ -13,12 +14,12 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use barca_core::hashing::{compute_definition_hash, optional_file_hash, relative_path, repo_child, sha256_hex, slugify, DefinitionHashPayload, PROTOCOL_VERSION};
+use barca_core::hashing::{compute_codebase_hash, compute_definition_hash, relative_path, repo_child, sha256_hex, slugify, DefinitionHashPayload, PROTOCOL_VERSION};
 use barca_core::models::{ArtifactMetadata, AssetDetail, IndexedAsset, InspectedAsset};
 use tokio::sync::{broadcast, Mutex, Notify};
 use tracing::{error, info};
 
-use crate::{python_bridge::PythonBridge, store::MetadataStore};
+use crate::{python_bridge::PythonBridge, snapshot::SnapshotManager, store::MetadataStore};
 
 /// A log entry emitted during job lifecycle, streamed to the UI in real time.
 #[derive(Clone, Debug)]
@@ -74,6 +75,12 @@ pub struct AppState {
     pub state_tx: broadcast::Sender<()>,
     pub python: Arc<dyn PythonBridge>,
     pub definition_cache: DefinitionCache,
+    /// Current merkle hash of the entire Python codebase.
+    pub current_codebase_hash: Arc<Mutex<String>>,
+    /// Manages frozen copies of the Python source tree for execution.
+    pub snapshot_manager: Arc<SnapshotManager>,
+    /// Path to the current active snapshot (set after reindex).
+    pub current_snapshot_path: Arc<Mutex<Option<PathBuf>>>,
     /// Maximum number of concurrent Python worker subprocesses.
     /// Set to 1 for single-process (sequential) execution.
     pub max_concurrent_jobs: usize,
@@ -94,8 +101,11 @@ impl AppState {
             job_completion_tx,
             job_log_tx,
             state_tx,
+            snapshot_manager: Arc::new(SnapshotManager::new(&repo_root)),
+            current_snapshot_path: Arc::new(Mutex::new(None)),
             python,
             definition_cache: Arc::new(Mutex::new(HashMap::new())),
+            current_codebase_hash: Arc::new(Mutex::new(String::new())),
             max_concurrent_jobs: cpus,
         }
     }
@@ -223,15 +233,32 @@ pub async fn reindex(state: &AppState) -> anyhow::Result<()> {
         let mut cache = state.definition_cache.lock().await;
         cache.clear();
     }
+    // Compute codebase-level merkle hash (all .py files + uv.lock)
+    let codebase_hash = compute_codebase_hash(&state.repo_root)?;
+    info!(codebase_hash = %codebase_hash, "computed codebase hash");
+    {
+        let mut current = state.current_codebase_hash.lock().await;
+        *current = codebase_hash.clone();
+    }
+
+    // Create a frozen snapshot of the codebase for workers to execute against
+    let snapshot_path = state.snapshot_manager.ensure_snapshot(&state.repo_root, &codebase_hash)?;
+    {
+        let mut current = state.current_snapshot_path.lock().await;
+        *current = Some(snapshot_path);
+    }
+
+    // Clean up old snapshots
+    state.snapshot_manager.cleanup(&[&codebase_hash])?;
+
     let inspected = state.python.inspect_modules(&[]).await?;
     let mut seen = std::collections::HashSet::new();
 
     // First pass: upsert all assets and collect input declarations
-    let uv_lock_hash = optional_file_hash(&state.repo_root.join("uv.lock"));
     let mut assets_with_inputs: Vec<(String, Vec<barca_core::models::AssetInput>)> = Vec::new();
 
     for inspected_asset in inspected {
-        let (indexed, inputs) = build_indexed_asset(&state.repo_root, inspected_asset, uv_lock_hash.clone())?;
+        let (indexed, inputs) = build_indexed_asset(&state.repo_root, inspected_asset, &codebase_hash)?;
         if !seen.insert(indexed.continuity_key.clone()) {
             return Err(anyhow!("duplicate continuity key detected: {}", indexed.continuity_key));
         }
@@ -267,7 +294,7 @@ pub async fn reindex(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, uv_lock_hash: Option<String>) -> anyhow::Result<(IndexedAsset, Vec<barca_core::models::AssetInput>)> {
+pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, codebase_hash: &str) -> anyhow::Result<(IndexedAsset, Vec<barca_core::models::AssetInput>)> {
     if inspected.kind != "asset" {
         return Err(anyhow!("unsupported node kind: {}", inspected.kind));
     }
@@ -282,12 +309,11 @@ pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, uv_lock_
     let serializer_kind = inspected.decorator_metadata.get("serializer").and_then(|value| value.as_str()).unwrap_or("json").to_string();
     let decorator_json = serde_json::to_string(&inspected.decorator_metadata)?;
     let definition_hash = compute_definition_hash(&DefinitionHashPayload {
-        module_source: &inspected.module_source,
+        codebase_hash,
         function_source: &inspected.function_source,
         decorator_metadata: &inspected.decorator_metadata,
         serializer_kind: &serializer_kind,
         python_version: &inspected.python_version,
-        uv_lock_hash: uv_lock_hash.as_deref(),
         protocol_version: PROTOCOL_VERSION,
     })?;
 
@@ -343,7 +369,7 @@ pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, uv_lock_
             return_type: inspected.return_type,
             serializer_kind,
             python_version: inspected.python_version,
-            uv_lock_hash,
+            codebase_hash: codebase_hash.to_string(),
         },
         inputs,
     ))
@@ -453,7 +479,8 @@ async fn enqueue_refresh_request_inner(state: &AppState, asset_id: i64) -> anyho
         .into_iter()
         .find(|asset| asset.function_name == detail.asset.function_name)
         .ok_or_else(|| anyhow!("asset {} could not be re-inspected", detail.asset.logical_name))?;
-    let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, optional_file_hash(&state.repo_root.join("uv.lock")))?;
+    let codebase_hash = state.current_codebase_hash.lock().await.clone();
+    let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, &codebase_hash)?;
 
     if current_indexed.definition_hash != detail.asset.definition_hash {
         let msg = format!("Definition changed since indexing for {}. Reindex first.", detail.asset.logical_name);
@@ -635,7 +662,8 @@ async fn execute_partition_batch(state: &AppState, jobs: Vec<barca_core::models:
                 Some(i) => i,
                 None => fail_all!(&jobs, Some(asset_name.as_str()), format!("asset {} could not be re-inspected", asset_name)),
             };
-            let (current_indexed, _) = match build_indexed_asset(&state.repo_root, current_inspected, barca_core::hashing::optional_file_hash(&state.repo_root.join("uv.lock"))) {
+            let cb_hash = state.current_codebase_hash.lock().await.clone();
+            let (current_indexed, _) = match build_indexed_asset(&state.repo_root, current_inspected, &cb_hash) {
                 Ok(r) => r,
                 Err(e) => fail_all!(&jobs, Some(asset_name.as_str()), e.to_string()),
             };
@@ -870,6 +898,7 @@ async fn execute_partition_batch(state: &AppState, jobs: Vec<barca_core::models:
             }
             fs::create_dir_all(&staging_dir).map_err(|e| (job.clone(), e.to_string()))?;
 
+            let snap = state_clone.current_snapshot_path.lock().await.clone();
             let worker = state_clone
                 .python
                 .materialize_asset(
@@ -880,6 +909,7 @@ async fn execute_partition_batch(state: &AppState, jobs: Vec<barca_core::models:
                     log.clone(),
                     aid,
                     input_kwargs_json.as_deref(),
+                    snap.as_deref(),
                 )
                 .await
                 .map_err(|e| (job.clone(), e.to_string()))?;
@@ -1036,7 +1066,8 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
                     .into_iter()
                     .find(|asset| asset.function_name == detail.asset.function_name)
                     .ok_or_else(|| anyhow!("asset {} could not be re-inspected", detail.asset.logical_name))?;
-                let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, optional_file_hash(&state.repo_root.join("uv.lock")))?;
+                let cb_hash = state.current_codebase_hash.lock().await.clone();
+                let (current_indexed, _) = build_indexed_asset(&state.repo_root, current_inspected, &cb_hash)?;
 
                 let mut cache = state.definition_cache.lock().await;
                 cache.insert(cache_key, current_indexed.definition_hash.clone());
@@ -1173,6 +1204,7 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
         }
         fs::create_dir_all(&staging_dir)?;
 
+        let snap = state.current_snapshot_path.lock().await.clone();
         let worker = state
             .python
             .materialize_asset(
@@ -1183,6 +1215,7 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
                 log.clone(),
                 aid,
                 input_kwargs_json.as_deref(),
+                snap.as_deref(),
             )
             .await?;
         let mut artifact_base = PathBuf::from(".barcafiles").join(&detail.asset.asset_slug).join(&detail.asset.definition_hash);

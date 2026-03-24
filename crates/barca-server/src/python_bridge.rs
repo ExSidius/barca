@@ -91,7 +91,36 @@ pub trait PythonBridge: Send + Sync {
         log_tx: broadcast::Sender<JobLogEntry>,
         asset_id: i64,
         input_kwargs_json: Option<&str>,
+        working_dir: Option<&Path>,
     ) -> anyhow::Result<WorkerResponse>;
+
+    /// Execute a batch of materialization jobs in a single Python process.
+    /// The default implementation falls back to calling `materialize_asset`
+    /// sequentially for each job.
+    async fn materialize_batch(
+        &self,
+        jobs: &[BatchJob],
+        log_tx: broadcast::Sender<JobLogEntry>,
+        working_dir: Option<&Path>,
+    ) -> anyhow::Result<Vec<BatchJobResult>>;
+}
+
+/// A single job in a batch materialization request.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BatchJob {
+    pub job_id: i64,
+    pub asset_id: i64,
+    pub module_path: String,
+    pub function_name: String,
+    pub output_dir: PathBuf,
+    pub input_kwargs_json: Option<String>,
+}
+
+/// Result of a single batch job.
+#[derive(Debug, Clone)]
+pub struct BatchJobResult {
+    pub job_id: i64,
+    pub result: Result<WorkerResponse, String>,
 }
 
 #[derive(Clone)]
@@ -143,7 +172,11 @@ impl PythonBridge for UvPythonBridge {
         log_tx: broadcast::Sender<JobLogEntry>,
         asset_id: i64,
         input_kwargs_json: Option<&str>,
+        working_dir: Option<&Path>,
     ) -> anyhow::Result<WorkerResponse> {
+        // uv run must execute from repo root (for venv + pyproject.toml),
+        // but PYTHONPATH points to the snapshot so imports use frozen code.
+        let pythonpath = working_dir.unwrap_or(&self.repo_root);
         let mut command = Command::new("uv");
         command.current_dir(&self.repo_root);
         command
@@ -160,7 +193,7 @@ impl PythonBridge for UvPythonBridge {
         if let Some(kwargs) = input_kwargs_json {
             command.arg("--input-kwargs").arg(kwargs);
         }
-        command.env("PYTHONPATH", self.repo_root.display().to_string());
+        command.env("PYTHONPATH", pythonpath.display().to_string());
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = command.spawn().context("failed to spawn python worker")?;
@@ -205,4 +238,111 @@ impl PythonBridge for UvPythonBridge {
 
         Ok(response)
     }
+
+    async fn materialize_batch(
+        &self,
+        jobs: &[BatchJob],
+        log_tx: broadcast::Sender<JobLogEntry>,
+        working_dir: Option<&Path>,
+    ) -> anyhow::Result<Vec<BatchJobResult>> {
+        let pythonpath = working_dir.unwrap_or(&self.repo_root);
+
+        // Write the job queue as a JSON file for the batch worker to consume
+        let queue_dir = self.repo_root.join(".barca").join("tmp");
+        fs::create_dir_all(&queue_dir)?;
+        let queue_file = queue_dir.join(format!("batch-{}.json", jobs[0].job_id));
+        let results_file = queue_dir.join(format!("batch-{}-results.json", jobs[0].job_id));
+        fs::write(&queue_file, serde_json::to_vec(jobs)?)?;
+
+        let mut command = Command::new("uv");
+        command.current_dir(&self.repo_root);
+        command
+            .arg("run")
+            .arg("python")
+            .arg("-m")
+            .arg("barca.batch_worker")
+            .arg("--queue-file")
+            .arg(&queue_file)
+            .arg("--results-file")
+            .arg(&results_file);
+        command.env("PYTHONPATH", pythonpath.display().to_string());
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let first_job = &jobs[0];
+        let mut child = command.spawn().context("failed to spawn batch worker")?;
+        let pid = child.id().unwrap_or(0);
+        info!(pid, count = jobs.len(), "batch worker started");
+        emit_log(&log_tx, first_job.asset_id, first_job.job_id, JobLogLevel::Info, format!("Batch worker started (pid:{pid}, jobs:{})", jobs.len()));
+
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let log_tx2 = log_tx.clone();
+        let aid = first_job.asset_id;
+        let jid = first_job.job_id;
+        let stdout_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                info!(pid, "{line}");
+                emit_log(&log_tx2, aid, jid, JobLogLevel::Output, &line);
+            }
+        });
+
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let stderr_log_tx = log_tx;
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                warn!(pid, "{line}");
+                emit_log(&stderr_log_tx, aid, jid, JobLogLevel::Warn, &line);
+            }
+        });
+
+        let status = child.wait().await.context("failed to wait for batch worker")?;
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+
+        // Clean up queue file
+        fs::remove_file(&queue_file).ok();
+
+        if !status.success() {
+            let msg = format!("batch worker exited with {status}");
+            return Ok(jobs.iter().map(|j| BatchJobResult { job_id: j.job_id, result: Err(msg.clone()) }).collect());
+        }
+
+        // Read batch results
+        let results_bytes = fs::read(&results_file).context("batch worker did not produce results file")?;
+        fs::remove_file(&results_file).ok();
+
+        let raw_results: Vec<BatchWorkerResult> = serde_json::from_slice(&results_bytes).context("failed to decode batch results")?;
+
+        Ok(raw_results
+            .into_iter()
+            .map(|r| {
+                if r.ok {
+                    // Read the individual result.json
+                    let result_path = PathBuf::from(&r.output_dir).join("result.json");
+                    match fs::read(&result_path) {
+                        Ok(bytes) => match serde_json::from_slice::<WorkerResponse>(&bytes) {
+                            Ok(resp) => BatchJobResult { job_id: r.job_id, result: Ok(resp) },
+                            Err(e) => BatchJobResult { job_id: r.job_id, result: Err(e.to_string()) },
+                        },
+                        Err(e) => BatchJobResult { job_id: r.job_id, result: Err(e.to_string()) },
+                    }
+                } else {
+                    BatchJobResult {
+                        job_id: r.job_id,
+                        result: Err(r.error.unwrap_or_else(|| "unknown error".to_string())),
+                    }
+                }
+            })
+            .collect())
+    }
+}
+
+/// Result entry from the batch worker's output JSON.
+#[derive(serde::Deserialize)]
+struct BatchWorkerResult {
+    job_id: i64,
+    ok: bool,
+    output_dir: String,
+    error: Option<String>,
 }

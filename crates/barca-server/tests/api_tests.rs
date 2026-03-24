@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use barca_core::models::{AssetDetail, AssetSummary, InspectedAsset, JobDetail, WorkerResponse};
-use barca_server::python_bridge::PythonBridge;
+use barca_server::python_bridge::{BatchJob, BatchJobResult, PythonBridge};
 use barca_server::store::MetadataStore;
 use barca_server::{AppState, JobLogEntry};
 use serde_json::Value;
@@ -69,11 +69,34 @@ impl PythonBridge for DynamicMockPythonBridge {
         _log_tx: broadcast::Sender<JobLogEntry>,
         _asset_id: i64,
         input_kwargs_json: Option<&str>,
+        _working_dir: Option<&std::path::Path>,
     ) -> anyhow::Result<WorkerResponse> {
         let kwargs: serde_json::Value = input_kwargs_json.map(|s| serde_json::from_str(s).unwrap()).unwrap_or(serde_json::json!({}));
 
         let response = (self.materialize_fn)(function_name, &kwargs, output_dir);
         Ok(response)
+    }
+
+    async fn materialize_batch(
+        &self,
+        jobs: &[BatchJob],
+        _log_tx: broadcast::Sender<JobLogEntry>,
+        _working_dir: Option<&std::path::Path>,
+    ) -> anyhow::Result<Vec<BatchJobResult>> {
+        let mut results = Vec::new();
+        for job in jobs {
+            let kwargs: serde_json::Value = job
+                .input_kwargs_json
+                .as_ref()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .unwrap_or(serde_json::json!({}));
+            let response = (self.materialize_fn)(&job.function_name, &kwargs, &job.output_dir);
+            results.push(BatchJobResult {
+                job_id: job.job_id,
+                result: Ok(response),
+            });
+        }
+        Ok(results)
     }
 }
 
