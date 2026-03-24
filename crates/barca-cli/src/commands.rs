@@ -11,18 +11,21 @@ use crate::display;
 
 /// Create a full AppState and reindex. Called at the top of every command
 /// (except reset) so the DAG is always up to date.
-async fn init(repo_root: &Path) -> anyhow::Result<AppState> {
+async fn init(repo_root: &Path, concurrency: Option<usize>) -> anyhow::Result<AppState> {
     let db_path = repo_root.join(".barca").join("metadata.db");
     let store = MetadataStore::open(&db_path).await?;
     let python = Arc::new(UvPythonBridge::new(repo_root.to_path_buf()));
-    let state = AppState::new(repo_root.to_path_buf(), store, python);
+    let mut state = AppState::new(repo_root.to_path_buf(), store, python);
+    if let Some(n) = concurrency {
+        state = state.with_max_concurrent_jobs(n);
+    }
     barca_server::reindex(&state).await?;
     Ok(state)
 }
 
-pub async fn serve() -> anyhow::Result<()> {
+pub async fn serve(concurrency: Option<usize>) -> anyhow::Result<()> {
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let state = init(&repo_root).await?;
+    let state = init(&repo_root, concurrency).await?;
 
     {
         let store = state.store.lock().await;
@@ -46,7 +49,7 @@ pub async fn serve() -> anyhow::Result<()> {
 
 pub async fn reindex_cmd() -> anyhow::Result<()> {
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let state = init(&repo_root).await?;
+    let state = init(&repo_root, None).await?;
     let store = state.store.lock().await;
     let assets = store.list_assets().await?;
     println!("{}", display::assets_table(&assets));
@@ -62,7 +65,7 @@ pub fn reset_cmd(db: bool, artifacts: bool, tmp: bool) -> anyhow::Result<()> {
 
 pub async fn assets_list() -> anyhow::Result<()> {
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let state = init(&repo_root).await?;
+    let state = init(&repo_root, None).await?;
     let store = state.store.lock().await;
     let assets = store.list_assets().await?;
     println!("{}", display::assets_table(&assets));
@@ -71,16 +74,16 @@ pub async fn assets_list() -> anyhow::Result<()> {
 
 pub async fn assets_show(id: i64) -> anyhow::Result<()> {
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let state = init(&repo_root).await?;
+    let state = init(&repo_root, None).await?;
     let store = state.store.lock().await;
     let detail = store.asset_detail(id).await?;
     println!("{}", display::asset_detail(&detail));
     Ok(())
 }
 
-pub async fn assets_refresh(id: i64) -> anyhow::Result<()> {
+pub async fn assets_refresh(id: i64, concurrency: Option<usize>) -> anyhow::Result<()> {
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let state = init(&repo_root).await?;
+    let state = init(&repo_root, concurrency).await?;
 
     // Spawn the worker so it can process the queued job
     let worker_state = state.clone();
@@ -135,7 +138,7 @@ pub async fn assets_refresh(id: i64) -> anyhow::Result<()> {
 
 pub async fn jobs_list() -> anyhow::Result<()> {
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let state = init(&repo_root).await?;
+    let state = init(&repo_root, None).await?;
     let store = state.store.lock().await;
     let pairs = store.list_recent_materializations(50).await?;
     let jobs: Vec<JobDetail> = pairs.into_iter().map(|(mat, asset)| JobDetail { job: mat, asset }).collect();
@@ -145,7 +148,7 @@ pub async fn jobs_list() -> anyhow::Result<()> {
 
 pub async fn jobs_show(id: i64) -> anyhow::Result<()> {
     let repo_root = std::env::current_dir().context("failed to resolve current dir")?;
-    let state = init(&repo_root).await?;
+    let state = init(&repo_root, None).await?;
     let store = state.store.lock().await;
     let (mat, asset) = store.get_materialization_with_asset(id).await?;
     let detail = JobDetail { job: mat, asset };

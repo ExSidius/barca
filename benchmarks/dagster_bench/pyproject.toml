@@ -1,0 +1,10 @@
+[project]
+name = "dagster-benchmark"
+version = "0.1.0"
+description = "Benchmark: 500 trivial parallel jobs with Dagster"
+requires-python = ">=3.11"
+dependencies = ["dagster>=1.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

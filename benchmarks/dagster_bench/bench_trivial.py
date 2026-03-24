@@ -1,0 +1,37 @@
+"""Dagster benchmark: 500 trivial assets (no work)."""
+
+import time
+import math
+import sys
+
+from dagster import asset, materialize
+
+
+def make_asset(idx: int):
+    @asset(name=f"trivial_{idx:04d}")
+    def _asset():
+        return {"i": idx, "status": "ok"}
+    return _asset
+
+
+assets = [make_asset(i) for i in range(500)]
+
+
+if __name__ == "__main__":
+    runs = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+
+    # Warm up
+    materialize(assets)
+
+    times = []
+    for i in range(runs):
+        t0 = time.perf_counter()
+        result = materialize(assets)
+        elapsed = time.perf_counter() - t0
+        n_success = len([e for e in result.all_events if e.is_step_success])
+        times.append(elapsed)
+        print(f"  Run {i+1}: {elapsed:.2f}s ({n_success} assets)")
+
+    avg = sum(times) / len(times)
+    std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
+    print(f"\n[dagster] 500 trivial assets: {avg:.2f}s +/- {std:.2f}s")

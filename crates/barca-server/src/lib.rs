@@ -74,6 +74,9 @@ pub struct AppState {
     pub state_tx: broadcast::Sender<()>,
     pub python: Arc<dyn PythonBridge>,
     pub definition_cache: DefinitionCache,
+    /// Maximum number of concurrent Python worker subprocesses.
+    /// Set to 1 for single-process (sequential) execution.
+    pub max_concurrent_jobs: usize,
 }
 
 impl AppState {
@@ -81,6 +84,9 @@ impl AppState {
         let (job_completion_tx, _) = broadcast::channel(16384);
         let (job_log_tx, _) = broadcast::channel(4096);
         let (state_tx, _) = broadcast::channel(16);
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
         Self {
             repo_root: repo_root.clone(),
             store: Arc::new(Mutex::new(store)),
@@ -90,7 +96,13 @@ impl AppState {
             state_tx,
             python,
             definition_cache: Arc::new(Mutex::new(HashMap::new())),
+            max_concurrent_jobs: cpus,
         }
+    }
+
+    pub fn with_max_concurrent_jobs(mut self, n: usize) -> Self {
+        self.max_concurrent_jobs = n;
+        self
     }
 }
 
@@ -337,16 +349,14 @@ pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, uv_lock_
     ))
 }
 
-/// Maximum number of concurrent Python worker subprocesses.
-const MAX_CONCURRENT_JOBS: usize = 64;
-
 /// How many jobs to claim from the queue in one batch.
 const CLAIM_BATCH_SIZE: usize = 256;
 
 pub async fn run_refresh_queue_worker(state: AppState) {
-    info!("refresh queue worker started (max_concurrent={})", MAX_CONCURRENT_JOBS);
+    let max_concurrent = state.max_concurrent_jobs;
+    info!("refresh queue worker started (max_concurrent={})", max_concurrent);
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_JOBS));
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(max_concurrent));
     let mut in_flight = tokio::task::JoinSet::new();
 
     loop {

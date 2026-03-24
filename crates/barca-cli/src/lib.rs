@@ -22,6 +22,10 @@ Examples:
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
+
+    /// Maximum number of concurrent worker subprocesses (default: number of CPU cores)
+    #[arg(long, short = 'j', global = true)]
+    concurrency: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -89,13 +93,15 @@ pub async fn run() -> anyhow::Result<()> {
 
     tracing_subscriber::fmt().with_env_filter("info").init();
 
+    let concurrency = cli.concurrency;
+
     match cli.command {
-        None | Some(Commands::Serve) => commands::serve().await,
+        None | Some(Commands::Serve) => commands::serve(concurrency).await,
         Some(Commands::Reindex) => commands::reindex_cmd().await,
         Some(Commands::Assets(sub)) => match sub {
             AssetsCmd::List => commands::assets_list().await,
             AssetsCmd::Show { id } => commands::assets_show(id).await,
-            AssetsCmd::Refresh { id } => commands::assets_refresh(id).await,
+            AssetsCmd::Refresh { id } => commands::assets_refresh(id, concurrency).await,
         },
         Some(Commands::Jobs(sub)) => match sub {
             JobsCmd::List => commands::jobs_list().await,
