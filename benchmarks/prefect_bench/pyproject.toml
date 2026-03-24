@@ -1,0 +1,10 @@
+[project]
+name = "prefect-benchmark"
+version = "0.1.0"
+description = "Benchmark: 500 trivial parallel jobs with Prefect"
+requires-python = ">=3.11"
+dependencies = ["prefect>=3.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
