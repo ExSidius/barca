@@ -35,6 +35,20 @@ bash run_all.sh 3
 | Prefect | ThreadPoolTaskRunner (64 threads) | Thread parallelism in 1 process |
 | Dagster | In-process executor | Sequential, no parallelism |
 
+## Known issues
+
+**Barca per-job subprocess overhead (~60ms/job).** Each Barca partition spawns a
+fresh `uv run python -m barca.worker` process. That ~60ms startup cost is
+amortized well at high concurrency (`-j 4` runs 4 subprocesses in parallel, so
+500 jobs only pay ~125 sequential rounds of overhead). But at `-j 1` it's
+catastrophic: 500 × 60ms = 30s of pure process-spawn overhead on top of the
+actual work, making sequential Barca slower than Dagster's in-process executor
+which simply loops within a single Python process.
+
+A future persistent-worker mode (long-lived Python process that receives work
+over a pipe/socket instead of restarting each time) would eliminate this cost
+and make Barca competitive even at `-j 1`.
+
 ## Individual scripts
 
 Each benchmark can be run standalone:
