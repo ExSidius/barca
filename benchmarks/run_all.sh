@@ -4,11 +4,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNS=${1:-3}
+CORES=$(nproc)
 
 echo "============================================"
 echo "  Orchestrator Benchmark Suite"
 echo "  $(date)"
-echo "  $(uname -m) / $(nproc) cores"
+echo "  $(uname -m) / ${CORES} cores"
 echo "  Runs per test: $RUNS"
 echo "============================================"
 echo ""
@@ -20,19 +21,23 @@ echo "  Measures pure framework overhead"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-echo "── Barca (64 concurrent subprocesses) ──"
+echo "── Barca -j 1 (sequential) ──"
 cd "$SCRIPT_DIR/barca_bench"
-python bench_trivial.py
+python bench_trivial.py "$RUNS" 1
+echo ""
+
+echo "── Barca -j $CORES (default: $CORES cores) ──"
+python bench_trivial.py "$RUNS"
 echo ""
 
 echo "── Prefect (64 threads, 1 process) ──"
 cd "$SCRIPT_DIR/prefect_bench"
-PREFECT_HOME=/tmp/prefect_bench PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench_trivial.py 2>/dev/null
+PREFECT_HOME=/tmp/prefect_bench PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench_trivial.py "$RUNS" 2>/dev/null
 echo ""
 
-echo "── Dagster (sequential, 1 process) ──"
+echo "── Dagster (sequential, in-process) ──"
 cd "$SCRIPT_DIR/dagster_bench"
-DAGSTER_HOME=/tmp/dagster_bench .venv/bin/python bench_trivial.py 2>/dev/null
+DAGSTER_HOME=/tmp/dagster_bench .venv/bin/python bench_trivial.py "$RUNS" 2>/dev/null
 echo ""
 
 # ── Benchmark 1b: 50ms work ──
@@ -40,23 +45,26 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "  BENCHMARK 1b: 500 jobs x 50ms work each"
 echo "  Simulates real-world I/O (API calls, DB queries)"
 echo "  Sequential minimum: 500 * 50ms = 25.0s"
-echo "  Parallel minimum (64 workers): ~0.39s + overhead"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-echo "── Barca (64 concurrent subprocesses) ──"
+echo "── Barca -j 1 (sequential) ──"
 cd "$SCRIPT_DIR/barca_bench"
+python bench.py "$RUNS" 1
+echo ""
+
+echo "── Barca -j $CORES (default: $CORES cores) ──"
 python bench.py "$RUNS"
 echo ""
 
 echo "── Prefect (64 threads, 1 process) ──"
 cd "$SCRIPT_DIR/prefect_bench"
-PREFECT_HOME=/tmp/prefect_bench PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench.py 2>/dev/null
+PREFECT_HOME=/tmp/prefect_bench PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench.py "$RUNS" 2>/dev/null
 echo ""
 
-echo "── Dagster (sequential, 1 process) ──"
+echo "── Dagster (sequential, in-process) ──"
 cd "$SCRIPT_DIR/dagster_bench"
-DAGSTER_HOME=/tmp/dagster_bench .venv/bin/python bench.py 2>/dev/null
+DAGSTER_HOME=/tmp/dagster_bench .venv/bin/python bench.py "$RUNS" 2>/dev/null
 echo ""
 
 # ── Benchmark 2: Cold Start ──
@@ -70,12 +78,12 @@ cd "$SCRIPT_DIR/barca_bench"
 python bench_cold_start.py "$RUNS"
 echo ""
 
-echo "── Prefect (flow + 1 task) ──"
+echo "── Prefect (flow + 1 task, warm server) ──"
 cd "$SCRIPT_DIR/prefect_bench"
 PREFECT_HOME=/tmp/prefect_cold PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench_cold_start.py "$RUNS" 2>/dev/null
 echo ""
 
-echo "── Dagster (materialize 1 asset) ──"
+echo "── Dagster (materialize 1 asset, warm modules) ──"
 cd "$SCRIPT_DIR/dagster_bench"
 DAGSTER_HOME=/tmp/dagster_cold .venv/bin/python bench_cold_start.py "$RUNS" 2>/dev/null
 echo ""

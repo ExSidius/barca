@@ -22,7 +22,7 @@ def benchmark_flow():
 if __name__ == "__main__":
     runs = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 
-    # Warm up
+    # Warm up Prefect's internal API server
     benchmark_flow()
 
     times = []
