@@ -201,8 +201,154 @@ fn test_refreshing_midpoint_materializes_upstream_only() {
 }
 
 // ---------------------------------------------------------------------------
+// Far-off dependency change tests
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn test_helper_module_change_invalidates_pipeline() {
+    helpers::ensure_python_ready_in(&iris_dir());
+    reset();
+
+    // Create a helper module that raw_data "depends on" via codebase hash
+    let helpers_path = iris_dir().join("iris_project").join("constants.py");
+    std::fs::write(&helpers_path, "N_ESTIMATORS = 50\n").unwrap();
+
+    reindex();
+    let eval_id = find_asset_id("evaluation");
+
+    // First run — full pipeline
+    barca(&["assets", "refresh", &eval_id.to_string()])
+        .timeout(std::time::Duration::from_secs(60))
+        .assert()
+        .success();
+
+    // Read the definition hash from `assets show`
+    let show_1 = String::from_utf8(
+        barca(&["assets", "show", &eval_id.to_string()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let def_hash_1 = extract_definition_hash(&show_1);
+
+    // Change the helper module
+    std::fs::write(&helpers_path, "N_ESTIMATORS = 100\n").unwrap();
+
+    // Reindex should pick up the codebase change
+    reindex();
+
+    // Definition hash should have changed
+    let show_2 = String::from_utf8(
+        barca(&["assets", "show", &eval_id.to_string()])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let def_hash_2 = extract_definition_hash(&show_2);
+
+    assert_ne!(
+        def_hash_1, def_hash_2,
+        "definition hash should change when a helper module is modified"
+    );
+
+    // Refresh should actually run (not cache hit) since definition changed
+    let output = String::from_utf8(
+        barca(&["assets", "refresh", &eval_id.to_string()])
+            .timeout(std::time::Duration::from_secs(60))
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(output.contains("success"), "should re-materialize after helper change");
+
+    // Clean up the helper file
+    std::fs::remove_file(&helpers_path).ok();
+}
+
+#[test]
+#[serial]
+fn test_version_history_after_helper_change() {
+    helpers::ensure_python_ready_in(&iris_dir());
+    reset();
+
+    let helpers_path = iris_dir().join("iris_project").join("version.py");
+    std::fs::write(&helpers_path, "V = 1\n").unwrap();
+
+    reindex();
+    let raw_id = find_asset_id("raw_data");
+
+    // First materialization
+    barca(&["assets", "refresh", &raw_id.to_string()])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success();
+
+    // Check jobs list has 1 job
+    let jobs_1 = String::from_utf8(
+        barca(&["jobs", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let success_count_1 = jobs_1.matches("success").count();
+
+    // Change helper, reindex, rematerialize
+    std::fs::write(&helpers_path, "V = 2\n").unwrap();
+    reindex();
+    barca(&["assets", "refresh", &raw_id.to_string()])
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+        .success();
+
+    // Should now have more jobs in history
+    let jobs_2 = String::from_utf8(
+        barca(&["jobs", "list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    let success_count_2 = jobs_2.matches("success").count();
+
+    assert!(
+        success_count_2 > success_count_1,
+        "should have more successful jobs after helper change (was {}, now {})",
+        success_count_1,
+        success_count_2,
+    );
+
+    // Clean up
+    std::fs::remove_file(&helpers_path).ok();
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract the definition hash from `assets show` output.
+fn extract_definition_hash(output: &str) -> String {
+    for line in output.lines() {
+        if line.contains("Definition hash:") {
+            return line.split(':').last().unwrap_or("").trim().to_string();
+        }
+    }
+    panic!("Definition hash not found in output:\n{}", output);
+}
 
 /// Find the value.json file for an asset whose directory name contains `slug`.
 fn find_value_json(barcafiles: &std::path::Path, slug: &str) -> String {
