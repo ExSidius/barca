@@ -30,11 +30,17 @@ echo ""
 git clone --branch "$BRANCH" "file://$REPO_ROOT" "$TMPDIR/barca" 2>&1 | tail -1
 cd "$TMPDIR/barca"
 
-# 2. Build CLI
+# 2. Build CLI and stage into Python package
 echo "Building barca CLI..."
 cargo build -p barca-cli 2>&1 | tail -1
 BARCA="$TMPDIR/barca/target/debug/barca"
 echo "Built: $BARCA"
+
+# Stage binary so `uv sync` bundles it into the venv
+mkdir -p "$TMPDIR/barca/crates/barca-py/data/scripts"
+cp "$BARCA" "$TMPDIR/barca/crates/barca-py/data/scripts/barca"
+chmod +x "$TMPDIR/barca/crates/barca-py/data/scripts/barca"
+echo "Staged binary for uv sync"
 echo ""
 
 # 3. Test each example
@@ -53,6 +59,13 @@ test_example() {
     # Install Python deps
     echo "  uv sync..."
     uv sync 2>&1 | tail -1
+
+    # Verify uv run barca works
+    if uv run barca --help >/dev/null 2>&1; then
+        echo "  uv run barca: OK"
+    else
+        echo "  WARN: uv run barca not available (using cargo binary directly)"
+    fi
 
     # Reindex
     echo "  reindex..."
