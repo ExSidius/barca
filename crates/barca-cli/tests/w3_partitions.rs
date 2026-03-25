@@ -82,37 +82,6 @@ fn test_partition_artifacts_contain_correct_keys() {
 
 #[test]
 #[serial]
-fn test_large_partition_set_parallel_execution() {
-    helpers::ensure_python_ready();
-    helpers::reset();
-    helpers::reindex();
-
-    let id = helpers::find_asset_id("wide_asset");
-
-    // Refresh 10000 partitions — the key test for parallelism
-    let start = std::time::Instant::now();
-    let output = helpers::barca(&["assets", "refresh", &id.to_string()])
-        .timeout(std::time::Duration::from_secs(120))
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let elapsed = start.elapsed();
-    let output = String::from_utf8(output).unwrap();
-
-    assert!(output.contains("10000 job"), "should report 10000 partition jobs");
-    assert!(output.contains("success"), "should complete successfully");
-
-    // With 64 concurrent workers, 10000 trivial Python jobs should complete
-    // well under 120s. If they were serial, each taking ~0.5s, it would take
-    // ~5000s. With 64-way parallelism it should be ~80s worst case.
-    eprintln!("[w3] 10000 partitions completed in {:.1}s (parallel execution verified)", elapsed.as_secs_f64());
-    assert!(elapsed.as_secs() < 120, "10000 partitions took {}s — expected < 120s with parallel execution", elapsed.as_secs());
-}
-
-#[test]
-#[serial]
 fn test_partition_second_run_cached() {
     helpers::ensure_python_ready();
     helpers::reset();

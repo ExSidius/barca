@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use barca_core::models::{AssetDetail, AssetSummary, InspectedAsset, JobDetail, WorkerResponse};
-use barca_server::python_bridge::PythonBridge;
+use barca_server::python_bridge::{BatchJob, BatchJobResult, PythonBridge};
 use barca_server::store::MetadataStore;
 use barca_server::{AppState, JobLogEntry};
 use serde_json::Value;
@@ -69,11 +69,34 @@ impl PythonBridge for DynamicMockPythonBridge {
         _log_tx: broadcast::Sender<JobLogEntry>,
         _asset_id: i64,
         input_kwargs_json: Option<&str>,
+        _working_dir: Option<&std::path::Path>,
     ) -> anyhow::Result<WorkerResponse> {
         let kwargs: serde_json::Value = input_kwargs_json.map(|s| serde_json::from_str(s).unwrap()).unwrap_or(serde_json::json!({}));
 
         let response = (self.materialize_fn)(function_name, &kwargs, output_dir);
         Ok(response)
+    }
+
+    async fn materialize_batch(
+        &self,
+        jobs: &[BatchJob],
+        _log_tx: broadcast::Sender<JobLogEntry>,
+        _working_dir: Option<&std::path::Path>,
+    ) -> anyhow::Result<Vec<BatchJobResult>> {
+        let mut results = Vec::new();
+        for job in jobs {
+            let kwargs: serde_json::Value = job
+                .input_kwargs_json
+                .as_ref()
+                .map(|s| serde_json::from_str(s).unwrap())
+                .unwrap_or(serde_json::json!({}));
+            let response = (self.materialize_fn)(&job.function_name, &kwargs, &job.output_dir);
+            results.push(BatchJobResult {
+                job_id: job.job_id,
+                result: Ok(response),
+            });
+        }
+        Ok(results)
     }
 }
 
@@ -223,6 +246,10 @@ impl Scenario {
         barca_server::reindex(&self.state).await.unwrap();
     }
 
+    fn repo_root(&self) -> &std::path::Path {
+        &self.state.repo_root
+    }
+
     /// Enqueue a refresh and run the worker until the target asset completes.
     async fn refresh(&self, asset_id: i64) {
         barca_server::enqueue_refresh_request(&self.state, asset_id).await.unwrap();
@@ -283,6 +310,22 @@ impl Scenario {
         let jobs = store.list_materializations_for_asset(asset_id, 1).await.unwrap();
         assert!(!jobs.is_empty(), "asset {} has no jobs", asset_id);
         assert_eq!(jobs[0].status, status, "asset {} latest job status should be '{}', got '{}'", asset_id, status, jobs[0].status);
+    }
+
+    async fn definition_hash(&self, asset_id: i64) -> String {
+        let store = self.state.store.lock().await;
+        let detail = store.asset_detail(asset_id).await.unwrap();
+        detail.asset.definition_hash
+    }
+
+    async fn codebase_hash(&self) -> String {
+        self.state.current_codebase_hash.lock().await.clone()
+    }
+
+    async fn latest_run_hash(&self, asset_id: i64) -> Option<String> {
+        let store = self.state.store.lock().await;
+        let mat = store.latest_successful_materialization(asset_id).await.unwrap();
+        mat.map(|m| m.run_hash)
     }
 
     async fn assert_all_partitions_succeeded(&self, asset_id: i64, n: usize) {
@@ -1440,4 +1483,226 @@ async fn test_cross_concurrent_enqueue_deduplication() {
 
     // Should still only have 1 job (second joined the first)
     s.assert_job_count(id, 1).await;
+}
+
+// ===========================================================================
+// Workflow 5: Codebase-level change detection (far-off dependencies)
+// ===========================================================================
+
+#[tokio::test]
+async fn test_w5_helper_module_change_invalidates_definition_hash() {
+    // Scenario: asset in assets.py imports from helpers.py.
+    // Changing helpers.py (not the asset's own file) should produce
+    // a new codebase_hash and therefore a new definition_hash.
+    let s = Scenario::new(DynamicMockPythonBridge::with_one_asset()).await;
+
+    // Write an initial helper file to the repo root
+    let helpers_path = s.repo_root().join("helpers.py");
+    std::fs::write(&helpers_path, "CONSTANT = 42\n").unwrap();
+
+    s.reindex().await;
+    let id = s.asset_id_by_name("my_asset").await;
+    let hash_before = s.definition_hash(id).await;
+    let codebase_hash_before = s.codebase_hash().await;
+
+    // Change the helper file (simulates editing a utility module)
+    std::fs::write(&helpers_path, "CONSTANT = 99\n").unwrap();
+
+    // Reindex — codebase_hash should change, which changes definition_hash
+    s.reindex().await;
+    let hash_after = s.definition_hash(id).await;
+    let codebase_hash_after = s.codebase_hash().await;
+
+    assert_ne!(codebase_hash_before, codebase_hash_after, "codebase_hash should change when any .py file changes");
+    assert_ne!(hash_before, hash_after, "definition_hash should change when a helper module changes");
+}
+
+#[tokio::test]
+async fn test_w5_helper_change_forces_rematerialization() {
+    // Full lifecycle: materialize → change helper → reindex → materialize again.
+    // Second materialization should NOT be a cache hit.
+    let s = Scenario::new(DynamicMockPythonBridge::with_one_asset()).await;
+
+    let helpers_path = s.repo_root().join("helpers.py");
+    std::fs::write(&helpers_path, "MULTIPLIER = 1\n").unwrap();
+
+    s.reindex().await;
+    let id = s.asset_id_by_name("my_asset").await;
+
+    // First materialization
+    s.refresh(id).await;
+    s.assert_fresh(id).await;
+    let run_hash_1 = s.latest_run_hash(id).await.unwrap();
+
+    // Change the helper
+    std::fs::write(&helpers_path, "MULTIPLIER = 10\n").unwrap();
+
+    // Reindex picks up the new codebase hash → new definition hash
+    s.reindex().await;
+
+    // Second materialization should produce a different run_hash
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    s.refresh(id).await;
+    let run_hash_2 = s.latest_run_hash(id).await.unwrap();
+
+    assert_ne!(run_hash_1, run_hash_2, "run_hash should change after helper module edit");
+}
+
+#[tokio::test]
+async fn test_w5_unrelated_file_change_invalidates_all_assets() {
+    // Changing ANY .py file should invalidate ALL assets (whole-codebase hash).
+    let s = Scenario::new(DynamicMockPythonBridge::with_dependency_pair()).await;
+
+    // Write an unrelated file that no asset imports
+    let unrelated = s.repo_root().join("unrelated_utils.py");
+    std::fs::write(&unrelated, "# nothing useful\n").unwrap();
+
+    s.reindex().await;
+    let fruit_id = s.asset_id_by_name("fruit").await;
+    let upper_id = s.asset_id_by_name("uppercased").await;
+    let fruit_hash_1 = s.definition_hash(fruit_id).await;
+    let upper_hash_1 = s.definition_hash(upper_id).await;
+
+    // Change the unrelated file
+    std::fs::write(&unrelated, "# something changed\nX = 1\n").unwrap();
+
+    s.reindex().await;
+    let fruit_hash_2 = s.definition_hash(fruit_id).await;
+    let upper_hash_2 = s.definition_hash(upper_id).await;
+
+    assert_ne!(fruit_hash_1, fruit_hash_2, "fruit definition_hash should change");
+    assert_ne!(upper_hash_1, upper_hash_2, "uppercased definition_hash should change");
+}
+
+#[tokio::test]
+async fn test_w5_helper_change_cascades_through_dependency_chain() {
+    // Full pipeline: fruit → uppercased. Change a helper file.
+    // Both should get new definition_hashes, and refreshing the leaf
+    // should produce new materializations (not cache hits).
+    let s = Scenario::new(DynamicMockPythonBridge::with_dependency_pair()).await;
+
+    let helpers_path = s.repo_root().join("helpers.py");
+    std::fs::write(&helpers_path, "VERSION = 1\n").unwrap();
+
+    s.reindex().await;
+    let fruit_id = s.asset_id_by_name("fruit").await;
+    let upper_id = s.asset_id_by_name("uppercased").await;
+
+    // Materialize the full chain
+    barca_server::enqueue_refresh_request(&s.state, upper_id).await.unwrap();
+    s.run_worker_until_complete(upper_id).await;
+    s.assert_fresh(fruit_id).await;
+    s.assert_fresh(upper_id).await;
+
+    let fruit_run_hash_1 = s.latest_run_hash(fruit_id).await.unwrap();
+    let upper_run_hash_1 = s.latest_run_hash(upper_id).await.unwrap();
+
+    // Change the helper and reindex
+    std::fs::write(&helpers_path, "VERSION = 2\n").unwrap();
+    s.reindex().await;
+
+    // Re-materialize the chain
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    s.refresh(fruit_id).await;
+    barca_server::enqueue_refresh_request(&s.state, upper_id).await.unwrap();
+    s.run_worker_until_complete(upper_id).await;
+
+    let fruit_run_hash_2 = s.latest_run_hash(fruit_id).await.unwrap();
+    let upper_run_hash_2 = s.latest_run_hash(upper_id).await.unwrap();
+
+    assert_ne!(fruit_run_hash_1, fruit_run_hash_2, "fruit should get new run_hash after helper change");
+    assert_ne!(upper_run_hash_1, upper_run_hash_2, "uppercased should get new run_hash after helper change");
+}
+
+#[tokio::test]
+async fn test_w5_no_change_means_cache_hit() {
+    // Sanity check: reindex without any file changes should NOT invalidate.
+    let s = Scenario::new(DynamicMockPythonBridge::with_one_asset()).await;
+
+    let helpers_path = s.repo_root().join("helpers.py");
+    std::fs::write(&helpers_path, "STABLE = true\n").unwrap();
+
+    s.reindex().await;
+    let id = s.asset_id_by_name("my_asset").await;
+    let hash_1 = s.definition_hash(id).await;
+
+    // Reindex again without changing anything
+    s.reindex().await;
+    let hash_2 = s.definition_hash(id).await;
+
+    assert_eq!(hash_1, hash_2, "definition_hash should be stable when no files change");
+}
+
+#[tokio::test]
+async fn test_w5_adding_new_py_file_invalidates() {
+    // Adding a brand new .py file (not imported by anyone) still changes codebase_hash.
+    let s = Scenario::new(DynamicMockPythonBridge::with_one_asset()).await;
+    s.reindex().await;
+    let id = s.asset_id_by_name("my_asset").await;
+    let hash_before = s.definition_hash(id).await;
+
+    // Add a new file
+    std::fs::write(s.repo_root().join("new_module.py"), "print('hello')\n").unwrap();
+
+    s.reindex().await;
+    let hash_after = s.definition_hash(id).await;
+
+    assert_ne!(hash_before, hash_after, "adding a new .py file should invalidate definition_hash");
+}
+
+#[tokio::test]
+async fn test_w5_deleting_py_file_invalidates() {
+    // Removing a .py file changes the codebase_hash.
+    let s = Scenario::new(DynamicMockPythonBridge::with_one_asset()).await;
+
+    let extra = s.repo_root().join("extra.py");
+    std::fs::write(&extra, "X = 1\n").unwrap();
+
+    s.reindex().await;
+    let id = s.asset_id_by_name("my_asset").await;
+    let hash_before = s.definition_hash(id).await;
+
+    // Delete the file
+    std::fs::remove_file(&extra).unwrap();
+
+    s.reindex().await;
+    let hash_after = s.definition_hash(id).await;
+
+    assert_ne!(hash_before, hash_after, "deleting a .py file should invalidate definition_hash");
+}
+
+#[tokio::test]
+async fn test_w5_version_history_preserved_across_helper_changes() {
+    // After a helper change + re-materialization, both the old and new
+    // materializations should exist in the version history.
+    let s = Scenario::new(DynamicMockPythonBridge::with_one_asset()).await;
+
+    let helpers_path = s.repo_root().join("helpers.py");
+    std::fs::write(&helpers_path, "V = 1\n").unwrap();
+
+    s.reindex().await;
+    let id = s.asset_id_by_name("my_asset").await;
+    s.refresh(id).await;
+    s.assert_job_count(id, 1).await;
+
+    // Change helper, reindex, rematerialize
+    std::fs::write(&helpers_path, "V = 2\n").unwrap();
+    s.reindex().await;
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    s.refresh(id).await;
+
+    // Should now have 2 materializations in history
+    s.assert_job_count(id, 2).await;
+
+    // Both should be successful
+    let store = s.state.store.lock().await;
+    let jobs = store.list_materializations_for_asset(id, 100).await.unwrap();
+    let successes: Vec<_> = jobs.iter().filter(|j| j.status == "success").collect();
+    assert_eq!(successes.len(), 2, "both materializations should be successful");
+
+    // They should have different definition_ids (different definition hashes)
+    assert_ne!(
+        successes[0].definition_id, successes[1].definition_id,
+        "materializations should belong to different definitions"
+    );
 }

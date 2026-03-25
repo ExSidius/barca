@@ -51,8 +51,14 @@ impl MetadataStore {
                     return_type TEXT,
                     serializer_kind TEXT NOT NULL,
                     python_version TEXT NOT NULL,
-                    uv_lock_hash TEXT,
+                    codebase_hash TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS codebase_snapshots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    codebase_hash TEXT NOT NULL UNIQUE,
+                    snapshot_path TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS materializations (
@@ -155,7 +161,7 @@ impl MetadataStore {
         self.conn
             .execute(
                 "INSERT INTO asset_definitions
-                 (asset_id, definition_hash, continuity_key, source_text, module_source_text, decorator_metadata_json, return_type, serializer_kind, python_version, uv_lock_hash, status, created_at)
+                 (asset_id, definition_hash, continuity_key, source_text, module_source_text, decorator_metadata_json, return_type, serializer_kind, python_version, codebase_hash, status, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'current', ?11)",
                 (
                     asset_id,
@@ -167,7 +173,7 @@ impl MetadataStore {
                     asset.return_type.as_deref(),
                     asset.serializer_kind.as_str(),
                     asset.python_version.as_str(),
-                    asset.uv_lock_hash.as_deref(),
+                    asset.codebase_hash.as_str(),
                     created_at,
                 ),
             )
@@ -238,7 +244,7 @@ impl MetadataStore {
                     d.return_type,
                     d.serializer_kind,
                     d.python_version,
-                    d.uv_lock_hash
+                    d.codebase_hash
                 FROM assets a
                 JOIN asset_definitions d ON d.asset_id = a.id AND d.status = 'current'
                 WHERE a.id = ?1
@@ -268,7 +274,7 @@ impl MetadataStore {
                 return_type: opt_text_col(&row, 12)?,
                 serializer_kind: text_col(&row, 13)?,
                 python_version: text_col(&row, 14)?,
-                uv_lock_hash: opt_text_col(&row, 15)?,
+                codebase_hash: text_col(&row, 15).unwrap_or_default(),
             },
             latest_materialization: self.latest_materialization(asset_id).await?,
         })
