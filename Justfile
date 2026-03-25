@@ -15,6 +15,8 @@ build-py:
     cp target/release/barca crates/barca-py/data/scripts/barca
     maturin develop -m crates/barca-py/Cargo.toml
     rm -rf crates/barca-py/data/scripts
+    # maturin develop skips data/scripts — copy binary to venv manually
+    @if [ -d ".venv/bin" ]; then cp target/release/barca .venv/bin/barca && echo "Installed CLI to .venv/bin/barca"; fi
 
 # Build the server binary.
 build:
