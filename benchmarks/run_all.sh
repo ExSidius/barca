@@ -97,6 +97,33 @@ cd "$SCRIPT_DIR/barca_bench"
 python bench_pickup.py 5
 echo ""
 
+# ── Benchmark 4: Spaceflights Pipeline ──
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  BENCHMARK 4: Spaceflights (10-asset diamond DAG)"
+echo "  Adapted from Kedro spaceflights starter"
+echo "  3 sources → 3 preps → merge → split → train → eval"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+echo "── Barca -j 1 (sequential) ──"
+cd "$SCRIPT_DIR/barca_bench"
+python bench_spaceflights.py "$RUNS" 1
+echo ""
+
+echo "── Barca -j $CORES (default: $CORES cores) ──"
+python bench_spaceflights.py "$RUNS"
+echo ""
+
+echo "── Prefect (8 threads, 1 process) ──"
+cd "$SCRIPT_DIR/prefect_bench"
+PREFECT_HOME=/tmp/prefect_sf PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench_spaceflights.py "$RUNS" 2>/dev/null
+echo ""
+
+echo "── Dagster (sequential, in-process) ──"
+cd "$SCRIPT_DIR/dagster_bench"
+DAGSTER_HOME=/tmp/dagster_sf .venv/bin/python bench_spaceflights.py "$RUNS" 2>/dev/null
+echo ""
+
 echo "============================================"
 echo "  Benchmark suite complete"
 echo "============================================"

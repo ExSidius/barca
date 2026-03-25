@@ -10,6 +10,19 @@ Aspirational benchmark suite for stress-testing barca's orchestration. Ordered b
 - **Tests**: Sequential deps, caching, far-off dependency invalidation
 - **Compute**: scikit-learn (load, split, fit, evaluate)
 
+### `spaceflights` — Full diamond, adapted from Kedro (implemented)
+```
+raw_shuttles ──→ prep_shuttles ──┐
+raw_companies ─→ prep_companies ─├→ master_table → split → train → evaluate
+raw_reviews ───→ prep_reviews ──┘
+```
+- **Depth**: 6 levels, width 3
+- **Pattern**: 3 independent sources, each preprocessed, merged into master table, then linear ML chain
+- **Tests**: Mixed fan-out/fan-in, deep chain after merge, all caching behaviors
+- **Compute**: pandas joins + sklearn RandomForestRegressor
+- **Source**: Adapted from [kedro-org/kedro-starters/spaceflights](https://github.com/kedro-org/kedro-starters)
+- **Benchmarked across**: Barca, Dagster, Prefect (see `benchmarks/`)
+
 ## Planned benchmarks
 
 ### `linear_chain` — Deep sequential pipeline
@@ -43,18 +56,6 @@ features → model_lr ─────────┘
 - **Pattern**: One asset feeds 3 independent models, results merged
 - **Tests**: Parallel model training, correct blend
 - **Compute**: sklearn RandomForest, LogisticRegression + simple average blend
-
-### `spaceflights` — Full diamond (adapted from Kedro)
-```
-raw_shuttles ──→ prep_shuttles ──┐
-raw_companies ─→ prep_companies ─├→ master_table → split → train → evaluate
-raw_reviews ───→ prep_reviews ──┘
-```
-- **Depth**: 6 levels, width 3
-- **Pattern**: 3 independent sources, each preprocessed, merged into master table, then linear ML chain
-- **Tests**: Mixed fan-out/fan-in, deep chain after merge, all caching behaviors
-- **Compute**: pandas joins + sklearn
-- **Source**: Adapted from [kedro-org/kedro-starters/spaceflights](https://github.com/kedro-org/kedro-starters)
 
 ### `partitioned_timeseries` — Mixed partitioned + non-partitioned
 ```
