@@ -698,20 +698,36 @@ async fn execute_partition_batch(state: &AppState, jobs: Vec<barca_core::models:
             let upstream_mat = match store.latest_successful_materialization(upstream_asset_id).await {
                 Ok(Some(m)) => m,
                 Ok(None) => {
-                    info!(asset_id = aid, upstream_asset_id, "upstream not ready — re-queuing partition batch");
-                    for job in &jobs {
-                        emit_log(
-                            log,
-                            aid,
-                            job.materialization_id,
-                            JobLogLevel::Info,
-                            format!("Upstream asset #{} not ready — re-queuing", upstream_asset_id),
-                        );
-                        let _ = store.requeue_materialization(job.materialization_id).await;
-                    }
+                    info!(asset_id = aid, upstream_asset_id, "upstream not ready — waiting for completion");
+                    emit_log(log, aid, jobs[0].materialization_id, JobLogLevel::Info, format!("Upstream asset #{} not ready — waiting", upstream_asset_id));
                     drop(store);
-                    state.job_queue_notify.notify_one();
-                    return;
+                    // Wait for upstream to complete
+                    let mut rx = state.job_completion_tx.subscribe();
+                    loop {
+                        match rx.recv().await {
+                            Ok(completed_aid) if completed_aid == upstream_asset_id => break,
+                            Ok(_) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    let store2 = state.store.lock().await;
+                    match store2.latest_successful_materialization(upstream_asset_id).await {
+                        Ok(Some(_)) => {
+                            // Re-acquire store for remaining iterations — but we need
+                            // to restart the input loop since store was dropped.
+                            // For simplicity, re-queue and let the next claim handle it.
+                            for job in &jobs {
+                                let _ = store2.requeue_materialization(job.materialization_id).await;
+                            }
+                            drop(store2);
+                            state.job_queue_notify.notify_one();
+                            return;
+                        }
+                        _ => {
+                            drop(store2);
+                            fail_all!(&jobs, Some(asset_name.as_str()), format!("upstream asset #{} failed", upstream_asset_id));
+                        }
+                    }
                 }
                 Err(e) => {
                     drop(store);
@@ -1104,15 +1120,28 @@ async fn execute_refresh_job(state: &AppState, job: barca_core::models::Material
                 let store = state.store.lock().await;
                 store.latest_successful_materialization(upstream_asset_id).await?
             };
-            let Some(upstream_mat) = upstream_mat else {
-                info!(asset_id = aid, job_id = jid, upstream_asset_id, "upstream not ready — re-queuing job");
-                emit_log(log, aid, jid, JobLogLevel::Info, format!("Upstream asset #{} not ready — re-queuing", upstream_asset_id));
+            let upstream_mat = if let Some(m) = upstream_mat {
+                m
+            } else {
+                info!(asset_id = aid, job_id = jid, upstream_asset_id, "upstream not ready — waiting for completion");
+                emit_log(log, aid, jid, JobLogLevel::Info, format!("Upstream asset #{} not ready — waiting", upstream_asset_id));
+                // Wait for the upstream to complete rather than busy-spinning.
+                let mut rx = state.job_completion_tx.subscribe();
+                loop {
+                    match rx.recv().await {
+                        Ok(completed_aid) if completed_aid == upstream_asset_id => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                // Re-check after upstream completion
                 let store = state.store.lock().await;
-                store.requeue_materialization(jid).await?;
-                // Notify worker to pick up next job (which should be the upstream)
+                let retry = store.latest_successful_materialization(upstream_asset_id).await?;
                 drop(store);
-                state.job_queue_notify.notify_one();
-                return Ok(());
+                match retry {
+                    Some(m) => m,
+                    None => return Err(anyhow!("upstream asset #{} failed — cannot proceed", upstream_asset_id)),
+                }
             };
 
             // Load the upstream artifact value
