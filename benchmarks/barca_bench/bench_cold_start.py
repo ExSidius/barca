@@ -8,12 +8,11 @@ import math
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(BENCH_DIR))
-CLI = os.path.join(REPO_ROOT, "target", "release", "barca")
-ENV = {**os.environ, "RUST_LOG": "error"}
+CLI = "barca"
 
 
 def run(args, **kwargs):
-    return subprocess.run(args, cwd=BENCH_DIR, check=True, env=ENV, **kwargs)
+    return subprocess.run(args, cwd=BENCH_DIR, check=True, **kwargs)
 
 
 def find_asset_id(name):

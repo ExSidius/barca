@@ -225,14 +225,14 @@ def train(data: dict) -> dict:
 @asset(inputs={"model": train, "data": split})
 def evaluate(model: dict, data: dict) -> dict:
     """Evaluate the trained model: R², MAE, RMSE."""
-    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
 
     y_test = data["y_test"]
     preds = model["predictions"]
 
     r2 = r2_score(y_test, preds)
     mae = mean_absolute_error(y_test, preds)
-    rmse = mean_squared_error(y_test, preds, squared=False)
+    rmse = root_mean_squared_error(y_test, preds)
 
     y_train = data["y_train"]
     train_preds = model["train_predictions"]
