@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNS=${1:-3}
 CORES=$(nproc)
+BARCA_VENV="$REPO_ROOT/.venv/bin"
 
 echo "============================================"
 echo "  Orchestrator Benchmark Suite"
@@ -23,11 +24,15 @@ echo ""
 
 echo "── Barca -j 1 (sequential) ──"
 cd "$SCRIPT_DIR/barca_bench"
-python bench_trivial.py "$RUNS" 1
+PATH="$BARCA_VENV:$PATH" python bench_trivial.py "$RUNS" 1
 echo ""
 
-echo "── Barca -j $CORES (default: $CORES cores) ──"
-python bench_trivial.py "$RUNS"
+echo "── Barca -j $CORES ($CORES threads, free-threaded Python) ──"
+PATH="$BARCA_VENV:$PATH" python bench_trivial.py "$RUNS" "$CORES"
+echo ""
+
+echo "── Barca -j 64 (64 threads, free-threaded Python) ──"
+PATH="$BARCA_VENV:$PATH" python bench_trivial.py "$RUNS" 64
 echo ""
 
 echo "── Prefect (64 threads, 1 process) ──"
@@ -50,11 +55,15 @@ echo ""
 
 echo "── Barca -j 1 (sequential) ──"
 cd "$SCRIPT_DIR/barca_bench"
-python bench.py "$RUNS" 1
+PATH="$BARCA_VENV:$PATH" python bench.py "$RUNS" 1
 echo ""
 
-echo "── Barca -j $CORES (default: $CORES cores) ──"
-python bench.py "$RUNS"
+echo "── Barca -j $CORES ($CORES threads, free-threaded Python) ──"
+PATH="$BARCA_VENV:$PATH" python bench.py "$RUNS" "$CORES"
+echo ""
+
+echo "── Barca -j 64 (64 threads, free-threaded Python) ──"
+PATH="$BARCA_VENV:$PATH" python bench.py "$RUNS" 64
 echo ""
 
 echo "── Prefect (64 threads, 1 process) ──"
@@ -75,31 +84,22 @@ echo ""
 
 echo "── Barca (reset + reindex + materialize) ──"
 cd "$SCRIPT_DIR/barca_bench"
-python bench_cold_start.py "$RUNS"
+PATH="$BARCA_VENV:$PATH" python bench_cold_start.py "$RUNS"
 echo ""
 
-echo "── Prefect (flow + 1 task, warm server) ──"
+echo "── Prefect (flow + 1 task) ──"
 cd "$SCRIPT_DIR/prefect_bench"
 PREFECT_HOME=/tmp/prefect_cold PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench_cold_start.py "$RUNS" 2>/dev/null
 echo ""
 
-echo "── Dagster (materialize 1 asset, warm modules) ──"
+echo "── Dagster (materialize 1 asset) ──"
 cd "$SCRIPT_DIR/dagster_bench"
 DAGSTER_HOME=/tmp/dagster_cold .venv/bin/python bench_cold_start.py "$RUNS" 2>/dev/null
 echo ""
 
-# ── Benchmark 3: Server Job Pickup ──
+# ── Benchmark 3: Spaceflights Pipeline ──
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  BENCHMARK 3: Server job pickup latency (Barca only)"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-cd "$SCRIPT_DIR/barca_bench"
-python bench_pickup.py 5
-echo ""
-
-# ── Benchmark 4: Spaceflights Pipeline ──
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  BENCHMARK 4: Spaceflights (10-asset diamond DAG)"
+echo "  BENCHMARK 3: Spaceflights (10-asset diamond DAG)"
 echo "  Adapted from Kedro spaceflights starter"
 echo "  3 sources → 3 preps → merge → split → train → eval"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -107,11 +107,11 @@ echo ""
 
 echo "── Barca -j 1 (sequential) ──"
 cd "$SCRIPT_DIR/barca_bench"
-python bench_spaceflights.py "$RUNS" 1
+PATH="$BARCA_VENV:$PATH" python bench_spaceflights.py "$RUNS" 1
 echo ""
 
-echo "── Barca -j $CORES (default: $CORES cores) ──"
-python bench_spaceflights.py "$RUNS"
+echo "── Barca -j $CORES ($CORES threads, free-threaded Python) ──"
+PATH="$BARCA_VENV:$PATH" python bench_spaceflights.py "$RUNS" "$CORES"
 echo ""
 
 echo "── Prefect (8 threads, 1 process) ──"

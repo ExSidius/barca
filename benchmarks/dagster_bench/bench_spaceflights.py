@@ -206,11 +206,11 @@ def train(data):
 
 @asset(ins={"model": AssetIn(key="train"), "data": AssetIn(key="split")})
 def evaluate(model, data):
-    from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+    from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
 
     r2 = r2_score(data["y_test"], model["predictions"])
     mae = mean_absolute_error(data["y_test"], model["predictions"])
-    rmse = mean_squared_error(data["y_test"], model["predictions"], squared=False)
+    rmse = root_mean_squared_error(data["y_test"], model["predictions"])
     train_r2 = r2_score(data["y_train"], model["train_predictions"])
     return {
         "test_r2": round(r2, 4),
