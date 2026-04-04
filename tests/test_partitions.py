@@ -80,3 +80,25 @@ def test_partition_second_run_cached(partition_project):
 
     # Should still be 3 (no new jobs created)
     assert count2 == count1
+
+
+def test_partition_parallel_execution(partition_project):
+    """Partitions run in parallel with max_workers > 1 and produce correct results."""
+    store = MetadataStore(str(partition_project / ".barca" / "metadata.db"))
+    assets = reindex(store, partition_project)
+    prices_id = next(a.asset_id for a in assets if "fetch_prices" in a.logical_name)
+
+    refresh(store, partition_project, prices_id, max_workers=3)
+
+    pairs = store.list_recent_materializations(50)
+    success_count = sum(1 for mat, _ in pairs if mat.status == "success" and mat.asset_id == prices_id)
+    assert success_count == 3
+
+    # Verify all partition artifacts are correct
+    barcafiles = partition_project / ".barcafiles"
+    tickers_found = set()
+    for value_file in barcafiles.rglob("value.json"):
+        value = json.loads(value_file.read_text())
+        if "ticker" in value:
+            tickers_found.add(value["ticker"])
+    assert tickers_found == {"AAPL", "MSFT", "GOOG"}

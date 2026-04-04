@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from barca._config import configured_modules, load_config
@@ -206,7 +208,7 @@ def reindex(store: MetadataStore, repo_root: Path) -> list[AssetSummary]:
 # ------------------------------------------------------------------
 
 
-def refresh(store: MetadataStore, repo_root: Path, asset_id: int) -> AssetDetail:
+def refresh(store: MetadataStore, repo_root: Path, asset_id: int, *, max_workers: int | None = None) -> AssetDetail:
     """Materialize an asset and its upstream deps recursively. Returns final detail."""
     detail = store.asset_detail(asset_id)
 
@@ -256,6 +258,7 @@ def refresh(store: MetadataStore, repo_root: Path, asset_id: int) -> AssetDetail
         return _refresh_partitioned(
             store, repo_root, detail, asset_inputs,
             input_kwargs, upstream_mat_ids, partition_values,
+            max_workers=max_workers,
         )
     else:
         return _refresh_single(
@@ -309,7 +312,11 @@ def _refresh_partitioned(
     base_input_kwargs: dict,
     upstream_mat_ids: list[int],
     partition_values: list[dict],
+    *,
+    max_workers: int | None = None,
 ) -> AssetDetail:
+    # Phase 1: Check caches and enqueue work items (sequential — DB access)
+    work_items: list[tuple[int, str, str, dict, Path]] = []
     for pv in partition_values:
         pk_json = json.dumps(pv, separators=(",", ":"))
         run_hash = compute_run_hash(
@@ -324,21 +331,82 @@ def _refresh_partitioned(
         mat_id = store.insert_queued_materialization(
             detail.asset.asset_id, detail.asset.definition_id, run_hash, pk_json,
         )
+        store.update_materialization_run_hash(mat_id, run_hash)
 
         # Merge partition key into kwargs
         merged_kwargs = {**base_input_kwargs}
         for k, v in pv.items():
             merged_kwargs[k] = v
 
-        try:
-            _execute_materialization(
-                store, repo_root, detail, mat_id, run_hash,
-                merged_kwargs, upstream_mat_ids,
-                partition_key_json=pk_json,
+        # Build artifact path
+        artifact_base = Path(".barcafiles") / detail.asset.asset_slug / detail.asset.definition_hash
+        pk = json.loads(pk_json)
+        if isinstance(pk, dict):
+            parts = sorted(
+                f"{k_}={v_}" if isinstance(v_, str) else f"{k_}={json.dumps(v_)}"
+                for k_, v_ in pk.items()
             )
-        except Exception as e:
-            store.mark_materialization_failed(mat_id, str(e))
-            raise
+            artifact_base = artifact_base / "partitions" / ",".join(parts)
+
+        artifact_dir = repo_root / artifact_base
+        artifact_dir.mkdir(parents=True, exist_ok=True)
+
+        work_items.append((mat_id, run_hash, pk_json, merged_kwargs, artifact_dir))
+
+    if not work_items:
+        return store.asset_detail(detail.asset.asset_id)
+
+    # Phase 2: Execute materializations in parallel (no DB access)
+    effective_workers = max_workers if max_workers is not None else os.cpu_count() or 1
+
+    if effective_workers <= 1:
+        # Sequential path — no thread overhead
+        results: list[tuple[int, str, str, Path]] = []
+        for mat_id, run_hash, pk_json, kwargs, artifact_dir in work_items:
+            try:
+                value_path = materialize_asset(
+                    detail.asset.module_path,
+                    detail.asset.function_name,
+                    artifact_dir,
+                    kwargs if kwargs else None,
+                )
+                results.append((mat_id, run_hash, pk_json, value_path))
+            except Exception as e:
+                store.mark_materialization_failed(mat_id, str(e))
+                raise
+    else:
+        results = []
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            future_to_meta = {}
+            for mat_id, run_hash, pk_json, kwargs, artifact_dir in work_items:
+                future = pool.submit(
+                    materialize_asset,
+                    detail.asset.module_path,
+                    detail.asset.function_name,
+                    artifact_dir,
+                    kwargs if kwargs else None,
+                )
+                future_to_meta[future] = (mat_id, run_hash, pk_json)
+
+            for future in as_completed(future_to_meta):
+                mat_id, run_hash, pk_json = future_to_meta[future]
+                try:
+                    value_path = future.result()
+                    results.append((mat_id, run_hash, pk_json, value_path))
+                except Exception as e:
+                    store.mark_materialization_failed(mat_id, str(e))
+                    raise
+
+    # Phase 3: Record results (sequential — DB access)
+    for mat_id, run_hash, pk_json, value_path in results:
+        value_bytes = value_path.read_bytes()
+        artifact_checksum = sha256_hex(value_bytes)
+        artifact_path_rel = relative_path(repo_root, value_path)
+        artifact_dir = value_path.parent
+        (artifact_dir / "code.txt").write_text(detail.asset.source_text)
+        store.mark_materialization_success(
+            mat_id, artifact_path_rel, "json", artifact_checksum,
+        )
 
     return store.asset_detail(detail.asset.asset_id)
 

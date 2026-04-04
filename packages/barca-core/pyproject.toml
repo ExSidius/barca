@@ -2,11 +2,13 @@
 name = "barca"
 version = "0.1.0"
 description = "Minimal asset orchestrator — core library."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.0",
-    "libsql-experimental>=0.0.50",
 ]
+
+[project.optional-dependencies]
+turso = ["libsql-experimental>=0.0.50"]
 
 [build-system]
 requires = ["hatchling"]

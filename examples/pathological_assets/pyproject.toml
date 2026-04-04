@@ -2,7 +2,7 @@
 name = "barca-pathological-assets"
 version = "0.1.0"
 description = "Pathological asset examples for AST dependency tracing validation."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = ["barca"]
 
 [tool.uv.sources]

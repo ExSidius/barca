@@ -2,7 +2,7 @@
 name = "barca-cli"
 version = "0.1.0"
 description = "Minimal asset orchestrator — CLI."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = [
     "barca",
     "typer>=0.9",

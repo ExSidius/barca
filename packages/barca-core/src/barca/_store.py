@@ -1,10 +1,9 @@
-"""MetadataStore — Turso/libSQL persistence layer."""
+"""MetadataStore — SQLite/libSQL persistence layer."""
 
 from __future__ import annotations
 
 import os
-
-import libsql_experimental as libsql
+import sqlite3
 
 from barca._hashing import now_ts
 from barca._models import (
@@ -87,12 +86,24 @@ CREATE TABLE IF NOT EXISTS materialization_inputs (
 """
 
 
+def _connect(db_path: str):
+    """Connect using libsql (for Turso remote) or stdlib sqlite3."""
+    if os.environ.get("BARCA_TURSO_URL"):
+        import libsql_experimental as libsql
+        return libsql.connect(
+            db_path,
+            sync_url=os.environ["BARCA_TURSO_URL"],
+            auth_token=os.environ.get("BARCA_TURSO_TOKEN", ""),
+        )
+    return sqlite3.connect(db_path)
+
+
 class MetadataStore:
     def __init__(self, db_path: str):
         parent = os.path.dirname(db_path)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        self.conn = libsql.connect(db_path)
+        self.conn = _connect(db_path)
         self._init_schema()
 
     def _init_schema(self) -> None:

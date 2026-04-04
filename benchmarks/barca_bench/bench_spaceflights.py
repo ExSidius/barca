@@ -42,6 +42,8 @@ def bench(runs, concurrency=None):
         asset_id = find_asset_id("evaluate")
 
         cmd = [CLI, "assets", "refresh", str(asset_id)]
+        if concurrency is not None:
+            cmd += ["-j", str(concurrency)]
 
         t0 = time.perf_counter()
         subprocess.run(cmd, cwd=BENCH_DIR, check=True, capture_output=True)

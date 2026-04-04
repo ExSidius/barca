@@ -2,7 +2,7 @@
 name = "barca-benchmark"
 version = "0.1.0"
 description = "Benchmark: 500 trivial parallel jobs"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = ["barca", "scikit-learn"]
 
 [tool.uv.sources]

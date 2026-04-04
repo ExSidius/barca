@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Install dependencies
+# Install dependencies (uses free-threaded Python 3.13t by default via .python-version)
 uv sync
 
 # Run tests
@@ -15,7 +15,9 @@ uv run pytest tests/ -v
 uv run barca reindex
 uv run barca assets list
 uv run barca assets show <id>
-uv run barca assets refresh <id>
+uv run barca assets refresh <id>         # default: -j cpu_count (parallel)
+uv run barca assets refresh <id> -j 1   # sequential
+uv run barca assets refresh <id> -j 64  # 64 threads
 uv run barca jobs list
 uv run barca jobs show <id>
 uv run barca reset [--db] [--artifacts] [--tmp]
@@ -63,7 +65,7 @@ The CLI opens `.barca/metadata.db` directly and uses the same `MetadataStore` + 
 
 ### Dependencies
 
-- **barca-core**: `pydantic>=2.0`, `libsql-experimental>=0.0.50`
+- **barca-core**: `pydantic>=2.0`, `sqlite3` (stdlib); optional `libsql-experimental` for Turso remote
 - **barca-cli**: `barca` (workspace), `typer>=0.9`
 - **dev**: `pytest>=8.0`
 
@@ -74,6 +76,7 @@ The CLI opens `.barca/metadata.db` directly and uses the same `MetadataStore` + 
 3. **Two packages** — `barca` is the reusable library; `barca-cli` is the thin CLI layer.
 4. **No async** — synchronous throughout for CLI simplicity.
 5. **No subprocess workers** — materialize via `importlib.import_module()` + direct function call.
+8. **Free-threaded Python** — defaults to 3.13t (GIL disabled). Partition parallelism via `ThreadPoolExecutor`. Opt out by changing `.python-version` to `3.13`.
 6. **Turso via libsql-experimental** — DB-API 2.0: `connect()`, `execute()`, `fetchall()`, `commit()`.
 7. **Same hashing protocol** — `PROTOCOL_VERSION = "0.3.0"`, JSON payload -> SHA-256.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import typer
@@ -12,7 +13,19 @@ from barca._store import MetadataStore
 
 from barca_cli.display import asset_detail, assets_table, job_detail, jobs_table
 
-app = typer.Typer(add_completion=False)
+
+def _check_gil() -> None:
+    """Warn if running with the GIL enabled (parallel perf will suffer)."""
+    is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
+    if is_gil_enabled is not None and is_gil_enabled():
+        typer.echo(
+            "barca: WARNING: GIL is enabled. For best parallel performance, "
+            "use the free-threaded build (python3.14t) or set PYTHON_GIL=0.",
+            err=True,
+        )
+
+
+app = typer.Typer(add_completion=False, callback=_check_gil)
 assets_app = typer.Typer(add_completion=False)
 jobs_app = typer.Typer(add_completion=False)
 app.add_typer(assets_app, name="assets")
@@ -71,17 +84,16 @@ def assets_show(asset_id: int) -> None:
 
 
 @assets_app.command("refresh")
-def assets_refresh(asset_id: int) -> None:
+def assets_refresh(
+    asset_id: int,
+    jobs: int = typer.Option(None, "-j", "--jobs", help="Max parallel workers (default: cpu_count)"),
+) -> None:
     """Materialize an asset (and upstream deps)."""
     root = _repo_root()
     store = _store()
     do_reindex(store, root)
 
-    # Check if already fresh
-    detail = store.asset_detail(asset_id)
-    pending = store.count_pending_materializations(asset_id)
-
-    result = do_refresh(store, root, asset_id)
+    result = do_refresh(store, root, asset_id, max_workers=jobs)
     typer.echo(asset_detail(result))
 
 
