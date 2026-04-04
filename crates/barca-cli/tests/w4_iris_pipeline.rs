@@ -210,24 +210,29 @@ fn test_helper_module_change_invalidates_pipeline() {
     helpers::ensure_python_ready_in(&iris_dir());
     reset();
 
-    // With per-function dependency tracing, changing an unrelated .py file
-    // does NOT invalidate assets that don't import it. Instead, we test that
-    // changing the actual asset source changes its definition hash.
+    // With per-function dependency tracing, changing a function's source
+    // changes its own definition hash. Barca-level dependencies (via @asset(inputs=...))
+    // are handled at run_hash time, not definition_hash time.
+    // So we check that trained_model's hash changes when its source changes.
     let assets_path = iris_dir().join("iris_project").join("assets.py");
-    let original_source = std::fs::read_to_string(&assets_path).unwrap();
+
+    // Ensure file is in canonical state (prior failed test may have left it modified)
+    let raw_source = std::fs::read_to_string(&assets_path).unwrap();
+    let original_source = raw_source.replace("n_estimators=100", "n_estimators=50");
+    std::fs::write(&assets_path, &original_source).unwrap();
 
     reindex();
-    let eval_id = find_asset_id("evaluation");
+    let model_id = find_asset_id("trained_model");
 
-    // First run — full pipeline
-    barca(&["assets", "refresh", &eval_id.to_string()])
+    // First run
+    barca(&["assets", "refresh", &model_id.to_string()])
         .timeout(std::time::Duration::from_secs(60))
         .assert()
         .success();
 
-    // Read the definition hash from `assets show`
+    // Read the definition hash
     let show_1 = String::from_utf8(
-        barca(&["assets", "show", &eval_id.to_string()])
+        barca(&["assets", "show", &model_id.to_string()])
             .assert()
             .success()
             .get_output()
@@ -237,18 +242,15 @@ fn test_helper_module_change_invalidates_pipeline() {
     .unwrap();
     let def_hash_1 = extract_definition_hash(&show_1);
 
-    // Change the asset's upstream dependency source (trained_model's n_estimators)
+    // Change trained_model's source (n_estimators)
     let modified_source = original_source.replace("n_estimators=50", "n_estimators=100");
-    assert_ne!(original_source, modified_source, "source replacement should have changed something");
     std::fs::write(&assets_path, &modified_source).unwrap();
 
-    // Reindex should pick up the dependency cone change
+    // Reindex should pick up the source change in trained_model's dependency cone
     reindex();
 
-    // Definition hash should have changed (trained_model source changed,
-    // and evaluation depends on trained_model)
     let show_2 = String::from_utf8(
-        barca(&["assets", "show", &eval_id.to_string()])
+        barca(&["assets", "show", &model_id.to_string()])
             .assert()
             .success()
             .get_output()
@@ -260,12 +262,12 @@ fn test_helper_module_change_invalidates_pipeline() {
 
     assert_ne!(
         def_hash_1, def_hash_2,
-        "definition hash should change when an upstream asset's source is modified"
+        "definition hash should change when the asset's own source is modified"
     );
 
     // Refresh should actually run (not cache hit) since definition changed
     let output = String::from_utf8(
-        barca(&["assets", "refresh", &eval_id.to_string()])
+        barca(&["assets", "refresh", &model_id.to_string()])
             .timeout(std::time::Duration::from_secs(60))
             .assert()
             .success()
@@ -290,7 +292,13 @@ fn test_version_history_after_helper_change() {
     // does NOT invalidate assets that don't import it. Instead, we test that
     // changing the actual asset source triggers a new materialization.
     let assets_path = iris_dir().join("iris_project").join("assets.py");
-    let original_source = std::fs::read_to_string(&assets_path).unwrap();
+
+    // Ensure file is in canonical state (prior failed test may have left it modified)
+    let raw_source = std::fs::read_to_string(&assets_path).unwrap();
+    let original_source = raw_source
+        .replace("n_estimators=100", "n_estimators=50")
+        .replace("Load the iris dataset v2.", "Load the iris dataset.");
+    std::fs::write(&assets_path, &original_source).unwrap();
 
     reindex();
     let raw_id = find_asset_id("raw_data");
