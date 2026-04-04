@@ -210,9 +210,11 @@ fn test_helper_module_change_invalidates_pipeline() {
     helpers::ensure_python_ready_in(&iris_dir());
     reset();
 
-    // Create a helper module that raw_data "depends on" via codebase hash
-    let helpers_path = iris_dir().join("iris_project").join("constants.py");
-    std::fs::write(&helpers_path, "N_ESTIMATORS = 50\n").unwrap();
+    // With per-function dependency tracing, changing an unrelated .py file
+    // does NOT invalidate assets that don't import it. Instead, we test that
+    // changing the actual asset source changes its definition hash.
+    let assets_path = iris_dir().join("iris_project").join("assets.py");
+    let original_source = std::fs::read_to_string(&assets_path).unwrap();
 
     reindex();
     let eval_id = find_asset_id("evaluation");
@@ -235,13 +237,16 @@ fn test_helper_module_change_invalidates_pipeline() {
     .unwrap();
     let def_hash_1 = extract_definition_hash(&show_1);
 
-    // Change the helper module
-    std::fs::write(&helpers_path, "N_ESTIMATORS = 100\n").unwrap();
+    // Change the asset's upstream dependency source (trained_model's n_estimators)
+    let modified_source = original_source.replace("n_estimators=50", "n_estimators=100");
+    assert_ne!(original_source, modified_source, "source replacement should have changed something");
+    std::fs::write(&assets_path, &modified_source).unwrap();
 
-    // Reindex should pick up the codebase change
+    // Reindex should pick up the dependency cone change
     reindex();
 
-    // Definition hash should have changed
+    // Definition hash should have changed (trained_model source changed,
+    // and evaluation depends on trained_model)
     let show_2 = String::from_utf8(
         barca(&["assets", "show", &eval_id.to_string()])
             .assert()
@@ -255,7 +260,7 @@ fn test_helper_module_change_invalidates_pipeline() {
 
     assert_ne!(
         def_hash_1, def_hash_2,
-        "definition hash should change when a helper module is modified"
+        "definition hash should change when an upstream asset's source is modified"
     );
 
     // Refresh should actually run (not cache hit) since definition changed
@@ -269,10 +274,10 @@ fn test_helper_module_change_invalidates_pipeline() {
             .clone(),
     )
     .unwrap();
-    assert!(output.contains("success"), "should re-materialize after helper change");
+    assert!(output.contains("success"), "should re-materialize after source change");
 
-    // Clean up the helper file
-    std::fs::remove_file(&helpers_path).ok();
+    // Restore original source
+    std::fs::write(&assets_path, &original_source).unwrap();
 }
 
 #[test]
@@ -281,8 +286,11 @@ fn test_version_history_after_helper_change() {
     helpers::ensure_python_ready_in(&iris_dir());
     reset();
 
-    let helpers_path = iris_dir().join("iris_project").join("version.py");
-    std::fs::write(&helpers_path, "V = 1\n").unwrap();
+    // With per-function dependency tracing, changing an unrelated .py file
+    // does NOT invalidate assets that don't import it. Instead, we test that
+    // changing the actual asset source triggers a new materialization.
+    let assets_path = iris_dir().join("iris_project").join("assets.py");
+    let original_source = std::fs::read_to_string(&assets_path).unwrap();
 
     reindex();
     let raw_id = find_asset_id("raw_data");
@@ -305,8 +313,14 @@ fn test_version_history_after_helper_change() {
     .unwrap();
     let success_count_1 = jobs_1.matches("success").count();
 
-    // Change helper, reindex, rematerialize
-    std::fs::write(&helpers_path, "V = 2\n").unwrap();
+    // Change raw_data's source (add a comment to change its hash)
+    let modified_source = original_source.replace(
+        "\"Load the iris dataset.\"",
+        "\"Load the iris dataset v2.\"",
+    );
+    assert_ne!(original_source, modified_source, "source replacement should have changed something");
+    std::fs::write(&assets_path, &modified_source).unwrap();
+
     reindex();
     barca(&["assets", "refresh", &raw_id.to_string()])
         .timeout(std::time::Duration::from_secs(30))
@@ -327,13 +341,13 @@ fn test_version_history_after_helper_change() {
 
     assert!(
         success_count_2 > success_count_1,
-        "should have more successful jobs after helper change (was {}, now {})",
+        "should have more successful jobs after source change (was {}, now {})",
         success_count_1,
         success_count_2,
     );
 
-    // Clean up
-    std::fs::remove_file(&helpers_path).ok();
+    // Restore original source
+    std::fs::write(&assets_path, &original_source).unwrap();
 }
 
 // ---------------------------------------------------------------------------

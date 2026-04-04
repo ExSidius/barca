@@ -17,7 +17,7 @@ use anyhow::{anyhow, Context};
 use barca_core::hashing::{compute_codebase_hash, compute_definition_hash, relative_path, repo_child, sha256_hex, slugify, DefinitionHashPayload, PROTOCOL_VERSION};
 use barca_core::models::{ArtifactMetadata, AssetDetail, IndexedAsset, InspectedAsset};
 use tokio::sync::{broadcast, Mutex, Notify};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{python_bridge::PythonBridge, snapshot::SnapshotManager, store::MetadataStore};
 
@@ -308,8 +308,19 @@ pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, codebase
     let asset_slug = slugify(&[relative_file.as_str(), filename, inspected.function_name.as_str()]);
     let serializer_kind = inspected.decorator_metadata.get("serializer").and_then(|value| value.as_str()).unwrap_or("json").to_string();
     let decorator_json = serde_json::to_string(&inspected.decorator_metadata)?;
+
+    // Use per-function dependency cone hash if available, fall back to codebase_hash
+    let effective_hash = inspected.dependency_cone_hash
+        .as_deref()
+        .unwrap_or(codebase_hash);
+
+    // Log purity warnings from AST analysis
+    for warning in &inspected.purity_warnings {
+        warn!(asset = %inspected.function_name, "{}", warning);
+    }
+
     let definition_hash = compute_definition_hash(&DefinitionHashPayload {
-        codebase_hash,
+        dependency_cone_hash: effective_hash,
         function_source: &inspected.function_source,
         decorator_metadata: &inspected.decorator_metadata,
         serializer_kind: &serializer_kind,
@@ -370,6 +381,7 @@ pub fn build_indexed_asset(repo_root: &Path, inspected: InspectedAsset, codebase
             serializer_kind,
             python_version: inspected.python_version,
             codebase_hash: codebase_hash.to_string(),
+            dependency_cone_hash: effective_hash.to_string(),
         },
         inputs,
     ))

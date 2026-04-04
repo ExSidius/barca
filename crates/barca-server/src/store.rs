@@ -52,6 +52,7 @@ impl MetadataStore {
                     serializer_kind TEXT NOT NULL,
                     python_version TEXT NOT NULL,
                     codebase_hash TEXT NOT NULL DEFAULT '',
+                    dependency_cone_hash TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL,
                     created_at INTEGER NOT NULL
                 );
@@ -161,8 +162,8 @@ impl MetadataStore {
         self.conn
             .execute(
                 "INSERT INTO asset_definitions
-                 (asset_id, definition_hash, continuity_key, source_text, module_source_text, decorator_metadata_json, return_type, serializer_kind, python_version, codebase_hash, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'current', ?11)",
+                 (asset_id, definition_hash, continuity_key, source_text, module_source_text, decorator_metadata_json, return_type, serializer_kind, python_version, codebase_hash, dependency_cone_hash, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'current', ?12)",
                 (
                     asset_id,
                     asset.definition_hash.as_str(),
@@ -174,6 +175,7 @@ impl MetadataStore {
                     asset.serializer_kind.as_str(),
                     asset.python_version.as_str(),
                     asset.codebase_hash.as_str(),
+                    asset.dependency_cone_hash.as_str(),
                     created_at,
                 ),
             )
@@ -244,7 +246,8 @@ impl MetadataStore {
                     d.return_type,
                     d.serializer_kind,
                     d.python_version,
-                    d.codebase_hash
+                    d.codebase_hash,
+                    d.dependency_cone_hash
                 FROM assets a
                 JOIN asset_definitions d ON d.asset_id = a.id AND d.status = 'current'
                 WHERE a.id = ?1
@@ -275,6 +278,7 @@ impl MetadataStore {
                 serializer_kind: text_col(&row, 13)?,
                 python_version: text_col(&row, 14)?,
                 codebase_hash: text_col(&row, 15).unwrap_or_default(),
+                dependency_cone_hash: text_col(&row, 16).unwrap_or_default(),
             },
             latest_materialization: self.latest_materialization(asset_id).await?,
         })

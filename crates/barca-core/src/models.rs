@@ -17,6 +17,11 @@ pub struct InspectedAsset {
     pub decorator_metadata: serde_json::Value,
     pub return_type: Option<String>,
     pub python_version: String,
+    /// Per-function dependency cone hash (None = fallback to codebase_hash)
+    pub dependency_cone_hash: Option<String>,
+    /// Purity analysis warnings (empty = pure function)
+    #[serde(default)]
+    pub purity_warnings: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -52,6 +57,7 @@ pub struct IndexedAsset {
     pub serializer_kind: String,
     pub python_version: String,
     pub codebase_hash: String,
+    pub dependency_cone_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]

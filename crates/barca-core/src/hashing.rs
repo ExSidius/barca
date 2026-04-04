@@ -6,7 +6,7 @@ use std::{
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-pub const PROTOCOL_VERSION: &str = "0.2.0";
+pub const PROTOCOL_VERSION: &str = "0.3.0";
 
 /// Directories to skip when walking the project for codebase hashing.
 const SKIP_DIRS: &[&str] = &[
@@ -122,7 +122,7 @@ pub fn now_ts() -> i64 {
 
 #[derive(Serialize)]
 pub struct DefinitionHashPayload<'a> {
-    pub codebase_hash: &'a str,
+    pub dependency_cone_hash: &'a str,
     pub function_source: &'a str,
     pub decorator_metadata: &'a serde_json::Value,
     pub serializer_kind: &'a str,

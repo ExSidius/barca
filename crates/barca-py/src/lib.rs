@@ -303,7 +303,7 @@ fn asset(func: Option<PyObject>, name: Option<String>, inputs: Option<PyObject>,
 /// Imports each module, finds functions with `__barca_kind__ == "asset"`,
 /// extracts source and metadata, returns JSON string to stdout.
 #[pyfunction]
-fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
+fn inspect_modules(py: Python<'_>, modules: Vec<String>, project_root: Option<String>) -> PyResult<String> {
     let importlib = py.import("importlib")?;
     let inspect_mod = py.import("inspect")?;
     let textwrap = py.import("textwrap")?;
@@ -395,6 +395,53 @@ fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
                 }
             };
 
+            // Compute per-function dependency cone hash via Python AST tracing
+            let (dep_hash, purity_warnings) = {
+                let trace_mod = py.import("barca.trace");
+                match trace_mod {
+                    Ok(trace) => {
+                        let dep_hash: Option<String> = match project_root.as_deref() {
+                            Some(root) => {
+                                match trace.call_method1("compute_dependency_hash", (&original, root)) {
+                                    Ok(result) => result.extract().ok(),
+                                    Err(e) => {
+                                        eprintln!("barca: dependency tracing failed for {}: {}", function_name, e);
+                                        None
+                                    }
+                                }
+                            }
+                            None => {
+                                match trace.call_method1("compute_dependency_hash", (&original,)) {
+                                    Ok(result) => result.extract().ok(),
+                                    Err(e) => {
+                                        eprintln!("barca: dependency tracing failed for {}: {}", function_name, e);
+                                        None
+                                    }
+                                }
+                            }
+                        };
+
+                        let purity_warnings: Vec<String> = match trace.call_method1("analyze_purity", (&original,)) {
+                            Ok(result) => {
+                                result.getattr("warnings").ok()
+                                    .and_then(|w| w.extract().ok())
+                                    .unwrap_or_default()
+                            }
+                            Err(e) => {
+                                eprintln!("barca: purity analysis failed for {}: {}", function_name, e);
+                                Vec::new()
+                            }
+                        };
+
+                        (dep_hash, purity_warnings)
+                    }
+                    Err(e) => {
+                        eprintln!("barca: could not import barca.trace: {}", e);
+                        (None, Vec::new())
+                    }
+                }
+            };
+
             let asset_record = serde_json::json!({
                 "kind": "asset",
                 "module_path": module.getattr("__name__")?.extract::<String>()?,
@@ -405,6 +452,8 @@ fn inspect_modules(py: Python<'_>, modules: Vec<String>) -> PyResult<String> {
                 "decorator_metadata": metadata,
                 "return_type": return_type,
                 "python_version": python_version,
+                "dependency_cone_hash": dep_hash,
+                "purity_warnings": purity_warnings,
             });
             assets.push(asset_record);
         }

@@ -151,6 +151,7 @@ impl PythonBridge for UvPythonBridge {
         for module in &effective {
             command.arg("--module").arg(module);
         }
+        command.arg("--project-root").arg(self.repo_root.display().to_string());
         command.env("PYTHONPATH", self.repo_root.display().to_string());
         command.stdout(Stdio::piped()).stderr(Stdio::piped());
 

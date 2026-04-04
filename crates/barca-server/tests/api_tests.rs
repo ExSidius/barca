@@ -115,6 +115,8 @@ fn make_simple_asset() -> InspectedAsset {
         decorator_metadata: serde_json::json!({}),
         return_type: Some("int".into()),
         python_version: "3.12.0".into(),
+        dependency_cone_hash: None,
+        purity_warnings: Vec::new(),
     }
 }
 
@@ -132,6 +134,8 @@ fn make_dependency_pair_assets() -> Vec<InspectedAsset> {
             decorator_metadata: serde_json::json!({"kind": "asset"}),
             return_type: Some("str".into()),
             python_version: "3.12.0".into(),
+            dependency_cone_hash: None,
+            purity_warnings: Vec::new(),
         },
         InspectedAsset {
             kind: "asset".into(),
@@ -148,6 +152,8 @@ fn make_dependency_pair_assets() -> Vec<InspectedAsset> {
             }),
             return_type: Some("str".into()),
             python_version: "3.12.0".into(),
+            dependency_cone_hash: None,
+            purity_warnings: Vec::new(),
         },
     ]
 }
@@ -172,6 +178,8 @@ fn make_partitioned_asset() -> InspectedAsset {
         }),
         return_type: Some("dict".into()),
         python_version: "3.12.0".into(),
+        dependency_cone_hash: None,
+        purity_warnings: Vec::new(),
     }
 }
 
@@ -689,6 +697,8 @@ async fn test_w2_change_upstream_code_invalidates_downstream() {
                 decorator_metadata: serde_json::json!({"kind": "asset"}),
                 return_type: Some("str".into()),
                 python_version: "3.12.0".into(),
+                dependency_cone_hash: None,
+                purity_warnings: Vec::new(),
             },
             InspectedAsset {
                 kind: "asset".into(),
@@ -705,6 +715,8 @@ async fn test_w2_change_upstream_code_invalidates_downstream() {
                 }),
                 return_type: Some("str".into()),
                 python_version: "3.12.0".into(),
+                dependency_cone_hash: None,
+                purity_warnings: Vec::new(),
             },
         ])
         .await;
@@ -764,6 +776,8 @@ async fn test_w2_revert_upstream_reuses_old_downstream_cache() {
                 decorator_metadata: serde_json::json!({"kind": "asset"}),
                 return_type: Some("str".into()),
                 python_version: "3.12.0".into(),
+                dependency_cone_hash: None,
+                purity_warnings: Vec::new(),
             },
             InspectedAsset {
                 kind: "asset".into(),
@@ -778,6 +792,8 @@ async fn test_w2_revert_upstream_reuses_old_downstream_cache() {
                 }),
                 return_type: Some("str".into()),
                 python_version: "3.12.0".into(),
+                dependency_cone_hash: None,
+                purity_warnings: Vec::new(),
             },
         ])
         .await;
@@ -1026,6 +1042,8 @@ async fn test_w3_large_partition_set_100() {
         }),
         return_type: Some("dict".into()),
         python_version: "3.12.0".into(),
+        dependency_cone_hash: None,
+        purity_warnings: Vec::new(),
     };
 
     let materialize_fn: MaterializeFn = Box::new(|function_name, kwargs, output_dir| {
@@ -1120,6 +1138,8 @@ fn make_unnamed_asset_at(file_path: &str, function_name: &str) -> InspectedAsset
         decorator_metadata: serde_json::json!({}),
         return_type: Some("int".into()),
         python_version: "3.12.0".into(),
+        dependency_cone_hash: None,
+        purity_warnings: Vec::new(),
     }
 }
 
@@ -1137,6 +1157,8 @@ fn make_named_asset_at(file_path: &str, function_name: &str, name: &str) -> Insp
         decorator_metadata: serde_json::json!({"name": name}),
         return_type: Some("int".into()),
         python_version: "3.12.0".into(),
+        dependency_cone_hash: None,
+        purity_warnings: Vec::new(),
     }
 }
 
