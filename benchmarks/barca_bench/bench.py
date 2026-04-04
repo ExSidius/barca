@@ -8,19 +8,15 @@ import math
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(BENCH_DIR))
-CLI = os.path.join(REPO_ROOT, "target", "release", "barca")
-ENV = {**os.environ, "RUST_LOG": "error"}
+CLI = "barca"
 
 
 def run(args, **kwargs):
-    return subprocess.run(args, cwd=BENCH_DIR, check=True, env=ENV, **kwargs)
+    return subprocess.run(args, cwd=BENCH_DIR, check=True, **kwargs)
 
 
 def find_asset_id(name, concurrency=None):
-    cmd = [CLI]
-    if concurrency is not None:
-        cmd += ["-j", str(concurrency)]
-    cmd += ["assets", "list"]
+    cmd = [CLI, "assets", "list"]
     result = run(cmd, capture_output=True, text=True)
     for line in result.stdout.splitlines():
         if name in line:
@@ -38,14 +34,10 @@ def bench(runs, concurrency=None):
         run([CLI, "reindex"], capture_output=True)
         asset_id = find_asset_id("parallel_500")
 
-        cmd = [CLI]
-        if concurrency is not None:
-            cmd += ["-j", str(concurrency)]
-        cmd += ["assets", "refresh", str(asset_id)]
+        cmd = [CLI, "assets", "refresh", str(asset_id)]
 
         t0 = time.perf_counter()
-        subprocess.run(cmd, cwd=BENCH_DIR, check=True, capture_output=True,
-                       env={**os.environ, "RUST_LOG": "warn"})
+        subprocess.run(cmd, cwd=BENCH_DIR, check=True, capture_output=True)
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
         print(f"  Run {i+1}: {elapsed:.2f}s")

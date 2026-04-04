@@ -5,124 +5,92 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Run the server using the basic_app example (cd into it for barca.toml + venv)
-cd examples/basic_app && cargo run -p barca-cli
-# or: cd examples/basic_app && cargo run -p barca-cli -- serve
-
-# CLI commands (open DB directly, no server needed)
-cargo run -p barca-cli -- assets list
-cargo run -p barca-cli -- assets show <id>
-cargo run -p barca-cli -- assets refresh <id>
-cargo run -p barca-cli -- jobs list
-cargo run -p barca-cli -- jobs show <id>
-cargo run -p barca-cli -- reindex
-cargo run -p barca-cli -- reset [--db] [--artifacts] [--tmp]
-
-# Run with hot reload (requires: cargo install cargo-watch)
-just dev
-
-# Build Tailwind CSS (run after changing Tailwind classes in templates)
-just build-css
-
-# Build and install the barca Python extension into the active venv
-just build-py
-# or: cd crates/barca-py && maturin develop
+# Install dependencies
+uv sync
 
 # Run tests
-cargo test -p barca-server -p barca-cli
-```
+uv run pytest tests/ -v
 
-Logging uses `tracing` with `RUST_LOG=info` by default.
+# CLI commands (from a project directory with barca.toml, or workspace root)
+uv run barca reindex
+uv run barca assets list
+uv run barca assets show <id>
+uv run barca assets refresh <id>
+uv run barca jobs list
+uv run barca jobs show <id>
+uv run barca reset [--db] [--artifacts] [--tmp]
+
+# Run from an example project
+cd examples/basic_app && uv sync && uv run barca reindex
+```
 
 ## Architecture
 
-Barca is a minimal asset orchestrator: a Rust (axum) backend that discovers Python functions decorated with `@asset()`, materializes them on demand, stores artifacts, and serves a reactive UI.
+Barca is a minimal asset orchestrator: a pure Python uv workspace that discovers Python functions decorated with `@asset()`, materializes them on demand, and stores artifacts with content-addressed caching.
 
 ### Workspace structure
 
-This is a Cargo workspace with four crates:
+This is a uv workspace with two packages:
 
-| Crate | Purpose |
-|---|---|
-| `crates/barca-cli` | Unified CLI (`barca` binary) — clap subcommands, table formatting, serve entry point |
-| `crates/barca-core` | Shared Rust library — models, hashing, serialization types |
-| `crates/barca-server` | Axum server library — routes, SSE, templates, store, python bridge trait |
-| `crates/barca-py` | PyO3 native extension — `@asset()` decorator, inspect CLI, worker CLI |
+| Package | Path | Purpose |
+|---|---|---|
+| `barca` | `packages/barca-core/` | Core library — decorator, models, store, engine, hashing, tracing |
+| `barca-cli` | `packages/barca-cli/` | CLI tool — typer app, table formatting |
 
-### Startup flow (`crates/barca-server/src/main.rs`)
-1. Load `barca.toml` → resolve Python modules to index
-2. Open Turso (local libSQL) at `.barca/metadata.db`
-3. Call `reindex()` → inspect Python modules via `uv run python -m barca.inspect`, upsert into DB
-4. Spawn background worker (`run_refresh_queue_worker`) that processes the materialization queue
-5. Start axum server on port 3000
+### Core library (`packages/barca-core/src/barca/`)
 
-### Core modules (`crates/barca-server/src/`)
 | File | Responsibility |
 |---|---|
-| `lib.rs` | Orchestration: `reindex()`, `enqueue_refresh_request()`, `run_refresh_queue_worker()`, `execute_refresh_job()` |
-| `server.rs` | Axum routes and SSE response handlers; all rendering logic that needs request context |
-| `templates.rs` | All HTML generation as Rust string functions (no template engine) |
-| `store.rs` | Turso (libSQL) layer — assets, definitions, materializations |
-| `python_bridge.rs` | `PythonBridge` trait + `UvPythonBridge` impl (subprocess to `uv run python -m barca.inspect` / `barca.worker`) |
-| `config.rs` | Parses `barca.toml` |
+| `__init__.py` | Public API: `asset`, `AssetWrapper`, `partitions`, `Partitions`, `unsafe` |
+| `_asset.py` | `@asset()` decorator, `AssetWrapper` class, `partitions()` helper |
+| `_unsafe.py` | `@unsafe` decorator — escape hatch for untraceable functions |
+| `_trace.py` | AST dependency tracing — `extract_dependencies()`, `compute_dependency_hash()`, `analyze_purity()` |
+| `_hashing.py` | Pure hash functions — `compute_codebase_hash()`, `compute_definition_hash()`, `compute_run_hash()` |
+| `_models.py` | Pydantic models — `InspectedAsset`, `IndexedAsset`, `AssetInput`, `MaterializationRecord`, `AssetSummary`, `AssetDetail`, `JobDetail` |
+| `_store.py` | `MetadataStore` — Turso/libSQL via `libsql-experimental` |
+| `_inspector.py` | `inspect_modules()` — imports modules, finds `@asset` functions, extracts metadata + dependency hashes |
+| `_engine.py` | Orchestration: `reindex()`, `refresh()`, `materialize_asset()`, `reset()`, `build_indexed_asset()` |
+| `_config.py` | `barca.toml` parsing via `tomllib` |
 
-### Shared library (`crates/barca-core/src/`)
+### CLI (`packages/barca-cli/src/barca_cli/`)
+
 | File | Responsibility |
 |---|---|
-| `models.rs` | Shared data structs (`InspectedAsset`, `WorkerResponse`, `IndexedAsset`, etc.) |
-| `hashing.rs` | Definition hash computation (deterministic, includes protocol version + uv.lock hash) |
+| `cli.py` | Typer app — `reindex`, `reset`, `assets {list,show,refresh}`, `jobs {list,show}` |
+| `display.py` | Table formatting for terminal output |
 
-### Python extension (`crates/barca-py/`)
-A PyO3 native extension built with maturin. The native Rust module is `_barca`, wrapped by a Python package `barca/`:
-- `src/lib.rs` — `#[pymodule] _barca`: `asset()` decorator, `inspect_modules()`, `materialize_asset()`
-- `python/barca/__init__.py` — re-exports `asset` and `AssetWrapper` from `_barca`
-- `python/barca/inspect.py` — thin CLI stub for `python -m barca.inspect`
-- `python/barca/worker.py` — thin CLI stub for `python -m barca.worker`
+The CLI opens `.barca/metadata.db` directly and uses the same `MetadataStore` + engine functions as any library consumer.
 
-Users install the extension with `maturin develop` (dev) or `pip install barca` (release). The server shells out to `python -m barca.inspect` / `python -m barca.worker` as subprocesses — same model as before, but the code behind those commands is now compiled Rust.
+### Dependencies
+
+- **barca-core**: `pydantic>=2.0`, `libsql-experimental>=0.0.50`
+- **barca-cli**: `barca` (workspace), `typer>=0.9`
+- **dev**: `pytest>=8.0`
+
+### Design principles
+
+1. **Pydantic models** — all data structures are `BaseModel`. Validation at boundaries.
+2. **Functional style** — pure functions wherever possible. Side effects (DB, file I/O) at the edges.
+3. **Two packages** — `barca` is the reusable library; `barca-cli` is the thin CLI layer.
+4. **No async** — synchronous throughout for CLI simplicity.
+5. **No subprocess workers** — materialize via `importlib.import_module()` + direct function call.
+6. **Turso via libsql-experimental** — DB-API 2.0: `connect()`, `execute()`, `fetchall()`, `commit()`.
+7. **Same hashing protocol** — `PROTOCOL_VERSION = "0.3.0"`, JSON payload -> SHA-256.
 
 ### Asset lifecycle
-1. **Index**: `reindex()` calls `python_bridge.inspect_modules()` → computes `definition_hash` (SHA-256 of source + metadata + uv.lock + protocol version) → upserts into `assets` + `asset_definitions` tables
-2. **Enqueue**: `POST /assets/{id}/materialize` → `enqueue_refresh_request()` checks for duplicate runs/active jobs before inserting into `materializations` queue
-3. **Execute**: Worker loop claims jobs → re-inspects asset → calls `python_bridge.materialize_asset()` → moves artifact to `.barcafiles/{slug}/{definition_hash}/value.json` → marks success/failure in DB → broadcasts completion via `tokio::sync::broadcast`
-4. **Serve**: SSE streams in `server.rs` subscribe to the broadcast channel and push `PatchElements` updates to the client
 
-### UI stack
-- **Datastar** (v1.0.0-RC.8): SSE-based DOM patching. Use `PatchElements::new(html).selector("#id").write_as_axum_sse_event()` for all patches. Attribute syntax: `data-on:click="@post('/url')"` (colon separator; `@` prefix). Signals: `data-signals='{mySignal: false}'` (JS object notation, not JSON). Event variable: `evt` (not `$event`). Panel open/close uses `$_panelOpen` signal with `data-class:open`; all panel content loaded via `@get` (no custom JS EventSource management).
-- **Tailwind CSS**: Built via `just build-css` (standalone Tailwind CLI in `bin/`), embedded via `include_str!("../../../static/css/output.css")`. Dark mode is class-based. Run `just build-css` after touching any Tailwind classes.
-- **Web Components**: `<asset-status-badge label="..." tone="...">` defined inline in `templates::web_components()`.
-- **Asset panel**: Opens via pure Datastar — `$_panelOpen = true; @get('/assets/{id}/panel/stream')`. No custom JavaScript. SSE events processed natively by Datastar, patching `#panel-content`.
+1. **Index**: `reindex()` imports Python modules, finds `@asset` functions, computes `definition_hash` (SHA-256 of source + metadata + dependency cone hash + protocol version), upserts into DB.
+2. **Refresh**: `refresh(store, repo_root, asset_id)` recursively materializes upstream deps, then calls the asset function, saves result as JSON to `.barcafiles/{slug}/{definition_hash}/value.json`, records success in DB.
+3. **Cache**: If `run_hash` matches an existing successful materialization, the asset is skipped (content-addressed caching).
+4. **Reset**: `reset()` removes `.barca/` (DB), `.barcafiles/` (artifacts), and/or `tmp/`.
 
-### CLI architecture (`crates/barca-cli/src/`)
-| File | Responsibility |
-|---|---|
-| `main.rs` | Clap Parser + subcommand dispatch |
-| `commands.rs` | Command implementations — each opens DB directly via the same store/lib.rs functions |
-| `display.rs` | Table formatters using `comfy-table` |
+### DB schema
 
-The CLI does NOT call the HTTP API. It opens `.barca/metadata.db` and uses the same `MetadataStore` + `lib.rs` orchestration as the server. For write operations (refresh/reindex), it creates a full `AppState` with a real `UvPythonBridge` and spawns the worker in-process.
-
-### PythonBridge trait
-`python_bridge::PythonBridge` is an async trait (`async_trait`). `AppState.python` is `Arc<dyn PythonBridge>`.
-- `UvPythonBridge` — real impl, shells out to `uv run python -m barca.*`
-- `MockPythonBridge` — used in API tests, returns canned data without Python
-
-### JSON API + OpenAPI
-All `/api/*` endpoints are annotated with `#[utoipa::path(...)]`. OpenAPI spec at `/api/openapi.json`, Swagger UI at `/api/docs`.
-
-Available endpoints:
-- `GET /api/assets` — list all assets
-- `GET /api/assets/{id}` — asset detail
-- `POST /api/assets/{id}/materialize` — enqueue refresh
-- `POST /api/reindex` — re-inspect Python modules
-- `GET /api/jobs` — list recent jobs
-- `GET /api/jobs/{id}` — job detail
+Turso (local libSQL) at `.barca/metadata.db`. Tables: `assets`, `asset_definitions`, `codebase_snapshots`, `materializations`, `job_logs`, `asset_inputs`, `materialization_inputs`.
 
 ### Key constraints
-- **Minimize custom JavaScript** — use Datastar attributes (`data-on:click`, `@get`, `@post`, signals, `data-class:`) instead of writing JavaScript. Only use JS when Datastar genuinely cannot handle the interaction.
-- All HTML templates live in `crates/barca-server/src/templates.rs` as Rust functions — no external template files.
+
+- `continuity_key` must be unique per asset (defaults to `{relative_file}:{function_name}`, overridable via `@asset(name=...)`).
 - No file should exceed ~500 lines; split further if needed.
-- No polling: use server-push SSE via broadcast channels.
-- `continuity_key` must be unique per asset (defaults to `file:function_name`, overridable via `@asset(name=...)`).
-- Always call `templates::escape_html()` when interpolating user/code data into HTML strings.
-- The server **never embeds Python** — it spawns subprocesses. No `pyo3` dependency in `barca-server`.
+- `dependency_cone_hash` traces per-function dependencies via AST; falls back to `codebase_hash` if tracing fails.
+- `@unsafe` decorated functions skip dependency tracing entirely.
