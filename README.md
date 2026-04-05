@@ -62,19 +62,26 @@ This installs the Python `@asset()` decorator and the `barca` CLI into your proj
 To install the latest development version directly from the repository:
 
 ```bash
-# Core library + CLI (recommended)
-uv add "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core"
-uv add "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
+uv add \
+  "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core" \
+  "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
+```
 
-# Optional HTTP server
-uv add "barca-server @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-server"
+Include the optional HTTP server:
+
+```bash
+uv add \
+  "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core" \
+  "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli" \
+  "barca-server @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-server"
 ```
 
 Or with pip:
 
 ```bash
-pip install "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core"
-pip install "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
+pip install \
+  "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core" \
+  "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
 ```
 
 ## Quick Start
