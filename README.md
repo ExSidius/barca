@@ -57,6 +57,26 @@ uv add barca
 
 This installs the Python `@asset()` decorator and the `barca` CLI into your project's virtualenv.
 
+### Install from GitHub
+
+To install the latest development version directly from the repository:
+
+```bash
+# Core library + CLI (recommended)
+uv add "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core"
+uv add "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
+
+# Optional HTTP server
+uv add "barca-server @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-server"
+```
+
+Or with pip:
+
+```bash
+pip install "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core"
+pip install "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
+```
+
 ## Quick Start
 
 ```bash
@@ -135,7 +155,7 @@ uv run barca jobs show <id>                Show job detail
 uv run barca reconcile                     Single-pass reconcile
 uv run barca reconcile --watch             Continuous reconcile loop
 uv run barca serve                         HTTP API + background scheduler
-uv run barca reset [--db] [--artifacts]    Clean generated files
+uv run barca reset [--db] [--artifacts] [--tmp]    Clean generated files
 ```
 
 ## Features
@@ -154,6 +174,7 @@ uv run barca reset [--db] [--artifacts]    Clean generated files
 - **HTTP API** — FastAPI server with REST endpoints for assets, sensors, jobs, and reconciliation
 - **CLI** — `barca` command for all operations (reads DB directly, no server needed)
 - **Notebook helpers** — `load_inputs()`, `materialize()`, `read_asset()`, `list_versions()` for interactive notebook iteration without recomputation
+- **Escape hatch** — `@unsafe` decorator skips AST dependency tracing for functions that cannot be statically analyzed
 
 **Planned** (workflows 8–9):
 
