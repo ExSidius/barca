@@ -2,10 +2,41 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Environment setup
+
+Before doing anything else, verify the environment is correct:
+
+```bash
+# 1. Keep uv up to date — a stale uv may resolve to an RC instead of the stable release
+uv self update
+
+# 2. Confirm the active Python is stable 3.14.3t (free-threaded, non-RC)
+uv run python --version   # must print "Python 3.14.3"
+
+# 3. If the venv is linked to an older interpreter, recreate it
+rm -rf .venv && uv sync --python cpython-3.14.3+freethreaded
+```
+
+The workspace pins to `3.14.3t` via `.python-version`. Never use a release candidate for tests or commits.
+
+## Pre-push checklist
+
+Run these before every push:
+
+```bash
+# Lint + format all files (ruff, trailing-whitespace, yaml/toml checks, etc.)
+pre-commit run --all-files
+
+# Full test suite must pass
+uv run pytest tests/ -v
+```
+
+Both commands must exit 0 before pushing.
+
 ## Commands
 
 ```bash
-# Install dependencies (uses free-threaded Python 3.14t by default via .python-version)
+# Install dependencies (uses free-threaded Python 3.14.3t via .python-version)
 uv sync
 
 # Run tests
