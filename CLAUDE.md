@@ -88,7 +88,7 @@ The server is **optional** — all CLI commands work without it. The server adds
 
 ### Dependencies
 
-- **barca-core**: `pydantic>=2.0`, `croniter>=2.0`, `sqlite3` (stdlib); optional `libsql-experimental` for Turso remote
+- **barca-core**: `pydantic>=2.0`, `croniter>=2.0`, `libsql>=0.1.0` (primary DB driver with MVCC); falls back to `sqlite3` (stdlib) if unavailable
 - **barca-cli**: `barca` (workspace), `typer>=0.9`
 - **barca-server**: `barca` (workspace), `fastapi>=0.115`, `uvicorn[standard]>=0.34`
 - **dev**: `pytest>=8.0`, `niquests>=3.0`
@@ -101,9 +101,9 @@ The server is **optional** — all CLI commands work without it. The server adds
 4. **Routes are thin wrappers** — FastAPI handlers validate params and delegate to `service.py`. No business logic in route functions.
 5. **No subprocess workers** — materialize via `importlib.import_module()` + direct function call.
 6. **Free-threaded Python** — defaults to 3.13t (GIL disabled). Partition parallelism via `ThreadPoolExecutor`. Opt out by changing `.python-version` to `3.13`.
-7. **Turso via libsql-experimental** — DB-API 2.0: `connect()`, `execute()`, `fetchall()`, `commit()`.
+7. **libSQL primary, Turso optional** — `libsql` package (DB-API 2.0) for MVCC concurrency; optional `BARCA_TURSO_URL` for remote sync.
 8. **Same hashing protocol** — `PROTOCOL_VERSION = "0.3.0"`, JSON payload -> SHA-256.
-9. **sqlite3 thread safety** — `MetadataStore` must be created in the same thread that uses it. Server routes create stores inside `to_thread` calls.
+9. **DB thread safety** — libSQL supports MVCC for concurrent reads. `MetadataStore` should still be created per-thread for server routes (`to_thread` pattern).
 
 ### Node kinds
 
