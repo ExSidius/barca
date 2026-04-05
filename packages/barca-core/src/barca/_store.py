@@ -117,6 +117,8 @@ def _connect(db_path: str):
 
 
 class MetadataStore:
+    """SQLite/libSQL persistence layer for all Barca metadata (assets, definitions, materializations, observations)."""
+
     def __init__(self, db_path: str):
         parent = os.path.dirname(db_path)
         if parent:
@@ -143,6 +145,7 @@ class MetadataStore:
     # ------------------------------------------------------------------
 
     def upsert_indexed_asset(self, asset: IndexedAsset) -> None:
+        """Insert or update an asset and its current definition. Marks prior definitions as 'historical'."""
         created_at = now_ts()
         existing_id = self._asset_id_by_continuity_key(asset.continuity_key)
 
@@ -206,6 +209,7 @@ class MetadataStore:
         self.conn.commit()
 
     def list_assets(self) -> list[AssetSummary]:
+        """Return all assets with their current definition and latest materialization status."""
         rows = self.conn.execute(
             """SELECT a.id, a.logical_name, a.module_path, a.file_path, a.function_name,
                       d.definition_hash, a.kind, a.schedule
@@ -234,6 +238,7 @@ class MetadataStore:
         return assets
 
     def asset_detail(self, asset_id: int) -> AssetDetail:
+        """Return full detail for an asset. Raises ValueError if not found."""
         row = self.conn.execute(
             """SELECT a.id, a.logical_name, a.continuity_key, a.module_path, a.file_path,
                       a.function_name, a.asset_slug,
@@ -279,6 +284,7 @@ class MetadataStore:
         )
 
     def asset_id_by_logical_name(self, logical_name: str) -> int | None:
+        """Look up an asset ID by its logical name. Returns None if not found."""
         row = self.conn.execute(
             "SELECT id FROM assets WHERE logical_name = ? LIMIT 1",
             (logical_name,),
@@ -293,6 +299,7 @@ class MetadataStore:
         self, asset_id: int, definition_id: int, run_hash: str,
         partition_key_json: str | None = None,
     ) -> int:
+        """Create a new materialization record with status 'queued'. Returns the materialization ID."""
         self.conn.execute(
             "INSERT INTO materializations (asset_id, definition_id, run_hash, status, partition_key_json, created_at) VALUES (?, ?, ?, 'queued', ?, ?)",
             (asset_id, definition_id, run_hash, partition_key_json, now_ts()),
@@ -305,6 +312,7 @@ class MetadataStore:
         self, asset_id: int, definition_id: int, run_hash: str,
         partition_keys: list[str],
     ) -> int:
+        """Create queued materialization records for multiple partition keys. Returns the count."""
         created_at = now_ts()
         for pk in partition_keys:
             self.conn.execute(
@@ -317,6 +325,7 @@ class MetadataStore:
     def successful_materialization_for_run(
         self, asset_id: int, run_hash: str,
     ) -> MaterializationRecord | None:
+        """Find a successful materialization matching the exact run_hash (cache lookup). Returns None on miss."""
         row = self.conn.execute(
             """SELECT id, asset_id, definition_id, run_hash, status,
                       artifact_path, artifact_format, artifact_checksum,
@@ -331,6 +340,7 @@ class MetadataStore:
     def active_materialization_for_run(
         self, asset_id: int, run_hash: str,
     ) -> MaterializationRecord | None:
+        """Find a queued or running materialization for this run_hash. Returns None if none active."""
         row = self.conn.execute(
             """SELECT id, asset_id, definition_id, run_hash, status,
                       artifact_path, artifact_format, artifact_checksum,
@@ -345,6 +355,7 @@ class MetadataStore:
     def active_materialization_for_asset(
         self, asset_id: int,
     ) -> MaterializationRecord | None:
+        """Find any queued or running materialization for this asset. Returns None if none active."""
         row = self.conn.execute(
             """SELECT id, asset_id, definition_id, run_hash, status,
                       artifact_path, artifact_format, artifact_checksum,
@@ -359,6 +370,7 @@ class MetadataStore:
     def latest_successful_materialization(
         self, asset_id: int,
     ) -> MaterializationRecord | None:
+        """Return the most recent successful materialization for an asset, or None."""
         row = self.conn.execute(
             """SELECT id, asset_id, definition_id, run_hash, status,
                       artifact_path, artifact_format, artifact_checksum,
@@ -374,6 +386,7 @@ class MetadataStore:
         self, materialization_id: int, artifact_path: str,
         artifact_format: str, artifact_checksum: str,
     ) -> None:
+        """Transition a materialization to 'success' and record its artifact metadata."""
         self.conn.execute(
             "UPDATE materializations SET status = 'success', artifact_path = ?, artifact_format = ?, artifact_checksum = ? WHERE id = ?",
             (artifact_path, artifact_format, artifact_checksum, materialization_id),
@@ -383,6 +396,7 @@ class MetadataStore:
     def mark_materialization_failed(
         self, materialization_id: int, error: str,
     ) -> None:
+        """Transition a materialization to 'failed' and record the error message."""
         self.conn.execute(
             "UPDATE materializations SET status = 'failed', last_error = ? WHERE id = ?",
             (error, materialization_id),
@@ -392,6 +406,7 @@ class MetadataStore:
     def update_materialization_run_hash(
         self, materialization_id: int, run_hash: str,
     ) -> None:
+        """Update the run_hash on a materialization (used when upstream IDs become known after queuing)."""
         self.conn.execute(
             "UPDATE materializations SET run_hash = ? WHERE id = ?",
             (run_hash, materialization_id),
@@ -399,6 +414,7 @@ class MetadataStore:
         self.conn.commit()
 
     def count_pending_materializations(self, asset_id: int) -> int:
+        """Count queued or running materializations for an asset."""
         row = self.conn.execute(
             "SELECT COUNT(*) FROM materializations WHERE asset_id = ? AND status IN ('queued', 'running')",
             (asset_id,),
@@ -406,6 +422,7 @@ class MetadataStore:
         return row[0]
 
     def list_recent_materializations(self, limit: int = 50) -> list[tuple[MaterializationRecord, AssetSummary]]:
+        """Return recent materializations paired with their asset summaries, ordered by newest first."""
         rows = self.conn.execute(
             """SELECT m.id, m.asset_id, m.definition_id, m.run_hash, m.status,
                       m.artifact_path, m.artifact_format, m.artifact_checksum,
@@ -441,6 +458,7 @@ class MetadataStore:
     def get_materialization_with_asset(
         self, materialization_id: int,
     ) -> tuple[MaterializationRecord, AssetSummary]:
+        """Return a single materialization with its asset summary. Raises ValueError if not found."""
         row = self.conn.execute(
             """SELECT m.id, m.asset_id, m.definition_id, m.run_hash, m.status,
                       m.artifact_path, m.artifact_format, m.artifact_checksum,
@@ -478,6 +496,7 @@ class MetadataStore:
     # ------------------------------------------------------------------
 
     def get_asset_inputs(self, definition_id: int) -> list[AssetInput]:
+        """Return all declared input dependencies for a definition, ordered by parameter name."""
         rows = self.conn.execute(
             "SELECT parameter_name, upstream_asset_ref, upstream_asset_id FROM asset_inputs WHERE definition_id = ? ORDER BY parameter_name",
             (definition_id,),
@@ -488,6 +507,7 @@ class MetadataStore:
         ]
 
     def upsert_asset_inputs(self, definition_id: int, inputs: list[AssetInput]) -> None:
+        """Replace all input declarations for a definition (delete + insert)."""
         self.conn.execute(
             "DELETE FROM asset_inputs WHERE definition_id = ?",
             (definition_id,),
@@ -504,6 +524,7 @@ class MetadataStore:
         self, materialization_id: int,
         inputs: list[dict],
     ) -> None:
+        """Record which upstream materializations were consumed by a materialization."""
         for inp in inputs:
             self.conn.execute(
                 "INSERT INTO materialization_inputs (materialization_id, parameter_name, upstream_materialization_id, upstream_asset_id) VALUES (?, ?, ?, ?)",
@@ -519,6 +540,7 @@ class MetadataStore:
         self, asset_id: int, definition_id: int, update_detected: bool,
         output_json: str | None = None,
     ) -> int:
+        """Record a sensor observation. Returns the observation ID."""
         self.conn.execute(
             "INSERT INTO sensor_observations (asset_id, definition_id, update_detected, output_json, created_at) VALUES (?, ?, ?, ?, ?)",
             (asset_id, definition_id, 1 if update_detected else 0, output_json, now_ts()),
@@ -528,6 +550,7 @@ class MetadataStore:
         return row[0]
 
     def latest_sensor_observation(self, asset_id: int) -> SensorObservation | None:
+        """Return the most recent sensor observation, or None if the sensor has never run."""
         row = self.conn.execute(
             """SELECT id, asset_id, definition_id, update_detected, output_json, created_at
                FROM sensor_observations WHERE asset_id = ?
@@ -542,6 +565,7 @@ class MetadataStore:
         )
 
     def list_sensor_observations(self, asset_id: int, limit: int = 50) -> list[SensorObservation]:
+        """Return recent sensor observations ordered by newest first."""
         rows = self.conn.execute(
             """SELECT id, asset_id, definition_id, update_detected, output_json, created_at
                FROM sensor_observations WHERE asset_id = ?
@@ -564,6 +588,7 @@ class MetadataStore:
         self, asset_id: int, definition_id: int, status: str,
         last_error: str | None = None,
     ) -> int:
+        """Record an effect execution ('success' or 'failed'). Returns the execution ID."""
         self.conn.execute(
             "INSERT INTO effect_executions (asset_id, definition_id, status, last_error, created_at) VALUES (?, ?, ?, ?, ?)",
             (asset_id, definition_id, status, last_error, now_ts()),
@@ -573,6 +598,7 @@ class MetadataStore:
         return row[0]
 
     def latest_effect_execution(self, asset_id: int) -> EffectExecution | None:
+        """Return the most recent effect execution, or None if never executed."""
         row = self.conn.execute(
             """SELECT id, asset_id, definition_id, status, last_error, created_at
                FROM effect_executions WHERE asset_id = ?
@@ -591,6 +617,7 @@ class MetadataStore:
     # ------------------------------------------------------------------
 
     def list_materializations(self, asset_id: int, limit: int = 50) -> list[MaterializationRecord]:
+        """Return all materializations for an asset ordered by newest first."""
         rows = self.conn.execute(
             """SELECT id, asset_id, definition_id, run_hash, status,
                       artifact_path, artifact_format, artifact_checksum,
@@ -604,6 +631,7 @@ class MetadataStore:
     def latest_successful_materialization_for_partition(
         self, asset_id: int, partition_key_json: str,
     ) -> MaterializationRecord | None:
+        """Return the most recent successful materialization for a specific partition key, or None."""
         row = self.conn.execute(
             """SELECT id, asset_id, definition_id, run_hash, status,
                       artifact_path, artifact_format, artifact_checksum,

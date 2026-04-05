@@ -88,6 +88,22 @@ uv run barca serve               # HTTP API + background scheduler
 
 No config file needed. Barca scans your project for decorated functions automatically.
 
+### Notebook Usage
+
+```python
+from barca import load_inputs, materialize, read_asset
+
+# Materialize an asset (with caching) and get its value
+data = materialize(my_asset)
+
+# Load upstream inputs for a function, then call it as plain Python
+kwargs = load_inputs(downstream)
+result = downstream(**kwargs)
+
+# Read the latest artifact without re-materializing
+value = read_asset(my_asset)
+```
+
 <details>
 <summary>Prefer bare <code>barca</code> commands?</summary>
 
@@ -124,7 +140,7 @@ uv run barca reset [--db] [--artifacts]    Clean generated files
 
 ## Features
 
-**Implemented** (workflows 1–6):
+**Implemented** (workflows 1–7):
 
 - **Asset discovery** — decorate any Python function with `@asset()`, barca finds it
 - **Dependency tracking** — declare upstream inputs with `@asset(inputs={"x": upstream})`, barca resolves the DAG, materializes upstreams first, and passes artifacts as kwargs
@@ -137,12 +153,12 @@ uv run barca reset [--db] [--artifacts]    Clean generated files
 - **Effects** — `@effect()` decorator for side-effect leaf nodes; execute after upstream assets
 - **HTTP API** — FastAPI server with REST endpoints for assets, sensors, jobs, and reconciliation
 - **CLI** — `barca` command for all operations (reads DB directly, no server needed)
+- **Notebook helpers** — `load_inputs()`, `materialize()`, `read_asset()`, `list_versions()` for interactive notebook iteration without recomputation
 
-**Planned** (workflows 7–9):
+**Planned** (workflows 8–9):
 
 | Workflow | Description | Status |
 |----------|-------------|--------|
-| 7 | Notebook workflow (`load_inputs()`) | Spec ready |
 | 8 | Backfill and replay | Spec ready |
 | 9 | Execution controls (timeout, cancel, retry) | Spec ready |
 
@@ -247,6 +263,7 @@ uv run pytest tests/ -v
 | `test_schedule` | 6 | Cron, manual, always schedules |
 | `test_trace` | 5 | AST dependency tracing, cross-file deps, purity analysis |
 | `test_codebase_hash` | 3 | Hash stability and invalidation |
+| `test_notebook` | 14 | Notebook helpers: materialize, load_inputs, read_asset, list_versions |
 | `test_server` | 14 | All HTTP endpoints, sensor e2e, reconcile integration |
 
 ## Development
@@ -278,6 +295,6 @@ uv run barca assets refresh 1
 | 4 | [Asset continuity (rename/move)](./docs/workflows/04-asset-continuity-rename-and-move.md) | Done |
 | 5 | [Schedule-driven reconciliation](./docs/workflows/05-schedule-driven-reconciliation-and-effects.md) | Done |
 | 6 | [Sensors and external observations](./docs/workflows/06-sensors-and-external-observations.md) | Done |
-| 7 | [Notebook workflow](./docs/workflows/07-notebook-workflow.md) | Planned |
+| 7 | [Notebook workflow](./docs/workflows/07-notebook-workflow.md) | Done |
 | 8 | [Backfill and replay](./docs/workflows/08-backfill-and-replay.md) | Planned |
 | 9 | [Execution controls](./docs/workflows/09-execution-controls-and-ad-hoc-params.md) | Planned |

@@ -1,0 +1,77 @@
+site_name: Barca
+site_description: A modern, minimal asset orchestrator
+site_url: https://exsidius.github.io/barca
+repo_url: https://github.com/ExSidius/barca
+repo_name: ExSidius/barca
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.expand
+    - content.code.copy
+    - search.highlight
+    - search.suggest
+  palette:
+    - scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+plugins:
+  - search
+  - mkdocstrings:
+      handlers:
+        python:
+          paths: [packages/barca-core/src]
+          options:
+            show_source: true
+            show_root_heading: true
+            members_order: source
+            docstring_style: google
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Concepts:
+    - Architecture: architecture.md
+    - Core Constraints: core-constraints.md
+  - API Reference:
+    - Decorators: api/decorators.md
+    - Notebook Helpers: api/notebook.md
+    - Models: api/models.md
+  - CLI Reference: cli.md
+  - Server API: server-api.md
+  - Development:
+    - Contributing: development.md
+    - Testing: testing.md
+    - Benchmarks: benchmarks.md
+    - Releases: releases.md
+  - Changelog: changelog.md
+  - Workflow Specs:
+    - 1 - Single Asset: workflows/01-single-asset-no-inputs.md
+    - 2 - Asset with Input: workflows/02-single-asset-one-input.md
+    - 3 - Partitions: workflows/03-parametrized-assets-and-partitions.md
+    - 4 - Asset Continuity: workflows/04-asset-continuity-rename-and-move.md
+    - 5 - Reconciliation: workflows/05-schedule-driven-reconciliation-and-effects.md
+    - 6 - Sensors: workflows/06-sensors-and-external-observations.md
+    - 7 - Notebook Workflow: workflows/07-notebook-workflow.md
+    - 8 - Backfill and Replay: workflows/08-backfill-and-replay.md
+    - 9 - Execution Controls: workflows/09-execution-controls-and-ad-hoc-params.md

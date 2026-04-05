@@ -52,7 +52,7 @@ This is a uv workspace with three packages:
 
 | File | Responsibility |
 |---|---|
-| `__init__.py` | Public API: `asset`, `sensor`, `effect`, `cron`, `partitions`, `Partitions`, `unsafe` |
+| `__init__.py` | Public API: `asset`, `sensor`, `effect`, `cron`, `partitions`, `Partitions`, `unsafe`, `load_inputs`, `materialize`, `read_asset`, `list_versions` |
 | `_asset.py` | `@asset()` decorator, `AssetWrapper` class, `partitions()` helper |
 | `_sensor.py` | `@sensor()` decorator, `SensorWrapper` class — external state observers |
 | `_effect.py` | `@effect()` decorator, `EffectWrapper` class — external state side-effects |
@@ -65,6 +65,7 @@ This is a uv workspace with three packages:
 | `_store.py` | `MetadataStore` — SQLite (stdlib) or Turso/libSQL via `libsql-experimental` |
 | `_inspector.py` | `inspect_modules()` — imports modules, finds `@asset`/`@sensor`/`@effect` functions, extracts metadata + dependency hashes |
 | `_engine.py` | Orchestration: `reindex()`, `refresh()`, `trigger_sensor()`, `materialize_asset()`, `reset()`, `build_indexed_asset()` |
+| `_notebook.py` | Notebook helpers — `load_inputs()`, `materialize()`, `read_asset()`, `list_versions()` for interactive/notebook usage |
 | `_config.py` | `barca.toml` parsing via `tomllib` |
 
 ### CLI (`packages/barca-cli/src/barca_cli/`)
@@ -155,3 +156,5 @@ SQLite at `.barca/metadata.db`. Tables: `assets`, `asset_definitions`, `codebase
 - `@unsafe` decorated functions skip dependency tracing entirely.
 - Effects cannot be used as inputs to other nodes (they are leaf nodes).
 - Sensors return `(update_detected: bool, output)` tuples.
+- `@sensor()` and `@effect()` accept optional `description: str` and `tags: list[str]` metadata parameters.
+- Notebook helpers (`load_inputs`, `materialize`, `read_asset`, `list_versions`) auto-discover the project root via `barca.toml`.
