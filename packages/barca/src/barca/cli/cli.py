@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 
 import typer
+from rich.console import Console
+from rich.text import Text
 
 from barca._engine import reindex as do_reindex, refresh as do_refresh, reset as do_reset, trigger_sensor as do_trigger_sensor
 from barca._models import JobDetail
@@ -14,6 +16,9 @@ from barca._reconciler import reconcile as do_reconcile
 from barca._store import MetadataStore
 
 from barca.cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary, sensor_observations_table
+
+_console = Console()
+_err = Console(stderr=True)
 
 
 def _check_gil() -> None:
@@ -26,10 +31,10 @@ def _check_gil() -> None:
     # Py_mod_gil, which is an upstream issue, not a misconfiguration.
     if os.environ.get("PYTHON_GIL") == "0":
         return
-    typer.echo(
+    _err.print(
         "barca: WARNING: GIL is enabled. For best parallel performance, "
         "use the free-threaded build (python3.14t) and set PYTHON_GIL=0.",
-        err=True,
+        style="yellow",
     )
 
 
@@ -58,7 +63,7 @@ def reindex() -> None:
     root = _repo_root()
     store = _store()
     assets = do_reindex(store, root)
-    typer.echo(assets_table(assets))
+    _console.print(assets_table(assets))
 
 
 @app.command()
@@ -70,7 +75,7 @@ def reset(
     """Remove generated files and caches."""
     root = _repo_root()
     output = do_reset(root, db=db, artifacts=artifacts, tmp=tmp)
-    typer.echo(output, nl=False)
+    _console.print(output, end="")
 
 
 @app.command()
@@ -85,10 +90,10 @@ def reconcile(
     while True:
         store = _store()
         result = do_reconcile(store, root)
-        typer.echo(reconcile_summary(result))
+        _console.print(reconcile_summary(result))
         if not watch:
             break
-        typer.echo(f"Sleeping {interval}s...")
+        _console.print(Text(f"Sleeping {interval}s...", style="dim"))
         time.sleep(interval)
 
 
@@ -114,7 +119,7 @@ def assets_list() -> None:
     store = _store()
     do_reindex(store, root)
     assets = store.list_assets()
-    typer.echo(assets_table(assets))
+    _console.print(assets_table(assets))
 
 
 @assets_app.command("show")
@@ -124,7 +129,7 @@ def assets_show(asset_id: int) -> None:
     store = _store()
     do_reindex(store, root)
     detail = store.asset_detail(asset_id)
-    typer.echo(asset_detail(detail))
+    _console.print(asset_detail(detail))
 
 
 @assets_app.command("refresh")
@@ -142,20 +147,20 @@ def assets_refresh(
         assets = store.list_assets()
         matches = [a for a in assets if name in a.logical_name or name in a.function_name]
         if not matches:
-            typer.echo(f"No asset matching '{name}'", err=True)
+            _err.print(f"No asset matching '{name}'", style="bold red")
             raise typer.Exit(1)
         if len(matches) > 1:
-            typer.echo(f"Multiple assets match '{name}':", err=True)
+            _err.print(f"Multiple assets match '{name}':", style="bold red")
             for m in matches:
-                typer.echo(f"  {m.asset_id}: {m.logical_name}", err=True)
+                _err.print(f"  {m.asset_id}: {m.logical_name}", style="dim")
             raise typer.Exit(1)
         asset_id = matches[0].asset_id
     elif asset_id is None:
-        typer.echo("Provide an asset ID or --name", err=True)
+        _err.print("Provide an asset ID or --name", style="bold red")
         raise typer.Exit(1)
 
     result = do_refresh(store, root, asset_id, max_workers=jobs)
-    typer.echo(asset_detail(result))
+    _console.print(asset_detail(result))
 
 
 @jobs_app.command("list")
@@ -166,7 +171,7 @@ def jobs_list() -> None:
     do_reindex(store, root)
     pairs = store.list_recent_materializations(50)
     jobs = [JobDetail(job=mat, asset=summary) for mat, summary in pairs]
-    typer.echo(jobs_table(jobs))
+    _console.print(jobs_table(jobs))
 
 
 @jobs_app.command("show")
@@ -177,7 +182,7 @@ def jobs_show(job_id: int) -> None:
     do_reindex(store, root)
     mat, summary = store.get_materialization_with_asset(job_id)
     detail = JobDetail(job=mat, asset=summary)
-    typer.echo(job_detail(detail))
+    _console.print(job_detail(detail))
 
 
 @sensors_app.command("list")
@@ -188,7 +193,7 @@ def sensors_list() -> None:
     do_reindex(store, root)
     assets = store.list_assets()
     sensors = [a for a in assets if a.kind == "sensor"]
-    typer.echo(assets_table(sensors))
+    _console.print(assets_table(sensors))
 
 
 @sensors_app.command("show")
@@ -199,13 +204,13 @@ def sensors_show(sensor_id: int) -> None:
     do_reindex(store, root)
     detail = store.asset_detail(sensor_id)
     if detail.asset.kind != "sensor":
-        typer.echo(f"Asset #{sensor_id} is not a sensor (kind: {detail.asset.kind})", err=True)
+        _err.print(f"Asset #{sensor_id} is not a sensor (kind: {detail.asset.kind})", style="bold red")
         raise typer.Exit(1)
-    typer.echo(asset_detail(detail))
+    _console.print(asset_detail(detail))
     observations = store.list_sensor_observations(sensor_id)
     if observations:
-        typer.echo("\nObservation history:")
-        typer.echo(sensor_observations_table(observations))
+        _console.print("\n[bold]Observation history:[/bold]")
+        _console.print(sensor_observations_table(observations))
 
 
 @sensors_app.command("trigger")
@@ -222,17 +227,21 @@ def sensors_trigger(
         assets = store.list_assets()
         matches = [a for a in assets if a.kind == "sensor" and (name in a.logical_name or name in a.function_name)]
         if not matches:
-            typer.echo(f"No sensor matching '{name}'", err=True)
+            _err.print(f"No sensor matching '{name}'", style="bold red")
             raise typer.Exit(1)
         if len(matches) > 1:
-            typer.echo(f"Multiple sensors match '{name}':", err=True)
+            _err.print(f"Multiple sensors match '{name}':", style="bold red")
             for m in matches:
-                typer.echo(f"  {m.asset_id}: {m.logical_name}", err=True)
+                _err.print(f"  {m.asset_id}: {m.logical_name}", style="dim")
             raise typer.Exit(1)
         sensor_id = matches[0].asset_id
     elif sensor_id is None:
-        typer.echo("Provide a sensor ID or --name", err=True)
+        _err.print("Provide a sensor ID or --name", style="bold red")
         raise typer.Exit(1)
 
     obs = do_trigger_sensor(store, root, sensor_id)
-    typer.echo(f"Observation #{obs.observation_id} recorded (update_detected: {obs.update_detected})")
+    update_style = "green" if obs.update_detected else "dim"
+    _console.print(
+        f"Observation [dim]#{obs.observation_id}[/dim] recorded "
+        f"(update_detected: [{update_style}]{obs.update_detected}[/{update_style}])"
+    )
