@@ -109,6 +109,8 @@ def bench_refresh_latency(runs):
             print("[barca] ERROR: Server failed to start")
             return []
 
+        # Ensure assets are indexed before looking up IDs
+        api_post("/reconcile")
         asset_id = find_asset_id("single_asset")
         print(f"[barca] HTTP refresh latency for single_asset (ID={asset_id}, {runs} runs):")
 

@@ -17,8 +17,10 @@ import urllib.request
 import urllib.error
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
+VENV_BIN = os.path.join(BENCH_DIR, ".venv", "bin")
 BASE_URL = "http://127.0.0.1:3000"
 GRAPHQL_URL = f"{BASE_URL}/graphql"
+DAGSTER_HOME = os.environ.get("DAGSTER_HOME", "/tmp/dagster_server_bench")
 
 
 # ── Dagster definitions (used by `dagster dev -f bench_server.py`) ───────────
@@ -123,15 +125,24 @@ def poll_run_completion(run_id, timeout=30):
     return "TIMEOUT", (time.perf_counter() - t0) * 1000
 
 
+def _dagster_env():
+    os.makedirs(DAGSTER_HOME, exist_ok=True)
+    return {**os.environ, "DAGSTER_HOME": DAGSTER_HOME}
+
+
+def _dagster_cmd():
+    return [os.path.join(VENV_BIN, "dagster"), "dev", "-f", "bench_server.py", "-p", "3000"]
+
+
 def bench_startup(runs):
     """Measure dagster dev startup time."""
     print(f"[dagster] Server startup time ({runs} runs):")
     times = []
     for i in range(runs):
         server = subprocess.Popen(
-            ["dagster", "dev", "-f", "bench_server.py", "-p", "3000"],
+            _dagster_cmd(),
             cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env={**os.environ, "DAGSTER_HOME": "/tmp/dagster_server_bench"},
+            env=_dagster_env(),
         )
         try:
             startup = wait_for_server()
@@ -155,9 +166,9 @@ def bench_startup(runs):
 def bench_refresh_latency(runs):
     """Measure GraphQL materialization latency (launch → success)."""
     server = subprocess.Popen(
-        ["dagster", "dev", "-f", "bench_server.py", "-p", "3000"],
+        _dagster_cmd(),
         cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env={**os.environ, "DAGSTER_HOME": "/tmp/dagster_server_bench"},
+        env=_dagster_env(),
     )
 
     try:

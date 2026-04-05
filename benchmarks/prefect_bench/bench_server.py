@@ -19,6 +19,8 @@ import urllib.request
 import urllib.error
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
+VENV_BIN = os.path.join(BENCH_DIR, ".venv", "bin")
+PREFECT_CMD = os.path.join(VENV_BIN, "prefect")
 BASE_URL = "http://127.0.0.1:4200"
 API_URL = f"{BASE_URL}/api"
 
@@ -61,7 +63,7 @@ def bench_startup(runs):
     times = []
     for i in range(runs):
         server = subprocess.Popen(
-            ["prefect", "server", "start", "--host", "127.0.0.1", "--port", "4200"],
+            [PREFECT_CMD, "server", "start", "--host", "127.0.0.1", "--port", "4200"],
             cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env={**os.environ,
                  "PREFECT_HOME": f"/tmp/prefect_server_bench_{i}",
@@ -98,7 +100,7 @@ def bench_flow_run_latency(runs):
     from prefect.client.orchestration import get_client
 
     server = subprocess.Popen(
-        ["prefect", "server", "start", "--host", "127.0.0.1", "--port", "4200"],
+        [PREFECT_CMD, "server", "start", "--host", "127.0.0.1", "--port", "4200"],
         cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         env={**os.environ,
              "PREFECT_HOME": "/tmp/prefect_server_bench",
