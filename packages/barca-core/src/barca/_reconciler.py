@@ -109,8 +109,8 @@ def reconcile(store: MetadataStore, repo_root: Path) -> ReconcileResult:
     return result
 
 
-def _handle_sensor(store, repo_root, detail, schedule, now, result, refreshed_ids, failed_ids, sensor_outputs):
-    """Check eligibility, call sensor, record observation."""
+def _handle_sensor(store, repo_root, detail, schedule, now, result, refreshed_ids, failed_ids, sensor_outputs) -> None:
+    """Execute a sensor if schedule-eligible. Records observation and mutates result/refreshed_ids/sensor_outputs."""
     aid = detail.asset.asset_id
 
     # Check schedule eligibility
@@ -152,8 +152,8 @@ def _handle_sensor(store, repo_root, detail, schedule, now, result, refreshed_id
         result.failed += 1
 
 
-def _handle_asset(store, repo_root, detail, inputs, schedule, now, result, refreshed_ids, failed_ids, sensor_outputs):
-    """Check staleness + eligibility, materialize if needed."""
+def _handle_asset(store, repo_root, detail, inputs, schedule, now, result, refreshed_ids, failed_ids, sensor_outputs) -> None:
+    """Materialize an asset if stale (definition changed or upstream refreshed) and schedule-eligible. Checks cache before executing."""
     aid = detail.asset.asset_id
 
     # Compute staleness: definition changed, or upstream refreshed this pass
@@ -275,8 +275,8 @@ def _handle_asset(store, repo_root, detail, inputs, schedule, now, result, refre
         result.failed += 1
 
 
-def _handle_effect(store, repo_root, detail, inputs, schedule, now, result, refreshed_ids, failed_ids, sensor_outputs):
-    """Check staleness + eligibility, execute effect."""
+def _handle_effect(store, repo_root, detail, inputs, schedule, now, result, refreshed_ids, failed_ids, sensor_outputs) -> None:
+    """Execute an effect if upstream was refreshed this pass. Effects are never cached."""
     aid = detail.asset.asset_id
 
     # Effects always re-execute when upstream is refreshed (never cached)

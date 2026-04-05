@@ -1,5 +1,7 @@
 # Notebook Workflow
 
+**Status: Implemented** — See `packages/barca-core/src/barca/_notebook.py` and `tests/test_notebook.py`.
+
 This document specifies how Barca assets should be used from a notebook.
 
 This is a core workflow, not an afterthought.

@@ -56,3 +56,6 @@ __marimo__/
 
 node_modules
 test-results
+
+# MkDocs
+site/
