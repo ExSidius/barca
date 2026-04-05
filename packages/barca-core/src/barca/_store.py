@@ -249,6 +249,9 @@ class MetadataStore:
         if row is None:
             raise ValueError(f"asset {asset_id} not found")
 
+        kind = row[17] or "asset"
+        latest_observation = self.latest_sensor_observation(asset_id) if kind == "sensor" else None
+
         return AssetDetail(
             asset=IndexedAsset(
                 asset_id=row[0],
@@ -258,7 +261,7 @@ class MetadataStore:
                 file_path=row[4],
                 function_name=row[5],
                 asset_slug=row[6],
-                kind=row[17] or "asset",
+                kind=kind,
                 definition_id=row[7],
                 definition_hash=row[8],
                 run_hash=row[8],  # placeholder — same as definition_hash
@@ -272,6 +275,7 @@ class MetadataStore:
                 dependency_cone_hash=row[16] or "",
             ),
             latest_materialization=self._latest_materialization(asset_id),
+            latest_observation=latest_observation,
         )
 
     def asset_id_by_logical_name(self, logical_name: str) -> int | None:
@@ -536,6 +540,21 @@ class MetadataStore:
             observation_id=row[0], asset_id=row[1], definition_id=row[2],
             update_detected=bool(row[3]), output_json=row[4], created_at=row[5],
         )
+
+    def list_sensor_observations(self, asset_id: int, limit: int = 50) -> list[SensorObservation]:
+        rows = self.conn.execute(
+            """SELECT id, asset_id, definition_id, update_detected, output_json, created_at
+               FROM sensor_observations WHERE asset_id = ?
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (asset_id, limit),
+        ).fetchall()
+        return [
+            SensorObservation(
+                observation_id=r[0], asset_id=r[1], definition_id=r[2],
+                update_detected=bool(r[3]), output_json=r[4], created_at=r[5],
+            )
+            for r in rows
+        ]
 
     # ------------------------------------------------------------------
     # Effect executions

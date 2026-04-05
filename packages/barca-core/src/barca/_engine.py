@@ -28,6 +28,7 @@ from barca._models import (
     IndexedAsset,
     InspectedAsset,
     MaterializationRecord,
+    SensorObservation,
 )
 from barca._store import MetadataStore
 
@@ -210,6 +211,11 @@ def refresh(store: MetadataStore, repo_root: Path, asset_id: int, *, max_workers
     """Materialize an asset and its upstream deps recursively. Returns final detail."""
     detail = store.asset_detail(asset_id)
 
+    if detail.asset.kind == "sensor":
+        raise ValueError(
+            f"asset #{asset_id} is a sensor — use trigger_sensor() instead of refresh()"
+        )
+
     # Resolve inputs
     asset_inputs = _resolve_asset_inputs(store, detail, repo_root)
 
@@ -263,6 +269,34 @@ def refresh(store: MetadataStore, repo_root: Path, asset_id: int, *, max_workers
             store, repo_root, detail, asset_inputs,
             input_kwargs, upstream_mat_ids,
         )
+
+
+def trigger_sensor(store: MetadataStore, repo_root: Path, asset_id: int) -> SensorObservation:
+    """Manually trigger a sensor, record and return the observation."""
+    detail = store.asset_detail(asset_id)
+
+    if detail.asset.kind != "sensor":
+        raise ValueError(f"asset #{asset_id} is not a sensor")
+
+    mod = importlib.import_module(detail.asset.module_path)
+    func = getattr(mod, detail.asset.function_name)
+    original = getattr(func, "__barca_original__", func)
+    sensor_result = original()
+
+    if not isinstance(sensor_result, tuple) or len(sensor_result) != 2:
+        raise ValueError(
+            f"sensor '{detail.asset.function_name}' must return (update_detected: bool, output), "
+            f"got {type(sensor_result).__name__}"
+        )
+
+    update_detected, output = sensor_result
+    output_json = json.dumps(output) if output is not None else None
+
+    store.insert_sensor_observation(
+        asset_id, detail.asset.definition_id, bool(update_detected), output_json,
+    )
+
+    return store.latest_sensor_observation(asset_id)
 
 
 def _refresh_single(

@@ -80,6 +80,7 @@ class AssetSummary(BaseModel):
 class AssetDetail(BaseModel):
     asset: IndexedAsset
     latest_materialization: MaterializationRecord | None = None
+    latest_observation: SensorObservation | None = None
 
 
 class JobDetail(BaseModel):

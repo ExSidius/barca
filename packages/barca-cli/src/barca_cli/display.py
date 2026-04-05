@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult
+from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult, SensorObservation
 
 
 def assets_table(assets: list[AssetSummary]) -> str:
@@ -23,9 +23,11 @@ def assets_table(assets: list[AssetSummary]) -> str:
 
 def asset_detail(detail: AssetDetail) -> str:
     a = detail.asset
+    kind_label = a.kind.capitalize() if a.kind else "Asset"
     lines = [
-        f"Asset #{a.asset_id}",
+        f"{kind_label} #{a.asset_id}",
         f"  Name:            {a.logical_name}",
+        f"  Kind:            {a.kind}",
         f"  Module:          {a.module_path}",
         f"  File:            {a.file_path}",
         f"  Function:        {a.function_name}",
@@ -34,7 +36,17 @@ def asset_detail(detail: AssetDetail) -> str:
     ]
     if a.return_type:
         lines.append(f"  Return type:     {a.return_type}")
-    if detail.latest_materialization:
+    if a.kind == "sensor":
+        if detail.latest_observation:
+            obs = detail.latest_observation
+            lines.append(f"  Last observation: #{obs.observation_id} (update_detected: {obs.update_detected})")
+            if obs.output_json:
+                truncated = obs.output_json[:80] + ("..." if len(obs.output_json) > 80 else "")
+                lines.append(f"  Output:          {truncated}")
+            lines.append(f"  Observed at:     {obs.created_at}")
+        else:
+            lines.append("  Last observation: none")
+    elif detail.latest_materialization:
         m = detail.latest_materialization
         lines.append(f"  Last job:        #{m.materialization_id} ({m.status})")
         if m.last_error:
@@ -92,6 +104,26 @@ def reconcile_summary(result: ReconcileResult) -> str:
     if total == 0:
         lines.append("  No nodes found.")
     return "\n".join(lines)
+
+
+def sensor_observations_table(observations: list[SensorObservation]) -> str:
+    if not observations:
+        return "No observations recorded."
+
+    headers = ["ID", "Update Detected", "Output", "Observed At"]
+    rows = []
+    for obs in observations:
+        output = obs.output_json or ""
+        if len(output) > 60:
+            output = output[:57] + "..."
+        rows.append([
+            str(obs.observation_id),
+            str(obs.update_detected),
+            output,
+            str(obs.created_at),
+        ])
+
+    return _format_table(headers, rows)
 
 
 def _format_table(headers: list[str], rows: list[list[str]]) -> str:

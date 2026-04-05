@@ -5,8 +5,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from barca._engine import reindex, refresh
-from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult
+from barca._engine import reindex, refresh, trigger_sensor as engine_trigger_sensor
+from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult, SensorObservation
 from barca._reconciler import reconcile
 from barca._store import MetadataStore
 
@@ -58,3 +58,32 @@ def get_job(store: MetadataStore, job_id: int) -> JobDetail:
     """Return detail for a single job."""
     mat, summary = store.get_materialization_with_asset(job_id)
     return JobDetail(job=mat, asset=summary)
+
+
+# ------------------------------------------------------------------
+# Sensors
+# ------------------------------------------------------------------
+
+
+def list_sensors(store: MetadataStore, repo_root: Path) -> list[AssetSummary]:
+    """Reindex and return all sensors."""
+    reindex(store, repo_root)
+    return [a for a in store.list_assets() if a.kind == "sensor"]
+
+
+def get_sensor_observations(
+    store: MetadataStore, asset_id: int, limit: int = 50,
+) -> list[SensorObservation]:
+    """Return observation history for a sensor."""
+    return store.list_sensor_observations(asset_id, limit)
+
+
+def trigger_sensor(
+    store: MetadataStore, repo_root: Path, asset_id: int,
+) -> SensorObservation:
+    """Reindex then trigger a sensor manually."""
+    reindex(store, repo_root)
+    logger.info("sensor trigger requested for asset %d", asset_id)
+    result = engine_trigger_sensor(store, repo_root, asset_id)
+    logger.info("sensor triggered for asset %d (update_detected=%s)", asset_id, result.update_detected)
+    return result
