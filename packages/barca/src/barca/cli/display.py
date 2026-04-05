@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from rich import box
-from rich.console import RenderableType
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -96,22 +96,22 @@ def asset_detail(detail: AssetDetail, repo_root: Path | None = None) -> Renderab
             kv.add_row("Observed at", Text(str(obs.created_at), style="dim"))
         else:
             kv.add_row("Last observation", Text("none", style="dim"))
-    elif detail.latest_materialization:
+    artifact_abs: str | None = None
+    if detail.latest_materialization:
         m = detail.latest_materialization
         kv.add_row("Last job", Text(f"#{m.materialization_id} ({m.status})", style=STATUS_STYLES.get(m.status, "")))
-        if m.artifact_path:
-            if repo_root is not None:
-                artifact_abs = str(repo_root / m.artifact_path)
-            else:
-                artifact_abs = m.artifact_path
-            kv.add_row("Artifact", Text(artifact_abs, style="dim"))
         if m.last_error:
             kv.add_row("Error", Text(m.last_error, style="bold red"))
+        if m.artifact_path:
+            artifact_abs = str(repo_root / m.artifact_path) if repo_root is not None else m.artifact_path
     else:
         kv.add_row("Last job", Text("none", style="dim"))
 
     kind_label = (a.kind or "asset").capitalize()
-    return Panel(kv, title=f"[bold]{kind_label} #{a.asset_id}[/bold]", box=box.ROUNDED, expand=False)
+    panel = Panel(kv, title=f"[bold]{kind_label} #{a.asset_id}[/bold]", box=box.ROUNDED, expand=False)
+    if artifact_abs:
+        return Group(panel, Text(f"  {artifact_abs}", style="dim"))
+    return panel
 
 
 def jobs_table(jobs: list[JobDetail]) -> RenderableType:
