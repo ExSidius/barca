@@ -76,6 +76,37 @@ cd "$SCRIPT_DIR/dagster_bench"
 DAGSTER_HOME=/tmp/dagster_bench .venv/bin/python bench.py "$RUNS" 2>/dev/null
 echo ""
 
+# ── Benchmark 1c: Concurrent Init ──
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  BENCHMARK 1c: 200 independent assets (concurrent init)"
+echo "  Measures reindex + parallel materialization overhead"
+echo "  Turso MVCC enables concurrent DB writes"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+echo "── Barca -j 1 (sequential) ──"
+cd "$SCRIPT_DIR/barca_bench"
+PATH="$BARCA_VENV:$PATH" python bench_concurrent_init.py "$RUNS" 200 1
+echo ""
+
+echo "── Barca -j $CORES ($CORES threads, free-threaded Python) ──"
+PATH="$BARCA_VENV:$PATH" python bench_concurrent_init.py "$RUNS" 200 "$CORES"
+echo ""
+
+echo "── Barca -j 64 (64 threads, free-threaded Python) ──"
+PATH="$BARCA_VENV:$PATH" python bench_concurrent_init.py "$RUNS" 200 64
+echo ""
+
+echo "── Prefect (64 threads, 1 process) ──"
+cd "$SCRIPT_DIR/prefect_bench"
+PREFECT_HOME=/tmp/prefect_cinit PREFECT_LOGGING_LEVEL=ERROR .venv/bin/python bench_concurrent_init.py "$RUNS" 200 2>/dev/null
+echo ""
+
+echo "── Dagster (sequential, in-process) ──"
+cd "$SCRIPT_DIR/dagster_bench"
+DAGSTER_HOME=/tmp/dagster_cinit .venv/bin/python bench_concurrent_init.py "$RUNS" 200 2>/dev/null
+echo ""
+
 # ── Benchmark 2: Cold Start ──
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  BENCHMARK 2: Cold start (single trivial asset)"
