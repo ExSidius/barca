@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from rich import box
 from rich.console import RenderableType
 from rich.panel import Panel
@@ -70,7 +72,7 @@ def assets_table(assets: list[AssetSummary]) -> RenderableType:
     return t
 
 
-def asset_detail(detail: AssetDetail) -> RenderableType:
+def asset_detail(detail: AssetDetail, repo_root: Path | None = None) -> RenderableType:
     a = detail.asset
     kv = _kv_table()
     kv.add_row("Name", a.logical_name)
@@ -97,6 +99,12 @@ def asset_detail(detail: AssetDetail) -> RenderableType:
     elif detail.latest_materialization:
         m = detail.latest_materialization
         kv.add_row("Last job", Text(f"#{m.materialization_id} ({m.status})", style=STATUS_STYLES.get(m.status, "")))
+        if m.artifact_path:
+            if repo_root is not None:
+                artifact_abs = str(repo_root / m.artifact_path)
+            else:
+                artifact_abs = m.artifact_path
+            kv.add_row("Artifact", Text(artifact_abs, style="dim"))
         if m.last_error:
             kv.add_row("Error", Text(m.last_error, style="bold red"))
     else:
@@ -155,8 +163,7 @@ def reconcile_summary(result: ReconcileResult) -> RenderableType:
     if result.failed:
         kv.add_row("Failed", Text(str(result.failed), style="bold red"))
 
-    total = (result.executed_sensors + result.executed_assets + result.executed_effects
-             + result.fresh + result.stale_waiting + result.failed)
+    total = result.executed_sensors + result.executed_assets + result.executed_effects + result.fresh + result.stale_waiting + result.failed
     if total == 0:
         kv.add_row("", Text("No nodes found.", style="dim italic"))
 
