@@ -6,7 +6,7 @@ requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.0",
     "croniter>=2.0",
-    "libsql>=0.1.0",
+    "pyturso>=0.5.0",
 ]
 
 [build-system]

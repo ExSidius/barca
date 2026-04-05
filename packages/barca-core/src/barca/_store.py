@@ -1,17 +1,10 @@
-"""MetadataStore — libSQL/Turso persistence layer (falls back to stdlib sqlite3)."""
+"""MetadataStore — Turso/libSQL persistence layer."""
 
 from __future__ import annotations
 
 import os
 
-try:
-    import libsql
-
-    _HAS_LIBSQL = True
-except ImportError:  # pragma: no cover
-    import sqlite3
-
-    _HAS_LIBSQL = False
+import turso
 
 from barca._hashing import now_ts
 from barca._models import (
@@ -113,17 +106,17 @@ CREATE TABLE IF NOT EXISTS effect_executions (
 
 
 def _connect(db_path: str):
-    """Connect using libsql (primary) with optional Turso remote sync, or stdlib sqlite3 as fallback."""
-    if _HAS_LIBSQL:
-        turso_url = os.environ.get("BARCA_TURSO_URL")
-        if turso_url:
-            return libsql.connect(
-                db_path,
-                sync_url=turso_url,
-                auth_token=os.environ.get("BARCA_TURSO_TOKEN", ""),
-            )
-        return libsql.connect(db_path)
-    return sqlite3.connect(db_path)  # pragma: no cover
+    """Connect using Turso with optional remote sync."""
+    turso_url = os.environ.get("BARCA_TURSO_URL")
+    if turso_url:
+        from turso.sync import connect as sync_connect
+
+        return sync_connect(
+            db_path,
+            remote_url=turso_url,
+            auth_token=os.environ.get("BARCA_TURSO_TOKEN", ""),
+        )
+    return turso.connect(db_path)
 
 
 class MetadataStore:
