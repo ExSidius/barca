@@ -71,7 +71,7 @@ Included:
 - partitions with `partitions(iterable)`
 - HTTP API (FastAPI) + background scheduler
 - CLI for all operations (no server required)
-- free-threaded Python (3.13t) for parallel partition execution
+- free-threaded Python (3.14t) for parallel partition execution
 
 Planned for later in 0.1:
 

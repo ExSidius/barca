@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 import os
+import warnings
 
-import turso
+# turso/lib.py has a `return` inside a `finally` block (SyntaxWarning) and its
+# C extension hasn't declared Py_mod_gil (RuntimeWarning on free-threaded Python).
+# Both are upstream issues; suppress them so users don't see noise on import.
+# filterwarnings at module level (not inside a context manager) is required because
+# the SyntaxWarning is emitted at compile time when the source file is first parsed.
+warnings.filterwarnings("ignore", category=SyntaxWarning, module="turso")
+warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*GIL.*")
+import turso  # noqa: E402
 
 from barca._hashing import now_ts
 from barca._models import (
@@ -111,12 +119,17 @@ def _connect(db_path: str):
     if turso_url:
         from turso.sync import connect as sync_connect
 
-        return sync_connect(
+        conn = sync_connect(
             db_path,
             remote_url=turso_url,
             auth_token=os.environ.get("BARCA_TURSO_TOKEN", ""),
         )
-    return turso.connect(db_path)
+    else:
+        conn = turso.connect(db_path)
+    # Allow concurrent writers to wait up to 10 seconds before raising
+    # "database is locked" — required for per-thread MetadataStore usage.
+    conn.execute("PRAGMA busy_timeout = 10000")
+    return conn
 
 
 class MetadataStore:
@@ -162,20 +175,21 @@ class MetadataStore:
             pass
 
         if existing_id is None:
+            # Atomic insert — INSERT OR IGNORE avoids the race condition where two
+            # threads both see no existing row and then contend on the UNIQUE constraint.
             self.conn.execute(
-                "INSERT INTO assets (logical_name, continuity_key, module_path, file_path, function_name, asset_slug, kind, schedule, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO assets (logical_name, continuity_key, module_path, file_path, function_name, asset_slug, kind, schedule, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (asset.logical_name, asset.continuity_key, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, asset.kind, schedule_str, created_at),
             )
             self.conn.commit()
-            row = self.conn.execute("SELECT last_insert_rowid()").fetchone()
-            asset_id = row[0]
-        else:
-            asset_id = existing_id
-            self.conn.execute(
-                "UPDATE assets SET logical_name = ?, module_path = ?, file_path = ?, function_name = ?, asset_slug = ?, kind = ?, schedule = ? WHERE id = ?",
-                (asset.logical_name, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, asset.kind, schedule_str, asset_id),
-            )
-            self.conn.commit()
+            existing_id = self._asset_id_by_continuity_key(asset.continuity_key)
+
+        asset_id = existing_id
+        self.conn.execute(
+            "UPDATE assets SET logical_name = ?, module_path = ?, file_path = ?, function_name = ?, asset_slug = ?, kind = ?, schedule = ? WHERE id = ?",
+            (asset.logical_name, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, asset.kind, schedule_str, asset_id),
+        )
+        self.conn.commit()
 
         # Mark all existing definitions as historical
         self.conn.execute(

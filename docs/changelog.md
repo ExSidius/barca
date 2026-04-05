@@ -25,7 +25,7 @@
 - Schedule-driven reconciliation: `"manual"`, `"always"`, `cron("...")` schedules
 - Single-pass and continuous (`--watch`) reconcile modes
 - AST-based dependency tracing with per-function dependency cone hashing
-- Partitioned assets with `ThreadPoolExecutor` parallelism (free-threaded Python 3.13t)
+- Partitioned assets with `ThreadPoolExecutor` parallelism (free-threaded Python 3.14t)
 - Asset continuity via `@asset(name="stable_name")`
 - SQLite metadata store with optional Turso/libSQL remote support
 - Typer CLI: `reindex`, `assets`, `sensors`, `jobs`, `reconcile`, `serve`, `reset`

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,12 +19,18 @@ from barca.cli.display import asset_detail, assets_table, job_detail, jobs_table
 def _check_gil() -> None:
     """Warn if running with the GIL enabled (parallel perf will suffer)."""
     is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
-    if is_gil_enabled is not None and is_gil_enabled():
-        typer.echo(
-            "barca: WARNING: GIL is enabled. For best parallel performance, "
-            "use the free-threaded build (python3.14t) or set PYTHON_GIL=0.",
-            err=True,
-        )
+    if is_gil_enabled is None or not is_gil_enabled():
+        return
+    # Suppress the warning if the user already set PYTHON_GIL=0 — the GIL may
+    # have been re-enabled by a C extension (e.g. turso) that hasn't declared
+    # Py_mod_gil, which is an upstream issue, not a misconfiguration.
+    if os.environ.get("PYTHON_GIL") == "0":
+        return
+    typer.echo(
+        "barca: WARNING: GIL is enabled. For best parallel performance, "
+        "use the free-threaded build (python3.14t) and set PYTHON_GIL=0.",
+        err=True,
+    )
 
 
 app = typer.Typer(add_completion=False, callback=_check_gil)

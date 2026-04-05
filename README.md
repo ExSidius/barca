@@ -6,7 +6,7 @@
 <p align="center">
   <a href="https://github.com/ExSidius/barca/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ExSidius/barca/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="https://github.com/ExSidius/barca/releases"><img alt="Release" src="https://img.shields.io/github/v/release/ExSidius/barca?include_prereleases&label=release" /></a>
-  <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.13-blue" />
+  <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.14-blue" />
   <img alt="License" src="https://img.shields.io/github/license/ExSidius/barca" />
 </p>
 
@@ -159,7 +159,7 @@ uv run barca reset [--db] [--artifacts] [--tmp]    Clean generated files
 - **Asset discovery** — decorate any Python function with `@asset()`, barca finds it
 - **Dependency tracking** — declare upstream inputs with `@asset(inputs={"x": upstream})`, barca resolves the DAG, materializes upstreams first, and passes artifacts as kwargs
 - **Partitioned assets** — `@asset(partitions={"key": partitions([...])})` fans out into N parallel jobs, one per partition value
-- **Parallel execution** — partition batches use `ThreadPoolExecutor` with free-threaded Python (3.13t, GIL disabled) for true thread parallelism
+- **Parallel execution** — partition batches use `ThreadPoolExecutor` with free-threaded Python (3.14t, GIL disabled) for true thread parallelism
 - **Artifact versioning** — each materialization is keyed by a `definition_hash` (source + deps + dependency cone hash) and a `run_hash` (definition + upstream versions + partition key); identical runs are cached
 - **Asset continuity** — rename or move assets while preserving lineage via `@asset(name="stable_name")`
 - **Schedule-driven reconciliation** — `"manual"`, `"always"`, or `cron("0 5 * * *")` schedules with single-pass or continuous reconcile
@@ -212,7 +212,7 @@ uv run barca reset [--db] [--artifacts] [--tmp]    Clean generated files
 **Key design decisions:**
 - Pure Python — no native extensions, no subprocess workers
 - Materialize via `importlib.import_module()` + direct function call
-- Free-threaded Python (3.13t) for true thread parallelism in partitions
+- Free-threaded Python (3.14t) for true thread parallelism in partitions
 - The CLI opens the database directly — no server needed
 - The server is optional — adds HTTP API and background scheduler
 - SQLite (stdlib) for metadata; optional Turso/libSQL for remote
@@ -251,7 +251,7 @@ GET  /jobs/{id}                        → JobDetail
 
 | Layer | Technology |
 |-------|-----------|
-| Core | Python 3.13+ (free-threaded) |
+| Core | Python 3.14+ (free-threaded) |
 | Models | [Pydantic](https://docs.pydantic.dev/) 2.0 |
 | Database | SQLite (stdlib); optional [Turso/libSQL](https://turso.tech/) |
 | CLI | [Typer](https://typer.tiangolo.com/) 0.9 |

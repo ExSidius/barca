@@ -48,7 +48,7 @@ packages/
 3. **Functional style** — pure functions wherever possible. Side effects (DB, file I/O) at the edges.
 4. **Three packages** — `barca` is the reusable library; `barca-cli` is the thin CLI layer; `barca-server` is the optional HTTP server.
 5. **Routes are thin wrappers** — FastAPI handlers validate params and delegate to `service.py`. No business logic in route functions.
-6. **Free-threaded Python** — defaults to 3.13t (GIL disabled). Partition parallelism via `ThreadPoolExecutor`.
+6. **Free-threaded Python** — defaults to 3.14t (GIL disabled). Partition parallelism via `ThreadPoolExecutor`.
 7. **Same hashing protocol** — `PROTOCOL_VERSION = "0.3.0"`, JSON payload -> SHA-256.
 8. **sqlite3 thread safety** — `MetadataStore` must be created in the same thread that uses it. Server routes create stores inside `to_thread` calls.
 
@@ -75,7 +75,7 @@ Barca executes user functions directly in the same Python process:
 
 There are no subprocess workers, no IPC, and no serialization boundaries between the orchestrator and user code. This keeps execution fast and tracebacks accurate.
 
-For partitioned assets, Barca uses `ThreadPoolExecutor` with free-threaded Python (3.13t, GIL disabled) for true parallel execution.
+For partitioned assets, Barca uses `ThreadPoolExecutor` with free-threaded Python (3.14t, GIL disabled) for true parallel execution.
 
 ## Storage
 

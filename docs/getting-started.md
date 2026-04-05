@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Python 3.13+ (free-threaded 3.13t recommended)
+- Python 3.14+ (free-threaded 3.14t recommended)
 - [uv](https://docs.astral.sh/uv/) package manager
 
 ## Installation
@@ -10,8 +10,13 @@
 ```bash
 uv init --app my-project
 cd my-project
+echo "3.14t" > .python-version
+echo "PYTHON_GIL=0" > .env
+uv python install 3.14t
 uv add barca
 ```
+
+The `.python-version` file pins the project to free-threaded Python. `PYTHON_GIL=0` ensures the GIL stays disabled even when C extensions (such as the turso DB driver) haven't yet declared GIL safety — without it, those extensions silently re-enable the GIL at import time and barca will warn you. Pass `--env-file .env` to `uv run` or export `PYTHON_GIL=0` in your shell to apply it automatically.
 
 This installs the `@asset()` decorator and the `barca` CLI into your project's virtualenv.
 

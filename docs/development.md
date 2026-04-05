@@ -55,12 +55,12 @@ uv run pytest tests/test_server.py -v
 
 ## Free-threaded Python
 
-Barca defaults to Python 3.13t (free-threaded, GIL disabled) via `.python-version`. This enables true thread parallelism for partitioned assets.
+Barca defaults to Python 3.14t (free-threaded, GIL disabled) via `.python-version`. This enables true thread parallelism for partitioned assets.
 
 To opt out and use standard Python:
 
 ```bash
-echo "3.13" > .python-version
+echo "3.14" > .python-version
 uv sync
 ```
 
@@ -77,5 +77,5 @@ barca/
 ├── benchmarks/              # Performance benchmarks
 ├── docs/                    # Documentation and specs
 ├── pyproject.toml           # Workspace root
-└── .python-version          # 3.13t (free-threaded)
+└── .python-version          # 3.14t (free-threaded)
 ```
