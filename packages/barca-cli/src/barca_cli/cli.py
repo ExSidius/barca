@@ -9,9 +9,10 @@ import typer
 
 from barca._engine import reindex as do_reindex, refresh as do_refresh, reset as do_reset
 from barca._models import JobDetail
+from barca._reconciler import reconcile as do_reconcile
 from barca._store import MetadataStore
 
-from barca_cli.display import asset_detail, assets_table, job_detail, jobs_table
+from barca_cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary
 
 
 def _check_gil() -> None:
@@ -61,6 +62,25 @@ def reset(
     root = _repo_root()
     output = do_reset(root, db=db, artifacts=artifacts, tmp=tmp)
     typer.echo(output, nl=False)
+
+
+@app.command()
+def reconcile(
+    watch: bool = typer.Option(False, "--watch", help="Run continuously"),
+    interval: int = typer.Option(60, "--interval", help="Seconds between reconcile passes (with --watch)"),
+) -> None:
+    """Run a single reconciliation pass (or loop with --watch)."""
+    import time
+
+    root = _repo_root()
+    while True:
+        store = _store()
+        result = do_reconcile(store, root)
+        typer.echo(reconcile_summary(result))
+        if not watch:
+            break
+        typer.echo(f"Sleeping {interval}s...")
+        time.sleep(interval)
 
 
 @assets_app.command("list")

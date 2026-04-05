@@ -10,9 +10,11 @@ from barca._models import (
     AssetDetail,
     AssetInput,
     AssetSummary,
+    EffectExecution,
     IndexedAsset,
     JobDetail,
     MaterializationRecord,
+    SensorObservation,
 )
 
 _SCHEMA = """
@@ -83,6 +85,22 @@ CREATE TABLE IF NOT EXISTS materialization_inputs (
     upstream_materialization_id INTEGER NOT NULL,
     upstream_asset_id INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sensor_observations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL,
+    definition_id INTEGER NOT NULL,
+    update_detected INTEGER NOT NULL,
+    output_json TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS effect_executions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL,
+    definition_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    last_error TEXT,
+    created_at INTEGER NOT NULL
+);
 """
 
 
@@ -112,6 +130,13 @@ class MetadataStore:
             if statement:
                 self.conn.execute(statement)
         self.conn.commit()
+        # Migrations for kind and schedule columns
+        for col, default in [("kind", "'asset'"), ("schedule", "'manual'")]:
+            try:
+                self.conn.execute(f"ALTER TABLE assets ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
+                self.conn.commit()
+            except Exception:
+                pass  # column already exists
 
     # ------------------------------------------------------------------
     # Assets
@@ -121,10 +146,19 @@ class MetadataStore:
         created_at = now_ts()
         existing_id = self._asset_id_by_continuity_key(asset.continuity_key)
 
+        # Extract schedule from decorator metadata
+        schedule_str = "manual"
+        try:
+            import json as _json
+            meta = _json.loads(asset.decorator_metadata_json)
+            schedule_str = meta.get("schedule", "manual")
+        except Exception:
+            pass
+
         if existing_id is None:
             self.conn.execute(
-                "INSERT INTO assets (logical_name, continuity_key, module_path, file_path, function_name, asset_slug, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (asset.logical_name, asset.continuity_key, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, created_at),
+                "INSERT INTO assets (logical_name, continuity_key, module_path, file_path, function_name, asset_slug, kind, schedule, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (asset.logical_name, asset.continuity_key, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, asset.kind, schedule_str, created_at),
             )
             self.conn.commit()
             row = self.conn.execute("SELECT last_insert_rowid()").fetchone()
@@ -132,8 +166,8 @@ class MetadataStore:
         else:
             asset_id = existing_id
             self.conn.execute(
-                "UPDATE assets SET logical_name = ?, module_path = ?, file_path = ?, function_name = ?, asset_slug = ? WHERE id = ?",
-                (asset.logical_name, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, asset_id),
+                "UPDATE assets SET logical_name = ?, module_path = ?, file_path = ?, function_name = ?, asset_slug = ?, kind = ?, schedule = ? WHERE id = ?",
+                (asset.logical_name, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, asset.kind, schedule_str, asset_id),
             )
             self.conn.commit()
 
@@ -173,7 +207,8 @@ class MetadataStore:
 
     def list_assets(self) -> list[AssetSummary]:
         rows = self.conn.execute(
-            """SELECT a.id, a.logical_name, a.module_path, a.file_path, a.function_name, d.definition_hash
+            """SELECT a.id, a.logical_name, a.module_path, a.file_path, a.function_name,
+                      d.definition_hash, a.kind, a.schedule
                FROM assets a
                JOIN asset_definitions d ON d.asset_id = a.id AND d.status = 'current'
                ORDER BY a.logical_name ASC""",
@@ -186,10 +221,12 @@ class MetadataStore:
             assets.append(AssetSummary(
                 asset_id=asset_id,
                 logical_name=row[1],
+                kind=row[6] or "asset",
                 module_path=row[2],
                 file_path=row[3],
                 function_name=row[4],
                 definition_hash=row[5],
+                schedule=row[7] or "manual",
                 materialization_status=latest.status if latest else None,
                 materialization_run_hash=latest.run_hash if latest else None,
                 materialization_created_at=latest.created_at if latest else None,
@@ -202,7 +239,7 @@ class MetadataStore:
                       a.function_name, a.asset_slug,
                       d.id, d.definition_hash, d.source_text, d.module_source_text,
                       d.decorator_metadata_json, d.return_type, d.serializer_kind,
-                      d.python_version, d.codebase_hash, d.dependency_cone_hash
+                      d.python_version, d.codebase_hash, d.dependency_cone_hash, a.kind
                FROM assets a
                JOIN asset_definitions d ON d.asset_id = a.id AND d.status = 'current'
                WHERE a.id = ?""",
@@ -221,6 +258,7 @@ class MetadataStore:
                 file_path=row[4],
                 function_name=row[5],
                 asset_slug=row[6],
+                kind=row[17] or "asset",
                 definition_id=row[7],
                 definition_hash=row[8],
                 run_hash=row[8],  # placeholder — same as definition_hash
@@ -468,6 +506,66 @@ class MetadataStore:
                 (materialization_id, inp["parameter_name"], inp["upstream_materialization_id"], inp["upstream_asset_id"]),
             )
         self.conn.commit()
+
+    # ------------------------------------------------------------------
+    # Sensor observations
+    # ------------------------------------------------------------------
+
+    def insert_sensor_observation(
+        self, asset_id: int, definition_id: int, update_detected: bool,
+        output_json: str | None = None,
+    ) -> int:
+        self.conn.execute(
+            "INSERT INTO sensor_observations (asset_id, definition_id, update_detected, output_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            (asset_id, definition_id, 1 if update_detected else 0, output_json, now_ts()),
+        )
+        self.conn.commit()
+        row = self.conn.execute("SELECT last_insert_rowid()").fetchone()
+        return row[0]
+
+    def latest_sensor_observation(self, asset_id: int) -> SensorObservation | None:
+        row = self.conn.execute(
+            """SELECT id, asset_id, definition_id, update_detected, output_json, created_at
+               FROM sensor_observations WHERE asset_id = ?
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (asset_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return SensorObservation(
+            observation_id=row[0], asset_id=row[1], definition_id=row[2],
+            update_detected=bool(row[3]), output_json=row[4], created_at=row[5],
+        )
+
+    # ------------------------------------------------------------------
+    # Effect executions
+    # ------------------------------------------------------------------
+
+    def insert_effect_execution(
+        self, asset_id: int, definition_id: int, status: str,
+        last_error: str | None = None,
+    ) -> int:
+        self.conn.execute(
+            "INSERT INTO effect_executions (asset_id, definition_id, status, last_error, created_at) VALUES (?, ?, ?, ?, ?)",
+            (asset_id, definition_id, status, last_error, now_ts()),
+        )
+        self.conn.commit()
+        row = self.conn.execute("SELECT last_insert_rowid()").fetchone()
+        return row[0]
+
+    def latest_effect_execution(self, asset_id: int) -> EffectExecution | None:
+        row = self.conn.execute(
+            """SELECT id, asset_id, definition_id, status, last_error, created_at
+               FROM effect_executions WHERE asset_id = ?
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (asset_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return EffectExecution(
+            execution_id=row[0], asset_id=row[1], definition_id=row[2],
+            status=row[3], last_error=row[4], created_at=row[5],
+        )
 
     # ------------------------------------------------------------------
     # Private helpers

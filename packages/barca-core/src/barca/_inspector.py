@@ -37,7 +37,7 @@ def inspect_modules(
 
         for _name, obj in inspect.getmembers(module):
             kind = getattr(obj, "__barca_kind__", None)
-            if kind != "asset":
+            if kind not in ("asset", "sensor", "effect"):
                 continue
 
             metadata = getattr(obj, "__barca_metadata__", {})
@@ -88,7 +88,7 @@ def inspect_modules(
             mod_path = getattr(module, "__name__", module_name)
 
             assets.append(InspectedAsset(
-                kind="asset",
+                kind=kind,
                 module_path=mod_path,
                 file_path=file_path,
                 function_name=function_name,

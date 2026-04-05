@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from barca._schedule import Schedule, serialize_schedule
+
 
 class Partitions:
     """Marker type for partition declarations."""
@@ -26,7 +28,7 @@ def partitions(values: list) -> Partitions:
 def _resolve_input_ref(value: Any) -> str:
     """Resolve an input value to a canonical asset ref: '{abs_path}:{func_name}'."""
     kind = getattr(value, "__barca_kind__", None)
-    if kind == "asset":
+    if kind in ("asset", "sensor"):
         original = getattr(value, "__barca_original__", value)
         source_file = inspect.getsourcefile(original)
         file_path = str(Path(source_file).resolve()) if source_file else ""
@@ -36,7 +38,7 @@ def _resolve_input_ref(value: Any) -> str:
     if isinstance(value, str):
         return value
 
-    raise TypeError("inputs values must be @asset-decorated functions or asset ref strings")
+    raise TypeError("inputs values must be @asset or @sensor decorated functions, or ref strings")
 
 
 class AssetWrapper:
@@ -52,12 +54,14 @@ class AssetWrapper:
         inputs: dict[str, str] | None = None,
         partitions: dict[str, dict] | None = None,
         serializer: str | None = None,
+        schedule: Schedule = "manual",
     ):
         self._original = original
         self._name = name
         self._inputs = inputs
         self._partitions = partitions
         self._serializer = serializer
+        self._schedule = schedule
         # Forward dunder attributes (can't use properties for these)
         self.__name__ = original.__name__
         self.__doc__ = original.__doc__
@@ -76,6 +80,7 @@ class AssetWrapper:
             "serializer": self._serializer,
             "inputs": self._inputs,
             "partitions": self._partitions,
+            "schedule": serialize_schedule(self._schedule),
         }
         return meta
 
@@ -87,7 +92,7 @@ class AssetWrapper:
         return self
 
 
-def asset(func=None, *, name=None, inputs=None, partitions=None, serializer=None):
+def asset(func=None, *, name=None, inputs=None, partitions=None, serializer=None, schedule: Schedule = "manual"):
     """Decorator that registers a Python function as a barca asset."""
 
     # Resolve inputs eagerly at decoration time
@@ -118,6 +123,7 @@ def asset(func=None, *, name=None, inputs=None, partitions=None, serializer=None
             inputs=resolved_inputs,
             partitions=resolved_partitions,
             serializer=serializer,
+            schedule=schedule,
         )
 
     # @asset() or @asset(name=...) etc.: return a decorator
@@ -128,6 +134,7 @@ def asset(func=None, *, name=None, inputs=None, partitions=None, serializer=None
             inputs=resolved_inputs,
             partitions=resolved_partitions,
             serializer=serializer,
+            schedule=schedule,
         )
 
     return decorator

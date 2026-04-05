@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-from barca._models import AssetDetail, AssetSummary, JobDetail
+from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult
 
 
 def assets_table(assets: list[AssetSummary]) -> str:
     if not assets:
         return "No assets indexed."
 
-    headers = ["ID", "Name", "Module", "Function", "Status"]
+    headers = ["ID", "Kind", "Name", "Module", "Function", "Schedule", "Status"]
     rows = []
     for a in assets:
         status = a.materialization_status or "never run"
-        rows.append([str(a.asset_id), a.logical_name, a.module_path, a.function_name, status])
+        rows.append([
+            str(a.asset_id), a.kind, a.logical_name, a.module_path,
+            a.function_name, a.schedule, status,
+        ])
 
     return _format_table(headers, rows)
 
@@ -67,6 +70,27 @@ def job_detail(detail: JobDetail) -> str:
         lines.append(f"  Artifact:  {j.artifact_path}")
     if j.last_error:
         lines.append(f"  Error:     {j.last_error}")
+    return "\n".join(lines)
+
+
+def reconcile_summary(result: ReconcileResult) -> str:
+    lines = ["Reconcile complete:"]
+    if result.executed_sensors:
+        lines.append(f"  Sensors executed:  {result.executed_sensors}")
+    if result.executed_assets:
+        lines.append(f"  Assets executed:   {result.executed_assets}")
+    if result.executed_effects:
+        lines.append(f"  Effects executed:  {result.executed_effects}")
+    if result.fresh:
+        lines.append(f"  Fresh (skipped):   {result.fresh}")
+    if result.stale_waiting:
+        lines.append(f"  Stale (waiting):   {result.stale_waiting}")
+    if result.failed:
+        lines.append(f"  Failed:            {result.failed}")
+    total = (result.executed_sensors + result.executed_assets + result.executed_effects
+             + result.fresh + result.stale_waiting + result.failed)
+    if total == 0:
+        lines.append("  No nodes found.")
     return "\n".join(lines)
 
 

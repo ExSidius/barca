@@ -42,9 +42,6 @@ def build_indexed_asset(
     inspected: InspectedAsset,
     codebase_hash: str,
 ) -> tuple[IndexedAsset, list[AssetInput]]:
-    if inspected.kind != "asset":
-        raise ValueError(f"unsupported node kind: {inspected.kind}")
-
     file_path = Path(inspected.file_path)
     relative_file = relative_path(repo_root, file_path)
     explicit_name = inspected.decorator_metadata.get("name")
@@ -101,6 +98,7 @@ def build_indexed_asset(
         file_path=relative_file,
         function_name=inspected.function_name,
         asset_slug=asset_slug,
+        kind=inspected.kind,
         definition_id=0,
         definition_hash=definition_hash,
         run_hash=run_hash,
