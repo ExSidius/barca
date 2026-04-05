@@ -1,44 +1,32 @@
 # Changelog
 
-## [0.2.2] - 2025-03-08
-
-### Fixed
-
-- Replace Tailwind CDN with production build: use PostCSS/Tailwind CLI to build CSS at compile time, eliminating "cdn.tailwindcss.com should not be used in production" warning
-
-### Technical
-
-- Added `package.json`, `tailwind.config.js`, `static/css/input.css` for Tailwind build
-- Built CSS embedded via `include_str!`; run `just build-css` or `npm run build:css` after changing templates
-
-## [0.2.1] - 2025-03-08
-
-### Fixed
-
-- Datastar action attributes: use `data-on:click` (colon) instead of `data-on-click` (hyphen) so Reindex and Refresh buttons work
-- Materialize SSE response: only patch the asset card, not the status fragment (avoids patching non-existent `#asset-status` into main content)
-- Full page reload on click: add `type="button"` and `__prevent` modifier to Datastar action buttons so clicks are intercepted and default behavior is prevented
-
-## [0.2.0] - 2025-03-08
+## [Unreleased]
 
 ### Added
 
-- Sidebar with Assets and Jobs tabs; default view is Assets
-- Right-side asset panel: clicking an asset card opens a panel instead of navigating
-- Job history in asset panel with status icons (queued: ..., running: spinner, success: green check, failed: red x)
-- Jobs view listing recent materializations across all assets
-- Live job updates via SSE push (no polling); panel stream pushes updates when jobs complete
-- datastar-rust SDK integration for all SSE patches
-- 3s sleep in example asset to simulate long-running computation
+- Sensors as first-class nodes: dedicated `barca sensors list/show/trigger` CLI commands, `GET /sensors`, `GET /sensors/{id}/observations`, `POST /sensors/{id}/trigger` API endpoints
+- `trigger_sensor()` engine function for manual sensor execution
+- `list_sensor_observations()` for observation history retrieval
+- `AssetDetail.latest_observation` populated for sensor nodes
+- Sensor-aware CLI display (observation info instead of materialization info)
+- 10 new tests (5 sensor unit + 5 server integration including e2e)
 
-### Changed
+## [0.1.0] - 2025
 
-- Reorganized Rust code: `lib.rs` (core orchestration), `server.rs` (web serving), `main.rs` (minimal entry point)
-- Removed asset detail page (`GET /assets/{id}`); replaced with inline panel
-- Asset card click opens panel via EventSource instead of navigation
+### Added
 
-### Technical
-
-- Added `list_materializations_for_asset` and `list_recent_materializations` to store
-- Added `job_completion_tx` broadcast channel for SSE push
-- Extended `docs/templates-architecture.md` with Datastar Integration patterns
+- Pure Python uv workspace architecture (3 packages: barca-core, barca-cli, barca-server)
+- `@asset()` decorator with dependency tracking, partitions, and content-addressed caching
+- `@sensor()` decorator for external state observation with `(update_detected, output)` return contract
+- `@effect()` decorator for side-effect leaf nodes
+- Schedule-driven reconciliation: `"manual"`, `"always"`, `cron("...")` schedules
+- Single-pass and continuous (`--watch`) reconcile modes
+- AST-based dependency tracing with per-function dependency cone hashing
+- Partitioned assets with `ThreadPoolExecutor` parallelism (free-threaded Python 3.13t)
+- Asset continuity via `@asset(name="stable_name")`
+- SQLite metadata store with optional Turso/libSQL remote support
+- Typer CLI: `reindex`, `assets`, `sensors`, `jobs`, `reconcile`, `serve`, `reset`
+- FastAPI HTTP server with background scheduler
+- 61 pytest tests covering all features
+- Benchmark suite comparing Barca, Prefect, and Dagster
+- Spaceflights benchmark (10-asset diamond DAG adapted from Kedro)

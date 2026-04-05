@@ -6,16 +6,14 @@ This file scopes Barca by release so the MVP does not quietly expand.
 
 Goal:
 
-- ship a usable local orchestrator with a strong Python authoring model and a real web UI
+- ship a usable local orchestrator with a strong Python authoring model
 
 ### 0.1.1
 
 Goal:
 
-- implement only the first workflow end to end
-- establish the Rust application skeleton
+- implement the first workflow end to end
 - establish the Python package skeleton
-- establish a minimal Datastar web UI
 
 Included:
 
@@ -23,16 +21,10 @@ Included:
   - one decorated asset
   - no inputs
   - JSON output path for simple scalar values
-- basic Rust app skeleton:
-  - `tokio` runtime
-  - HTTP server
-  - Datastar frontend shell
-  - local metadata service abstraction
-  - basic executor abstraction
 - basic Python package skeleton:
   - `@asset`
+  - metadata attachment on decorated functions
   - inspection helper for no-input assets
-  - worker entrypoint for no-input asset execution
   - JSON serializer for supported simple values
 - indexing for the first workflow
 - materialization for the first workflow
@@ -43,12 +35,10 @@ Included:
 - `.barcafiles` layout for the first workflow
 - preflight `definition_hash` consistency check
 - cache reuse for the first workflow
-- basic web UI with:
+- basic CLI with:
   - asset list
-  - asset detail page
-  - latest materialization status
-  - trigger materialization action
-  - live status update for a running materialization
+  - asset detail
+  - trigger materialization
 
 Explicitly out of scope for 0.1.1:
 
@@ -60,25 +50,16 @@ Explicitly out of scope for 0.1.1:
 - schedules/reconciler loop
 - retries/timeouts/cancellation
 - notebook helpers beyond plain import-and-call
-- advanced artifact formats beyond JSON for the first happy path
+- advanced artifact formats beyond JSON
 
-Exit criteria:
-
-- a user can define the first workflow asset
-- Barca can index it
-- Barca can materialize it through the Rust orchestrator
-- Barca writes the expected `.barcafiles/...` layout
-- Barca reuses the prior materialization when the definition has not changed
-- the web UI shows the asset and lets the user trigger the run
+### 0.1 full scope
 
 Included:
 
-- Rust runtime with `tokio`
-- HTTP/API server and main web UI
+- pure Python uv workspace (3 packages: core, CLI, server)
 - asset autodiscovery from decorator semantics
-- asset graph rendering in the web UI
-- pure `@asset` workflow
-- `@sensor` workflow
+- `@asset` workflow with dependency tracking
+- `@sensor` workflow with observation history
 - `@effect` workflow
 - schedule-driven reconciliation with:
   - `manual`
@@ -87,19 +68,17 @@ Included:
 - preflight definition hash consistency checks
 - append-only history for definitions and materializations
 - provenance-based cache reuse
+- partitions with `partitions(iterable)`
+- HTTP API (FastAPI) + background scheduler
+- CLI for all operations (no server required)
+- free-threaded Python (3.13t) for parallel partition execution
+
+Planned for later in 0.1:
+
 - notebook workflow with `load_inputs(...) -> dict`
-- partitions with:
-  - `partitions(iterable)`
-  - `partitions_from(...)`
-- ad hoc runtime params included in cache identity
-- timeout support on assets, sensors, and effects:
-  - `timeout_seconds`, default `300`
-- fixed retry policy:
-  - 3 attempts total
-  - exponential backoff
-- real-time running state in the web UI
-- real-time cancellation
-- cancelled and timed-out runs recorded as incomplete and not published as current
+- timeout support on assets, sensors, and effects
+- fixed retry policy (3 attempts, exponential backoff)
+- cancellation
 
 Explicitly out of scope for 0.1:
 
@@ -111,12 +90,7 @@ Explicitly out of scope for 0.1:
 - distributed execution
 - advanced effect idempotency semantics
 - automatic rename/move continuity merging
-
-Interpretation of the backfill/replay cut:
-
-- users can still run specific partitions
-- users can still rerun stale assets
-- users cannot yet target arbitrary historical upstream materializations or sensor observations as a first-class replay feature
+- web UI (deferred — CLI and HTTP API cover operator needs)
 
 ## 0.2
 
@@ -129,16 +103,8 @@ Planned additions:
 - TUI
 - explicit replay support
 - explicit backfill support
-- historical provenance selection in UI/operator flows
-- replay/backfill run modes distinct from normal refresh runs
-- richer historical navigation in the UI/TUI
-
-Likely candidates for 0.2, but not locked:
-
-- thin job/run-selection layer
-- partition inheritance ergonomics
-- richer effect controls
-- rename/move advisory matching in the UI
+- historical provenance selection
+- richer historical navigation
 
 ## Notes
 
@@ -149,6 +115,6 @@ Barca 0.1 should prove that:
 - the asset-first API is pleasant
 - provenance-based caching works
 - schedule-driven reconciliation works
-- the web UI is strong enough to operate the system
+- the CLI and HTTP API are strong enough to operate the system
 
 Once that is true, 0.2 can safely add historical/operator power without destabilizing the core model.

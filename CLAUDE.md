@@ -18,6 +18,9 @@ uv run barca assets show <id>
 uv run barca assets refresh <id>         # default: -j cpu_count (parallel)
 uv run barca assets refresh <id> -j 1   # sequential
 uv run barca assets refresh <id> -j 64  # 64 threads
+uv run barca sensors list                 # list all sensors
+uv run barca sensors show <id>            # sensor detail + observation history
+uv run barca sensors trigger <id>         # manually trigger a sensor
 uv run barca reconcile                    # single-pass reconcile
 uv run barca reconcile --watch            # continuous reconcile loop
 uv run barca reconcile --watch --interval 30
@@ -61,14 +64,14 @@ This is a uv workspace with three packages:
 | `_models.py` | Pydantic models — `InspectedAsset`, `IndexedAsset`, `AssetInput`, `MaterializationRecord`, `AssetSummary`, `AssetDetail`, `JobDetail`, `SensorObservation`, `EffectExecution`, `ReconcileResult` |
 | `_store.py` | `MetadataStore` — SQLite (stdlib) or Turso/libSQL via `libsql-experimental` |
 | `_inspector.py` | `inspect_modules()` — imports modules, finds `@asset`/`@sensor`/`@effect` functions, extracts metadata + dependency hashes |
-| `_engine.py` | Orchestration: `reindex()`, `refresh()`, `materialize_asset()`, `reset()`, `build_indexed_asset()` |
+| `_engine.py` | Orchestration: `reindex()`, `refresh()`, `trigger_sensor()`, `materialize_asset()`, `reset()`, `build_indexed_asset()` |
 | `_config.py` | `barca.toml` parsing via `tomllib` |
 
 ### CLI (`packages/barca-cli/src/barca_cli/`)
 
 | File | Responsibility |
 |---|---|
-| `cli.py` | Typer app — `reindex`, `reset`, `reconcile`, `serve`, `assets {list,show,refresh}`, `jobs {list,show}` |
+| `cli.py` | Typer app — `reindex`, `reset`, `reconcile`, `serve`, `assets {list,show,refresh}`, `sensors {list,show,trigger}`, `jobs {list,show}` |
 | `display.py` | Table formatting for terminal output |
 
 ### Server (`packages/barca-server/src/barca_server/`)
@@ -128,13 +131,16 @@ The server is **optional** — all CLI commands work without it. The server adds
 ### Server API endpoints
 
 ```
-GET  /health                → {"status": "ok", "scheduler_running": bool}
-GET  /assets                → [AssetSummary, ...]
-GET  /assets/{id}           → AssetDetail
-POST /assets/{id}/refresh   → AssetDetail
-POST /reconcile             → ReconcileResult
-GET  /jobs                  → [JobDetail, ...]
-GET  /jobs/{id}             → JobDetail
+GET  /health                           → {"status": "ok", "scheduler_running": bool}
+GET  /assets                           → [AssetSummary, ...]
+GET  /assets/{id}                      → AssetDetail
+POST /assets/{id}/refresh              → AssetDetail
+GET  /sensors                          → [AssetSummary, ...]  (kind=sensor only)
+GET  /sensors/{id}/observations        → [SensorObservation, ...]
+POST /sensors/{id}/trigger             → SensorObservation
+POST /reconcile                        → ReconcileResult
+GET  /jobs                             → [JobDetail, ...]
+GET  /jobs/{id}                        → JobDetail
 ```
 
 ### DB schema

@@ -1,330 +1,122 @@
 # Architecture
 
-This document describes the 0.1 Barca architecture at a high level.
-
-The main principle is:
-
-- Python owns authoring and runtime values
-- Rust owns orchestration, state, scheduling, API, and operator UX
-
-That split keeps the user-facing API very Pythonic while still giving Barca a strong local runtime and UI.
+This document describes the Barca architecture.
 
 ## High-level shape
 
-Barca is two cooperating systems:
+Barca is a pure Python uv workspace with three packages:
 
-1. a Python SDK used by end users to define assets, sensors, and effects
-2. a Rust orchestrator that discovers those definitions, plans work, executes workers, tracks state, and serves the UI/API
+1. **barca** (core library) — decorators, models, store, engine, hashing, tracing, reconciler
+2. **barca-cli** — typer-based CLI tool
+3. **barca-server** — optional FastAPI HTTP API + background scheduler
 
-At runtime, the Rust side launches isolated Python worker processes via `uv run`.
+Users define assets, sensors, and effects with Python decorators. Barca discovers them via `importlib`, materializes them via direct function call, and stores artifacts with content-addressed caching.
 
-Those workers import and execute the user’s real code from its original location.
+## Workspace structure
 
-## Why this split
+```
+packages/
+├── barca-core/src/barca/       # Core library
+│   ├── __init__.py             # Public API: asset, sensor, effect, cron, partitions
+│   ├── _asset.py               # @asset() decorator, AssetWrapper
+│   ├── _sensor.py              # @sensor() decorator, SensorWrapper
+│   ├── _effect.py              # @effect() decorator, EffectWrapper
+│   ├── _schedule.py            # cron(), CronSchedule, is_schedule_eligible()
+│   ├── _reconciler.py          # reconcile() — single-pass DAG walk
+│   ├── _engine.py              # reindex(), refresh(), trigger_sensor(), reset()
+│   ├── _store.py               # MetadataStore — SQLite/libSQL persistence
+│   ├── _models.py              # Pydantic models for all data structures
+│   ├── _inspector.py           # inspect_modules() — discovers decorated functions
+│   ├── _hashing.py             # SHA-256 hashing protocol
+│   ├── _trace.py               # AST dependency tracing
+│   ├── _config.py              # barca.toml parsing
+│   └── _unsafe.py              # @unsafe escape hatch
+├── barca-cli/src/barca_cli/    # CLI tool
+│   ├── cli.py                  # Typer app — reindex, reset, reconcile, serve, assets, sensors, jobs
+│   └── display.py              # Table formatting for terminal output
+└── barca-server/src/barca_server/  # HTTP server (optional)
+    ├── app.py                  # FastAPI app factory, lifespan, route handlers
+    ├── service.py              # Pure business logic (no FastAPI deps)
+    ├── scheduler.py            # Background reconcile loop
+    └── logging.py              # Structured JSON logging
+```
 
-Python should own:
+## Design principles
 
-- decorators
-- function authoring
-- runtime types like pandas and polars
-- notebook ergonomics
-- serializers/deserializers close to Python values
+1. **Pure Python** — no native extensions, no subprocess workers, no Rust. Materialize via `importlib.import_module()` + direct function call.
+2. **Pydantic models** — all data structures are `BaseModel`. Validation at boundaries.
+3. **Functional style** — pure functions wherever possible. Side effects (DB, file I/O) at the edges.
+4. **Three packages** — `barca` is the reusable library; `barca-cli` is the thin CLI layer; `barca-server` is the optional HTTP server.
+5. **Routes are thin wrappers** — FastAPI handlers validate params and delegate to `service.py`. No business logic in route functions.
+6. **Free-threaded Python** — defaults to 3.13t (GIL disabled). Partition parallelism via `ThreadPoolExecutor`.
+7. **Same hashing protocol** — `PROTOCOL_VERSION = "0.3.0"`, JSON payload -> SHA-256.
+8. **sqlite3 thread safety** — `MetadataStore` must be created in the same thread that uses it. Server routes create stores inside `to_thread` calls.
 
-Rust should own:
+## Node kinds
 
-- DAG discovery coordination
-- persistent metadata
-- scheduling and reconciliation
-- concurrency and cancellation
-- execution supervision
-- web API
-- Datastar-driven web UI
+| Kind | Decorator | Schedule default | Cached | Can be input |
+|------|-----------|-----------------|--------|-------------|
+| **asset** | `@asset()` | `"manual"` | Yes (by `run_hash`) | Yes |
+| **sensor** | `@sensor()` | `"always"` | No (always re-runs) | Yes |
+| **effect** | `@effect()` | `"always"` | No (always re-runs) | No (leaf node) |
 
-This is the cleanest way to avoid rebuilding Python ergonomics in Rust while also avoiding a Python-based orchestrator control plane.
+Sensors are source nodes that bring external state into the graph. They return `(update_detected: bool, output)` tuples and record append-only observation history.
 
-## Rust responsibilities
+Effects are leaf nodes that push graph state to external systems. They execute after their upstream assets/sensors.
 
-The Rust side is the product core.
+## Execution model
 
-For 0.1 it should implement:
+Barca executes user functions directly in the same Python process:
 
-- indexing and discovery orchestration
-- metadata persistence in the local Turso-backed store
-- DAG validation and cycle detection
-- staleness computation
-- schedule eligibility computation
-- reconciler loop
-- run claiming and coordination
-- worker process launching via `uv run`
-- timeout enforcement
-- retry and backoff behavior
-- cancellation
-- real-time event streaming to the UI
-- HTTP/API server
-- Datastar web UI
+1. `importlib.import_module(module_path)` loads the user's module
+2. `getattr(mod, function_name)` retrieves the decorated function
+3. The original function (unwrapped from the decorator) is called with resolved inputs
+4. Results are serialized to JSON and stored in `.barcafiles/`
 
-### Rust subsystems
+There are no subprocess workers, no IPC, and no serialization boundaries between the orchestrator and user code. This keeps execution fast and tracebacks accurate.
 
-Recommended internal modules:
+For partitioned assets, Barca uses `ThreadPoolExecutor` with free-threaded Python (3.13t, GIL disabled) for true parallel execution.
 
-- `indexer`
-  - discover configured Python modules
-  - ask Python inspection code to describe nodes
-  - validate graph shape
-- `metadata`
-  - read/write definitions, materializations, observations, executions, run attempts
-- `planner`
-  - compute stale state
-  - compute runnable state
-  - expand partitions
-  - resolve ad hoc params
-- `executor`
-  - spawn and monitor Python worker processes
-  - enforce timeout and cancellation
-  - publish success/failure/cancelled results
-- `reconciler`
-  - periodic manager loop for schedule-driven operation
-- `api`
-  - JSON endpoints and Datastar fragment endpoints
-- `ui`
-  - server-rendered views and streaming updates
-
-## Python responsibilities
-
-The Python side should stay intentionally small and author-focused.
-
-For 0.1 it should implement:
-
-- `@asset`
-- `@sensor`
-- `@effect`
-- `asset_ref(...)`
-- `partitions(...)`
-- `partitions_from(...)`
-- `cron(...)` helper
-- decorator metadata capture
-- inspection helpers used by indexing
-- worker entrypoint used by Rust
-- serializer/deserializer layer
-- notebook helpers such as:
-  - `load_inputs(...)`
-  - `materialize(...)`
-  - `read_asset(...)`
-  - `list_versions(...)`
-
-### Python package structure
-
-Recommended conceptual modules:
-
-- `barca.decorators`
-  - decorators and metadata containers
-- `barca.refs`
-  - asset refs, partition refs, schedule helpers
-- `barca.inspect`
-  - module/function inspection for indexing
-- `barca.worker`
-  - CLI/entrypoint called by `uv run`
-- `barca.io`
-  - serializers and deserializers
-- `barca.notebook`
-  - `load_inputs`, `read_asset`, helper APIs
-- `barca.types`
-  - Pydantic models and supported type declarations
-
-## Boundary between Rust and Python
-
-The boundary should be narrow and explicit.
-
-Rust should not try to understand Python runtime values directly.
-
-Python should not own orchestration state or scheduling.
-
-The contract between them should be a small manifest/protocol.
-
-### Rust -> Python worker input
-
-For each execution attempt, Rust should pass a manifest describing:
-
-- node kind: asset / sensor / effect
-- module path
-- function name
-- expected `definition_hash`
-- selected upstream artifact references
-- selected params
-- selected partition key
-- serializer expectations
-- output staging directory
-
-### Python worker -> Rust result
-
-The Python worker should return structured result data describing:
-
-- success / failure / cancelled / timed out
-- produced artifact manifest, if any
-- output metadata
-- logs or error payload
-- sensor `updated_detected` when applicable
-
-This should be JSON-based so the boundary stays simple.
-
-## Discovery flow
-
-Discovery should be coordinated by Rust but executed through Python-aware inspection.
-
-Recommended flow:
-
-1. Rust loads Barca config and Python source roots.
-2. Rust launches a Python inspection command via `uv run`.
-3. Python imports modules, discovers decorated nodes, and returns structured metadata.
-4. Rust validates:
-   - duplicate continuity keys
-   - dependency refs
-   - partition metadata
-   - DAG acyclicity
-5. Rust writes definitions into metadata storage.
-
-This keeps Python introspection in Python, where it belongs.
-
-## Execution flow
-
-For a normal asset execution:
-
-1. Rust selects a runnable stale node.
-2. Rust resolves upstream provenance, params, and partition key.
-3. Rust computes the intended `run_hash`.
-4. Rust checks for an existing successful matching record.
-5. If matched, Rust reuses it without spawning Python.
-6. If not matched, Rust spawns a Python worker with the execution manifest.
-7. Python imports the real user module and calls the real function.
-8. Python serializes outputs to the staging directory.
-9. Rust validates and publishes the result into durable metadata and `.barcafiles`.
-
-This keeps cache reuse and state transitions in Rust, while actual user code execution stays in Python.
-
-## Storage architecture
-
-Barca uses two storage layers:
+## Storage
 
 ### Metadata store
 
-Local Turso-backed store for:
+SQLite at `.barca/metadata.db`. Tables:
 
-- assets
-- sensors
-- effects
-- definitions
-- materializations
-- sensor observations
-- effect executions
-- run attempts
-- state transitions
-- provenance edges
-
-This is append-only for historical records.
+- `assets` — discovered nodes (assets, sensors, effects)
+- `asset_definitions` — versioned definition snapshots
+- `codebase_snapshots` — merkle tree hashes
+- `materializations` — execution records for assets
+- `sensor_observations` — execution records for sensors
+- `effect_executions` — execution records for effects
+- `asset_inputs` — DAG edges (parameter → upstream asset)
 
 ### Artifact store
 
-Filesystem-backed `.barcafiles` tree for:
+Filesystem at `.barcafiles/`:
 
-- JSON outputs
-- Parquet outputs
-- pickle outputs
-- `code.txt`
-- per-materialization metadata snapshots
+```
+.barcafiles/{asset_slug}/{definition_hash}/
+├── value.json     # serialized return value
+└── code.txt       # source text at time of materialization
+```
 
-Turso is the source of truth for identity and lineage.
+## Reconciliation
 
-The filesystem is the durable artifact payload layer.
+`reconcile()` performs a single-pass DAG walk:
 
-## UI architecture
+1. **Reindex** — discover all nodes from Python modules
+2. **Topo-sort** — Kahn's algorithm over the DAG
+3. **Walk** — for each node in order:
+   - **Sensors**: check schedule eligibility, execute, record observation, propagate `update_detected` downstream
+   - **Assets**: check staleness (definition changed or upstream refreshed), check schedule, check cache, materialize if needed
+   - **Effects**: check upstream freshness, execute if upstream was refreshed
 
-The 0.1 UI should be Rust-first and server-driven.
+The reconciler can run as a single pass (`barca reconcile`), in a loop (`barca reconcile --watch`), or as a background scheduler in the server (`barca serve`).
 
-Recommended stack:
+## Dependencies
 
-- `axum` for HTTP
-- Datastar for incremental updates
-- server-rendered HTML fragments
-
-The UI should consume the same state model the reconciler uses:
-
-- DAG structure from autodiscovered decorator metadata
-- node states from reconciler state
-- run attempts from executor metadata
-- provenance history from the metadata store
-
-This avoids a split between “control-plane truth” and “UI truth.”
-
-## Real-time behavior
-
-Rust should own:
-
-- worker lifecycle
-- live run state
-- cancellation
-- timeout deadlines
-- retry scheduling
-
-The UI should subscribe to those state changes through server-side streaming or Datastar event updates.
-
-That means users can:
-
-- watch running nodes live
-- cancel them live
-- see retries and timeouts
-- see stale/fresh transitions as they happen
-
-## Web UI vs Python helper APIs
-
-The web UI is for operators.
-
-The Python helper APIs are for authors and notebook users.
-
-They should share the same metadata and selection semantics, but serve different workflows:
-
-- web UI
-  - inspect graph
-  - inspect stale/runnable state
-  - run/cancel nodes
-  - inspect lineage and history
-- Python helpers
-  - `load_inputs(...)`
-  - manual materialization
-  - notebook-friendly experimentation
-
-## Why not put more in Python
-
-A Python-first control plane would make some things easier initially, but it would weaken:
-
-- process supervision
-- cancellation and timeout handling
-- UI/server concurrency
-- metadata/service structure
-
-Rust is the better place for the long-running orchestrator and operator surface.
-
-## Why not put more in Rust
-
-Trying to move authoring, value typing, or serialization too far into Rust would make the Python UX worse.
-
-In particular, Rust should not own:
-
-- dataframe semantics
-- Python type inspection logic
-- notebook helper ergonomics
-- reconstruction of user code behavior
-
-That would produce a more complicated system with a worse API.
-
-## 0.1 architecture summary
-
-For 0.1, the clean balance is:
-
-- Python package:
-  - thin, ergonomic, author-facing
-  - decorators, inspection, worker runtime, serializer logic, notebook helpers
-- Rust application:
-  - authoritative orchestrator
-  - metadata, scheduling, execution control, API, web UI
-
-This keeps the MVP narrow while still producing a real orchestrator rather than a library with a thin wrapper.
+- **barca (core)**: `pydantic>=2.0`, `croniter>=2.0`, `sqlite3` (stdlib); optional `libsql-experimental` for Turso remote
+- **barca-cli**: `barca` (workspace), `typer>=0.9`
+- **barca-server**: `barca` (workspace), `fastapi>=0.115`, `uvicorn[standard]>=0.34`
+- **dev**: `pytest>=8.0`, `niquests>=3.0`

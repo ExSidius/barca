@@ -9,7 +9,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 
-from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult
+from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult, SensorObservation
 from barca._store import MetadataStore
 from barca_server.logging import configure_logging
 from barca_server.scheduler import scheduler_loop
@@ -73,6 +73,15 @@ def create_app(
     def _run_get_job(job_id: int):
         return service.get_job(MetadataStore(db_path), job_id)
 
+    def _run_list_sensors():
+        return service.list_sensors(MetadataStore(db_path), repo_root)
+
+    def _run_get_sensor_observations(sensor_id: int):
+        return service.get_sensor_observations(MetadataStore(db_path), sensor_id)
+
+    def _run_trigger_sensor(sensor_id: int):
+        return service.trigger_sensor(MetadataStore(db_path), repo_root, sensor_id)
+
     # --- Routes (thin wrappers around service layer) ---
 
     @app.get("/health")
@@ -111,6 +120,23 @@ def create_app(
     async def jobs_show(job_id: int) -> JobDetail:
         try:
             return await asyncio.to_thread(_run_get_job, job_id)
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+
+    # --- Sensor routes ---
+
+    @app.get("/sensors")
+    async def sensors_list() -> list[AssetSummary]:
+        return await asyncio.to_thread(_run_list_sensors)
+
+    @app.get("/sensors/{sensor_id}/observations")
+    async def sensor_observations(sensor_id: int) -> list[SensorObservation]:
+        return await asyncio.to_thread(_run_get_sensor_observations, sensor_id)
+
+    @app.post("/sensors/{sensor_id}/trigger")
+    async def sensor_trigger(sensor_id: int) -> SensorObservation:
+        try:
+            return await asyncio.to_thread(_run_trigger_sensor, sensor_id)
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e))
 

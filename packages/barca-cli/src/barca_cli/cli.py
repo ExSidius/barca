@@ -7,12 +7,12 @@ from pathlib import Path
 
 import typer
 
-from barca._engine import reindex as do_reindex, refresh as do_refresh, reset as do_reset
+from barca._engine import reindex as do_reindex, refresh as do_refresh, reset as do_reset, trigger_sensor as do_trigger_sensor
 from barca._models import JobDetail
 from barca._reconciler import reconcile as do_reconcile
 from barca._store import MetadataStore
 
-from barca_cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary
+from barca_cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary, sensor_observations_table
 
 
 def _check_gil() -> None:
@@ -29,8 +29,10 @@ def _check_gil() -> None:
 app = typer.Typer(add_completion=False, callback=_check_gil)
 assets_app = typer.Typer(add_completion=False)
 jobs_app = typer.Typer(add_completion=False)
+sensors_app = typer.Typer(add_completion=False)
 app.add_typer(assets_app, name="assets")
 app.add_typer(jobs_app, name="jobs")
+app.add_typer(sensors_app, name="sensors")
 
 
 def _repo_root() -> Path:
@@ -169,3 +171,61 @@ def jobs_show(job_id: int) -> None:
     mat, summary = store.get_materialization_with_asset(job_id)
     detail = JobDetail(job=mat, asset=summary)
     typer.echo(job_detail(detail))
+
+
+@sensors_app.command("list")
+def sensors_list() -> None:
+    """List all indexed sensors."""
+    root = _repo_root()
+    store = _store()
+    do_reindex(store, root)
+    assets = store.list_assets()
+    sensors = [a for a in assets if a.kind == "sensor"]
+    typer.echo(assets_table(sensors))
+
+
+@sensors_app.command("show")
+def sensors_show(sensor_id: int) -> None:
+    """Show details and observation history for a sensor."""
+    root = _repo_root()
+    store = _store()
+    do_reindex(store, root)
+    detail = store.asset_detail(sensor_id)
+    if detail.asset.kind != "sensor":
+        typer.echo(f"Asset #{sensor_id} is not a sensor (kind: {detail.asset.kind})", err=True)
+        raise typer.Exit(1)
+    typer.echo(asset_detail(detail))
+    observations = store.list_sensor_observations(sensor_id)
+    if observations:
+        typer.echo("\nObservation history:")
+        typer.echo(sensor_observations_table(observations))
+
+
+@sensors_app.command("trigger")
+def sensors_trigger(
+    sensor_id: int = typer.Argument(None, help="Sensor ID to trigger"),
+    name: str = typer.Option(None, "-n", "--name", help="Sensor name substring to match"),
+) -> None:
+    """Manually trigger a sensor and record an observation."""
+    root = _repo_root()
+    store = _store()
+    do_reindex(store, root)
+
+    if name is not None:
+        assets = store.list_assets()
+        matches = [a for a in assets if a.kind == "sensor" and (name in a.logical_name or name in a.function_name)]
+        if not matches:
+            typer.echo(f"No sensor matching '{name}'", err=True)
+            raise typer.Exit(1)
+        if len(matches) > 1:
+            typer.echo(f"Multiple sensors match '{name}':", err=True)
+            for m in matches:
+                typer.echo(f"  {m.asset_id}: {m.logical_name}", err=True)
+            raise typer.Exit(1)
+        sensor_id = matches[0].asset_id
+    elif sensor_id is None:
+        typer.echo("Provide a sensor ID or --name", err=True)
+        raise typer.Exit(1)
+
+    obs = do_trigger_sensor(store, root, sensor_id)
+    typer.echo(f"Observation #{obs.observation_id} recorded (update_detected: {obs.update_detected})")

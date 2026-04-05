@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from barca._engine import reindex
+from barca._engine import reindex, refresh, trigger_sensor
 from barca._reconciler import reconcile
 from barca._store import MetadataStore
 
@@ -137,3 +137,80 @@ def test_sensor_false_does_not_trigger_downstream(tmp_path):
         _cleanup("fmod")
         from barca._trace import clear_caches
         clear_caches()
+
+
+def test_list_sensor_observations(sensor_project):
+    """list_sensor_observations returns observations in reverse chronological order."""
+    store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
+    # Run reconcile twice to create multiple observations
+    reconcile(store, sensor_project)
+    reconcile(store, sensor_project)
+
+    assets = store.list_assets()
+    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+    observations = store.list_sensor_observations(sensor_asset.asset_id)
+
+    assert len(observations) >= 2
+    # Verify reverse chronological order
+    for i in range(len(observations) - 1):
+        assert observations[i].created_at >= observations[i + 1].created_at
+
+    # Verify limit works
+    limited = store.list_sensor_observations(sensor_asset.asset_id, limit=1)
+    assert len(limited) == 1
+
+
+def test_asset_detail_includes_latest_observation(sensor_project):
+    """asset_detail populates latest_observation for sensors, not for assets."""
+    store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
+    reconcile(store, sensor_project)
+
+    assets = store.list_assets()
+    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+    process_asset = [a for a in assets if a.function_name == "process"][0]
+
+    sensor_detail = store.asset_detail(sensor_asset.asset_id)
+    assert sensor_detail.latest_observation is not None
+    assert sensor_detail.latest_observation.update_detected is True
+
+    asset_detail = store.asset_detail(process_asset.asset_id)
+    assert asset_detail.latest_observation is None
+
+
+def test_trigger_sensor_returns_observation(sensor_project):
+    """trigger_sensor executes the sensor and returns a valid observation."""
+    store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
+    reindex(store, sensor_project)
+
+    assets = store.list_assets()
+    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+
+    obs = trigger_sensor(store, sensor_project, sensor_asset.asset_id)
+    assert obs is not None
+    assert obs.update_detected is True
+    assert obs.output_json is not None
+    assert "rows" in obs.output_json
+
+
+def test_trigger_sensor_rejects_non_sensor(sensor_project):
+    """trigger_sensor raises ValueError when called on a regular asset."""
+    store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
+    reindex(store, sensor_project)
+
+    assets = store.list_assets()
+    process_asset = [a for a in assets if a.function_name == "process"][0]
+
+    with pytest.raises(ValueError, match="not a sensor"):
+        trigger_sensor(store, sensor_project, process_asset.asset_id)
+
+
+def test_refresh_rejects_sensor(sensor_project):
+    """refresh raises ValueError when called on a sensor."""
+    store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
+    reindex(store, sensor_project)
+
+    assets = store.list_assets()
+    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+
+    with pytest.raises(ValueError, match="sensor"):
+        refresh(store, sensor_project, sensor_asset.asset_id)
