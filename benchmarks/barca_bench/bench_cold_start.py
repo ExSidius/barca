@@ -7,7 +7,6 @@ import sys
 import math
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(os.path.dirname(BENCH_DIR))
 CLI = "barca"
 
 

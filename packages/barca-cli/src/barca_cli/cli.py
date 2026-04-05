@@ -85,13 +85,30 @@ def assets_show(asset_id: int) -> None:
 
 @assets_app.command("refresh")
 def assets_refresh(
-    asset_id: int,
+    asset_id: int = typer.Argument(None, help="Asset ID to refresh"),
+    name: str = typer.Option(None, "-n", "--name", help="Asset name substring to match"),
     jobs: int = typer.Option(None, "-j", "--jobs", help="Max parallel workers (default: cpu_count)"),
 ) -> None:
     """Materialize an asset (and upstream deps)."""
     root = _repo_root()
     store = _store()
     do_reindex(store, root)
+
+    if name is not None:
+        assets = store.list_assets()
+        matches = [a for a in assets if name in a.logical_name or name in a.function_name]
+        if not matches:
+            typer.echo(f"No asset matching '{name}'", err=True)
+            raise typer.Exit(1)
+        if len(matches) > 1:
+            typer.echo(f"Multiple assets match '{name}':", err=True)
+            for m in matches:
+                typer.echo(f"  {m.asset_id}: {m.logical_name}", err=True)
+            raise typer.Exit(1)
+        asset_id = matches[0].asset_id
+    elif asset_id is None:
+        typer.echo("Provide an asset ID or --name", err=True)
+        raise typer.Exit(1)
 
     result = do_refresh(store, root, asset_id, max_workers=jobs)
     typer.echo(asset_detail(result))
