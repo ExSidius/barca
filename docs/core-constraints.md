@@ -38,8 +38,8 @@ This is a hard product decision, not an optional adapter.
 That means:
 
 - indexing happens against a `uv`-managed project environment
-- execution happens via `uv run`
-- dependency state is tracked via `uv.lock`
+- execution happens within the `uv`-managed virtualenv
+- dependency state is tracked via the project's dependency graph
 
 ### Why this is the right constraint
 
@@ -68,7 +68,7 @@ At minimum, that means checking:
 - function name resolves
 - current `definition_hash` matches the planned `definition_hash`
 
-If not, the worker should fail fast and require re-indexing.
+If not, execution should fail fast and require re-indexing.
 
 This prevents the orchestrator from running stale plans against changed source.
 
@@ -174,8 +174,8 @@ These constraints imply:
 - asset discovery requires importable, source-backed Python modules
 - notebook-defined assets are not first-class indexed assets in v1
 - graph validation is a mandatory indexing step
-- the worker protocol must include the planned `definition_hash`
-- `uv.lock` is part of cache invalidation and provenance
+- the execution engine must verify the planned `definition_hash`
+- dependency cone hashing is part of cache invalidation and provenance
 - definitions and materializations are append-only records
 - duplicate live continuity keys should fail indexing
 - old matching provenance can become current again without rerunning

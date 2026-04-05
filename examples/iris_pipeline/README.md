@@ -6,26 +6,13 @@ A 4-asset sequential ML pipeline using scikit-learn's iris dataset.
 raw_data → train_test_split → trained_model → evaluation
 ```
 
-## Setup (from a branch checkout)
+## Setup
 
 ```bash
-# 1. Build the Rust CLI (from repo root)
-cargo build -p barca-cli
-
-# 2. Install Python dependencies (from this directory)
 cd examples/iris_pipeline
 uv sync
-
-# 3. Run the pipeline
-cargo run -p barca-cli -- reindex
-cargo run -p barca-cli -- assets refresh 1   # refresh evaluation (cascades all deps)
-```
-
-Or use the built binary directly:
-
-```bash
-../../target/debug/barca reindex
-../../target/debug/barca assets refresh 1
+uv run barca reindex
+uv run barca assets refresh 1   # refresh evaluation (cascades all deps)
 ```
 
 ## What it does
@@ -40,8 +27,7 @@ Or use the built binary directly:
 ## Expected output
 
 ```
-$ cargo run -p barca-cli -- assets refresh 1
-Waiting for materialization of asset #1 (4 jobs)...
+$ uv run barca assets refresh 1
 Asset #1
   Name:     iris_project/assets.py:evaluation
   Function: evaluation
@@ -67,7 +53,16 @@ The evaluation artifact (`.barcafiles/.../value.json`) contains:
 Second run is instant (cached):
 
 ```
-$ cargo run -p barca-cli -- assets refresh 1
+$ uv run barca assets refresh 1
 Asset #1
   Last job: #5 (success)    # reuses cached materialization
+```
+
+## Parallel execution
+
+Use `-j` to control parallelism (relevant for partitioned assets):
+
+```bash
+uv run barca assets refresh 1 -j 4    # 4 threads
+uv run barca assets refresh 1 -j 1    # sequential
 ```

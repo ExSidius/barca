@@ -1,96 +1,81 @@
 # Development Setup
 
-How to install and test barca from source (a git branch rather than a PyPI release).
+How to install and develop barca from source.
 
-## Quick start (with Just)
-
-If you have [just](https://github.com/casey/just) installed:
+## Quick start
 
 ```bash
 git clone https://github.com/ExSidius/barca.git
 cd barca
-just build-py                          # builds CLI + Python extension, installs into venv
-cd examples/iris_pipeline && uv sync   # install example deps
-uv run barca reindex                   # discover assets
-uv run barca assets refresh 1          # run the pipeline
+uv sync                              # install all workspace packages + dev deps
+uv run pytest tests/ -v              # run tests
 ```
 
-## Manual setup (without Just)
+## Running an example
 
 ```bash
-git clone https://github.com/ExSidius/barca.git
-cd barca
-
-# 1. Build the Rust CLI binary
-cargo build -p barca-cli --release
-
-# 2. Stage the binary so maturin bundles it into the Python wheel
-mkdir -p crates/barca-py/data/scripts
-cp target/release/barca crates/barca-py/data/scripts/barca
-chmod +x crates/barca-py/data/scripts/barca
-
-# 3. Install the Python extension (includes the CLI binary)
-cd examples/iris_pipeline   # or whichever example
-uv sync
-
-# 4. Verify
+cd examples/basic_app && uv sync
 uv run barca reindex
-
-# 5. Clean up the staged binary (don't commit it)
-rm -f ../../crates/barca-py/data/scripts/barca
+uv run barca assets list
+uv run barca assets refresh 1
 ```
 
-## Testing from a branch
-
-To test a feature branch in full isolation (fresh clone, no shared state):
+Or the iris ML pipeline:
 
 ```bash
-./scripts/test-from-branch.sh                  # test all examples
-./scripts/test-from-branch.sh iris_pipeline    # test one example
+cd examples/iris_pipeline && uv sync
+uv run barca reindex
+uv run barca assets refresh 1        # cascades all upstream deps
 ```
 
-This clones the current branch into a temp directory, builds everything from
-scratch, runs each example, verifies caching, and cleans up on exit.
+## How it works
 
-## How `uv run barca` works
+Barca is a uv workspace with three Python packages:
 
-The `barca` Python package (built by maturin from `crates/barca-py/`) contains
-two things:
+| Package | Path | Purpose |
+|---------|------|---------|
+| `barca` | `packages/barca-core/` | Core library — decorators, models, store, engine |
+| `barca-cli` | `packages/barca-cli/` | CLI — typer app |
+| `barca-server` | `packages/barca-server/` | HTTP API — FastAPI + uvicorn (optional) |
 
-1. **A native Python extension** (`barca._barca`): the `@asset()` decorator,
-   `inspect_modules()`, `materialize_asset()` — all compiled Rust via PyO3.
-
-2. **The CLI binary** (`barca`): bundled via maturin's `data/scripts/` mechanism.
-   When the wheel is installed, the binary lands in the venv's `bin/` directory,
-   making `uv run barca` work.
-
-In development, step 2 requires manually building and staging the binary
-(see above). In a PyPI release, the `just release` command handles this
-automatically for all target platforms.
-
-## Without `uv run` (cargo directly)
-
-If you don't need `uv run barca` and just want to iterate on Rust code:
-
-```bash
-cargo build -p barca-cli
-cd examples/iris_pipeline && uv sync   # only needed once for Python deps
-cargo run -p barca-cli -- reindex
-cargo run -p barca-cli -- assets refresh 1
-```
-
-This is faster for Rust development since you skip the maturin build. The
-`cargo run -p barca-cli --` prefix replaces `uv run barca`.
+`uv sync` at the workspace root installs all three packages in development mode. The CLI entry point `barca` is provided by `barca-cli`.
 
 ## Running tests
 
 ```bash
-# Unit + API tests (fast, no Python needed)
-cargo test -p barca-server
+# Full test suite
+uv run pytest tests/ -v
 
-# CLI integration tests against real Python examples
-just build-py
-cd examples/basic_app && uv sync
-cd examples/iris_pipeline && uv sync
-cargo test -p barca-cli
+# Specific test file
+uv run pytest tests/test_sensor.py -v
+
+# Just server tests (requires niquests)
+uv run pytest tests/test_server.py -v
+```
+
+## Free-threaded Python
+
+Barca defaults to Python 3.13t (free-threaded, GIL disabled) via `.python-version`. This enables true thread parallelism for partitioned assets.
+
+To opt out and use standard Python:
+
+```bash
+echo "3.13" > .python-version
+uv sync
+```
+
+## Project structure
+
+```
+barca/
+├── packages/
+│   ├── barca-core/          # Core library
+│   ├── barca-cli/           # CLI tool
+│   └── barca-server/        # HTTP server (optional)
+├── tests/                   # All tests (pytest)
+├── examples/                # Example projects
+├── benchmarks/              # Performance benchmarks
+├── docs/                    # Documentation and specs
+├── pyproject.toml           # Workspace root
+└── .python-version          # 3.13t (free-threaded)
 ```
