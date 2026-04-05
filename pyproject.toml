@@ -2,7 +2,7 @@
 name = "barca-workspace"
 version = "0.1.0"
 description = "Barca — minimal asset orchestrator"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 
 [tool.uv]
 dev-dependencies = [

@@ -76,7 +76,7 @@ Barca defaults to Python 3.14t (free-threaded build, GIL disabled). This gives
 flag controls concurrency (default: cpu_count).
 
 To opt out and use regular Python 3.14+, change `.python-version` from `3.14t`
-to `3.13`. Threads will still work for I/O-bound tasks (GIL is released during
+to `3.14`. Threads will still work for I/O-bound tasks (GIL is released during
 I/O), but CPU-bound partitions won't get true parallelism.
 
 ## Individual scripts

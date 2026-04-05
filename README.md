@@ -6,7 +6,7 @@
 <p align="center">
   <a href="https://github.com/ExSidius/barca/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ExSidius/barca/actions/workflows/ci.yml/badge.svg" /></a>
   <a href="https://github.com/ExSidius/barca/releases"><img alt="Release" src="https://img.shields.io/github/v/release/ExSidius/barca?include_prereleases&label=release" /></a>
-  <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.13-blue" />
+  <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.14-blue" />
   <img alt="License" src="https://img.shields.io/github/license/ExSidius/barca" />
 </p>
 

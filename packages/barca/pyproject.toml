@@ -2,7 +2,7 @@
 name = "barca"
 version = "0.1.0"
 description = "Minimal asset orchestrator."
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "pydantic>=2.0",
     "croniter>=2.0",

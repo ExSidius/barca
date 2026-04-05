@@ -60,7 +60,7 @@ Barca defaults to Python 3.14t (free-threaded, GIL disabled) via `.python-versio
 To opt out and use standard Python:
 
 ```bash
-echo "3.13" > .python-version
+echo "3.14" > .python-version
 uv sync
 ```
 
