@@ -10,8 +10,12 @@
 ```bash
 uv init --app my-project
 cd my-project
+echo "3.13t" > .python-version
+uv python install 3.13t
 uv add barca
 ```
+
+The `.python-version` file pins the project to free-threaded Python (GIL disabled), which enables full parallel performance for partitioned assets. Without it, barca will warn that the GIL is active and parallel workers will be serialized.
 
 This installs the `@asset()` decorator and the `barca` CLI into your project's virtualenv.
 
