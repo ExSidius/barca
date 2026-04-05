@@ -131,6 +131,146 @@ barca assets refresh 1
 ```
 </details>
 
+## Learning Path
+
+Work through these in order to get familiar with barca progressively. Each section has a minimal example; click the link for the full specification and edge-case details.
+
+### 1. Single asset — index, materialize, cache &nbsp;[→ full spec](./docs/workflows/01-single-asset-no-inputs.md)
+
+The simplest possible node. Barca indexes it, materializes it once, then reuses the cached artifact on every subsequent run until the code changes.
+
+```python
+from barca import asset
+
+@asset()
+def hello() -> dict:
+    return {"message": "Hello from barca!"}
+```
+
+```bash
+uv run barca reindex             # discover @asset() functions
+uv run barca assets refresh 1   # materialize → .barcafiles/.../value.json
+uv run barca assets refresh 1   # instant: cache hit, no re-execution
+```
+
+---
+
+### 2. Asset dependencies — declare inputs, barca resolves the DAG &nbsp;[→ full spec](./docs/workflows/02-single-asset-one-input.md)
+
+Pass upstream functions via `inputs=`. Barca materializes them first and injects their outputs as kwargs. The downstream `run_hash` covers upstream version, so any upstream change cascades automatically.
+
+```python
+@asset()
+def raw_data() -> list[dict]:
+    return [{"x": 1}, {"x": 2}, {"x": 3}]
+
+@asset(inputs={"data": raw_data})
+def summary(data: list[dict]) -> dict:
+    return {"count": len(data), "total": sum(d["x"] for d in data)}
+```
+
+```bash
+uv run barca assets refresh 2   # materializes raw_data first, then summary
+```
+
+---
+
+### 3. Partitioned assets — fan-out with parallel workers &nbsp;[→ full spec](./docs/workflows/03-parametrized-assets-and-partitions.md)
+
+`partitions()` turns one asset definition into N independent materializations, each cached separately. Use `-j` to run them in parallel with free-threaded Python.
+
+```python
+from barca import asset, partitions
+
+@asset(partitions={"ticker": partitions(["AAPL", "MSFT", "GOOG"])})
+def prices(ticker: str) -> dict:
+    return {"ticker": ticker, "price": len(ticker) * 100}
+```
+
+```bash
+uv run barca assets refresh 1 -j 4   # 4 parallel workers
+```
+
+---
+
+### 4. Asset continuity — preserve history across renames &nbsp;[→ full spec](./docs/workflows/04-asset-continuity-rename-and-move.md)
+
+Without an explicit `name=`, barca keys identity to `file_path:function_name`. Renaming or moving the function breaks the link. Use `name=` to pin a stable key so lineage and cached artifacts survive refactors.
+
+```python
+# Before rename: continuity_key = "my_project/etl.py:load_raw"
+@asset()
+def load_raw() -> list[dict]: ...
+
+# After rename: continuity_key unchanged — history preserved
+@asset(name="load_raw")
+def ingest_raw_data() -> list[dict]: ...
+```
+
+---
+
+### 5. Schedules, reconciliation, and effects &nbsp;[→ full spec](./docs/workflows/05-schedule-driven-reconciliation-and-effects.md)
+
+Assets default to `"manual"`. Set `schedule="always"` or a cron expression to make nodes run automatically during `barca reconcile`. `@effect()` is a side-effect leaf node (write to DB, send email) that is never cached and can't be used as an input.
+
+```python
+from barca import asset, effect, cron
+
+@asset(schedule=cron("0 5 * * *"))   # refresh daily at 5 AM
+def daily_report() -> dict:
+    return {"rows": 42}
+
+@effect(inputs={"report": daily_report}, schedule="always")
+def publish(report: dict) -> None:
+    print(f"Publishing {report}")    # push to Slack, S3, etc.
+```
+
+```bash
+uv run barca reconcile          # single pass — runs eligible stale nodes
+uv run barca reconcile --watch  # continuous loop
+```
+
+---
+
+### 6. Sensors — bring external state into the DAG &nbsp;[→ full spec](./docs/workflows/06-sensors-and-external-observations.md)
+
+Sensors are ingress nodes that poll external systems. They return `(update_detected: bool, output)`. Downstream assets only re-run when `update_detected=True`. Each execution is recorded as an observation (not a cached artifact).
+
+```python
+from barca import sensor, asset
+
+@sensor(schedule="always")
+def inbox_files() -> tuple[bool, list[str]]:
+    files = list(Path("inbox").glob("*.csv"))
+    return bool(files), [str(f) for f in files]
+
+@asset(inputs={"paths": inbox_files}, schedule="always")
+def parse_inbox(paths: list[str]) -> list[dict]:
+    return [{"file": p, "rows": 0} for p in paths]
+```
+
+---
+
+### 7. Notebook workflow — call assets as plain Python &nbsp;[→ full spec](./docs/workflows/07-notebook-workflow.md)
+
+`load_inputs()` resolves upstream materializations and returns them as a plain `dict`, so you can call any asset function directly in a notebook or REPL without re-running the full pipeline.
+
+```python
+from barca import load_inputs, materialize, read_asset, list_versions
+
+# resolve and inject upstream artifacts
+kwargs = load_inputs(parse_inbox)
+result = parse_inbox(**kwargs)
+
+# or let barca materialize and cache in one call
+data = materialize(parse_inbox)
+
+# read the latest artifact without re-executing
+value = read_asset(daily_report)
+```
+
+---
+
 ### CLI Reference
 
 All commands below use `uv run` prefix. If you've activated your virtualenv, you can omit it.
@@ -300,14 +440,16 @@ uv run barca assets refresh 1
 
 ### Workflow specs
 
-| # | Workflow | Status |
-|---|---------|--------|
-| 1 | [Single asset, no inputs](./docs/workflows/01-single-asset-no-inputs.md) | Done |
-| 2 | [Single asset with one input](./docs/workflows/02-single-asset-one-input.md) | Done |
-| 3 | [Parametrized assets and partitions](./docs/workflows/03-parametrized-assets-and-partitions.md) | Done |
-| 4 | [Asset continuity (rename/move)](./docs/workflows/04-asset-continuity-rename-and-move.md) | Done |
-| 5 | [Schedule-driven reconciliation](./docs/workflows/05-schedule-driven-reconciliation-and-effects.md) | Done |
-| 6 | [Sensors and external observations](./docs/workflows/06-sensors-and-external-observations.md) | Done |
-| 7 | [Notebook workflow](./docs/workflows/07-notebook-workflow.md) | Done |
-| 8 | [Backfill and replay](./docs/workflows/08-backfill-and-replay.md) | Planned |
-| 9 | [Execution controls](./docs/workflows/09-execution-controls-and-ad-hoc-params.md) | Planned |
+See the [Learning Path](#learning-path) above for annotated examples. The full specifications (edge cases, DB schema, acceptance criteria) live in `docs/workflows/`:
+
+| # | Workflow | Spec |
+|---|---------|------|
+| 1 | Single asset, no inputs | [01-single-asset-no-inputs.md](./docs/workflows/01-single-asset-no-inputs.md) |
+| 2 | Single asset with one input | [02-single-asset-one-input.md](./docs/workflows/02-single-asset-one-input.md) |
+| 3 | Parametrized assets and partitions | [03-parametrized-assets-and-partitions.md](./docs/workflows/03-parametrized-assets-and-partitions.md) |
+| 4 | Asset continuity (rename/move) | [04-asset-continuity-rename-and-move.md](./docs/workflows/04-asset-continuity-rename-and-move.md) |
+| 5 | Schedule-driven reconciliation and effects | [05-schedule-driven-reconciliation-and-effects.md](./docs/workflows/05-schedule-driven-reconciliation-and-effects.md) |
+| 6 | Sensors and external observations | [06-sensors-and-external-observations.md](./docs/workflows/06-sensors-and-external-observations.md) |
+| 7 | Notebook workflow | [07-notebook-workflow.md](./docs/workflows/07-notebook-workflow.md) |
+| 8 | Backfill and replay *(planned)* | [08-backfill-and-replay.md](./docs/workflows/08-backfill-and-replay.md) |
+| 9 | Execution controls *(planned)* | [09-execution-controls-and-ad-hoc-params.md](./docs/workflows/09-execution-controls-and-ad-hoc-params.md) |

@@ -32,8 +32,7 @@ def _check_gil() -> None:
     if os.environ.get("PYTHON_GIL") == "0":
         return
     _err.print(
-        "barca: WARNING: GIL is enabled. For best parallel performance, "
-        "use the free-threaded build (python3.14t) and set PYTHON_GIL=0.",
+        "barca: WARNING: GIL is enabled. For best parallel performance, use the free-threaded build (python3.14t) and set PYTHON_GIL=0.",
         style="yellow",
     )
 
@@ -129,7 +128,7 @@ def assets_show(asset_id: int) -> None:
     store = _store()
     do_reindex(store, root)
     detail = store.asset_detail(asset_id)
-    _console.print(asset_detail(detail))
+    _console.print(asset_detail(detail, repo_root=root))
 
 
 @assets_app.command("refresh")
@@ -160,7 +159,7 @@ def assets_refresh(
         raise typer.Exit(1)
 
     result = do_refresh(store, root, asset_id, max_workers=jobs)
-    _console.print(asset_detail(result))
+    _console.print(asset_detail(result, repo_root=root))
 
 
 @jobs_app.command("list")
@@ -241,7 +240,4 @@ def sensors_trigger(
 
     obs = do_trigger_sensor(store, root, sensor_id)
     update_style = "green" if obs.update_detected else "dim"
-    _console.print(
-        f"Observation [dim]#{obs.observation_id}[/dim] recorded "
-        f"(update_detected: [{update_style}]{obs.update_detected}[/{update_style}])"
-    )
+    _console.print(f"Observation [dim]#{obs.observation_id}[/dim] recorded (update_detected: [{update_style}]{obs.update_detected}[/{update_style}])")
