@@ -6,7 +6,7 @@ requires-python = ">=3.13"
 
 [tool.uv]
 dev-dependencies = [
-    "barca[server]",
+    "barca",
     "pytest>=8.0",
     "scikit-learn>=1.0",
     "niquests>=3.0",

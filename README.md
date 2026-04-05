@@ -65,12 +65,6 @@ To install the latest development version directly from the repository:
 uv add "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca"
 ```
 
-Include the optional HTTP server:
-
-```bash
-uv add "barca[server] @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca"
-```
-
 Or with pip:
 
 ```bash
@@ -197,7 +191,6 @@ uv run barca reset [--db] [--artifacts] [--tmp]    Clean generated files
 │  │                                            │   │
 │  │  barca.cli    — typer commands, display    │   │
 │  │  barca.server — FastAPI, scheduler         │   │
-│  │               (optional: barca[server])    │   │
 │  └────────────────────────────────────────────┘   │
 └──────────────────────────────────────────────────┘
          │                       │
@@ -214,7 +207,7 @@ uv run barca reset [--db] [--artifacts] [--tmp]    Clean generated files
 |-------------|---------|
 | `barca` | Public API — `@asset`, `@sensor`, `@effect`, `cron`, `partitions`, notebook helpers |
 | `barca.cli` | CLI entry point — `barca` command, table formatting |
-| `barca.server` | HTTP API + background scheduler — requires `barca[server]` |
+| `barca.server` | HTTP API + background scheduler |
 
 **Key design decisions:**
 - Pure Python — no native extensions, no subprocess workers

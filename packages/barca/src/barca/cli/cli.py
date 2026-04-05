@@ -92,12 +92,8 @@ def serve(
     log_level: str = typer.Option("info", "--log-level", help="Log level (debug, info, warning, error)"),
 ) -> None:
     """Start the barca server (HTTP API + background scheduler)."""
-    try:
-        import uvicorn
-        from barca.server.app import create_app
-    except ImportError:
-        typer.echo("barca[server] is required for `barca serve`. Install with: uv add barca[server]", err=True)
-        raise typer.Exit(1)
+    import uvicorn
+    from barca.server.app import create_app
 
     root = _repo_root()
     application = create_app(repo_root=root, interval=interval, log_level=log_level)
