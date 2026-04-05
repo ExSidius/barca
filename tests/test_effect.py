@@ -79,6 +79,12 @@ def test_effect_executes_after_upstream(tmp_path):
         exec_record = store.latest_effect_execution(effect_asset.asset_id)
         assert exec_record is not None
         assert exec_record.status == "success"
+        # Verify asset_detail includes latest_execution for effect nodes
+        detail = store.asset_detail(effect_asset.asset_id)
+        assert detail.asset.kind == "effect"
+        assert detail.latest_execution is not None
+        assert detail.latest_execution.status == "success"
+        assert detail.latest_observation is None
     finally:
         sys.path.remove(str(project_dir))
         _cleanup("emod")

@@ -93,6 +93,7 @@ class AssetDetail(BaseModel):
     asset: IndexedAsset = Field(description="The indexed asset with its current definition")
     latest_materialization: MaterializationRecord | None = Field(default=None, description="Most recent materialization record, or None if never materialized")
     latest_observation: SensorObservation | None = Field(default=None, description="Most recent sensor observation (only populated for sensor nodes)")
+    latest_execution: EffectExecution | None = Field(default=None, description="Most recent effect execution (only populated for effect nodes)")
 
 
 class JobDetail(BaseModel):

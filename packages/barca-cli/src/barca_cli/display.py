@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult, SensorObservation
+from barca._models import AssetDetail, AssetSummary, EffectExecution, JobDetail, ReconcileResult, SensorObservation
 
 
 def assets_table(assets: list[AssetSummary]) -> str:
@@ -46,6 +46,15 @@ def asset_detail(detail: AssetDetail) -> str:
             lines.append(f"  Observed at:     {obs.created_at}")
         else:
             lines.append("  Last observation: none")
+    elif a.kind == "effect":
+        if detail.latest_execution:
+            ex = detail.latest_execution
+            lines.append(f"  Last execution:  #{ex.execution_id} ({ex.status})")
+            if ex.last_error:
+                lines.append(f"  Error:           {ex.last_error}")
+            lines.append(f"  Executed at:     {ex.created_at}")
+        else:
+            lines.append("  Last execution:  none")
     elif detail.latest_materialization:
         m = detail.latest_materialization
         lines.append(f"  Last job:        #{m.materialization_id} ({m.status})")

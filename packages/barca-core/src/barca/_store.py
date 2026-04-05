@@ -259,6 +259,7 @@ class MetadataStore:
 
         kind = row[17] or "asset"
         latest_observation = self.latest_sensor_observation(asset_id) if kind == "sensor" else None
+        latest_execution = self.latest_effect_execution(asset_id) if kind == "effect" else None
 
         return AssetDetail(
             asset=IndexedAsset(
@@ -284,6 +285,7 @@ class MetadataStore:
             ),
             latest_materialization=self._latest_materialization(asset_id),
             latest_observation=latest_observation,
+            latest_execution=latest_execution,
         )
 
     def asset_id_by_logical_name(self, logical_name: str) -> int | None:
