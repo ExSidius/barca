@@ -83,6 +83,21 @@ def reconcile(
         time.sleep(interval)
 
 
+@app.command()
+def serve(
+    port: int = typer.Option(8400, "--port", help="HTTP port"),
+    interval: int = typer.Option(60, "--interval", help="Seconds between reconcile passes"),
+    log_level: str = typer.Option("info", "--log-level", help="Log level (debug, info, warning, error)"),
+) -> None:
+    """Start the barca server (HTTP API + background scheduler)."""
+    import uvicorn
+    from barca_server.app import create_app
+
+    root = _repo_root()
+    application = create_app(repo_root=root, interval=interval, log_level=log_level)
+    uvicorn.run(application, host="0.0.0.0", port=port)
+
+
 @assets_app.command("list")
 def assets_list() -> None:
     """List all indexed assets."""
