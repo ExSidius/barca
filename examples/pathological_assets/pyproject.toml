@@ -6,7 +6,7 @@ requires-python = ">=3.13"
 dependencies = ["barca"]
 
 [tool.uv.sources]
-barca = { path = "../../packages/barca-core" }
+barca = { path = "../../packages/barca" }
 
 [build-system]
 requires = ["hatchling"]

@@ -12,7 +12,7 @@ import niquests
 import pytest
 import uvicorn
 
-from barca_server.app import create_app
+from barca.server.app import create_app
 
 
 @pytest.fixture

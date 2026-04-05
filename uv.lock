@@ -5,8 +5,6 @@ requires-python = ">=3.13"
 [manifest]
 members = [
     "barca",
-    "barca-cli",
-    "barca-server",
     "barca-workspace",
 ]
 
@@ -66,49 +64,23 @@ wheels = [
 [[package]]
 name = "barca"
 version = "0.1.0"
-source = { editable = "packages/barca-core" }
+source = { editable = "packages/barca" }
 dependencies = [
     { name = "croniter" },
+    { name = "fastapi" },
     { name = "pydantic" },
     { name = "pyturso" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "croniter", specifier = ">=2.0" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pyturso", specifier = ">=0.5.0" },
-]
-
-[[package]]
-name = "barca-cli"
-version = "0.1.0"
-source = { editable = "packages/barca-cli" }
-dependencies = [
-    { name = "barca" },
     { name = "typer" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "barca", editable = "packages/barca-core" },
-    { name = "typer", specifier = ">=0.9" },
-]
-
-[[package]]
-name = "barca-server"
-version = "0.1.0"
-source = { editable = "packages/barca-server" }
-dependencies = [
-    { name = "barca" },
-    { name = "fastapi" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "barca", editable = "packages/barca-core" },
+    { name = "croniter", specifier = ">=2.0" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "pydantic", specifier = ">=2.0" },
+    { name = "pyturso", specifier = ">=0.5.0" },
+    { name = "typer", specifier = ">=0.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
 ]
 
@@ -120,8 +92,6 @@ source = { virtual = "." }
 [package.dev-dependencies]
 dev = [
     { name = "barca" },
-    { name = "barca-cli" },
-    { name = "barca-server" },
     { name = "mkdocs-material" },
     { name = "mkdocstrings", extra = ["python"] },
     { name = "niquests" },
@@ -133,9 +103,7 @@ dev = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "barca", editable = "packages/barca-core" },
-    { name = "barca-cli", editable = "packages/barca-cli" },
-    { name = "barca-server", editable = "packages/barca-server" },
+    { name = "barca", editable = "packages/barca" },
     { name = "mkdocs-material", specifier = ">=9.0" },
     { name = "mkdocstrings", extras = ["python"], specifier = ">=0.24" },
     { name = "niquests", specifier = ">=3.0" },

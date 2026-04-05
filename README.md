@@ -62,19 +62,13 @@ This installs the Python `@asset()` decorator and the `barca` CLI into your proj
 To install the latest development version directly from the repository:
 
 ```bash
-# Core library + CLI (recommended)
-uv add "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core"
-uv add "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
-
-# Optional HTTP server
-uv add "barca-server @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-server"
+uv add "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca"
 ```
 
 Or with pip:
 
 ```bash
-pip install "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-core"
-pip install "barca-cli @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca-cli"
+pip install "barca @ git+https://github.com/ExSidius/barca.git#subdirectory=packages/barca"
 ```
 
 ## Quick Start
@@ -186,36 +180,34 @@ uv run barca reset [--db] [--artifacts] [--tmp]    Clean generated files
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│               barca (Python, uv workspace)           │
-│                                                      │
-│  ┌──────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │ barca-cli│  │ barca-server │  │  barca (core) │  │
-│  │          │  │              │  │               │  │
-│  │ typer    │  │ FastAPI      │  │ decorators    │  │
-│  │ commands │  │ routes       │  │ models        │  │
-│  │ display  │  │ scheduler    │  │ engine        │  │
-│  │          │  │ service      │  │ reconciler    │  │
-│  │          │  │              │  │ store (SQLite)│  │
-│  │          │  │              │  │ hashing       │  │
-│  │          │  │              │  │ tracing       │  │
-│  └──────────┘  └──────────────┘  └───────────────┘  │
-└─────────────────────────────────────────────────────┘
-         │                              │
-         ▼                              ▼
-   .barca/metadata.db           .barcafiles/
-   (SQLite — assets,            (versioned artifacts:
-    definitions, jobs,           value.json, code.txt)
+┌──────────────────────────────────────────────────┐
+│            barca (Python, uv workspace)           │
+│                                                   │
+│  ┌────────────────────────────────────────────┐   │
+│  │                  barca                     │   │
+│  │                                            │   │
+│  │  decorators · models · engine · reconciler │   │
+│  │  store (SQLite/Turso) · hashing · tracing  │   │
+│  │                                            │   │
+│  │  barca.cli    — typer commands, display    │   │
+│  │  barca.server — FastAPI, scheduler         │   │
+│  └────────────────────────────────────────────┘   │
+└──────────────────────────────────────────────────┘
+         │                       │
+         ▼                       ▼
+   .barca/metadata.db      .barcafiles/
+   (SQLite — assets,       (versioned artifacts:
+    definitions, jobs,      value.json, code.txt)
     observations)
 ```
 
-**Three packages**, one uv workspace:
+**One package** at `packages/barca/`, with an optional `[server]` extra:
 
-| Package | Path | Purpose |
-|---------|------|---------|
-| `barca` | `packages/barca-core/` | Core library — decorators, models, store, engine, hashing, tracing, reconciler |
-| `barca-cli` | `packages/barca-cli/` | CLI tool — typer app, table formatting |
-| `barca-server` | `packages/barca-server/` | HTTP API + background scheduler — FastAPI, uvicorn (optional) |
+| Import path | Purpose |
+|-------------|---------|
+| `barca` | Public API — `@asset`, `@sensor`, `@effect`, `cron`, `partitions`, notebook helpers |
+| `barca.cli` | CLI entry point — `barca` command, table formatting |
+| `barca.server` | HTTP API + background scheduler |
 
 **Key design decisions:**
 - Pure Python — no native extensions, no subprocess workers
@@ -292,7 +284,7 @@ uv run pytest tests/ -v
 ```bash
 git clone https://github.com/ExSidius/barca.git
 cd barca
-uv sync                              # install all workspace packages
+uv sync                              # install the package + dev deps
 uv run pytest tests/ -v              # run tests
 cd examples/basic_app && uv sync     # run an example
 uv run barca reindex

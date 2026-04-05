@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 
 from barca._store import MetadataStore
-from barca_server.service import run_reconcile
+from barca.server.service import run_reconcile
 
 logger = logging.getLogger("barca.server.scheduler")
 

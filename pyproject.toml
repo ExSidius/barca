@@ -7,8 +7,6 @@ requires-python = ">=3.13"
 [tool.uv]
 dev-dependencies = [
     "barca",
-    "barca-cli",
-    "barca-server",
     "pytest>=8.0",
     "scikit-learn>=1.0",
     "niquests>=3.0",
@@ -17,12 +15,10 @@ dev-dependencies = [
 ]
 
 [tool.uv.workspace]
-members = ["packages/*"]
+members = ["packages/barca"]
 
 [tool.uv.sources]
 barca = { workspace = true }
-barca-cli = { workspace = true }
-barca-server = { workspace = true }
 
 [tool.ruff]
 line-length = 200
