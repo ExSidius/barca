@@ -587,6 +587,35 @@ class MetadataStore:
         )
 
     # ------------------------------------------------------------------
+    # Materialization queries (notebook helpers)
+    # ------------------------------------------------------------------
+
+    def list_materializations(self, asset_id: int, limit: int = 50) -> list[MaterializationRecord]:
+        rows = self.conn.execute(
+            """SELECT id, asset_id, definition_id, run_hash, status,
+                      artifact_path, artifact_format, artifact_checksum,
+                      last_error, partition_key_json, created_at
+               FROM materializations WHERE asset_id = ?
+               ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (asset_id, limit),
+        ).fetchall()
+        return [_mat_from_row(r) for r in rows]
+
+    def latest_successful_materialization_for_partition(
+        self, asset_id: int, partition_key_json: str,
+    ) -> MaterializationRecord | None:
+        row = self.conn.execute(
+            """SELECT id, asset_id, definition_id, run_hash, status,
+                      artifact_path, artifact_format, artifact_checksum,
+                      last_error, partition_key_json, created_at
+               FROM materializations
+               WHERE asset_id = ? AND status = 'success' AND partition_key_json = ?
+               ORDER BY created_at DESC, id DESC LIMIT 1""",
+            (asset_id, partition_key_json),
+        ).fetchone()
+        return _mat_from_row(row) if row else None
+
+    # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
 
