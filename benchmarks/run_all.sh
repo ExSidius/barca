@@ -124,6 +124,53 @@ cd "$SCRIPT_DIR/dagster_bench"
 DAGSTER_HOME=/tmp/dagster_sf .venv/bin/python bench_spaceflights.py "$RUNS" 2>/dev/null
 echo ""
 
+# ── Benchmark 4: Server Benchmarks ──
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  BENCHMARK 4a: Server startup time"
+echo "  Time from process start to first successful API response"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+echo "── Barca (uvicorn + FastAPI) ──"
+cd "$SCRIPT_DIR/barca_bench"
+PATH="$BARCA_VENV:$PATH" python bench_server.py "$RUNS" startup
+echo ""
+
+echo "── Prefect (prefect server start) ──"
+cd "$SCRIPT_DIR/prefect_bench"
+PREFECT_HOME=/tmp/prefect_srv PREFECT_LOGGING_LEVEL=ERROR PREFECT_API_URL=http://127.0.0.1:4200/api .venv/bin/python bench_server.py "$RUNS" startup 2>/dev/null
+echo ""
+
+echo "── Dagster (dagster dev) ──"
+cd "$SCRIPT_DIR/dagster_bench"
+DAGSTER_HOME=/tmp/dagster_srv .venv/bin/python bench_server.py "$RUNS" startup 2>/dev/null
+echo ""
+
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo "  BENCHMARK 4b: Server API latency"
+echo "  Time from HTTP request to materialization complete"
+echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+
+echo "── Barca (POST /assets/{id}/refresh) ──"
+cd "$SCRIPT_DIR/barca_bench"
+PATH="$BARCA_VENV:$PATH" python bench_server.py "$RUNS" refresh
+echo ""
+
+echo "── Barca (POST /reconcile) ──"
+PATH="$BARCA_VENV:$PATH" python bench_server.py "$RUNS" reconcile
+echo ""
+
+echo "── Prefect (flow run via server) ──"
+cd "$SCRIPT_DIR/prefect_bench"
+PREFECT_HOME=/tmp/prefect_srv PREFECT_LOGGING_LEVEL=ERROR PREFECT_API_URL=http://127.0.0.1:4200/api .venv/bin/python bench_server.py "$RUNS" flow 2>/dev/null
+echo ""
+
+echo "── Dagster (GraphQL materialization) ──"
+cd "$SCRIPT_DIR/dagster_bench"
+DAGSTER_HOME=/tmp/dagster_srv .venv/bin/python bench_server.py "$RUNS" refresh 2>/dev/null
+echo ""
+
 echo "============================================"
 echo "  Benchmark suite complete"
 echo "============================================"
