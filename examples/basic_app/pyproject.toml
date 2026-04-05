@@ -2,11 +2,11 @@
 name = "barca-basic-app"
 version = "0.1.0"
 description = "Example Barca app for the 0.1.1 vertical slice."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = ["barca"]
 
 [tool.uv.sources]
-barca = { path = "../../crates/barca-py" }
+barca = { path = "../../packages/barca-core" }
 
 [build-system]
 requires = ["hatchling"]

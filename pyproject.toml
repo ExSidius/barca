@@ -1,24 +1,26 @@
 [project]
 name = "barca-workspace"
-version = "0.0.1"
-description = "Barca workspace root"
-requires-python = ">=3.11"
-dependencies = [
+version = "0.1.0"
+description = "Barca — minimal asset orchestrator"
+requires-python = ">=3.13"
+
+[tool.uv]
+dev-dependencies = [
     "barca",
+    "barca-cli",
+    "barca-server",
+    "pytest>=8.0",
+    "scikit-learn>=1.0",
+    "niquests>=3.0",
 ]
 
-[tool.uv.sources]
-barca = { path = "crates/barca-py", editable = true }
+[tool.uv.workspace]
+members = ["packages/*"]
 
-[build-system]
-requires = ["maturin>=1.0,<2.0"]
-build-backend = "maturin"
+[tool.uv.sources]
+barca = { workspace = true }
+barca-cli = { workspace = true }
+barca-server = { workspace = true }
 
 [tool.ruff]
 line-length = 200
-
-[tool.maturin]
-manifest-path = "crates/barca-py/Cargo.toml"
-features = ["pyo3/extension-module"]
-python-source = "crates/barca-py/python"
-module-name = "barca._barca"

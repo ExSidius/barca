@@ -1,0 +1,16 @@
+[project]
+name = "barca-pathological-assets"
+version = "0.1.0"
+description = "Pathological asset examples for AST dependency tracing validation."
+requires-python = ">=3.13"
+dependencies = ["barca"]
+
+[tool.uv.sources]
+barca = { path = "../../packages/barca-core" }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pathological_project"]

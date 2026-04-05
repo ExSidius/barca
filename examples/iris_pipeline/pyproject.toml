@@ -2,11 +2,11 @@
 name = "iris-pipeline"
 version = "0.1.0"
 description = "Iris ML pipeline built with Barca."
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 dependencies = ["barca", "scikit-learn"]
 
 [tool.uv.sources]
-barca = { path = "../../crates/barca-py" }
+barca = { path = "../../packages/barca-core" }
 
 [build-system]
 requires = ["hatchling"]
