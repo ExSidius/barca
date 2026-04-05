@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Python 3.13+ (free-threaded 3.13t recommended)
+- Python 3.14+ (free-threaded 3.14t recommended)
 - [uv](https://docs.astral.sh/uv/) package manager
 
 ## Installation
@@ -10,8 +10,8 @@
 ```bash
 uv init --app my-project
 cd my-project
-echo "3.13t" > .python-version
-uv python install 3.13t
+echo "3.14t" > .python-version
+uv python install 3.14t
 uv add barca
 ```
 

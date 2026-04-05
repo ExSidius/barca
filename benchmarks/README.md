@@ -5,7 +5,7 @@ Compares Barca, Prefect, and Dagster on orchestration overhead and parallel thro
 ## Quick start
 
 ```bash
-# Prerequisites: uv, Python 3.13+ (free-threaded recommended)
+# Prerequisites: uv, Python 3.14+ (free-threaded recommended)
 # One-time setup:
 cd benchmarks/barca_bench && uv sync && cd ..
 cd prefect_bench && uv venv && uv pip install "prefect>=3.0" "scikit-learn" && cd ..
@@ -71,11 +71,11 @@ state.
 
 ## Free-threaded Python
 
-Barca defaults to Python 3.13t (free-threaded build, GIL disabled). This gives
+Barca defaults to Python 3.14t (free-threaded build, GIL disabled). This gives
 `ThreadPoolExecutor` true parallelism without subprocess overhead. The `-j N`
 flag controls concurrency (default: cpu_count).
 
-To opt out and use regular Python 3.13+, change `.python-version` from `3.13t`
+To opt out and use regular Python 3.14+, change `.python-version` from `3.14t`
 to `3.13`. Threads will still work for I/O-bound tasks (GIL is released during
 I/O), but CPU-bound partitions won't get true parallelism.
 

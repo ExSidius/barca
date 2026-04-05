@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Install dependencies (uses free-threaded Python 3.13t by default via .python-version)
+# Install dependencies (uses free-threaded Python 3.14t by default via .python-version)
 uv sync
 
 # Run tests
@@ -100,7 +100,7 @@ The server is **optional** — all CLI commands work without it. The server adds
 3. **Three packages** — `barca` is the reusable library; `barca-cli` is the thin CLI layer; `barca-server` is the optional HTTP server.
 4. **Routes are thin wrappers** — FastAPI handlers validate params and delegate to `service.py`. No business logic in route functions.
 5. **No subprocess workers** — materialize via `importlib.import_module()` + direct function call.
-6. **Free-threaded Python** — defaults to 3.13t (GIL disabled). Partition parallelism via `ThreadPoolExecutor`. Opt out by changing `.python-version` to `3.13`.
+6. **Free-threaded Python** — defaults to 3.14t (GIL disabled). Partition parallelism via `ThreadPoolExecutor`. Opt out by changing `.python-version` to `3.13`.
 7. **Turso primary** — `pyturso` package (DB-API 2.0) for MVCC concurrency; optional `BARCA_TURSO_URL` for remote sync via `turso.sync`.
 8. **Same hashing protocol** — `PROTOCOL_VERSION = "0.3.0"`, JSON payload -> SHA-256.
 9. **DB thread safety** — Turso/libSQL supports MVCC for concurrent reads. `MetadataStore` should still be created per-thread for server routes (`to_thread` pattern).
