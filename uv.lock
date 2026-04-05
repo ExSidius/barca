@@ -70,20 +70,15 @@ source = { editable = "packages/barca-core" }
 dependencies = [
     { name = "croniter" },
     { name = "pydantic" },
-]
-
-[package.optional-dependencies]
-turso = [
-    { name = "libsql-experimental" },
+    { name = "pyturso" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "croniter", specifier = ">=2.0" },
-    { name = "libsql-experimental", marker = "extra == 'turso'", specifier = ">=0.0.50" },
     { name = "pydantic", specifier = ">=2.0" },
+    { name = "pyturso", specifier = ">=0.5.0" },
 ]
-provides-extras = ["turso"]
 
 [[package]]
 name = "barca-cli"
@@ -406,17 +401,6 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/41/f2/d34e8b3a08a9cc79a50b2208a93dce981fe615b64d5a4d4abee421d898df/joblib-1.5.3.tar.gz", hash = "sha256:8561a3269e6801106863fd0d6d84bb737be9e7631e33aaed3fb9ce5953688da3", size = 331603, upload-time = "2025-12-15T08:41:46.427Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/7b/91/984aca2ec129e2757d1e4e3c81c3fcda9d0f85b74670a094cc443d9ee949/joblib-1.5.3-py3-none-any.whl", hash = "sha256:5fc3c5039fc5ca8c0276333a188bbd59d6b7ab37fe6632daa76bc7f9ec18e713", size = 309071, upload-time = "2025-12-15T08:41:44.973Z" },
-]
-
-[[package]]
-name = "libsql-experimental"
-version = "0.0.55"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/53/14/d3eb81673e2096f38eb48f08e38b447f6f2fdc37a50bdb1810d4a225a7aa/libsql_experimental-0.0.55.tar.gz", hash = "sha256:34df13ad6da446e4ccede9b3803af40684da399c8f304848b54ea37e7111b249", size = 31954, upload-time = "2025-06-09T07:26:48.682Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/a0/9f/3589b9590ba948922bd200a02d754fa29e739da81a2953367e9283667a16/libsql_experimental-0.0.55-cp313-cp313-macosx_10_12_x86_64.whl", hash = "sha256:f3bfd7af2ca9d1ff8f8c7f7fce5f1a650bfe53c23b45658253480fe287283bae", size = 4881245, upload-time = "2025-06-09T07:26:37.382Z" },
-    { url = "https://files.pythonhosted.org/packages/37/cf/4aead944cb90f82ab1b61edc78dbe893420e8c4ceee19e1fdae775b1273d/libsql_experimental-0.0.55-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:b3476a78edb8f59aa6c571d6def1840fff8d263eb4bbc4b26b2afd7400cb9ba2", size = 4656348, upload-time = "2025-06-09T07:26:39.04Z" },
-    { url = "https://files.pythonhosted.org/packages/70/73/134dc2db0c3805f62953c85778bf93ac2f4a5ad81d49e592be990b012711/libsql_experimental-0.0.55-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7a5dd325f87425546e0a7f0d460d4b6e1852bc4d4194a7b5ad127614ef8b3b10", size = 5273740, upload-time = "2025-06-09T07:26:40.597Z" },
 ]
 
 [[package]]
@@ -863,6 +847,21 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
+]
+
+[[package]]
+name = "pyturso"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/41/89/0b25d31d9b4babd68b9f3b2010eab553769fed81df0fad28d6646a13f147/pyturso-0.5.1.tar.gz", hash = "sha256:418c186393cbb4fad30baaa4d6be18fe03369cf4691a4f42fb459758c92cb5fe", size = 1938764, upload-time = "2026-03-10T12:40:39.996Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/76/2a9c43f08ed81f93fcdee85d0312b34f8063310f6a79e634cd4639765825/pyturso-0.5.1-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:030fd5b1bfe72f82f125e4de31f2298198d460a7e59b8602fc0b51af504fafe9", size = 4534230, upload-time = "2026-03-10T12:40:19.825Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/5b/aaf24492637f246adfd79d3b62d7de4440240b741a430cc0b9e9b551510b/pyturso-0.5.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:baa8846a322434a8b31c2acdd20ed19bab2de770a5f295b9892e06c1b3fb84ff", size = 15160998, upload-time = "2026-03-10T12:40:23.044Z" },
+    { url = "https://files.pythonhosted.org/packages/55/c2/5f61ace6ebec4d023983ea797e032820797ed27ad565b824f40213a19c6b/pyturso-0.5.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:2e10b4d4b47a2db2cf47c4cbf0345bbc5a99b7ec5528101d2fca5fd03f11e878", size = 4534591, upload-time = "2026-03-10T12:40:26.341Z" },
+    { url = "https://files.pythonhosted.org/packages/58/cb/aa78241f51e11d3bda76b8e2551ef18226b2c8f5fc359766a4856c832298/pyturso-0.5.1-cp314-cp314-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ef8822aca1a10fb60d5c161669e55e1347730d99a8943cc7db2fd1028900805a", size = 15155567, upload-time = "2026-03-10T12:40:29.846Z" },
 ]
 
 [[package]]

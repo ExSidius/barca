@@ -6,10 +6,8 @@ requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.0",
     "croniter>=2.0",
+    "pyturso>=0.5.0",
 ]
-
-[project.optional-dependencies]
-turso = ["libsql-experimental>=0.0.50"]
 
 [build-system]
 requires = ["hatchling"]
