@@ -11,9 +11,9 @@ from fastapi import FastAPI, HTTPException
 
 from barca._models import AssetDetail, AssetSummary, JobDetail, ReconcileResult, SensorObservation
 from barca._store import MetadataStore
-from barca_server.logging import configure_logging
-from barca_server.scheduler import scheduler_loop
-from barca_server import service
+from barca.server.logging import configure_logging
+from barca.server.scheduler import scheduler_loop
+from barca.server import service
 
 logger = logging.getLogger("barca.server.app")
 

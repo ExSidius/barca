@@ -12,7 +12,7 @@ from barca._models import JobDetail
 from barca._reconciler import reconcile as do_reconcile
 from barca._store import MetadataStore
 
-from barca_cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary, sensor_observations_table
+from barca.cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary, sensor_observations_table
 
 
 def _check_gil() -> None:
@@ -92,8 +92,12 @@ def serve(
     log_level: str = typer.Option("info", "--log-level", help="Log level (debug, info, warning, error)"),
 ) -> None:
     """Start the barca server (HTTP API + background scheduler)."""
-    import uvicorn
-    from barca_server.app import create_app
+    try:
+        import uvicorn
+        from barca.server.app import create_app
+    except ImportError:
+        typer.echo("barca[server] is required for `barca serve`. Install with: uv add barca[server]", err=True)
+        raise typer.Exit(1)
 
     root = _repo_root()
     application = create_app(repo_root=root, interval=interval, log_level=log_level)

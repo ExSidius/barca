@@ -1,13 +1,23 @@
 [project]
 name = "barca"
 version = "0.1.0"
-description = "Minimal asset orchestrator — core library."
+description = "Minimal asset orchestrator."
 requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.0",
     "croniter>=2.0",
     "pyturso>=0.5.0",
+    "typer>=0.9",
 ]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+]
+
+[project.scripts]
+barca = "barca.cli.cli:app"
 
 [build-system]
 requires = ["hatchling"]
