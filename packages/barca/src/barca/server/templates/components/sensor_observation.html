@@ -2,20 +2,20 @@
 <div class="card p-4 flex flex-col gap-2">
   <div class="flex items-center justify-between">
     <span class="text-xs font-medium text-[var(--text-3)] uppercase tracking-wider">{{ label or 'Observation' }}</span>
-    {{ status_badge(obs.status) }}
+    {% if obs.update_detected %}
+      <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border text-green-400 bg-green-500/10 border-green-500/20">update detected</span>
+    {% else %}
+      <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border text-neutral-400 bg-neutral-500/10 border-neutral-500/20">no update</span>
+    {% endif %}
   </div>
   <div class="kv-grid">
     <span class="kv-label">Update detected</span>
     <span class="kv-value font-mono">{{ 'yes' if obs.update_detected else 'no' }}</span>
     <span class="kv-label">Observed at</span>
-    <span class="kv-value">{{ obs.observed_at or '—' }}</span>
+    <span class="kv-value">{{ obs.created_at or '—' }}</span>
     {% if obs.output_json %}
     <span class="kv-label">Output</span>
     <span class="kv-value font-mono text-xs break-all">{{ obs.output_json }}</span>
-    {% endif %}
-    {% if obs.last_error %}
-    <span class="kv-label">Error</span>
-    <span class="kv-value text-red-400 font-mono text-xs break-all">{{ obs.last_error }}</span>
     {% endif %}
   </div>
 </div>

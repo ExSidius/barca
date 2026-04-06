@@ -58,6 +58,12 @@ def create_app(
     async def lifespan(app: FastAPI):
         nonlocal scheduler_task
         logger.info("server starting (repo_root=%s, interval=%d)", repo_root, interval)
+        # Validate DB schema before accepting any traffic — fail fast with a clear message.
+        try:
+            MetadataStore(db_path_str)
+        except RuntimeError as exc:
+            logger.error("DB schema check failed — run 'barca reset --db' then retry.\n%s", exc)
+            raise SystemExit(1) from exc
         scheduler_task = asyncio.create_task(scheduler_loop(repo_root, db_path_str, interval, reconcile_lock))
         wal_task = asyncio.create_task(notifier.watch_wal(db_path))
         yield

@@ -147,19 +147,75 @@ class MetadataStore:
             if statement:
                 self.conn.execute(statement)
         self.conn.commit()
-        # Migrations for kind and schedule columns
-        for col, default in [("kind", "'asset'"), ("schedule", "'manual'")]:
+        self._run_migrations()
+        self._validate_schema()
+
+    def _run_migrations(self) -> None:
+        """Apply all additive column migrations in order. Safe to re-run (ALTER TABLE fails silently if column exists)."""
+
+        def _add(table: str, col: str, col_def: str) -> None:
             try:
-                self.conn.execute(f"ALTER TABLE assets ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
                 self.conn.commit()
             except Exception:
-                pass  # column already exists
-        # Migration: partition_key_json added later
-        try:
-            self.conn.execute("ALTER TABLE materializations ADD COLUMN partition_key_json TEXT")
-            self.conn.commit()
-        except Exception:
-            pass  # column already exists
+                pass  # column already exists — that's fine
+
+        # assets table
+        _add("assets", "kind", "TEXT NOT NULL DEFAULT 'asset'")
+        _add("assets", "schedule", "TEXT NOT NULL DEFAULT 'manual'")
+
+        # asset_definitions table
+        _add("asset_definitions", "codebase_hash", "TEXT NOT NULL DEFAULT ''")
+        _add("asset_definitions", "dependency_cone_hash", "TEXT NOT NULL DEFAULT ''")
+
+        # materializations table
+        _add("materializations", "partition_key_json", "TEXT")
+
+    def _validate_schema(self) -> None:
+        """Check that all expected columns are present. Raises RuntimeError with reset instructions if not."""
+        # Only list columns that are actually queried — not every column in the DDL.
+        # This list grows as new columns are added (and migrations are added alongside).
+        expected: dict[str, list[str]] = {
+            "assets": ["id", "logical_name", "continuity_key", "module_path", "file_path", "function_name", "asset_slug", "kind", "schedule", "created_at"],
+            "asset_definitions": [
+                "id",
+                "asset_id",
+                "definition_hash",
+                "continuity_key",
+                "source_text",
+                "module_source_text",
+                "decorator_metadata_json",
+                "return_type",
+                "serializer_kind",
+                "python_version",
+                "codebase_hash",
+                "dependency_cone_hash",
+                "status",
+                "created_at",
+            ],
+            "materializations": ["id", "asset_id", "definition_id", "run_hash", "status", "artifact_path", "artifact_format", "artifact_checksum", "last_error", "partition_key_json", "created_at"],
+            "sensor_observations": ["id", "asset_id", "definition_id", "update_detected", "output_json", "created_at"],
+            "effect_executions": ["id", "asset_id", "definition_id", "status", "last_error", "created_at"],
+            "job_logs": ["id", "materialization_id", "asset_id", "level", "message", "created_at"],
+        }
+        missing: list[str] = []
+        for table, cols in expected.items():
+            try:
+                rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+                present = {r[1] for r in rows}
+                for col in cols:
+                    if col not in present:
+                        missing.append(f"  {table}.{col}")
+            except Exception as exc:
+                missing.append(f"  {table} (could not inspect: {exc})")
+
+        if missing:
+            col_list = "\n".join(missing)
+            raise RuntimeError(
+                f"Database schema is out of date — the following columns are missing:\n{col_list}\n\n"
+                "Run  barca reset --db  to drop and recreate the database, then re-run your command.\n"
+                "(Your artifact files in .barcafiles/ are not affected by --db reset.)"
+            )
 
     # ------------------------------------------------------------------
     # Assets

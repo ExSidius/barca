@@ -55,7 +55,11 @@ def _repo_root() -> Path:
 def _store() -> MetadataStore:
     root = _repo_root()
     db_path = root / ".barca" / "metadata.db"
-    return MetadataStore(str(db_path))
+    try:
+        return MetadataStore(str(db_path))
+    except RuntimeError as exc:
+        _console.print(f"[bold red]✗ Schema error:[/bold red] {exc}", err=True)
+        raise typer.Exit(1) from exc
 
 
 @app.command()
