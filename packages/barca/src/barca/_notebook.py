@@ -6,10 +6,9 @@ import inspect
 import json
 from pathlib import Path
 
-from barca._engine import reindex, refresh, trigger_sensor
+from barca._engine import refresh, reindex
 from barca._hashing import relative_path
 from barca._store import MetadataStore
-
 
 # ------------------------------------------------------------------
 # Internal helpers
@@ -36,9 +35,7 @@ def _find_project_root(fn) -> Path:
                 break
             d = parent
 
-    raise FileNotFoundError(
-        "Could not find barca.toml — are you inside a Barca project?"
-    )
+    raise FileNotFoundError("Could not find barca.toml — are you inside a Barca project?")
 
 
 def _bootstrap(fn) -> tuple[MetadataStore, Path, int]:
@@ -67,10 +64,7 @@ def _resolve_asset_id(store: MetadataStore, repo_root: Path, fn) -> int:
 
     asset_id = store.asset_id_by_logical_name(continuity_key)
     if asset_id is None:
-        raise ValueError(
-            f"Asset '{continuity_key}' not found in the index. "
-            f"Has reindex been run?"
-        )
+        raise ValueError(f"Asset '{continuity_key}' not found in the index. Has reindex been run?")
     return asset_id
 
 
@@ -86,28 +80,23 @@ def _load_upstream_value(
     if detail.asset.kind == "sensor":
         obs = store.latest_sensor_observation(upstream_id)
         if obs is None or obs.output_json is None:
-            raise ValueError(
-                f"Sensor '{detail.asset.logical_name}' has no observations yet"
-            )
+            raise ValueError(f"Sensor '{detail.asset.logical_name}' has no observations yet")
         return json.loads(obs.output_json)
 
     # Asset — load from materialization artifact
     if partition is not None:
         pk_json = json.dumps(partition, separators=(",", ":"))
         mat = store.latest_successful_materialization_for_partition(
-            upstream_id, pk_json,
+            upstream_id,
+            pk_json,
         )
     else:
         mat = store.latest_successful_materialization(upstream_id)
 
     if mat is None:
-        raise ValueError(
-            f"Asset '{detail.asset.logical_name}' has no successful materialization"
-        )
+        raise ValueError(f"Asset '{detail.asset.logical_name}' has no successful materialization")
     if not mat.artifact_path:
-        raise ValueError(
-            f"Asset '{detail.asset.logical_name}' has no artifact path"
-        )
+        raise ValueError(f"Asset '{detail.asset.logical_name}' has no artifact path")
     return json.loads((repo_root / mat.artifact_path).read_text())
 
 
@@ -135,18 +124,20 @@ def _resolve_inputs(store, repo_root, detail):
         if ":" in abs_ref:
             colon_pos = abs_ref.rfind(":")
             abs_path = abs_ref[:colon_pos]
-            func_name = abs_ref[colon_pos + 1:]
+            func_name = abs_ref[colon_pos + 1 :]
             rel = relative_path(repo_root, Path(abs_path))
             canonical_ref = f"{rel}:{func_name}"
         else:
             canonical_ref = abs_ref
 
         upstream_id = store.asset_id_by_logical_name(canonical_ref)
-        result.append(AssetInput(
-            parameter_name=param_name,
-            upstream_asset_ref=canonical_ref,
-            upstream_asset_id=upstream_id,
-        ))
+        result.append(
+            AssetInput(
+                parameter_name=param_name,
+                upstream_asset_ref=canonical_ref,
+                upstream_asset_id=upstream_id,
+            )
+        )
 
     return result
 
@@ -178,7 +169,10 @@ def load_inputs(asset_fn, *, partition: dict | None = None) -> dict[str, object]
         if uid is None or uid <= 0:
             continue
         kwargs[inp.parameter_name] = _load_upstream_value(
-            store, repo_root, uid, partition,
+            store,
+            repo_root,
+            uid,
+            partition,
         )
     return kwargs
 
@@ -193,19 +187,15 @@ def materialize(asset_fn) -> object:
     detail = store.asset_detail(asset_id)
 
     if detail.asset.kind == "sensor":
-        raise ValueError(
-            "Cannot materialize a sensor — use read_asset() after triggering"
-        )
+        raise ValueError("Cannot materialize a sensor — use read_asset() after triggering")
     if detail.asset.kind == "effect":
-        raise ValueError(
-            "Cannot materialize an effect — effects are side-effects, not cached values"
-        )
+        raise ValueError("Cannot materialize an effect — effects are side-effects, not cached values")
 
     refresh(store, repo_root, asset_id)
 
     mat = store.latest_successful_materialization(asset_id)
     if mat is None or not mat.artifact_path:
-        raise ValueError(f"Materialization produced no artifact")
+        raise ValueError("Materialization produced no artifact")
     return json.loads((repo_root / mat.artifact_path).read_text())
 
 
@@ -215,16 +205,14 @@ def read_asset(asset_or_sensor_fn) -> object:
     detail = store.asset_detail(asset_id)
 
     if detail.asset.kind == "effect":
-        raise ValueError(
-            "Cannot read an effect — effects have no stored output"
-        )
+        raise ValueError("Cannot read an effect — effects have no stored output")
 
     return _load_upstream_value(store, repo_root, asset_id)
 
 
 def list_versions(asset_or_sensor_fn) -> list[dict]:
     """List historical materializations or sensor observations."""
-    store, repo_root, asset_id = _bootstrap(asset_or_sensor_fn)
+    store, _repo_root, asset_id = _bootstrap(asset_or_sensor_fn)
     detail = store.asset_detail(asset_id)
 
     if detail.asset.kind == "sensor":

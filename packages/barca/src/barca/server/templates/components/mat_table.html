@@ -1,0 +1,38 @@
+{% from "components/macros.html" import status_badge, hash_display %}
+<table class="data-table w-full">
+  <thead>
+    <tr>
+      <th>Status</th>
+      <th>Run Hash</th>
+      <th>Artifact</th>
+      <th>Created</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for m in materializations %}
+    <tr>
+      <td>{{ status_badge(m.status) }}</td>
+      <td>{{ hash_display(m.run_hash) }}</td>
+      <td>
+        {% if m.artifact_path %}
+          <span class="font-mono text-xs text-[var(--text-3)] truncate max-w-[240px] block" title="{{ m.artifact_path }}">
+            {{ m.artifact_path | replace(repo_root | string, '') if repo_root is defined else m.artifact_path }}
+          </span>
+        {% else %}
+          <span class="text-[var(--text-3)]">—</span>
+        {% endif %}
+      </td>
+      <td class="text-xs text-[var(--text-3)]">{{ m.created_at or '—' }}</td>
+    </tr>
+    {% if m.last_error %}
+    <tr class="bg-red-500/5">
+      <td colspan="4" class="py-2 px-4 text-xs text-red-400 font-mono">{{ m.last_error }}</td>
+    </tr>
+    {% endif %}
+    {% else %}
+    <tr>
+      <td colspan="4" class="py-8 text-center text-sm text-[var(--text-3)]">No materializations yet</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

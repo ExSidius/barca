@@ -12,6 +12,9 @@ dev = [
     "niquests>=3.0",
     "mkdocs-material>=9.0",
     "mkdocstrings[python]>=0.24",
+    "httpx>=0.28.1",
+    "ty>=0.0.29",
+    "ruff>=0.15.9",
 ]
 
 [tool.uv]
@@ -23,5 +26,49 @@ members = ["packages/barca"]
 [tool.uv.sources]
 barca = { workspace = true }
 
+# ---------------------------------------------------------------------------
+# Ruff — linter + formatter
+# ---------------------------------------------------------------------------
 [tool.ruff]
 line-length = 200
+target-version = "py313"
+exclude = ["experiments/", "benchmarks/"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "RUF",  # ruff-specific rules
+]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "B008",   # do not call functions in default arguments (FastAPI uses this)
+    "UP007",  # X | Y union syntax (keep Optional for clarity in older code)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["barca"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+# ---------------------------------------------------------------------------
+# ty — fast Python type checker (Astral)
+# ---------------------------------------------------------------------------
+[tool.ty.environment]
+python-version = "3.14"
+root = ["packages/barca/src"]
+
+[tool.ty.rules]
+# Treat these as errors (not just warnings)
+division-by-zero = "error"
+invalid-argument-type = "error"
+invalid-return-type = "error"
+missing-argument = "error"
+too-many-positional-arguments = "error"
+unresolved-attribute = "error"

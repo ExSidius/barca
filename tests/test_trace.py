@@ -3,7 +3,6 @@
 import importlib
 import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -31,15 +30,18 @@ def trace_project(tmp_path):
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
 
-    (mod_dir / "helpers.py").write_text(textwrap.dedent("""\
+    (mod_dir / "helpers.py").write_text(
+        textwrap.dedent("""\
         def normalize(text):
             return text.strip().lower()
 
         def format_output(value, prefix="result"):
             return f"{prefix}: {value}"
-    """))
+    """)
+    )
 
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset, unsafe
         from tracemod.helpers import normalize
 
@@ -63,7 +65,8 @@ def trace_project(tmp_path):
         @asset()
         def uses_unsafe() -> dict:
             return {"value": load_dynamic()}
-    """))
+    """)
+    )
 
     _cleanup_modules("tracemod")
     clear_caches()
@@ -77,7 +80,6 @@ def trace_project(tmp_path):
 def test_same_file_dep_traced(trace_project):
     clear_caches()
     _cleanup_modules("tracemod")
-    import tracemod.assets
     from tracemod.assets import same_file_dep
 
     original = getattr(same_file_dep, "__barca_original__", same_file_dep)
@@ -89,8 +91,6 @@ def test_same_file_dep_traced(trace_project):
 def test_cross_file_dep_traced(trace_project):
     clear_caches()
     _cleanup_modules("tracemod")
-    import tracemod.helpers
-    import tracemod.assets
     from tracemod.assets import cross_file_dep
 
     original = getattr(cross_file_dep, "__barca_original__", cross_file_dep)
@@ -102,7 +102,6 @@ def test_cross_file_dep_traced(trace_project):
 def test_unsafe_skips_tracing(trace_project):
     clear_caches()
     _cleanup_modules("tracemod")
-    import tracemod.assets
     from tracemod.assets import load_dynamic
 
     result = extract_dependencies(load_dynamic, str(trace_project))
@@ -112,8 +111,7 @@ def test_unsafe_skips_tracing(trace_project):
 def test_purity_analysis(trace_project):
     clear_caches()
     _cleanup_modules("tracemod")
-    import tracemod.assets
-    from tracemod.assets import same_file_dep, load_dynamic
+    from tracemod.assets import load_dynamic, same_file_dep
 
     original = getattr(same_file_dep, "__barca_original__", same_file_dep)
     result = analyze_purity(original)
@@ -126,8 +124,6 @@ def test_purity_analysis(trace_project):
 def test_dependency_hash_changes_with_helper(trace_project):
     clear_caches()
     _cleanup_modules("tracemod")
-    import tracemod.helpers
-    import tracemod.assets
     from tracemod.assets import cross_file_dep
 
     original = getattr(cross_file_dep, "__barca_original__", cross_file_dep)
@@ -135,21 +131,26 @@ def test_dependency_hash_changes_with_helper(trace_project):
 
     # Change the helper
     helpers_file = trace_project / "tracemod" / "helpers.py"
-    helpers_file.write_text(textwrap.dedent("""\
+    helpers_file.write_text(
+        textwrap.dedent("""\
         def normalize(text):
             return text.strip().upper()
 
         def format_output(value, prefix="result"):
             return f"{prefix}: {value}"
-    """))
+    """)
+    )
 
     clear_caches()
     _cleanup_modules("tracemod")
     import tracemod.helpers as th
+
     importlib.reload(th)
     import tracemod.assets as ta
+
     importlib.reload(ta)
     from tracemod.assets import cross_file_dep as cross2
+
     original2 = getattr(cross2, "__barca_original__", cross2)
 
     hash2 = compute_dependency_hash(original2, str(trace_project))

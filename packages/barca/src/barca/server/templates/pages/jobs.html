@@ -1,0 +1,32 @@
+{% extends "layout.html" %}
+
+{% block title %}Jobs — Barca{% endblock %}
+
+{% set active_page = 'jobs' %}
+
+{% block breadcrumb %}
+<span class="text-[var(--text-3)]">Jobs</span>
+{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-4" data-signals="{statusFilter: 'all'}">
+
+  <!-- Filters -->
+  <div class="tab-group">
+    <button class="tab-btn" data-class:active="$statusFilter === 'all'"
+      data-on:click="$statusFilter='all'; @get('/ui/fragments/jobs')">All</button>
+    <button class="tab-btn" data-class:active="$statusFilter === 'success'"
+      data-on:click="$statusFilter='success'; @get('/ui/fragments/jobs?status=success')">Success</button>
+    <button class="tab-btn" data-class:active="$statusFilter === 'failed'"
+      data-on:click="$statusFilter='failed'; @get('/ui/fragments/jobs?status=failed')">Failed</button>
+    <button class="tab-btn" data-class:active="$statusFilter === 'running'"
+      data-on:click="$statusFilter='running'; @get('/ui/fragments/jobs?status=running')">Running</button>
+  </div>
+
+  <!-- Jobs table -->
+  <div class="card overflow-hidden">
+    {% include "components/job_table_body.html" %}
+  </div>
+
+</div>
+{% endblock %}

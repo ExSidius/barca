@@ -3,9 +3,9 @@
 Uses ThreadPoolTaskRunner with max_workers=64.
 """
 
-import time
 import math
 import sys
+import time
 
 from prefect import flow, task
 from prefect.task_runners import ThreadPoolTaskRunner
@@ -37,7 +37,7 @@ if __name__ == "__main__":
         results = benchmark_flow()
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.2f}s ({len(results)} results)")
+        print(f"  Run {i + 1}: {elapsed:.2f}s ({len(results)} results)")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))

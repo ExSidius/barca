@@ -13,15 +13,13 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import pytest
-
 from barca._models import IndexedAsset
 from barca._store import MetadataStore
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_asset(n: int) -> IndexedAsset:
     """Return a minimal IndexedAsset with a unique continuity_key."""
@@ -54,6 +52,7 @@ def _store(db_path: str) -> MetadataStore:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 def test_concurrent_upsert_unique_assets(tmp_path: Path) -> None:
     """N threads each upsert a distinct asset — all rows must be written."""

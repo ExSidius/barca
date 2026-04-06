@@ -1,10 +1,9 @@
 """W2: Asset dependencies — upstream resolution, artifact passing."""
 
-import importlib
 import json
 import sys
 
-from barca._engine import reindex, refresh
+from barca._engine import refresh, reindex
 from barca._store import MetadataStore
 from barca._trace import clear_caches
 
@@ -27,7 +26,7 @@ def test_refresh_downstream_triggers_upstream(dep_project):
     assets = reindex(store, dep_project)
 
     upper_id = next(a.asset_id for a in assets if "uppercased" in a.logical_name)
-    detail = refresh(store, dep_project, upper_id)
+    refresh(store, dep_project, upper_id)
 
     # Both assets should be materialized
     for a in assets:

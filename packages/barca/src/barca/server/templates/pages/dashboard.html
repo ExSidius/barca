@@ -1,0 +1,92 @@
+{% extends "layout.html" %}
+{% from "components/macros.html" import status_badge, kind_badge %}
+
+{% block title %}Dashboard — Barca{% endblock %}
+
+{% set active_page = 'dashboard' %}
+
+{% block breadcrumb %}
+<span>Dashboard</span>
+{% endblock %}
+
+{% block content %}
+<div class="flex flex-col gap-6">
+
+  <!-- Stat cards -->
+  <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+    <div class="stat-card">
+      <div class="stat-value">{{ total_assets }}</div>
+      <div class="stat-label">Assets</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">{{ total_sensors }}</div>
+      <div class="stat-label">Sensors</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">{{ total_effects }}</div>
+      <div class="stat-label">Effects</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value flex items-center gap-1.5">
+        {% if scheduler_running %}
+          <span class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></span>
+          <span class="text-green-400">Running</span>
+        {% else %}
+          <span class="w-2 h-2 rounded-full bg-neutral-500"></span>
+          <span class="text-[var(--text-3)]">Stopped</span>
+        {% endif %}
+      </div>
+      <div class="stat-label">Scheduler</div>
+    </div>
+  </div>
+
+  <!-- Recent jobs + asset overview -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+    <!-- Recent jobs -->
+    <div class="card flex flex-col">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+        <h2 class="text-sm font-medium text-[var(--text-1)]">Recent Jobs</h2>
+        <a href="/ui/jobs" class="text-xs text-[var(--text-3)] hover:text-[var(--text-1)] transition-colors">View all →</a>
+      </div>
+      <div class="divide-y divide-[var(--border)]">
+        {% for j in recent_jobs %}
+        <a href="/ui/jobs/{{ j.job.job_id }}" class="flex items-center gap-3 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors">
+          <div class="shrink-0">{{ status_badge(j.job.status) }}</div>
+          <div class="flex flex-col gap-0.5 min-w-0">
+            <span class="text-xs font-medium text-[var(--text-1)] truncate">{{ j.job.asset_continuity_key or 'unknown' }}</span>
+            <span class="text-xs text-[var(--text-3)]">{{ j.job.started_at or '—' }}</span>
+          </div>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="ml-auto text-[var(--text-3)] shrink-0">
+            <polyline points="9 18 15 12 9 6"/>
+          </svg>
+        </a>
+        {% else %}
+        <div class="px-4 py-8 text-center text-sm text-[var(--text-3)]">No jobs yet</div>
+        {% endfor %}
+      </div>
+    </div>
+
+    <!-- Asset overview -->
+    <div class="card flex flex-col">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+        <h2 class="text-sm font-medium text-[var(--text-1)]">Assets</h2>
+        <a href="/ui/assets" class="text-xs text-[var(--text-3)] hover:text-[var(--text-1)] transition-colors">View all →</a>
+      </div>
+      <div class="divide-y divide-[var(--border)]">
+        {% for a in assets[:8] %}
+        <a href="/ui/{% if a.kind == 'sensor' %}sensors{% else %}assets{% endif %}/{{ a.asset_id }}"
+           class="flex items-center gap-3 px-4 py-3 hover:bg-[var(--bg-hover)] transition-colors">
+          <div class="shrink-0">{{ kind_badge(a.kind) }}</div>
+          <span class="text-xs font-mono text-[var(--text-2)] truncate">{{ a.logical_name }}</span>
+          <div class="ml-auto shrink-0">{{ status_badge(a.materialization_status) }}</div>
+        </a>
+        {% else %}
+        <div class="px-4 py-8 text-center text-sm text-[var(--text-3)]">No assets indexed yet</div>
+        {% endfor %}
+      </div>
+    </div>
+
+  </div>
+</div>
+{% endblock %}

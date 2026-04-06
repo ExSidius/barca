@@ -1,10 +1,10 @@
 """Barca benchmark: 500 partitions x 50ms work each, via CLI."""
 
-import subprocess
-import time
-import os
-import sys
 import math
+import os
+import subprocess
+import sys
+import time
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(BENCH_DIR))
@@ -42,7 +42,7 @@ def bench(runs, concurrency=None):
         subprocess.run(cmd, cwd=BENCH_DIR, check=True, capture_output=True)
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.2f}s")
+        print(f"  Run {i + 1}: {elapsed:.2f}s")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))

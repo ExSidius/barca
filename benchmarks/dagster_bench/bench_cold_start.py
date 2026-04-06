@@ -3,9 +3,9 @@
 Note: Run 1 includes module loading overhead.
 """
 
-import time
-import sys
 import math
+import sys
+import time
 
 from dagster import asset, materialize
 
@@ -28,7 +28,7 @@ def main():
         materialize([trivial_single])
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.3f}s")
+        print(f"  Run {i + 1}: {elapsed:.3f}s")
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
     print(f"[dagster] Cold start avg: {avg:.3f}s +/- {std:.3f}s (warm modules)")

@@ -31,7 +31,7 @@ def _gen_module(root, n_assets):
 def bench(runs, n_assets, max_workers):
     from pathlib import Path
 
-    from barca._engine import reindex, refresh, reset
+    from barca._engine import refresh, reindex, reset
     from barca._store import MetadataStore
 
     root = Path(BENCH_DIR)
@@ -94,7 +94,7 @@ def bench(runs, n_assets, max_workers):
         times_reindex.append(t_reindex)
         times_materialize.append(t_materialize)
         times_total.append(total)
-        print(f"  Run {i+1}: reindex={t_reindex:.3f}s  materialize={t_materialize:.3f}s  total={total:.3f}s")
+        print(f"  Run {i + 1}: reindex={t_reindex:.3f}s  materialize={t_materialize:.3f}s  total={total:.3f}s")
 
     def stats(ts):
         avg = sum(ts) / len(ts)

@@ -15,7 +15,6 @@ from barca._hashing import (
     compute_codebase_hash,
     compute_definition_hash,
     compute_run_hash,
-    now_ts,
     relative_path,
     sha256_hex,
     slugify,
@@ -27,11 +26,9 @@ from barca._models import (
     AssetSummary,
     IndexedAsset,
     InspectedAsset,
-    MaterializationRecord,
     SensorObservation,
 )
 from barca._store import MetadataStore
-
 
 # ------------------------------------------------------------------
 # Build indexed asset from inspected asset (pure function)
@@ -78,15 +75,17 @@ def build_indexed_asset(
                 if ":" in abs_ref:
                     colon_pos = abs_ref.rfind(":")
                     abs_path = abs_ref[:colon_pos]
-                    func_name = abs_ref[colon_pos + 1:]
+                    func_name = abs_ref[colon_pos + 1 :]
                     rel = relative_path(repo_root, Path(abs_path))
                     canonical_ref = f"{rel}:{func_name}"
                 else:
                     canonical_ref = abs_ref
-                inputs.append(AssetInput(
-                    parameter_name=param_name,
-                    upstream_asset_ref=canonical_ref,
-                ))
+                inputs.append(
+                    AssetInput(
+                        parameter_name=param_name,
+                        upstream_asset_ref=canonical_ref,
+                    )
+                )
 
     has_inputs = len(inputs) > 0
     run_hash = "" if has_inputs else definition_hash
@@ -122,8 +121,7 @@ def build_indexed_asset(
 
 def discover_barca_modules(root: Path) -> list[str]:
     """Walk .py files looking for barca imports, return dotted module names."""
-    skip = {".venv", "__pycache__", ".git", ".barca", ".barcafiles",
-            "build", "dist", "node_modules", "target", "tmp"}
+    skip = {".venv", "__pycache__", ".git", ".barca", ".barcafiles", "build", "dist", "node_modules", "target", "tmp"}
     modules = []
     for py_file in root.rglob("*.py"):
         if any(part in skip for part in py_file.parts):
@@ -191,10 +189,7 @@ def reindex(store: MetadataStore, repo_root: Path) -> list[AssetSummary]:
         for inp in inputs:
             upstream_id = store.asset_id_by_logical_name(inp.upstream_asset_ref)
             if upstream_id is None:
-                raise ValueError(
-                    f"input '{inp.parameter_name}' on asset '{continuity_key}' "
-                    f"references unknown asset '{inp.upstream_asset_ref}'"
-                )
+                raise ValueError(f"input '{inp.parameter_name}' on asset '{continuity_key}' references unknown asset '{inp.upstream_asset_ref}'")
             inp.upstream_asset_id = upstream_id
 
         store.upsert_asset_inputs(detail.asset.definition_id, inputs)
@@ -212,9 +207,7 @@ def refresh(store: MetadataStore, repo_root: Path, asset_id: int, *, max_workers
     detail = store.asset_detail(asset_id)
 
     if detail.asset.kind == "sensor":
-        raise ValueError(
-            f"asset #{asset_id} is a sensor — use trigger_sensor() instead of refresh()"
-        )
+        raise ValueError(f"asset #{asset_id} is a sensor — use trigger_sensor() instead of refresh()")
 
     # Resolve inputs
     asset_inputs = _resolve_asset_inputs(store, detail, repo_root)
@@ -260,14 +253,23 @@ def refresh(store: MetadataStore, repo_root: Path, asset_id: int, *, max_workers
 
     if partition_values:
         return _refresh_partitioned(
-            store, repo_root, detail, asset_inputs,
-            input_kwargs, upstream_mat_ids, partition_values,
+            store,
+            repo_root,
+            detail,
+            asset_inputs,
+            input_kwargs,
+            upstream_mat_ids,
+            partition_values,
             max_workers=max_workers,
         )
     else:
         return _refresh_single(
-            store, repo_root, detail, asset_inputs,
-            input_kwargs, upstream_mat_ids,
+            store,
+            repo_root,
+            detail,
+            asset_inputs,
+            input_kwargs,
+            upstream_mat_ids,
         )
 
 
@@ -284,19 +286,22 @@ def trigger_sensor(store: MetadataStore, repo_root: Path, asset_id: int) -> Sens
     sensor_result = original()
 
     if not isinstance(sensor_result, tuple) or len(sensor_result) != 2:
-        raise ValueError(
-            f"sensor '{detail.asset.function_name}' must return (update_detected: bool, output), "
-            f"got {type(sensor_result).__name__}"
-        )
+        raise ValueError(f"sensor '{detail.asset.function_name}' must return (update_detected: bool, output), got {type(sensor_result).__name__}")
 
     update_detected, output = sensor_result
     output_json = json.dumps(output) if output is not None else None
 
     store.insert_sensor_observation(
-        asset_id, detail.asset.definition_id, bool(update_detected), output_json,
+        asset_id,
+        detail.asset.definition_id,
+        bool(update_detected),
+        output_json,
     )
 
-    return store.latest_sensor_observation(asset_id)
+    obs = store.latest_sensor_observation(asset_id)
+    if obs is None:
+        raise RuntimeError(f"sensor observation not found after insert for asset {asset_id}")
+    return obs
 
 
 def _refresh_single(
@@ -308,11 +313,7 @@ def _refresh_single(
     upstream_mat_ids: list[int],
 ) -> AssetDetail:
     has_inputs = len(asset_inputs) > 0
-    run_hash = (
-        compute_run_hash(detail.asset.definition_hash, upstream_mat_ids)
-        if has_inputs
-        else detail.asset.definition_hash
-    )
+    run_hash = compute_run_hash(detail.asset.definition_hash, upstream_mat_ids) if has_inputs else detail.asset.definition_hash
 
     # Check cache
     existing = store.successful_materialization_for_run(detail.asset.asset_id, run_hash)
@@ -321,13 +322,20 @@ def _refresh_single(
 
     # Enqueue and execute
     mat_id = store.insert_queued_materialization(
-        detail.asset.asset_id, detail.asset.definition_id, run_hash,
+        detail.asset.asset_id,
+        detail.asset.definition_id,
+        run_hash,
     )
 
     try:
         _execute_materialization(
-            store, repo_root, detail, mat_id, run_hash,
-            input_kwargs, upstream_mat_ids,
+            store,
+            repo_root,
+            detail,
+            mat_id,
+            run_hash,
+            input_kwargs,
+            upstream_mat_ids,
         )
     except Exception as e:
         store.mark_materialization_failed(mat_id, str(e))
@@ -352,7 +360,9 @@ def _refresh_partitioned(
     for pv in partition_values:
         pk_json = json.dumps(pv, separators=(",", ":"))
         run_hash = compute_run_hash(
-            detail.asset.definition_hash, upstream_mat_ids, pk_json,
+            detail.asset.definition_hash,
+            upstream_mat_ids,
+            pk_json,
         )
 
         # Check cache
@@ -361,7 +371,10 @@ def _refresh_partitioned(
             continue
 
         mat_id = store.insert_queued_materialization(
-            detail.asset.asset_id, detail.asset.definition_id, run_hash, pk_json,
+            detail.asset.asset_id,
+            detail.asset.definition_id,
+            run_hash,
+            pk_json,
         )
         store.update_materialization_run_hash(mat_id, run_hash)
 
@@ -374,10 +387,7 @@ def _refresh_partitioned(
         artifact_base = Path(".barcafiles") / detail.asset.asset_slug / detail.asset.definition_hash
         pk = json.loads(pk_json)
         if isinstance(pk, dict):
-            parts = sorted(
-                f"{k_}={v_}" if isinstance(v_, str) else f"{k_}={json.dumps(v_)}"
-                for k_, v_ in pk.items()
-            )
+            parts = sorted(f"{k_}={v_}" if isinstance(v_, str) else f"{k_}={json.dumps(v_)}" for k_, v_ in pk.items())
             artifact_base = artifact_base / "partitions" / ",".join(parts)
 
         artifact_dir = repo_root / artifact_base
@@ -430,14 +440,17 @@ def _refresh_partitioned(
                     raise
 
     # Phase 3: Record results (sequential — DB access)
-    for mat_id, run_hash, pk_json, value_path in results:
+    for mat_id, _run_hash, _pk_json, value_path in results:
         value_bytes = value_path.read_bytes()
         artifact_checksum = sha256_hex(value_bytes)
         artifact_path_rel = relative_path(repo_root, value_path)
         artifact_dir = value_path.parent
         (artifact_dir / "code.txt").write_text(detail.asset.source_text)
         store.mark_materialization_success(
-            mat_id, artifact_path_rel, "json", artifact_checksum,
+            mat_id,
+            artifact_path_rel,
+            "json",
+            artifact_checksum,
         )
 
     return store.asset_detail(detail.asset.asset_id)
@@ -461,10 +474,7 @@ def _execute_materialization(
     if partition_key_json:
         pk = json.loads(partition_key_json)
         if isinstance(pk, dict):
-            parts = sorted(
-                f"{k}={v}" if isinstance(v, str) else f"{k}={json.dumps(v)}"
-                for k, v in pk.items()
-            )
+            parts = sorted(f"{k}={v}" if isinstance(v, str) else f"{k}={json.dumps(v)}" for k, v in pk.items())
             artifact_base = artifact_base / "partitions" / ",".join(parts)
 
     artifact_dir = repo_root / artifact_base
@@ -487,7 +497,10 @@ def _execute_materialization(
     (artifact_dir / "code.txt").write_text(detail.asset.source_text)
 
     store.mark_materialization_success(
-        mat_id, artifact_path_rel, "json", artifact_checksum,
+        mat_id,
+        artifact_path_rel,
+        "json",
+        artifact_checksum,
     )
 
 
@@ -545,18 +558,20 @@ def _resolve_asset_inputs(
         if ":" in abs_ref:
             colon_pos = abs_ref.rfind(":")
             abs_path = abs_ref[:colon_pos]
-            func_name = abs_ref[colon_pos + 1:]
+            func_name = abs_ref[colon_pos + 1 :]
             rel = relative_path(repo_root, Path(abs_path))
             canonical_ref = f"{rel}:{func_name}"
         else:
             canonical_ref = abs_ref
 
         upstream_id = store.asset_id_by_logical_name(canonical_ref)
-        result.append(AssetInput(
-            parameter_name=param_name,
-            upstream_asset_ref=canonical_ref,
-            upstream_asset_id=upstream_id,
-        ))
+        result.append(
+            AssetInput(
+                parameter_name=param_name,
+                upstream_asset_ref=canonical_ref,
+                upstream_asset_id=upstream_id,
+            )
+        )
 
     if result:
         store.upsert_asset_inputs(detail.asset.definition_id, result)

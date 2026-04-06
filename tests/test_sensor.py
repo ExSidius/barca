@@ -2,11 +2,10 @@
 
 import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 
-from barca._engine import reindex, refresh, trigger_sensor
+from barca._engine import refresh, reindex, trigger_sensor
 from barca._reconciler import reconcile
 from barca._store import MetadataStore
 
@@ -25,7 +24,8 @@ def sensor_project(tmp_path):
     mod_dir = project_dir / "smod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "pipeline.py").write_text(textwrap.dedent("""\
+    (mod_dir / "pipeline.py").write_text(
+        textwrap.dedent("""\
         from barca import sensor, asset, effect
 
         @sensor(schedule="always")
@@ -39,12 +39,15 @@ def sensor_project(tmp_path):
         @effect(inputs={"result": process}, schedule="always")
         def notify(result):
             pass  # would send notification
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["smod.pipeline"]
-    """))
+    """)
+    )
 
     _cleanup("smod")
     sys.path.insert(0, str(project_dir))
@@ -52,6 +55,7 @@ def sensor_project(tmp_path):
     sys.path.remove(str(project_dir))
     _cleanup("smod")
     from barca._trace import clear_caches
+
     clear_caches()
 
 
@@ -81,7 +85,7 @@ def test_sensor_indexed_with_kind(sensor_project):
     reindex(store, sensor_project)
 
     assets = store.list_assets()
-    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+    sensor_asset = next(a for a in assets if a.function_name == "check_file")
     assert sensor_asset.kind == "sensor"
 
 
@@ -92,7 +96,7 @@ def test_sensor_observation_stored_after_reconcile(sensor_project):
     assert result.executed_sensors >= 1
 
     assets = store.list_assets()
-    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+    sensor_asset = next(a for a in assets if a.function_name == "check_file")
     obs = store.latest_sensor_observation(sensor_asset.asset_id)
     assert obs is not None
     assert obs.update_detected is True
@@ -106,7 +110,8 @@ def test_sensor_false_does_not_trigger_downstream(tmp_path):
     mod_dir = project_dir / "fmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "pipeline.py").write_text(textwrap.dedent("""\
+    (mod_dir / "pipeline.py").write_text(
+        textwrap.dedent("""\
         from barca import sensor, asset
 
         @sensor(schedule="always")
@@ -116,12 +121,15 @@ def test_sensor_false_does_not_trigger_downstream(tmp_path):
         @asset(inputs={"data": idle_sensor}, schedule="always")
         def downstream(data):
             return {"got": data}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["fmod.pipeline"]
-    """))
+    """)
+    )
 
     _cleanup("fmod")
     sys.path.insert(0, str(project_dir))
@@ -136,6 +144,7 @@ def test_sensor_false_does_not_trigger_downstream(tmp_path):
         sys.path.remove(str(project_dir))
         _cleanup("fmod")
         from barca._trace import clear_caches
+
         clear_caches()
 
 
@@ -147,7 +156,7 @@ def test_list_sensor_observations(sensor_project):
     reconcile(store, sensor_project)
 
     assets = store.list_assets()
-    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+    sensor_asset = next(a for a in assets if a.function_name == "check_file")
     observations = store.list_sensor_observations(sensor_asset.asset_id)
 
     assert len(observations) >= 2
@@ -166,8 +175,8 @@ def test_asset_detail_includes_latest_observation(sensor_project):
     reconcile(store, sensor_project)
 
     assets = store.list_assets()
-    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
-    process_asset = [a for a in assets if a.function_name == "process"][0]
+    sensor_asset = next(a for a in assets if a.function_name == "check_file")
+    process_asset = next(a for a in assets if a.function_name == "process")
 
     sensor_detail = store.asset_detail(sensor_asset.asset_id)
     assert sensor_detail.latest_observation is not None
@@ -183,7 +192,7 @@ def test_trigger_sensor_returns_observation(sensor_project):
     reindex(store, sensor_project)
 
     assets = store.list_assets()
-    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+    sensor_asset = next(a for a in assets if a.function_name == "check_file")
 
     obs = trigger_sensor(store, sensor_project, sensor_asset.asset_id)
     assert obs is not None
@@ -198,7 +207,7 @@ def test_trigger_sensor_rejects_non_sensor(sensor_project):
     reindex(store, sensor_project)
 
     assets = store.list_assets()
-    process_asset = [a for a in assets if a.function_name == "process"][0]
+    process_asset = next(a for a in assets if a.function_name == "process")
 
     with pytest.raises(ValueError, match="not a sensor"):
         trigger_sensor(store, sensor_project, process_asset.asset_id)
@@ -210,7 +219,7 @@ def test_refresh_rejects_sensor(sensor_project):
     reindex(store, sensor_project)
 
     assets = store.list_assets()
-    sensor_asset = [a for a in assets if a.function_name == "check_file"][0]
+    sensor_asset = next(a for a in assets if a.function_name == "check_file")
 
     with pytest.raises(ValueError, match="sensor"):
         refresh(store, sensor_project, sensor_asset.asset_id)

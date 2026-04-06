@@ -4,14 +4,14 @@ Starts the barca server, measures time-to-ready, then POSTs refresh requests
 and measures end-to-end latency (POST → materialization complete).
 """
 
+import json
 import math
 import os
 import subprocess
 import sys
 import time
-import json
-import urllib.request
 import urllib.error
+import urllib.request
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_URL = "http://127.0.0.1:8400"
@@ -68,20 +68,21 @@ def bench_startup(runs):
     times = []
     for i in range(runs):
         # Clean slate
-        subprocess.run([CLI, "reset", "--db", "--artifacts"], cwd=BENCH_DIR,
-                       capture_output=True)
+        subprocess.run([CLI, "reset", "--db", "--artifacts"], cwd=BENCH_DIR, capture_output=True)
 
         server = subprocess.Popen(
             [CLI, "serve", "--port", "8400", "--interval", "3600", "--log-level", "error"],
-            cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=BENCH_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
         try:
             startup = wait_for_server()
             if startup is None:
-                print(f"  Run {i+1}: FAILED (timeout)")
+                print(f"  Run {i + 1}: FAILED (timeout)")
                 continue
             times.append(startup)
-            print(f"  Run {i+1}: {startup*1000:.0f}ms")
+            print(f"  Run {i + 1}: {startup * 1000:.0f}ms")
         finally:
             server.terminate()
             server.wait(timeout=5)
@@ -89,18 +90,19 @@ def bench_startup(runs):
     if times:
         avg = sum(times) / len(times)
         std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
-        print(f"[barca] Startup avg: {avg*1000:.0f}ms +/- {std*1000:.0f}ms")
+        print(f"[barca] Startup avg: {avg * 1000:.0f}ms +/- {std * 1000:.0f}ms")
     return times
 
 
 def bench_refresh_latency(runs):
     """Measure HTTP refresh latency (POST → materialization complete)."""
     # Start server once
-    subprocess.run([CLI, "reset", "--db", "--artifacts"], cwd=BENCH_DIR,
-                   capture_output=True)
+    subprocess.run([CLI, "reset", "--db", "--artifacts"], cwd=BENCH_DIR, capture_output=True)
     server = subprocess.Popen(
         [CLI, "serve", "--port", "8400", "--interval", "3600", "--log-level", "error"],
-        cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=BENCH_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
     try:
@@ -117,15 +119,14 @@ def bench_refresh_latency(runs):
         times = []
         for i in range(runs):
             # Reset artifacts to force re-materialization
-            subprocess.run([CLI, "reset", "--artifacts"], cwd=BENCH_DIR,
-                           capture_output=True)
+            subprocess.run([CLI, "reset", "--artifacts"], cwd=BENCH_DIR, capture_output=True)
             # Re-index after reset
             api_post("/reconcile")
             time.sleep(0.1)
 
             latency_ms, status = measure_refresh(asset_id)
             times.append(latency_ms)
-            print(f"  Run {i+1}: {latency_ms:.0f}ms ({status})")
+            print(f"  Run {i + 1}: {latency_ms:.0f}ms ({status})")
 
         if times:
             avg = sum(times) / len(times)
@@ -140,11 +141,12 @@ def bench_refresh_latency(runs):
 
 def bench_reconcile_latency(runs):
     """Measure HTTP reconcile latency (POST → reconcile complete)."""
-    subprocess.run([CLI, "reset", "--db", "--artifacts"], cwd=BENCH_DIR,
-                   capture_output=True)
+    subprocess.run([CLI, "reset", "--db", "--artifacts"], cwd=BENCH_DIR, capture_output=True)
     server = subprocess.Popen(
         [CLI, "serve", "--port", "8400", "--interval", "3600", "--log-level", "error"],
-        cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=BENCH_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
     try:
@@ -162,7 +164,7 @@ def bench_reconcile_latency(runs):
             n_assets = result.get("executed_assets", 0)
             n_sensors = result.get("executed_sensors", 0)
             times.append(elapsed)
-            print(f"  Run {i+1}: {elapsed:.0f}ms (assets={n_assets}, sensors={n_sensors})")
+            print(f"  Run {i + 1}: {elapsed:.0f}ms (assets={n_assets}, sensors={n_sensors})")
 
         if times:
             avg = sum(times) / len(times)

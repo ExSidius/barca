@@ -4,17 +4,16 @@
 Measures tracing speed on real Barca pipelines and synthetic scale tests.
 """
 
-import os
-import sys
-import time
-import tempfile
 import importlib
 import importlib.util
-import textwrap
+import os
+import sys
+import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from trace import extract_dependencies, compute_dependency_hash, analyze_purity, clear_caches
+from trace import analyze_purity, clear_caches, compute_dependency_hash, extract_dependencies
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -36,50 +35,41 @@ def bench_module(name, module_path, project_root):
         return 0, 0
 
     # Find all functions (not just @asset — we want all for benchmarking)
-    funcs = [
-        (fname, obj) for fname, obj in vars(mod).items()
-        if callable(obj) and not fname.startswith("_")
-        and hasattr(obj, "__module__")
-    ]
+    funcs = [(fname, obj) for fname, obj in vars(mod).items() if callable(obj) and not fname.startswith("_") and hasattr(obj, "__module__")]
 
     print(f"\n  {name}: {len(funcs)} functions in {os.path.basename(module_path)}")
 
     # Benchmark: extract_dependencies for all functions
     clear_caches()
     t0 = time.perf_counter()
-    for fname, func in funcs:
+    for _fname, func in funcs:
         extract_dependencies(func, project_root)
     t_deps = time.perf_counter() - t0
 
     # Benchmark: compute_dependency_hash for all functions
     clear_caches()
     t0 = time.perf_counter()
-    for fname, func in funcs:
+    for _fname, func in funcs:
         compute_dependency_hash(func, project_root)
     t_hash = time.perf_counter() - t0
 
     # Benchmark: analyze_purity for all functions
     t0 = time.perf_counter()
-    for fname, func in funcs:
+    for _fname, func in funcs:
         analyze_purity(func)
     t_purity = time.perf_counter() - t0
 
     # Benchmark: cached re-run (should be near-instant)
     t0 = time.perf_counter()
-    for fname, func in funcs:
+    for _fname, func in funcs:
         compute_dependency_hash(func, project_root)
     t_cached = time.perf_counter() - t0
 
     per_func = t_hash / len(funcs) if funcs else 0
-    print(f"    extract_dependencies: {t_deps*1000:.1f}ms total, "
-          f"{t_deps/len(funcs)*1000:.2f}ms/func")
-    print(f"    compute_dep_hash:     {t_hash*1000:.1f}ms total, "
-          f"{per_func*1000:.2f}ms/func")
-    print(f"    analyze_purity:       {t_purity*1000:.1f}ms total, "
-          f"{t_purity/len(funcs)*1000:.2f}ms/func")
-    print(f"    cached re-hash:       {t_cached*1000:.1f}ms total "
-          f"(speedup: {t_hash/t_cached:.1f}x)" if t_cached > 0 else
-          f"    cached re-hash:       {t_cached*1000:.1f}ms total")
+    print(f"    extract_dependencies: {t_deps * 1000:.1f}ms total, {t_deps / len(funcs) * 1000:.2f}ms/func")
+    print(f"    compute_dep_hash:     {t_hash * 1000:.1f}ms total, {per_func * 1000:.2f}ms/func")
+    print(f"    analyze_purity:       {t_purity * 1000:.1f}ms total, {t_purity / len(funcs) * 1000:.2f}ms/func")
+    print(f"    cached re-hash:       {t_cached * 1000:.1f}ms total (speedup: {t_hash / t_cached:.1f}x)" if t_cached > 0 else f"    cached re-hash:       {t_cached * 1000:.1f}ms total")
 
     return len(funcs), t_hash
 
@@ -103,17 +93,11 @@ def bench_synthetic(n_files, funcs_per_file):
                     dep_file_idx = dep_idx // funcs_per_file
                     if dep_file_idx == f_idx:
                         # Same file reference
-                        lines.append(
-                            f"def func_{global_idx:04d}():\n"
-                            f"    return func_{dep_idx:04d}() + 1\n"
-                        )
+                        lines.append(f"def func_{global_idx:04d}():\n    return func_{dep_idx:04d}() + 1\n")
                     else:
                         # Cross-file import
                         lines.insert(0, f"from mod_{dep_file_idx:03d} import func_{dep_idx:04d}\n")
-                        lines.append(
-                            f"def func_{global_idx:04d}():\n"
-                            f"    return func_{dep_idx:04d}() + 1\n"
-                        )
+                        lines.append(f"def func_{global_idx:04d}():\n    return func_{dep_idx:04d}() + 1\n")
 
             filepath = os.path.join(tmpdir, f"mod_{f_idx:03d}.py")
             with open(filepath, "w") as fp:
@@ -145,11 +129,8 @@ def bench_synthetic(n_files, funcs_per_file):
             t_cached = time.perf_counter() - t0
 
             per_func = t_total / len(all_funcs) if all_funcs else 0
-            print(f"    Full trace:   {t_total*1000:.1f}ms total, "
-                  f"{per_func*1000:.2f}ms/func")
-            print(f"    Cached re-run: {t_cached*1000:.1f}ms total "
-                  f"(speedup: {t_total/t_cached:.1f}x)" if t_cached > 0 else
-                  f"    Cached re-run: {t_cached*1000:.1f}ms total")
+            print(f"    Full trace:   {t_total * 1000:.1f}ms total, {per_func * 1000:.2f}ms/func")
+            print(f"    Cached re-run: {t_cached * 1000:.1f}ms total (speedup: {t_total / t_cached:.1f}x)" if t_cached > 0 else f"    Cached re-run: {t_cached * 1000:.1f}ms total")
 
             return len(all_funcs), t_total
 
@@ -188,7 +169,7 @@ def main():
         bench_synthetic(n_files, funcs_per_file)
 
     print(f"\n{'=' * 60}")
-    print(f"  Target: <1s for 100 assets. Subprocess spawn is ~60ms/asset.")
+    print("  Target: <1s for 100 assets. Subprocess spawn is ~60ms/asset.")
     print(f"{'=' * 60}")
 
 

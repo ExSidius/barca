@@ -10,11 +10,13 @@ import typer
 from rich.console import Console
 from rich.text import Text
 
-from barca._engine import reindex as do_reindex, refresh as do_refresh, reset as do_reset, trigger_sensor as do_trigger_sensor
+from barca._engine import refresh as do_refresh
+from barca._engine import reindex as do_reindex
+from barca._engine import reset as do_reset
+from barca._engine import trigger_sensor as do_trigger_sensor
 from barca._models import JobDetail
 from barca._reconciler import reconcile as do_reconcile
 from barca._store import MetadataStore
-
 from barca.cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary, sensor_observations_table
 
 _console = Console()
@@ -104,6 +106,7 @@ def serve(
 ) -> None:
     """Start the barca server (HTTP API + background scheduler)."""
     import uvicorn
+
     from barca.server.app import create_app
 
     root = _repo_root()

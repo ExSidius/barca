@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import inspect
-from pathlib import Path
 from typing import Any
 
 from barca._schedule import Schedule, serialize_schedule

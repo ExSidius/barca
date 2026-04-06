@@ -67,7 +67,7 @@ class MaterializationRecord(BaseModel):
     artifact_format: str | None = Field(default=None, description="Serialization format of the artifact (e.g. 'json')")
     artifact_checksum: str | None = Field(default=None, description="SHA-256 checksum of the artifact file contents")
     last_error: str | None = Field(default=None, description="Error message if status is 'failed'")
-    partition_key_json: str | None = Field(default=None, description="JSON-serialized partition key (e.g. '{\"ticker\": \"AAPL\"}'), or None for non-partitioned assets")
+    partition_key_json: str | None = Field(default=None, description='JSON-serialized partition key (e.g. \'{"ticker": "AAPL"}\'), or None for non-partitioned assets')
     created_at: int = Field(description="Unix timestamp when the materialization was created")
 
 

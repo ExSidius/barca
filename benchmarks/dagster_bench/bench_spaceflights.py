@@ -8,14 +8,13 @@ Topology:
 Uses in-process executor (sequential, Dagster's default).
 """
 
-import random
-import time
 import math
+import random
 import sys
+import time
 from collections import defaultdict
 
-from dagster import asset, materialize, AssetIn
-
+from dagster import AssetIn, asset, materialize
 
 # ── Level 1: Raw data ───────────────────────────────────────────────────────
 
@@ -27,16 +26,18 @@ def raw_shuttles():
     engine_types = ["Plasma", "Ion", "Warp", "Fusion"]
     rows = []
     for i in range(200):
-        rows.append({
-            "id": i,
-            "shuttle_type": rng.choice(shuttle_types),
-            "engine_type": rng.choice(engine_types),
-            "num_engines": rng.randint(1, 6),
-            "passenger_capacity": rng.randint(4, 200),
-            "crew_size": rng.randint(2, 20),
-            "d_check_complete": rng.choice([True, False]),
-            "moon_clearance_complete": rng.choice([True, False]),
-        })
+        rows.append(
+            {
+                "id": i,
+                "shuttle_type": rng.choice(shuttle_types),
+                "engine_type": rng.choice(engine_types),
+                "num_engines": rng.randint(1, 6),
+                "passenger_capacity": rng.randint(4, 200),
+                "crew_size": rng.randint(2, 20),
+                "d_check_complete": rng.choice([True, False]),
+                "moon_clearance_complete": rng.choice([True, False]),
+            }
+        )
     return {"shuttles": rows}
 
 
@@ -46,14 +47,16 @@ def raw_companies():
     names = [f"SpaceCo-{i}" for i in range(50)]
     rows = []
     for i, name in enumerate(names):
-        rows.append({
-            "id": i,
-            "company_name": name,
-            "company_rating": round(rng.uniform(1.0, 100.0), 2),
-            "company_location": rng.choice(["Earth", "Mars", "Europa", "Titan"]),
-            "total_fleet_count": rng.randint(1, 50),
-            "iata_approved": rng.choice([True, False]),
-        })
+        rows.append(
+            {
+                "id": i,
+                "company_name": name,
+                "company_rating": round(rng.uniform(1.0, 100.0), 2),
+                "company_location": rng.choice(["Earth", "Mars", "Europa", "Titan"]),
+                "total_fleet_count": rng.randint(1, 50),
+                "iata_approved": rng.choice([True, False]),
+            }
+        )
     return {"companies": rows}
 
 
@@ -62,13 +65,15 @@ def raw_reviews():
     rng = random.Random(44)
     rows = []
     for i in range(500):
-        rows.append({
-            "id": i,
-            "shuttle_id": rng.randint(0, 199),
-            "company_id": rng.randint(0, 49),
-            "review_score": round(rng.uniform(1.0, 10.0), 2),
-            "price": round(rng.uniform(100.0, 100000.0), 2),
-        })
+        rows.append(
+            {
+                "id": i,
+                "shuttle_id": rng.randint(0, 199),
+                "company_id": rng.randint(0, 49),
+                "review_score": round(rng.uniform(1.0, 10.0), 2),
+                "price": round(rng.uniform(100.0, 100000.0), 2),
+            }
+        )
     return {"reviews": rows}
 
 
@@ -83,14 +88,16 @@ def prep_shuttles(raw):
     for s in raw["shuttles"]:
         if not s["d_check_complete"] or not s["moon_clearance_complete"]:
             continue
-        rows.append({
-            "id": s["id"],
-            "shuttle_type_encoded": type_map.get(s["shuttle_type"], 0),
-            "engine_type_encoded": engine_map.get(s["engine_type"], 0),
-            "num_engines": s["num_engines"],
-            "passenger_capacity": s["passenger_capacity"],
-            "crew_size": s["crew_size"],
-        })
+        rows.append(
+            {
+                "id": s["id"],
+                "shuttle_type_encoded": type_map.get(s["shuttle_type"], 0),
+                "engine_type_encoded": engine_map.get(s["engine_type"], 0),
+                "num_engines": s["num_engines"],
+                "passenger_capacity": s["passenger_capacity"],
+                "crew_size": s["crew_size"],
+            }
+        )
     return {"shuttles": rows}
 
 
@@ -102,13 +109,15 @@ def prep_companies(raw):
     for c in raw["companies"]:
         if not c["iata_approved"]:
             continue
-        rows.append({
-            "id": c["id"],
-            "company_name": c["company_name"],
-            "company_rating_norm": round(c["company_rating"] / max_rating, 4),
-            "company_location": c["company_location"],
-            "total_fleet_count": c["total_fleet_count"],
-        })
+        rows.append(
+            {
+                "id": c["id"],
+                "company_name": c["company_name"],
+                "company_rating_norm": round(c["company_rating"] / max_rating, 4),
+                "company_location": c["company_location"],
+                "total_fleet_count": c["total_fleet_count"],
+            }
+        )
     return {"companies": rows}
 
 
@@ -122,23 +131,27 @@ def prep_reviews(raw):
 
     rows = []
     for (sid, cid), vals in agg.items():
-        rows.append({
-            "shuttle_id": sid,
-            "company_id": cid,
-            "mean_score": round(sum(vals["scores"]) / len(vals["scores"]), 4),
-            "mean_price": round(sum(vals["prices"]) / len(vals["prices"]), 2),
-        })
+        rows.append(
+            {
+                "shuttle_id": sid,
+                "company_id": cid,
+                "mean_score": round(sum(vals["scores"]) / len(vals["scores"]), 4),
+                "mean_price": round(sum(vals["prices"]) / len(vals["prices"]), 2),
+            }
+        )
     return {"reviews": rows}
 
 
 # ── Level 3: Merge ───────────────────────────────────────────────────────────
 
 
-@asset(ins={
-    "shuttles": AssetIn(key="prep_shuttles"),
-    "companies": AssetIn(key="prep_companies"),
-    "reviews": AssetIn(key="prep_reviews"),
-})
+@asset(
+    ins={
+        "shuttles": AssetIn(key="prep_shuttles"),
+        "companies": AssetIn(key="prep_companies"),
+        "reviews": AssetIn(key="prep_reviews"),
+    }
+)
 def master_table(shuttles, companies, reviews):
     shuttle_map = {s["id"]: s for s in shuttles["shuttles"]}
     company_map = {c["id"]: c for c in companies["companies"]}
@@ -150,16 +163,18 @@ def master_table(shuttles, companies, reviews):
         c = company_map.get(r["company_id"])
         if s is None or c is None:
             continue
-        features.append([
-            s["shuttle_type_encoded"],
-            s["engine_type_encoded"],
-            s["num_engines"],
-            s["passenger_capacity"],
-            s["crew_size"],
-            c["company_rating_norm"],
-            c["total_fleet_count"],
-            r["mean_score"],
-        ])
+        features.append(
+            [
+                s["shuttle_type_encoded"],
+                s["engine_type_encoded"],
+                s["num_engines"],
+                s["passenger_capacity"],
+                s["crew_size"],
+                c["company_rating_norm"],
+                c["total_fleet_count"],
+                r["mean_score"],
+            ]
+        )
         targets.append(r["mean_price"])
     return {"features": features, "targets": targets, "n_samples": len(features)}
 
@@ -206,7 +221,7 @@ def train(data):
 
 @asset(ins={"model": AssetIn(key="train"), "data": AssetIn(key="split")})
 def evaluate(model, data):
-    from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score
+    from sklearn.metrics import mean_absolute_error, r2_score, root_mean_squared_error
 
     r2 = r2_score(data["y_test"], model["predictions"])
     mae = mean_absolute_error(data["y_test"], model["predictions"])
@@ -224,9 +239,16 @@ def evaluate(model, data):
 # ── All assets for materialize() ────────────────────────────────────────────
 
 all_assets = [
-    raw_shuttles, raw_companies, raw_reviews,
-    prep_shuttles, prep_companies, prep_reviews,
-    master_table, split, train, evaluate,
+    raw_shuttles,
+    raw_companies,
+    raw_reviews,
+    prep_shuttles,
+    prep_companies,
+    prep_reviews,
+    master_table,
+    split,
+    train,
+    evaluate,
 ]
 
 if __name__ == "__main__":
@@ -242,7 +264,7 @@ if __name__ == "__main__":
         elapsed = time.perf_counter() - t0
         n_success = len([e for e in result.all_events if e.is_step_success])
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.2f}s ({n_success} assets)")
+        print(f"  Run {i + 1}: {elapsed:.2f}s ({n_success} assets)")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))

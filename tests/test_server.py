@@ -6,7 +6,6 @@ import sys
 import textwrap
 import threading
 import time
-from pathlib import Path
 
 import niquests
 import pytest
@@ -24,7 +23,8 @@ def server_project(tmp_path):
     mod_dir = project_dir / "srvmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset
 
         @asset(schedule="always")
@@ -34,12 +34,15 @@ def server_project(tmp_path):
         @asset(schedule="manual")
         def manual_only() -> dict:
             return {"message": "manual"}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["srvmod.assets"]
-    """))
+    """)
+    )
 
     to_remove = [k for k in sys.modules if k == "srvmod" or k.startswith("srvmod.")]
     for k in to_remove:
@@ -52,6 +55,7 @@ def server_project(tmp_path):
     for k in to_remove:
         del sys.modules[k]
     from barca._trace import clear_caches
+
     clear_caches()
 
 
@@ -94,7 +98,7 @@ def test_health(server_url):
 
 
 def test_assets_list(server_url):
-    resp = niquests.get(f"{server_url}/assets")
+    resp = niquests.get(f"{server_url}/api/assets")
     assert resp.status_code == 200
     assets = resp.json()
     assert isinstance(assets, list)
@@ -106,10 +110,10 @@ def test_assets_list(server_url):
 
 def test_asset_detail(server_url):
     # First get asset list to find an ID
-    assets = niquests.get(f"{server_url}/assets").json()
+    assets = niquests.get(f"{server_url}/api/assets").json()
     asset_id = assets[0]["asset_id"]
 
-    resp = niquests.get(f"{server_url}/assets/{asset_id}")
+    resp = niquests.get(f"{server_url}/api/assets/{asset_id}")
     assert resp.status_code == 200
     detail = resp.json()
     assert "asset" in detail
@@ -117,12 +121,12 @@ def test_asset_detail(server_url):
 
 
 def test_asset_detail_not_found(server_url):
-    resp = niquests.get(f"{server_url}/assets/99999")
+    resp = niquests.get(f"{server_url}/api/assets/99999")
     assert resp.status_code == 404
 
 
 def test_reconcile(server_url):
-    resp = niquests.post(f"{server_url}/reconcile")
+    resp = niquests.post(f"{server_url}/api/reconcile")
     assert resp.status_code == 200
     result = resp.json()
     assert "executed_assets" in result
@@ -132,10 +136,10 @@ def test_reconcile(server_url):
 
 def test_refresh_asset(server_url):
     # Get an asset to refresh
-    assets = niquests.get(f"{server_url}/assets").json()
-    greeting = [a for a in assets if a["function_name"] == "greeting"][0]
+    assets = niquests.get(f"{server_url}/api/assets").json()
+    greeting = next(a for a in assets if a["function_name"] == "greeting")
 
-    resp = niquests.post(f"{server_url}/assets/{greeting['asset_id']}/refresh")
+    resp = niquests.post(f"{server_url}/api/assets/{greeting['asset_id']}/refresh")
     assert resp.status_code == 200
     detail = resp.json()
     assert detail["latest_materialization"] is not None
@@ -144,10 +148,10 @@ def test_refresh_asset(server_url):
 
 def test_jobs_list(server_url):
     # Trigger a refresh first so there's at least one job
-    assets = niquests.get(f"{server_url}/assets").json()
-    niquests.post(f"{server_url}/assets/{assets[0]['asset_id']}/refresh")
+    assets = niquests.get(f"{server_url}/api/assets").json()
+    niquests.post(f"{server_url}/api/assets/{assets[0]['asset_id']}/refresh")
 
-    resp = niquests.get(f"{server_url}/jobs")
+    resp = niquests.get(f"{server_url}/api/jobs")
     assert resp.status_code == 200
     jobs = resp.json()
     assert isinstance(jobs, list)
@@ -156,20 +160,20 @@ def test_jobs_list(server_url):
 
 def test_job_detail(server_url):
     # Trigger a refresh first
-    assets = niquests.get(f"{server_url}/assets").json()
-    niquests.post(f"{server_url}/assets/{assets[0]['asset_id']}/refresh")
+    assets = niquests.get(f"{server_url}/api/assets").json()
+    niquests.post(f"{server_url}/api/assets/{assets[0]['asset_id']}/refresh")
 
-    jobs = niquests.get(f"{server_url}/jobs").json()
+    jobs = niquests.get(f"{server_url}/api/jobs").json()
     job_id = jobs[0]["job"]["materialization_id"]
 
-    resp = niquests.get(f"{server_url}/jobs/{job_id}")
+    resp = niquests.get(f"{server_url}/api/jobs/{job_id}")
     assert resp.status_code == 200
     detail = resp.json()
     assert detail["job"]["materialization_id"] == job_id
 
 
 def test_job_not_found(server_url):
-    resp = niquests.get(f"{server_url}/jobs/99999")
+    resp = niquests.get(f"{server_url}/api/jobs/99999")
     assert resp.status_code == 404
 
 
@@ -191,7 +195,8 @@ def sensor_server_project(tmp_path):
     mod_dir = project_dir / "senmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "pipeline.py").write_text(textwrap.dedent(f"""\
+    (mod_dir / "pipeline.py").write_text(
+        textwrap.dedent(f"""\
         import os
         from barca import sensor, asset
 
@@ -206,12 +211,15 @@ def sensor_server_project(tmp_path):
         @asset(inputs={{"data": file_watcher}}, schedule="always")
         def transform(data):
             return {{"upper": data["content"].upper(), "mtime": data["mtime"]}}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["senmod.pipeline"]
-    """))
+    """)
+    )
 
     to_remove = [k for k in sys.modules if k == "senmod" or k.startswith("senmod.")]
     for k in to_remove:
@@ -224,6 +232,7 @@ def sensor_server_project(tmp_path):
     for k in to_remove:
         del sys.modules[k]
     from barca._trace import clear_caches
+
     clear_caches()
 
 
@@ -257,8 +266,8 @@ def sensor_server_url(sensor_server_project):
 
 
 def test_sensors_list_endpoint(sensor_server_url):
-    """GET /sensors returns only sensor-kind nodes."""
-    resp = niquests.get(f"{sensor_server_url}/sensors")
+    """GET /api/sensors returns only sensor-kind nodes."""
+    resp = niquests.get(f"{sensor_server_url}/api/sensors")
     assert resp.status_code == 200
     sensors = resp.json()
     assert isinstance(sensors, list)
@@ -268,11 +277,11 @@ def test_sensors_list_endpoint(sensor_server_url):
 
 
 def test_sensor_trigger_endpoint(sensor_server_url):
-    """POST /sensors/{id}/trigger returns an observation."""
-    sensors = niquests.get(f"{sensor_server_url}/sensors").json()
+    """POST /api/sensors/{id}/trigger returns an observation."""
+    sensors = niquests.get(f"{sensor_server_url}/api/sensors").json()
     sensor_id = sensors[0]["asset_id"]
 
-    resp = niquests.post(f"{sensor_server_url}/sensors/{sensor_id}/trigger")
+    resp = niquests.post(f"{sensor_server_url}/api/sensors/{sensor_id}/trigger")
     assert resp.status_code == 200
     obs = resp.json()
     assert obs["update_detected"] is True
@@ -280,26 +289,26 @@ def test_sensor_trigger_endpoint(sensor_server_url):
 
 
 def test_sensor_observations_endpoint(sensor_server_url):
-    """GET /sensors/{id}/observations returns observation history."""
-    sensors = niquests.get(f"{sensor_server_url}/sensors").json()
+    """GET /api/sensors/{id}/observations returns observation history."""
+    sensors = niquests.get(f"{sensor_server_url}/api/sensors").json()
     sensor_id = sensors[0]["asset_id"]
 
     # Trigger twice to create history
-    niquests.post(f"{sensor_server_url}/sensors/{sensor_id}/trigger")
-    niquests.post(f"{sensor_server_url}/sensors/{sensor_id}/trigger")
+    niquests.post(f"{sensor_server_url}/api/sensors/{sensor_id}/trigger")
+    niquests.post(f"{sensor_server_url}/api/sensors/{sensor_id}/trigger")
 
-    resp = niquests.get(f"{sensor_server_url}/sensors/{sensor_id}/observations")
+    resp = niquests.get(f"{sensor_server_url}/api/sensors/{sensor_id}/observations")
     assert resp.status_code == 200
     observations = resp.json()
     assert len(observations) >= 2
 
 
 def test_sensor_trigger_rejects_non_sensor(sensor_server_url):
-    """POST /sensors/{id}/trigger returns 404 for non-sensor assets."""
-    assets = niquests.get(f"{sensor_server_url}/assets").json()
-    non_sensor = [a for a in assets if a["kind"] != "sensor"][0]
+    """POST /api/sensors/{id}/trigger returns 404 for non-sensor assets."""
+    assets = niquests.get(f"{sensor_server_url}/api/assets").json()
+    non_sensor = next(a for a in assets if a["kind"] != "sensor")
 
-    resp = niquests.post(f"{sensor_server_url}/sensors/{non_sensor['asset_id']}/trigger")
+    resp = niquests.post(f"{sensor_server_url}/api/sensors/{non_sensor['asset_id']}/trigger")
     assert resp.status_code == 404
 
 
@@ -309,21 +318,21 @@ def test_e2e_sensor_reconcile_rematerialize(sensor_server_project, sensor_server
 
     # First reconcile — the scheduler may have already run one pass at startup,
     # so we check state (not just counts from this call).
-    resp = niquests.post(f"{sensor_server_url}/reconcile")
+    resp = niquests.post(f"{sensor_server_url}/api/reconcile")
     assert resp.status_code == 200
 
     # Verify sensor has at least one observation
-    sensors = niquests.get(f"{sensor_server_url}/sensors").json()
+    sensors = niquests.get(f"{sensor_server_url}/api/sensors").json()
     sensor_id = sensors[0]["asset_id"]
-    observations = niquests.get(f"{sensor_server_url}/sensors/{sensor_id}/observations").json()
+    observations = niquests.get(f"{sensor_server_url}/api/sensors/{sensor_id}/observations").json()
     assert len(observations) >= 1
     assert observations[0]["update_detected"] is True
     initial_obs_count = len(observations)
 
     # Verify downstream asset has been materialized (by scheduler or our reconcile)
-    assets = niquests.get(f"{sensor_server_url}/assets").json()
-    transform = [a for a in assets if a["function_name"] == "transform"][0]
-    detail = niquests.get(f"{sensor_server_url}/assets/{transform['asset_id']}").json()
+    assets = niquests.get(f"{sensor_server_url}/api/assets").json()
+    transform = next(a for a in assets if a["function_name"] == "transform")
+    detail = niquests.get(f"{sensor_server_url}/api/assets/{transform['asset_id']}").json()
     assert detail["latest_materialization"] is not None
     assert detail["latest_materialization"]["status"] == "success"
 
@@ -332,13 +341,13 @@ def test_e2e_sensor_reconcile_rematerialize(sensor_server_project, sensor_server
     data_file.write_text("updated content")
 
     # Second reconcile — sensor detects file change
-    resp = niquests.post(f"{sensor_server_url}/reconcile")
+    resp = niquests.post(f"{sensor_server_url}/api/reconcile")
     assert resp.status_code == 200
     result2 = resp.json()
     assert result2["executed_sensors"] >= 1
 
     # Verify observation count increased — sensor ran again and recorded new data
-    observations2 = niquests.get(f"{sensor_server_url}/sensors/{sensor_id}/observations").json()
+    observations2 = niquests.get(f"{sensor_server_url}/api/sensors/{sensor_id}/observations").json()
     assert len(observations2) > initial_obs_count
 
     # Verify the latest observation captured the updated content

@@ -9,7 +9,7 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 from barca._engine import materialize_asset, reindex
-from barca._hashing import compute_run_hash, now_ts, relative_path, sha256_hex
+from barca._hashing import compute_run_hash, relative_path, sha256_hex
 from barca._models import AssetInput, ReconcileResult
 from barca._schedule import deserialize_schedule, is_schedule_eligible
 from barca._store import MetadataStore
@@ -80,11 +80,7 @@ def reconcile(store: MetadataStore, repo_root: Path) -> ReconcileResult:
         inputs = inputs_by_id.get(aid, [])
 
         # Check if any upstream failed — skip if so
-        upstream_failed = any(
-            inp.upstream_asset_id in failed_ids
-            for inp in inputs
-            if inp.upstream_asset_id and inp.upstream_asset_id > 0
-        )
+        upstream_failed = any(inp.upstream_asset_id in failed_ids for inp in inputs if inp.upstream_asset_id and inp.upstream_asset_id > 0)
         if upstream_failed:
             result.failed += 1
             failed_ids.add(aid)
@@ -92,18 +88,41 @@ def reconcile(store: MetadataStore, repo_root: Path) -> ReconcileResult:
 
         if kind == "sensor":
             _handle_sensor(
-                store, repo_root, detail, schedule, now,
-                result, refreshed_ids, failed_ids, sensor_outputs,
+                store,
+                repo_root,
+                detail,
+                schedule,
+                now,
+                result,
+                refreshed_ids,
+                failed_ids,
+                sensor_outputs,
             )
         elif kind == "asset":
             _handle_asset(
-                store, repo_root, detail, inputs, schedule, now,
-                result, refreshed_ids, failed_ids, sensor_outputs,
+                store,
+                repo_root,
+                detail,
+                inputs,
+                schedule,
+                now,
+                result,
+                refreshed_ids,
+                failed_ids,
+                sensor_outputs,
             )
         elif kind == "effect":
             _handle_effect(
-                store, repo_root, detail, inputs, schedule, now,
-                result, refreshed_ids, failed_ids, sensor_outputs,
+                store,
+                repo_root,
+                detail,
+                inputs,
+                schedule,
+                now,
+                result,
+                refreshed_ids,
+                failed_ids,
+                sensor_outputs,
             )
 
     return result
@@ -128,16 +147,16 @@ def _handle_sensor(store, repo_root, detail, schedule, now, result, refreshed_id
         sensor_result = original()
 
         if not isinstance(sensor_result, tuple) or len(sensor_result) != 2:
-            raise ValueError(
-                f"sensor '{detail.asset.function_name}' must return (update_detected: bool, output), "
-                f"got {type(sensor_result).__name__}"
-            )
+            raise ValueError(f"sensor '{detail.asset.function_name}' must return (update_detected: bool, output), got {type(sensor_result).__name__}")
 
         update_detected, output = sensor_result
         output_json = json.dumps(output) if output is not None else None
 
         store.insert_sensor_observation(
-            aid, detail.asset.definition_id, bool(update_detected), output_json,
+            aid,
+            detail.asset.definition_id,
+            bool(update_detected),
+            output_json,
         )
 
         if update_detected:
@@ -146,7 +165,7 @@ def _handle_sensor(store, repo_root, detail, schedule, now, result, refreshed_id
 
         result.executed_sensors += 1
 
-    except Exception as e:
+    except Exception:
         store.insert_sensor_observation(aid, detail.asset.definition_id, False, None)
         failed_ids.add(aid)
         result.failed += 1
@@ -159,16 +178,9 @@ def _handle_asset(store, repo_root, detail, inputs, schedule, now, result, refre
     # Compute staleness: definition changed, or upstream refreshed this pass
     latest_mat = store.latest_successful_materialization(aid)
 
-    definition_stale = (
-        latest_mat is None
-        or latest_mat.definition_id != detail.asset.definition_id
-    )
+    definition_stale = latest_mat is None or latest_mat.definition_id != detail.asset.definition_id
 
-    upstream_refreshed = any(
-        inp.upstream_asset_id in refreshed_ids
-        for inp in inputs
-        if inp.upstream_asset_id and inp.upstream_asset_id > 0
-    )
+    upstream_refreshed = any(inp.upstream_asset_id in refreshed_ids for inp in inputs if inp.upstream_asset_id and inp.upstream_asset_id > 0)
 
     is_stale = definition_stale or upstream_refreshed
 
@@ -226,11 +238,7 @@ def _handle_asset(store, repo_root, detail, inputs, schedule, now, result, refre
     # Compute run_hash
     upstream_mat_ids.sort()
     has_inputs = len(inputs) > 0
-    run_hash = (
-        compute_run_hash(detail.asset.definition_hash, upstream_mat_ids)
-        if has_inputs
-        else detail.asset.definition_hash
-    )
+    run_hash = compute_run_hash(detail.asset.definition_hash, upstream_mat_ids) if has_inputs else detail.asset.definition_hash
 
     # Check cache
     existing = store.successful_materialization_for_run(aid, run_hash)
@@ -245,7 +253,9 @@ def _handle_asset(store, repo_root, detail, inputs, schedule, now, result, refre
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
         mat_id = store.insert_queued_materialization(
-            aid, detail.asset.definition_id, run_hash,
+            aid,
+            detail.asset.definition_id,
+            run_hash,
         )
         store.update_materialization_run_hash(mat_id, run_hash)
 
@@ -262,14 +272,17 @@ def _handle_asset(store, repo_root, detail, inputs, schedule, now, result, refre
         (artifact_dir / "code.txt").write_text(detail.asset.source_text)
 
         store.mark_materialization_success(
-            mat_id, artifact_path_rel, "json", artifact_checksum,
+            mat_id,
+            artifact_path_rel,
+            "json",
+            artifact_checksum,
         )
 
         refreshed_ids.add(aid)
         result.executed_assets += 1
 
     except Exception as e:
-        if 'mat_id' in locals():
+        if "mat_id" in locals():
             store.mark_materialization_failed(mat_id, str(e))
         failed_ids.add(aid)
         result.failed += 1
@@ -280,11 +293,7 @@ def _handle_effect(store, repo_root, detail, inputs, schedule, now, result, refr
     aid = detail.asset.asset_id
 
     # Effects always re-execute when upstream is refreshed (never cached)
-    upstream_refreshed = any(
-        inp.upstream_asset_id in refreshed_ids
-        for inp in inputs
-        if inp.upstream_asset_id and inp.upstream_asset_id > 0
-    )
+    upstream_refreshed = any(inp.upstream_asset_id in refreshed_ids for inp in inputs if inp.upstream_asset_id and inp.upstream_asset_id > 0)
 
     # Also check schedule eligibility
     latest_exec = store.latest_effect_execution(aid)

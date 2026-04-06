@@ -1,0 +1,49 @@
+{% macro status_badge(status) %}
+  {% set cfg = {
+    'success': ('text-green-400',  'bg-green-500/10',  'border-green-500/20'),
+    'failed':  ('text-red-400',    'bg-red-500/10',    'border-red-500/20'),
+    'running': ('text-yellow-400', 'bg-yellow-500/10', 'border-yellow-500/20'),
+    'queued':  ('text-blue-400',   'bg-blue-500/10',   'border-blue-500/20'),
+    'skipped': ('text-neutral-400','bg-neutral-500/10','border-neutral-500/20'),
+  } %}
+  {% set c = cfg.get(status, ('text-neutral-400', 'bg-neutral-500/10', 'border-neutral-500/20')) %}
+  <span class="status-{{ status or 'none' }} inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium border font-mono {{ c[0] }} {{ c[1] }} {{ c[2] }}">
+    {% if status == 'running' %}<span class="dot w-1.5 h-1.5 rounded-full bg-current"></span>{% endif %}
+    {{ status or 'never' }}
+  </span>
+{% endmacro %}
+
+{% macro kind_badge(kind) %}
+  {% set cfg = {
+    'asset':  'text-blue-400 bg-blue-500/10 border-blue-500/20',
+    'sensor': 'text-violet-400 bg-violet-500/10 border-violet-500/20',
+    'effect': 'text-amber-400 bg-amber-500/10 border-amber-500/20',
+  } %}
+  <span class="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium border {{ cfg.get(kind, 'text-neutral-400 bg-neutral-500/10 border-neutral-500/20') }}">{{ kind }}</span>
+{% endmacro %}
+
+{% macro hash_display(h) %}
+  {% if h %}
+    <span class="hash font-mono text-xs text-[var(--text-3)] cursor-pointer select-all" title="{{ h }}">{{ h[:8] }}…</span>
+  {% else %}
+    <span class="text-[var(--text-3)]">—</span>
+  {% endif %}
+{% endmacro %}
+
+{% macro relative_time(dt) %}
+  {% if dt %}
+    <span class="text-[var(--text-3)] text-xs" title="{{ dt }}">{{ dt }}</span>
+  {% else %}
+    <span class="text-[var(--text-3)]">—</span>
+  {% endif %}
+{% endmacro %}
+
+{% macro empty_state(icon, title, subtitle="") %}
+<div class="flex flex-col items-center justify-center py-16 gap-3 text-center">
+  <div class="text-3xl text-[var(--text-3)]">{{ icon }}</div>
+  <p class="text-sm font-medium text-[var(--text-2)]">{{ title }}</p>
+  {% if subtitle %}
+    <p class="text-xs text-[var(--text-3)] max-w-xs">{{ subtitle }}</p>
+  {% endif %}
+</div>
+{% endmacro %}

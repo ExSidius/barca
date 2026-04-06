@@ -1,0 +1,38 @@
+{% from "components/macros.html" import status_badge %}
+<table class="data-table w-full">
+  <thead>
+    <tr>
+      <th>Status</th>
+      <th>Update Detected</th>
+      <th>Output</th>
+      <th>Observed At</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for o in observations %}
+    <tr>
+      <td>{{ status_badge(o.status) }}</td>
+      <td>
+        {% if o.update_detected %}
+          <span class="text-green-400 text-xs font-mono">yes</span>
+        {% else %}
+          <span class="text-[var(--text-3)] text-xs font-mono">no</span>
+        {% endif %}
+      </td>
+      <td class="font-mono text-xs text-[var(--text-3)] max-w-[320px] truncate">
+        {{ o.output_json or '—' }}
+      </td>
+      <td class="text-xs text-[var(--text-3)]">{{ o.observed_at or '—' }}</td>
+    </tr>
+    {% if o.last_error %}
+    <tr class="bg-red-500/5">
+      <td colspan="4" class="py-2 px-4 text-xs text-red-400 font-mono">{{ o.last_error }}</td>
+    </tr>
+    {% endif %}
+    {% else %}
+    <tr>
+      <td colspan="4" class="py-8 text-center text-sm text-[var(--text-3)]">No observations yet</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

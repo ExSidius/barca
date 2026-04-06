@@ -4,13 +4,13 @@ Starts the barca server, POSTs a materialize request, and polls the job API
 until the status transitions to 'success'.
 """
 
-import subprocess
-import time
-import os
-import sys
 import json
-import urllib.request
+import os
+import subprocess
+import sys
+import time
 import urllib.error
+import urllib.request
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(os.path.dirname(BENCH_DIR))
@@ -83,8 +83,10 @@ def main():
 
     print("[barca] Starting server...")
     server = subprocess.Popen(
-        [CLI, "serve"], cwd=BENCH_DIR,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        [CLI, "serve"],
+        cwd=BENCH_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         env={**os.environ, "RUST_LOG": "warn"},
     )
 
@@ -100,8 +102,7 @@ def main():
         totals = []
         for i in range(runs):
             # Force fresh materialization by resetting artifacts
-            subprocess.run([CLI, "reset", "--artifacts"], cwd=BENCH_DIR,
-                           capture_output=True, env={**os.environ, "RUST_LOG": "error"})
+            subprocess.run([CLI, "reset", "--artifacts"], cwd=BENCH_DIR, capture_output=True, env={**os.environ, "RUST_LOG": "error"})
             api_post("/api/reindex")
             time.sleep(0.3)
 
@@ -110,11 +111,10 @@ def main():
                 pickup, total, post = result
                 pickups.append(pickup)
                 totals.append(total)
-                print(f"  Run {i+1}: pickup={pickup:.0f}ms, total={total:.0f}ms (POST={post:.0f}ms)")
+                print(f"  Run {i + 1}: pickup={pickup:.0f}ms, total={total:.0f}ms (POST={post:.0f}ms)")
 
         if pickups:
-            print(f"[barca] Avg pickup: {sum(pickups)/len(pickups):.0f}ms, "
-                  f"avg total: {sum(totals)/len(totals):.0f}ms")
+            print(f"[barca] Avg pickup: {sum(pickups) / len(pickups):.0f}ms, avg total: {sum(totals) / len(totals):.0f}ms")
     finally:
         server.terminate()
         server.wait(timeout=5)

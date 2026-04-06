@@ -19,6 +19,7 @@ def unsafe(func=None, *, cache=False):
     def load_static_config():
         return yaml.safe_load(open("static.yaml"))
     """
+
     def decorator(fn):
         fn.__unsafe__ = True
         fn.__unsafe_cache__ = cache

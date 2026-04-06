@@ -5,14 +5,12 @@ it.  The notebook helpers let you materialize the dataset once and iterate on
 models without recomputation.
 """
 
-import json
 import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 
-from barca._engine import reindex, refresh, trigger_sensor
+from barca._engine import reindex, trigger_sensor
 from barca._notebook import list_versions, load_inputs, materialize, read_asset
 from barca._store import MetadataStore
 
@@ -36,7 +34,8 @@ def ml_project(tmp_path):
     mod_dir = project_dir / "mlmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "pipeline.py").write_text(textwrap.dedent("""\
+    (mod_dir / "pipeline.py").write_text(
+        textwrap.dedent("""\
         from barca import asset
 
         @asset()
@@ -53,12 +52,15 @@ def ml_project(tmp_path):
         def tree_model(data: dict) -> dict:
             n = len(data["labels"])
             return {"model": "tree", "accuracy": 0.82, "n_samples": n}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["mlmod.pipeline"]
-    """))
+    """)
+    )
 
     _cleanup("mlmod")
     sys.path.insert(0, str(project_dir))
@@ -66,6 +68,7 @@ def ml_project(tmp_path):
     sys.path.remove(str(project_dir))
     _cleanup("mlmod")
     from barca._trace import clear_caches
+
     clear_caches()
 
 
@@ -82,7 +85,8 @@ def sensor_project(tmp_path):
     mod_dir = project_dir / "smod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "pipeline.py").write_text(textwrap.dedent("""\
+    (mod_dir / "pipeline.py").write_text(
+        textwrap.dedent("""\
         from barca import sensor, asset, effect
 
         @sensor(schedule="always")
@@ -96,12 +100,15 @@ def sensor_project(tmp_path):
         @effect(inputs={"result": process}, schedule="always")
         def notify(result):
             pass
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["smod.pipeline"]
-    """))
+    """)
+    )
 
     _cleanup("smod")
     sys.path.insert(0, str(project_dir))
@@ -109,6 +116,7 @@ def sensor_project(tmp_path):
     sys.path.remove(str(project_dir))
     _cleanup("smod")
     from barca._trace import clear_caches
+
     clear_caches()
 
 
@@ -225,8 +233,9 @@ def test_read_asset_sensor(sensor_project):
 
 def test_load_inputs_effect(sensor_project):
     """load_inputs works for effects — they have inputs too."""
-    from barca._reconciler import reconcile as _reconcile
     import smod.pipeline as m
+
+    from barca._reconciler import reconcile as _reconcile
 
     # Reconcile runs the full pipeline: sensor → asset → effect
     store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
