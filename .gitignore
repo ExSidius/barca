@@ -56,6 +56,10 @@ __marimo__/
 
 node_modules
 test-results
+playwright-report/
+
+# Vite build output (React UI)
+packages/barca/src/barca/server/ui/dist/
 
 # MkDocs
 site/

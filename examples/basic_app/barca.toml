@@ -1,0 +1,2 @@
+[project]
+modules = ["example_project.assets"]

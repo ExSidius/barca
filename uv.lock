@@ -67,9 +67,7 @@ version = "0.1.0"
 source = { editable = "packages/barca" }
 dependencies = [
     { name = "croniter" },
-    { name = "datastar-py" },
     { name = "fastapi" },
-    { name = "jinja2" },
     { name = "pydantic" },
     { name = "pyturso" },
     { name = "typer" },
@@ -80,9 +78,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "croniter", specifier = ">=2.0" },
-    { name = "datastar-py", specifier = ">=0.8.0" },
     { name = "fastapi", specifier = ">=0.115" },
-    { name = "jinja2", specifier = ">=3.1" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pyturso", specifier = ">=0.5.0" },
     { name = "typer", extras = ["all"], specifier = ">=0.9" },
@@ -204,15 +200,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/df/de/5832661ed55107b8a09af3f0a2e71e0957226a59eb1dcf0a445cce6daf20/croniter-6.2.2.tar.gz", hash = "sha256:ba60832a5ec8e12e51b8691c3309a113d1cf6526bdf1a48150ce8ec7a532d0ab", size = 113762, upload-time = "2026-03-15T08:43:48.112Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d0/39/783980e78cb92c2d7bdb1fc7dbc86e94ccc6d58224d76a7f1f51b6c51e30/croniter-6.2.2-py3-none-any.whl", hash = "sha256:a5d17b1060974d36251ea4faf388233eca8acf0d09cbd92d35f4c4ac8f279960", size = 45422, upload-time = "2026-03-15T08:43:46.626Z" },
-]
-
-[[package]]
-name = "datastar-py"
-version = "0.8.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e9/e3/28f8b1ba914302378fdec7050a11ca69e937f000ba16b9c9f8aaf8f8667e/datastar_py-0.8.0.tar.gz", hash = "sha256:a6893608da32378ae22640c115c80e50b2e905db1a2adca840d1ee6b1009b308", size = 137445, upload-time = "2025-12-19T19:43:53.802Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/92/9c/2d805013718a5e90e1574e54b5eef6e64955c7c0f319d1ef9fc4dcdd6a79/datastar_py-0.8.0-py3-none-any.whl", hash = "sha256:637b557d163ad31d1b1c8ecf13c02ae33cd5134ec3f606ed38d0cefcac675d54", size = 19023, upload-time = "2025-12-19T19:43:52.626Z" },
 ]
 
 [[package]]
