@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import sys
 import textwrap
-from pathlib import Path
 
 import pytest
 
@@ -34,7 +33,8 @@ def tmp_project(tmp_path):
     mod_dir = project_dir / "mymod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset
 
         @asset()
@@ -44,12 +44,15 @@ def tmp_project(tmp_path):
         @asset()
         def greeting() -> str:
             return "Hello from Barca!"
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["mymod.assets"]
-    """))
+    """)
+    )
 
     _cleanup_modules("mymod")
     sys.path.insert(0, str(project_dir))
@@ -57,6 +60,7 @@ def tmp_project(tmp_path):
     sys.path.remove(str(project_dir))
     _cleanup_modules("mymod")
     from barca._trace import clear_caches
+
     clear_caches()
 
 
@@ -69,7 +73,8 @@ def dep_project(tmp_path):
     mod_dir = project_dir / "depmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset
 
         @asset()
@@ -79,12 +84,15 @@ def dep_project(tmp_path):
         @asset(inputs={"fruit": fruit})
         def uppercased(fruit: str) -> str:
             return fruit.upper()
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["depmod.assets"]
-    """))
+    """)
+    )
 
     _cleanup_modules("depmod")
     sys.path.insert(0, str(project_dir))
@@ -92,6 +100,7 @@ def dep_project(tmp_path):
     sys.path.remove(str(project_dir))
     _cleanup_modules("depmod")
     from barca._trace import clear_caches
+
     clear_caches()
 
 
@@ -104,18 +113,22 @@ def partition_project(tmp_path):
     mod_dir = project_dir / "partmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset, partitions
 
         @asset(partitions={"ticker": partitions(["AAPL", "MSFT", "GOOG"])})
         def fetch_prices(ticker: str) -> dict:
             return {"ticker": ticker, "price": len(ticker) * 100}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["partmod.assets"]
-    """))
+    """)
+    )
 
     _cleanup_modules("partmod")
     sys.path.insert(0, str(project_dir))
@@ -123,4 +136,5 @@ def partition_project(tmp_path):
     sys.path.remove(str(project_dir))
     _cleanup_modules("partmod")
     from barca._trace import clear_caches
+
     clear_caches()

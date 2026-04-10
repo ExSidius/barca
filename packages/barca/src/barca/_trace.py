@@ -19,7 +19,6 @@ import sysconfig
 import textwrap
 from dataclasses import dataclass, field
 from functools import lru_cache
-from pathlib import Path
 
 from barca._unsafe import is_unsafe
 
@@ -37,8 +36,13 @@ for _key in ("stdlib", "platstdlib", "purelib", "platlib"):
 
 # Known impure function names (module.func or bare func)
 _IMPURE_CALLS = {
-    "open", "print", "exec", "eval", "input",
-    "setattr", "delattr",
+    "open",
+    "print",
+    "exec",
+    "eval",
+    "input",
+    "setattr",
+    "delattr",
 }
 
 _IMPURE_ATTR_CALLS = {
@@ -77,6 +81,7 @@ class PurityResult:
 @dataclass
 class TraceResult:
     """Result of extract_dependencies."""
+
     dependencies: dict[str, str]  # qualified_name -> source_or_repr
     warnings: list[str] = field(default_factory=list)
 
@@ -177,7 +182,7 @@ def _collect_referenced_names(source: str) -> tuple[set[str], list[ast.Import | 
             names.add(node.value.id)
 
         # Import statements
-        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+        elif isinstance(node, ast.Import | ast.ImportFrom):
             imports.append(node)
 
     return names, imports
@@ -203,7 +208,7 @@ def _process_single_func(func, project_root, visited, result):
         return []
 
     func_file = _get_file_safe(func)
-    func_name = getattr(func, "__name__", repr(func))
+    getattr(func, "__name__", repr(func))
     func_globals = getattr(func, "__globals__", {})
 
     # Single-pass: collect all referenced names and imports
@@ -260,6 +265,7 @@ def _process_single_func(func, project_root, visited, result):
                 if mod_obj is None:
                     try:
                         import importlib
+
                         mod_obj = importlib.import_module(mod_name)
                     except (ImportError, ModuleNotFoundError):
                         result.warnings.append(f"Cannot resolve star import: from {mod_name} import *")
@@ -273,10 +279,7 @@ def _process_single_func(func, project_root, visited, result):
                             mod_source = _read_source(mod_file) if os.path.isfile(mod_file) else None
                             if mod_source:
                                 result.dependencies[dep_key] = mod_source
-                                result.warnings.append(
-                                    f"Star import 'from {mod_name} import *' — "
-                                    f"hashing entire module (consider explicit imports)"
-                                )
+                                result.warnings.append(f"Star import 'from {mod_name} import *' — hashing entire module (consider explicit imports)")
                 continue
 
             # Named imports
@@ -288,8 +291,7 @@ def _process_single_func(func, project_root, visited, result):
                 obj_file = _get_file_safe(obj)
                 if obj_file and _is_project_local(obj_file, project_root):
                     obj_name = getattr(obj, "__name__", imported_name)
-                    dep_key = _make_dep_key(obj_file, obj_name) if callable(obj) else \
-                              _make_dep_key(obj_file, f"imported:{imported_name}")
+                    dep_key = _make_dep_key(obj_file, obj_name) if callable(obj) else _make_dep_key(obj_file, f"imported:{imported_name}")
                     if dep_key not in visited:
                         visited.add(dep_key)
                         if callable(obj):
@@ -418,24 +420,20 @@ def analyze_purity(func) -> PurityResult:
             result.impure_reasons.append(f"'nonlocal {names}' — mutates enclosing scope")
 
         # yield / yield from (generators are stateful)
-        elif isinstance(node, (ast.Yield, ast.YieldFrom)):
+        elif isinstance(node, ast.Yield | ast.YieldFrom):
             result.is_pure = False
             result.impure_reasons.append("yield — function is a stateful generator")
 
         # Attribute/subscript assignment (obj.x = val, d[k] = val)
-        elif isinstance(node, (ast.Assign, ast.AugAssign)):
+        elif isinstance(node, ast.Assign | ast.AugAssign):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             for target in targets:
                 if isinstance(target, ast.Attribute):
                     result.is_pure = False
-                    result.impure_reasons.append(
-                        "Attribute assignment — likely mutating external object"
-                    )
+                    result.impure_reasons.append("Attribute assignment — likely mutating external object")
                 elif isinstance(target, ast.Subscript):
                     result.is_pure = False
-                    result.impure_reasons.append(
-                        "Subscript assignment — likely mutating external container"
-                    )
+                    result.impure_reasons.append("Subscript assignment — likely mutating external container")
 
         # Function calls
         elif isinstance(node, ast.Call):
@@ -446,15 +444,10 @@ def analyze_purity(func) -> PurityResult:
                     result.is_pure = False
                     result.impure_reasons.append(f"Call to '{call_name}()' — side effect")
                     if call_name == "open":
-                        result.warnings.append(
-                            f"WARNING: {func_name} ({func_file}) calls open() — "
-                            f"external data dependency. Consider @asset(extra_deps=[...])"
-                        )
+                        result.warnings.append(f"WARNING: {func_name} ({func_file}) calls open() — external data dependency. Consider @asset(extra_deps=[...])")
                 if call_name in _DYNAMIC_DISPATCH_CALLS:
                     result.is_pure = False
-                    result.impure_reasons.append(
-                        f"Call to '{call_name}()' — dynamic dispatch, cannot trace target"
-                    )
+                    result.impure_reasons.append(f"Call to '{call_name}()' — dynamic dispatch, cannot trace target")
                     result.warnings.append(
                         f"WARNING: {func_name} ({func_file}) uses {call_name}() — "
                         f"dependency tracing cannot guarantee correctness. Consider:\n"
@@ -469,26 +462,16 @@ def analyze_purity(func) -> PurityResult:
                     attr = node.func.attr
                     if (mod, attr) in _IMPURE_ATTR_CALLS:
                         result.is_pure = False
-                        result.impure_reasons.append(
-                            f"Call to '{mod}.{attr}()' — side effect or non-deterministic"
-                        )
+                        result.impure_reasons.append(f"Call to '{mod}.{attr}()' — side effect or non-deterministic")
                         if mod == "importlib" and attr == "import_module":
-                            result.warnings.append(
-                                f"WARNING: {func_name} ({func_file}) uses "
-                                f"importlib.import_module() — dynamic import, "
-                                f"cannot trace target module"
-                            )
+                            result.warnings.append(f"WARNING: {func_name} ({func_file}) uses importlib.import_module() — dynamic import, cannot trace target module")
                     elif mod in _NONDETERMINISTIC_MODULES:
                         result.is_pure = False
-                        result.impure_reasons.append(
-                            f"Call to '{mod}.{attr}()' — potentially non-deterministic"
-                        )
+                        result.impure_reasons.append(f"Call to '{mod}.{attr}()' — potentially non-deterministic")
 
         # Attribute access (not call) on known impure modules
         elif isinstance(node, ast.Attribute):
-            if (isinstance(node.value, ast.Name)
-                    and node.value.id == "os" and node.attr == "environ"
-                    and isinstance(node.ctx, ast.Load)):
+            if isinstance(node.value, ast.Name) and node.value.id == "os" and node.attr == "environ" and isinstance(node.ctx, ast.Load):
                 result.is_pure = False
                 result.impure_reasons.append("Access to os.environ — external state dependency")
 

@@ -2,7 +2,6 @@ import time
 
 from barca import asset, partitions
 
-
 # --- Workflow 1: Single assets, no inputs ---
 
 

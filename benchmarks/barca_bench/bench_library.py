@@ -3,10 +3,8 @@
 Apples-to-apples comparison with Dagster/Prefect which also run in-process.
 """
 
-import json
 import math
 import os
-import shutil
 import sys
 import time
 
@@ -17,7 +15,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(BENCH_DIR))
 if BENCH_DIR not in sys.path:
     sys.path.insert(0, BENCH_DIR)
 
-from barca._engine import reindex, refresh, reset
+from barca._engine import refresh, reindex, reset
 from barca._store import MetadataStore
 
 
@@ -28,6 +26,7 @@ def _store():
 
 def _reset():
     from pathlib import Path
+
     reset(Path(BENCH_DIR), db=True, artifacts=True)
 
 
@@ -40,8 +39,10 @@ def _find_asset_id(store, name):
 
 # ── Cold start ──────────────────────────────────────────────────────────────
 
+
 def bench_cold_start(runs):
     from pathlib import Path
+
     root = Path(BENCH_DIR)
 
     print(f"[barca in-process] Cold start: single asset ({runs} runs):")
@@ -55,7 +56,7 @@ def bench_cold_start(runs):
         refresh(store, root, asset_id)
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.3f}s")
+        print(f"  Run {i + 1}: {elapsed:.3f}s")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
@@ -64,8 +65,10 @@ def bench_cold_start(runs):
 
 # ── Spaceflights ────────────────────────────────────────────────────────────
 
+
 def bench_spaceflights(runs, max_workers=None):
     from pathlib import Path
+
     root = Path(BENCH_DIR)
 
     label = f"-j {max_workers}" if max_workers else "default"
@@ -89,7 +92,7 @@ def bench_spaceflights(runs, max_workers=None):
         refresh(store, root, asset_id, max_workers=max_workers)
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.3f}s")
+        print(f"  Run {i + 1}: {elapsed:.3f}s")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
@@ -98,8 +101,10 @@ def bench_spaceflights(runs, max_workers=None):
 
 # ── 500 partitions x 50ms ──────────────────────────────────────────────────
 
+
 def bench_parallel(runs, max_workers=None):
     from pathlib import Path
+
     root = Path(BENCH_DIR)
 
     label = f"-j {max_workers}" if max_workers else "default"
@@ -123,7 +128,7 @@ def bench_parallel(runs, max_workers=None):
         refresh(store, root, asset_id, max_workers=max_workers)
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.2f}s")
+        print(f"  Run {i + 1}: {elapsed:.2f}s")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
@@ -132,8 +137,10 @@ def bench_parallel(runs, max_workers=None):
 
 # ── 500 trivial ────────────────────────────────────────────────────────────
 
+
 def bench_trivial(runs, max_workers=None):
     from pathlib import Path
+
     root = Path(BENCH_DIR)
 
     label = f"-j {max_workers}" if max_workers else "default"
@@ -157,7 +164,7 @@ def bench_trivial(runs, max_workers=None):
         refresh(store, root, asset_id, max_workers=max_workers)
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.2f}s")
+        print(f"  Run {i + 1}: {elapsed:.2f}s")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))

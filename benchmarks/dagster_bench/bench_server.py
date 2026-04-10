@@ -13,8 +13,8 @@ import os
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 VENV_BIN = os.path.join(BENCH_DIR, ".venv", "bin")
@@ -25,7 +25,8 @@ DAGSTER_HOME = os.environ.get("DAGSTER_HOME", "/tmp/dagster_server_bench")
 
 # ── Dagster definitions (used by `dagster dev -f bench_server.py`) ───────────
 
-from dagster import asset as dagster_asset, Definitions
+from dagster import Definitions
+from dagster import asset as dagster_asset
 
 
 @dagster_asset
@@ -37,6 +38,7 @@ defs = Definitions(assets=[single_asset])
 
 
 # ── Benchmark helpers ────────────────────────────────────────────────────────
+
 
 def graphql_query(query, variables=None):
     """Execute a GraphQL query against the Dagster API."""
@@ -141,16 +143,18 @@ def bench_startup(runs):
     for i in range(runs):
         server = subprocess.Popen(
             _dagster_cmd(),
-            cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=BENCH_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=_dagster_env(),
         )
         try:
             startup = wait_for_server()
             if startup is None:
-                print(f"  Run {i+1}: FAILED (timeout)")
+                print(f"  Run {i + 1}: FAILED (timeout)")
                 continue
             times.append(startup)
-            print(f"  Run {i+1}: {startup*1000:.0f}ms")
+            print(f"  Run {i + 1}: {startup * 1000:.0f}ms")
         finally:
             server.terminate()
             server.wait(timeout=10)
@@ -159,7 +163,7 @@ def bench_startup(runs):
     if times:
         avg = sum(times) / len(times)
         std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
-        print(f"[dagster] Startup avg: {avg*1000:.0f}ms +/- {std*1000:.0f}ms")
+        print(f"[dagster] Startup avg: {avg * 1000:.0f}ms +/- {std * 1000:.0f}ms")
     return times
 
 
@@ -167,7 +171,9 @@ def bench_refresh_latency(runs):
     """Measure GraphQL materialization latency (launch → success)."""
     server = subprocess.Popen(
         _dagster_cmd(),
-        cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        cwd=BENCH_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
         env=_dagster_env(),
     )
 
@@ -186,10 +192,10 @@ def bench_refresh_latency(runs):
         for i in range(runs):
             t0 = time.perf_counter()
             run_id = launch_materialization("single_asset")
-            status, poll_ms = poll_run_completion(run_id)
+            status, _poll_ms = poll_run_completion(run_id)
             total_ms = (time.perf_counter() - t0) * 1000
             times.append(total_ms)
-            print(f"  Run {i+1}: {total_ms:.0f}ms ({status})")
+            print(f"  Run {i + 1}: {total_ms:.0f}ms ({status})")
 
         if times:
             avg = sum(times) / len(times)

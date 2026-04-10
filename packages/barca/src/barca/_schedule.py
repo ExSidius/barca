@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Union
+from typing import Literal, Union, cast
 
 from croniter import croniter
 
@@ -11,6 +11,7 @@ from croniter import croniter
 @dataclass(frozen=True)
 class CronSchedule:
     """A cron-expression schedule."""
+
     expr: str
 
     def __post_init__(self):
@@ -57,5 +58,5 @@ def deserialize_schedule(value: str) -> Schedule:
     if value.startswith("cron:"):
         return CronSchedule(value[5:])
     if value in ("manual", "always"):
-        return value
+        return cast("Schedule", value)
     raise ValueError(f"invalid schedule value: {value!r}")

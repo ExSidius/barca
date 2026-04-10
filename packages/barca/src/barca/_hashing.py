@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import time
 from pathlib import Path
 
 PROTOCOL_VERSION = "0.3.0"
 
-SKIP_DIRS = frozenset({
-    ".venv", "__pycache__", ".git", ".barca", ".barcafiles",
-    "build", "dist", "node_modules", "target", "tmp",
-})
+SKIP_DIRS = frozenset(
+    {
+        ".venv",
+        "__pycache__",
+        ".git",
+        ".barca",
+        ".barcafiles",
+        "build",
+        "dist",
+        "node_modules",
+        "target",
+        "tmp",
+    }
+)
 
 
 def sha256_hex(data: bytes) -> str:

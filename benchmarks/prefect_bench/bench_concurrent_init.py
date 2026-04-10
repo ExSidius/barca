@@ -21,6 +21,7 @@ def make_flow(n_assets, max_workers=64):
     def init_flow():
         futures = [init_task.submit(i) for i in range(n_assets)]
         return [f.result() for f in futures]
+
     return init_flow
 
 
@@ -40,7 +41,7 @@ if __name__ == "__main__":
         results = benchmark_flow()
         elapsed = time.perf_counter() - t0
         times.append(elapsed)
-        print(f"  Run {i+1}: {elapsed:.3f}s ({len(results)} results)")
+        print(f"  Run {i + 1}: {elapsed:.3f}s ({len(results)} results)")
 
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))

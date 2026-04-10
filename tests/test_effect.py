@@ -5,7 +5,6 @@ import textwrap
 
 import pytest
 
-from barca._engine import reindex
 from barca._reconciler import reconcile
 from barca._store import MetadataStore
 
@@ -35,6 +34,7 @@ def test_effect_cannot_be_used_as_input():
         pass
 
     with pytest.raises(TypeError, match="ref strings"):
+
         @asset(inputs={"data": my_effect})
         def bad_asset(data):
             return data
@@ -47,7 +47,8 @@ def test_effect_executes_after_upstream(tmp_path):
     mod_dir = project_dir / "emod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "pipeline.py").write_text(textwrap.dedent("""\
+    (mod_dir / "pipeline.py").write_text(
+        textwrap.dedent("""\
         from barca import asset, effect
 
         @asset(schedule="always")
@@ -57,12 +58,15 @@ def test_effect_executes_after_upstream(tmp_path):
         @effect(inputs={"data": data_source}, schedule="always")
         def push_data(data):
             pass  # would push somewhere
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["emod.pipeline"]
-    """))
+    """)
+    )
 
     _cleanup("emod")
     sys.path.insert(0, str(project_dir))
@@ -75,7 +79,7 @@ def test_effect_executes_after_upstream(tmp_path):
 
         # Verify effect execution recorded
         assets = store.list_assets()
-        effect_asset = [a for a in assets if a.function_name == "push_data"][0]
+        effect_asset = next(a for a in assets if a.function_name == "push_data")
         exec_record = store.latest_effect_execution(effect_asset.asset_id)
         assert exec_record is not None
         assert exec_record.status == "success"
@@ -83,4 +87,5 @@ def test_effect_executes_after_upstream(tmp_path):
         sys.path.remove(str(project_dir))
         _cleanup("emod")
         from barca._trace import clear_caches
+
         clear_caches()

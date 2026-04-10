@@ -3,8 +3,6 @@
 import sys
 import textwrap
 
-import pytest
-
 from barca._reconciler import reconcile
 from barca._store import MetadataStore
 
@@ -22,18 +20,22 @@ def test_always_assets_get_materialized(tmp_path):
     mod_dir = project_dir / "amod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset
 
         @asset(schedule="always")
         def auto_asset():
             return {"auto": True}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["amod.assets"]
-    """))
+    """)
+    )
 
     _cleanup("amod")
     sys.path.insert(0, str(project_dir))
@@ -47,6 +49,7 @@ def test_always_assets_get_materialized(tmp_path):
         sys.path.remove(str(project_dir))
         _cleanup("amod")
         from barca._trace import clear_caches
+
         clear_caches()
 
 
@@ -57,18 +60,22 @@ def test_manual_assets_are_skipped(tmp_path):
     mod_dir = project_dir / "mmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset
 
         @asset(schedule="manual")
         def manual_asset():
             return {"manual": True}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["mmod.assets"]
-    """))
+    """)
+    )
 
     _cleanup("mmod")
     sys.path.insert(0, str(project_dir))
@@ -83,6 +90,7 @@ def test_manual_assets_are_skipped(tmp_path):
         sys.path.remove(str(project_dir))
         _cleanup("mmod")
         from barca._trace import clear_caches
+
         clear_caches()
 
 
@@ -94,7 +102,8 @@ def test_full_pipeline_sensor_to_effect(tmp_path):
     mod_dir = project_dir / "fullmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "pipeline.py").write_text(textwrap.dedent("""\
+    (mod_dir / "pipeline.py").write_text(
+        textwrap.dedent("""\
         from barca import sensor, asset, effect
 
         @sensor(schedule="always")
@@ -108,12 +117,15 @@ def test_full_pipeline_sensor_to_effect(tmp_path):
         @effect(inputs={"result": transform}, schedule="always")
         def sink(result):
             pass
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["fullmod.pipeline"]
-    """))
+    """)
+    )
 
     _cleanup("fullmod")
     sys.path.insert(0, str(project_dir))
@@ -129,6 +141,7 @@ def test_full_pipeline_sensor_to_effect(tmp_path):
         sys.path.remove(str(project_dir))
         _cleanup("fullmod")
         from barca._trace import clear_caches
+
         clear_caches()
 
 
@@ -140,18 +153,22 @@ def test_second_reconcile_is_fresh(tmp_path):
     mod_dir = project_dir / "frmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
-    (mod_dir / "assets.py").write_text(textwrap.dedent("""\
+    (mod_dir / "assets.py").write_text(
+        textwrap.dedent("""\
         from barca import asset
 
         @asset(schedule="always")
         def simple():
             return {"x": 1}
-    """))
+    """)
+    )
 
-    (project_dir / "barca.toml").write_text(textwrap.dedent("""\
+    (project_dir / "barca.toml").write_text(
+        textwrap.dedent("""\
         [project]
         modules = ["frmod.assets"]
-    """))
+    """)
+    )
 
     _cleanup("frmod")
     sys.path.insert(0, str(project_dir))
@@ -169,4 +186,5 @@ def test_second_reconcile_is_fresh(tmp_path):
         sys.path.remove(str(project_dir))
         _cleanup("frmod")
         from barca._trace import clear_caches
+
         clear_caches()

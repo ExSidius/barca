@@ -1,0 +1,16 @@
+{
+  "name": "barca",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "test:e2e:headed": "playwright test --headed",
+    "test:e2e:debug": "playwright test --debug",
+    "test:e2e:visual": "playwright test --grep @visual",
+    "test:e2e:visual:ui": "playwright test --grep @visual --ui"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.58.0"
+  }
+}

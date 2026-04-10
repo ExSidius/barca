@@ -1,10 +1,10 @@
 """Barca cold start benchmark: time to materialize a single trivial asset from scratch."""
 
-import subprocess
-import time
-import os
-import sys
 import math
+import os
+import subprocess
+import sys
+import time
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 CLI = "barca"
@@ -40,7 +40,7 @@ def main():
     for i in range(runs):
         t = cold_start_single()
         times.append(t)
-        print(f"  Run {i+1}: {t:.3f}s")
+        print(f"  Run {i + 1}: {t:.3f}s")
     avg = sum(times) / len(times)
     std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
     print(f"[barca] Cold start avg: {avg:.3f}s +/- {std:.3f}s")

@@ -21,6 +21,7 @@ def run_suite(name, module_name):
     except Exception as e:
         print(f"  [ERROR] Failed to run: {e}")
         import traceback
+
         traceback.print_exc()
         return 0, 1, []
 
@@ -60,8 +61,7 @@ def main():
     elapsed = time.perf_counter() - t0
 
     print(f"\n{'=' * 60}")
-    print(f"  RESULTS: {total_passed} passed, {total_failed} failed "
-          f"({elapsed:.3f}s)")
+    print(f"  RESULTS: {total_passed} passed, {total_failed} failed ({elapsed:.3f}s)")
     print(f"{'=' * 60}")
 
     return 0 if total_failed == 0 else 1

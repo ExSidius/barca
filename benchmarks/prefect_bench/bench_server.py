@@ -15,8 +15,8 @@ import os
 import subprocess
 import sys
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 BENCH_DIR = os.path.dirname(os.path.abspath(__file__))
 VENV_BIN = os.path.join(BENCH_DIR, ".venv", "bin")
@@ -64,18 +64,18 @@ def bench_startup(runs):
     for i in range(runs):
         server = subprocess.Popen(
             [PREFECT_CMD, "server", "start", "--host", "127.0.0.1", "--port", "4200"],
-            cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env={**os.environ,
-                 "PREFECT_HOME": f"/tmp/prefect_server_bench_{i}",
-                 "PREFECT_LOGGING_LEVEL": "ERROR"},
+            cwd=BENCH_DIR,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "PREFECT_HOME": f"/tmp/prefect_server_bench_{i}", "PREFECT_LOGGING_LEVEL": "ERROR"},
         )
         try:
             startup = wait_for_server()
             if startup is None:
-                print(f"  Run {i+1}: FAILED (timeout)")
+                print(f"  Run {i + 1}: FAILED (timeout)")
                 continue
             times.append(startup)
-            print(f"  Run {i+1}: {startup*1000:.0f}ms")
+            print(f"  Run {i + 1}: {startup * 1000:.0f}ms")
         finally:
             server.terminate()
             server.wait(timeout=10)
@@ -84,7 +84,7 @@ def bench_startup(runs):
     if times:
         avg = sum(times) / len(times)
         std = math.sqrt(sum((t - avg) ** 2 for t in times) / len(times))
-        print(f"[prefect] Startup avg: {avg*1000:.0f}ms +/- {std*1000:.0f}ms")
+        print(f"[prefect] Startup avg: {avg * 1000:.0f}ms +/- {std * 1000:.0f}ms")
     return times
 
 
@@ -97,14 +97,13 @@ def bench_flow_run_latency(runs):
     cost that Prefect adds.
     """
     from prefect import flow
-    from prefect.client.orchestration import get_client
 
     server = subprocess.Popen(
         [PREFECT_CMD, "server", "start", "--host", "127.0.0.1", "--port", "4200"],
-        cwd=BENCH_DIR, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        env={**os.environ,
-             "PREFECT_HOME": "/tmp/prefect_server_bench",
-             "PREFECT_LOGGING_LEVEL": "ERROR"},
+        cwd=BENCH_DIR,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env={**os.environ, "PREFECT_HOME": "/tmp/prefect_server_bench", "PREFECT_LOGGING_LEVEL": "ERROR"},
     )
 
     try:
@@ -127,7 +126,7 @@ def bench_flow_run_latency(runs):
             trivial_flow()
             elapsed = (time.perf_counter() - t0) * 1000
             times.append(elapsed)
-            print(f"  Run {i+1}: {elapsed:.0f}ms")
+            print(f"  Run {i + 1}: {elapsed:.0f}ms")
 
         if times:
             avg = sum(times) / len(times)

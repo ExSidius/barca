@@ -66,15 +66,11 @@ def evaluation(model: dict, split: dict) -> dict:
     y_test = split["y_test"]
     predictions = model["predictions"]
     accuracy = accuracy_score(y_test, predictions)
-    report = classification_report(
-        y_test, predictions, target_names=split["target_names"], output_dict=True
-    )
+    report = classification_report(y_test, predictions, target_names=split["target_names"], output_dict=True)
 
     return {
         "test_accuracy": round(accuracy, 4),
         "train_accuracy": model["train_accuracy"],
-        "feature_importances": dict(
-            zip(split["feature_names"], model["feature_importances"])
-        ),
+        "feature_importances": dict(zip(split["feature_names"], model["feature_importances"], strict=False)),
         "classification_report": report,
     }

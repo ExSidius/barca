@@ -13,10 +13,10 @@ These assets exercise edge cases in dependency tracing:
 from barca import asset, unsafe
 from pathological_project.helpers import normalize
 
-
 # ---------------------------------------------------------------------------
 # 1. Pure asset with same-file helper
 # ---------------------------------------------------------------------------
+
 
 def compute_score(x):
     return x * 0.85
@@ -45,6 +45,7 @@ def threshold_check() -> dict:
 # 3. Transitive chain: step_a -> step_b -> chained_result
 # ---------------------------------------------------------------------------
 
+
 def step_a():
     return 1
 
@@ -64,6 +65,7 @@ def chained_result() -> dict:
 # 4. Cross-file dependency
 # ---------------------------------------------------------------------------
 
+
 @asset()
 def normalized_data() -> dict:
     """Depends on helpers.normalize — cross-file dependency tracing."""
@@ -73,6 +75,7 @@ def normalized_data() -> dict:
 # ---------------------------------------------------------------------------
 # 5. @unsafe: acknowledging untraceable behavior
 # ---------------------------------------------------------------------------
+
 
 @unsafe
 def load_dynamic_config():
@@ -91,12 +94,14 @@ def config_based() -> dict:
 # 6. Impure function (should emit purity warning at reindex)
 # ---------------------------------------------------------------------------
 
+
 @asset()
 def impure_asset() -> dict:
     """Uses open() — tracer should warn about external data dependency.
     Falls back to conservative hashing."""
     import json
     import os
+
     data_path = os.path.join(os.path.dirname(__file__), "sample_data.json")
     if os.path.exists(data_path):
         with open(data_path) as f:
@@ -108,9 +113,11 @@ def impure_asset() -> dict:
 # 7. Closure dependency
 # ---------------------------------------------------------------------------
 
+
 def make_transformer(factor):
     def transform(x):
         return x * factor
+
     return transform
 
 

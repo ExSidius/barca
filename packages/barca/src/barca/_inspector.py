@@ -40,7 +40,16 @@ def inspect_modules(
             if kind not in ("asset", "sensor", "effect"):
                 continue
 
+            # Skip class objects: accessing a @property on the class returns the
+            # descriptor itself (not the computed value). We only want instances.
+            if inspect.isclass(obj):
+                continue
+
             metadata = getattr(obj, "__barca_metadata__", {})
+            if not isinstance(metadata, dict):
+                # Defensive: skip anything where metadata can't be serialised
+                continue
+
             original = getattr(obj, "__barca_original__", obj)
 
             # Get function source
@@ -87,18 +96,20 @@ def inspect_modules(
 
             mod_path = getattr(module, "__name__", module_name)
 
-            assets.append(InspectedAsset(
-                kind=kind,
-                module_path=mod_path,
-                file_path=file_path,
-                function_name=function_name,
-                function_source=function_source,
-                module_source=module_source,
-                decorator_metadata=metadata,
-                return_type=return_type,
-                python_version=python_version,
-                dependency_cone_hash=dep_hash,
-                purity_warnings=purity_warnings,
-            ))
+            assets.append(
+                InspectedAsset(
+                    kind=kind,
+                    module_path=mod_path,
+                    file_path=file_path,
+                    function_name=function_name,
+                    function_source=function_source,
+                    module_source=module_source,
+                    decorator_metadata=metadata,
+                    return_type=return_type,
+                    python_version=python_version,
+                    dependency_cone_hash=dep_hash,
+                    purity_warnings=purity_warnings,
+                )
+            )
 
     return assets

@@ -25,13 +25,26 @@ Run these before every push:
 
 ```bash
 # Lint + format all files (ruff, trailing-whitespace, yaml/toml checks, etc.)
-pre-commit run --all-files
+# prek is a Rust-based pre-commit tool (faster than pre-commit)
+prek run --all-files
 
-# Full test suite must pass
+# Full test suite must pass (Python + E2E tests)
 uv run pytest tests/ -v
+npm run test:e2e
 ```
 
-Both commands must exit 0 before pushing.
+All commands must exit 0 before pushing. The `prek run --all-files` command will:
+- ✅ Lint Python code (ruff)
+- ✅ Format code (ruff format)
+- ✅ Check trailing whitespace, YAML/TOML syntax, merge conflicts, etc.
+
+The React UI lives in `packages/barca/src/barca/server/ui/`. To rebuild it after changes:
+
+```bash
+cd packages/barca/src/barca/server/ui && npm run build
+```
+
+`npm run test:e2e` builds it automatically as part of the Playwright webServer config.
 
 ## Commands
 

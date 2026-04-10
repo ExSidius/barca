@@ -14,14 +14,13 @@ warnings.filterwarnings("ignore", category=SyntaxWarning, module="turso")
 warnings.filterwarnings("ignore", category=RuntimeWarning, message=".*GIL.*")
 import turso  # noqa: E402
 
-from barca._hashing import now_ts
-from barca._models import (
+from barca._hashing import now_ts  # noqa: E402
+from barca._models import (  # noqa: E402
     AssetDetail,
     AssetInput,
     AssetSummary,
     EffectExecution,
     IndexedAsset,
-    JobDetail,
     MaterializationRecord,
     SensorObservation,
 )
@@ -148,13 +147,75 @@ class MetadataStore:
             if statement:
                 self.conn.execute(statement)
         self.conn.commit()
-        # Migrations for kind and schedule columns
-        for col, default in [("kind", "'asset'"), ("schedule", "'manual'")]:
+        self._run_migrations()
+        self._validate_schema()
+
+    def _run_migrations(self) -> None:
+        """Apply all additive column migrations in order. Safe to re-run (ALTER TABLE fails silently if column exists)."""
+
+        def _add(table: str, col: str, col_def: str) -> None:
             try:
-                self.conn.execute(f"ALTER TABLE assets ADD COLUMN {col} TEXT NOT NULL DEFAULT {default}")
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
                 self.conn.commit()
             except Exception:
-                pass  # column already exists
+                pass  # column already exists — that's fine
+
+        # assets table
+        _add("assets", "kind", "TEXT NOT NULL DEFAULT 'asset'")
+        _add("assets", "schedule", "TEXT NOT NULL DEFAULT 'manual'")
+
+        # asset_definitions table
+        _add("asset_definitions", "codebase_hash", "TEXT NOT NULL DEFAULT ''")
+        _add("asset_definitions", "dependency_cone_hash", "TEXT NOT NULL DEFAULT ''")
+
+        # materializations table
+        _add("materializations", "partition_key_json", "TEXT")
+
+    def _validate_schema(self) -> None:
+        """Check that all expected columns are present. Raises RuntimeError with reset instructions if not."""
+        # Only list columns that are actually queried — not every column in the DDL.
+        # This list grows as new columns are added (and migrations are added alongside).
+        expected: dict[str, list[str]] = {
+            "assets": ["id", "logical_name", "continuity_key", "module_path", "file_path", "function_name", "asset_slug", "kind", "schedule", "created_at"],
+            "asset_definitions": [
+                "id",
+                "asset_id",
+                "definition_hash",
+                "continuity_key",
+                "source_text",
+                "module_source_text",
+                "decorator_metadata_json",
+                "return_type",
+                "serializer_kind",
+                "python_version",
+                "codebase_hash",
+                "dependency_cone_hash",
+                "status",
+                "created_at",
+            ],
+            "materializations": ["id", "asset_id", "definition_id", "run_hash", "status", "artifact_path", "artifact_format", "artifact_checksum", "last_error", "partition_key_json", "created_at"],
+            "sensor_observations": ["id", "asset_id", "definition_id", "update_detected", "output_json", "created_at"],
+            "effect_executions": ["id", "asset_id", "definition_id", "status", "last_error", "created_at"],
+            "job_logs": ["id", "materialization_id", "asset_id", "level", "message", "created_at"],
+        }
+        missing: list[str] = []
+        for table, cols in expected.items():
+            try:
+                rows = self.conn.execute(f"PRAGMA table_info({table})").fetchall()
+                present = {r[1] for r in rows}
+                for col in cols:
+                    if col not in present:
+                        missing.append(f"  {table}.{col}")
+            except Exception as exc:
+                missing.append(f"  {table} (could not inspect: {exc})")
+
+        if missing:
+            col_list = "\n".join(missing)
+            raise RuntimeError(
+                f"Database schema is out of date — the following columns are missing:\n{col_list}\n\n"
+                "Run  barca reset --db  to drop and recreate the database, then re-run your command.\n"
+                "(Your artifact files in .barcafiles/ are not affected by --db reset.)"
+            )
 
     # ------------------------------------------------------------------
     # Assets
@@ -169,6 +230,7 @@ class MetadataStore:
         schedule_str = "manual"
         try:
             import json as _json
+
             meta = _json.loads(asset.decorator_metadata_json)
             schedule_str = meta.get("schedule", "manual")
         except Exception:
@@ -185,6 +247,8 @@ class MetadataStore:
             existing_id = self._asset_id_by_continuity_key(asset.continuity_key)
 
         asset_id = existing_id
+        if asset_id is None:
+            raise RuntimeError(f"failed to upsert asset '{asset.continuity_key}' — INSERT OR IGNORE produced no row")
         self.conn.execute(
             "UPDATE assets SET logical_name = ?, module_path = ?, file_path = ?, function_name = ?, asset_slug = ?, kind = ?, schedule = ? WHERE id = ?",
             (asset.logical_name, asset.module_path, asset.file_path, asset.function_name, asset.asset_slug, asset.kind, schedule_str, asset_id),
@@ -216,11 +280,18 @@ class MetadataStore:
                 codebase_hash, dependency_cone_hash, status, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', ?)""",
             (
-                asset_id, asset.definition_hash, asset.continuity_key,
-                asset.source_text, asset.module_source_text,
-                asset.decorator_metadata_json, asset.return_type,
-                asset.serializer_kind, asset.python_version,
-                asset.codebase_hash, asset.dependency_cone_hash, created_at,
+                asset_id,
+                asset.definition_hash,
+                asset.continuity_key,
+                asset.source_text,
+                asset.module_source_text,
+                asset.decorator_metadata_json,
+                asset.return_type,
+                asset.serializer_kind,
+                asset.python_version,
+                asset.codebase_hash,
+                asset.dependency_cone_hash,
+                created_at,
             ),
         )
         self.conn.commit()
@@ -239,19 +310,21 @@ class MetadataStore:
         for row in rows:
             asset_id = row[0]
             latest = self._latest_materialization(asset_id)
-            assets.append(AssetSummary(
-                asset_id=asset_id,
-                logical_name=row[1],
-                kind=row[6] or "asset",
-                module_path=row[2],
-                file_path=row[3],
-                function_name=row[4],
-                definition_hash=row[5],
-                schedule=row[7] or "manual",
-                materialization_status=latest.status if latest else None,
-                materialization_run_hash=latest.run_hash if latest else None,
-                materialization_created_at=latest.created_at if latest else None,
-            ))
+            assets.append(
+                AssetSummary(
+                    asset_id=asset_id,
+                    logical_name=row[1],
+                    kind=row[6] or "asset",
+                    module_path=row[2],
+                    file_path=row[3],
+                    function_name=row[4],
+                    definition_hash=row[5],
+                    schedule=row[7] or "manual",
+                    materialization_status=latest.status if latest else None,
+                    materialization_run_hash=latest.run_hash if latest else None,
+                    materialization_created_at=latest.created_at if latest else None,
+                )
+            )
         return assets
 
     def asset_detail(self, asset_id: int) -> AssetDetail:
@@ -313,7 +386,10 @@ class MetadataStore:
     # ------------------------------------------------------------------
 
     def insert_queued_materialization(
-        self, asset_id: int, definition_id: int, run_hash: str,
+        self,
+        asset_id: int,
+        definition_id: int,
+        run_hash: str,
         partition_key_json: str | None = None,
     ) -> int:
         """Create a new materialization record with status 'queued'. Returns the materialization ID."""
@@ -326,7 +402,10 @@ class MetadataStore:
         return row[0]
 
     def insert_queued_materializations_batch(
-        self, asset_id: int, definition_id: int, run_hash: str,
+        self,
+        asset_id: int,
+        definition_id: int,
+        run_hash: str,
         partition_keys: list[str],
     ) -> int:
         """Create queued materialization records for multiple partition keys. Returns the count."""
@@ -340,7 +419,9 @@ class MetadataStore:
         return len(partition_keys)
 
     def successful_materialization_for_run(
-        self, asset_id: int, run_hash: str,
+        self,
+        asset_id: int,
+        run_hash: str,
     ) -> MaterializationRecord | None:
         """Find a successful materialization matching the exact run_hash (cache lookup). Returns None on miss."""
         row = self.conn.execute(
@@ -355,7 +436,9 @@ class MetadataStore:
         return _mat_from_row(row) if row else None
 
     def active_materialization_for_run(
-        self, asset_id: int, run_hash: str,
+        self,
+        asset_id: int,
+        run_hash: str,
     ) -> MaterializationRecord | None:
         """Find a queued or running materialization for this run_hash. Returns None if none active."""
         row = self.conn.execute(
@@ -370,7 +453,8 @@ class MetadataStore:
         return _mat_from_row(row) if row else None
 
     def active_materialization_for_asset(
-        self, asset_id: int,
+        self,
+        asset_id: int,
     ) -> MaterializationRecord | None:
         """Find any queued or running materialization for this asset. Returns None if none active."""
         row = self.conn.execute(
@@ -385,7 +469,8 @@ class MetadataStore:
         return _mat_from_row(row) if row else None
 
     def latest_successful_materialization(
-        self, asset_id: int,
+        self,
+        asset_id: int,
     ) -> MaterializationRecord | None:
         """Return the most recent successful materialization for an asset, or None."""
         row = self.conn.execute(
@@ -400,8 +485,11 @@ class MetadataStore:
         return _mat_from_row(row) if row else None
 
     def mark_materialization_success(
-        self, materialization_id: int, artifact_path: str,
-        artifact_format: str, artifact_checksum: str,
+        self,
+        materialization_id: int,
+        artifact_path: str,
+        artifact_format: str,
+        artifact_checksum: str,
     ) -> None:
         """Transition a materialization to 'success' and record its artifact metadata."""
         self.conn.execute(
@@ -411,7 +499,9 @@ class MetadataStore:
         self.conn.commit()
 
     def mark_materialization_failed(
-        self, materialization_id: int, error: str,
+        self,
+        materialization_id: int,
+        error: str,
     ) -> None:
         """Transition a materialization to 'failed' and record the error message."""
         self.conn.execute(
@@ -421,7 +511,9 @@ class MetadataStore:
         self.conn.commit()
 
     def update_materialization_run_hash(
-        self, materialization_id: int, run_hash: str,
+        self,
+        materialization_id: int,
+        run_hash: str,
     ) -> None:
         """Update the run_hash on a materialization (used when upstream IDs become known after queuing)."""
         self.conn.execute(
@@ -473,7 +565,8 @@ class MetadataStore:
         return result
 
     def get_materialization_with_asset(
-        self, materialization_id: int,
+        self,
+        materialization_id: int,
     ) -> tuple[MaterializationRecord, AssetSummary]:
         """Return a single materialization with its asset summary. Raises ValueError if not found."""
         row = self.conn.execute(
@@ -518,10 +611,7 @@ class MetadataStore:
             "SELECT parameter_name, upstream_asset_ref, upstream_asset_id FROM asset_inputs WHERE definition_id = ? ORDER BY parameter_name",
             (definition_id,),
         ).fetchall()
-        return [
-            AssetInput(parameter_name=r[0], upstream_asset_ref=r[1], upstream_asset_id=r[2])
-            for r in rows
-        ]
+        return [AssetInput(parameter_name=r[0], upstream_asset_ref=r[1], upstream_asset_id=r[2]) for r in rows]
 
     def upsert_asset_inputs(self, definition_id: int, inputs: list[AssetInput]) -> None:
         """Replace all input declarations for a definition (delete + insert)."""
@@ -538,7 +628,8 @@ class MetadataStore:
         self.conn.commit()
 
     def insert_materialization_inputs(
-        self, materialization_id: int,
+        self,
+        materialization_id: int,
         inputs: list[dict],
     ) -> None:
         """Record which upstream materializations were consumed by a materialization."""
@@ -554,7 +645,10 @@ class MetadataStore:
     # ------------------------------------------------------------------
 
     def insert_sensor_observation(
-        self, asset_id: int, definition_id: int, update_detected: bool,
+        self,
+        asset_id: int,
+        definition_id: int,
+        update_detected: bool,
         output_json: str | None = None,
     ) -> int:
         """Record a sensor observation. Returns the observation ID."""
@@ -577,8 +671,12 @@ class MetadataStore:
         if row is None:
             return None
         return SensorObservation(
-            observation_id=row[0], asset_id=row[1], definition_id=row[2],
-            update_detected=bool(row[3]), output_json=row[4], created_at=row[5],
+            observation_id=row[0],
+            asset_id=row[1],
+            definition_id=row[2],
+            update_detected=bool(row[3]),
+            output_json=row[4],
+            created_at=row[5],
         )
 
     def list_sensor_observations(self, asset_id: int, limit: int = 50) -> list[SensorObservation]:
@@ -591,8 +689,12 @@ class MetadataStore:
         ).fetchall()
         return [
             SensorObservation(
-                observation_id=r[0], asset_id=r[1], definition_id=r[2],
-                update_detected=bool(r[3]), output_json=r[4], created_at=r[5],
+                observation_id=r[0],
+                asset_id=r[1],
+                definition_id=r[2],
+                update_detected=bool(r[3]),
+                output_json=r[4],
+                created_at=r[5],
             )
             for r in rows
         ]
@@ -602,7 +704,10 @@ class MetadataStore:
     # ------------------------------------------------------------------
 
     def insert_effect_execution(
-        self, asset_id: int, definition_id: int, status: str,
+        self,
+        asset_id: int,
+        definition_id: int,
+        status: str,
         last_error: str | None = None,
     ) -> int:
         """Record an effect execution ('success' or 'failed'). Returns the execution ID."""
@@ -625,28 +730,34 @@ class MetadataStore:
         if row is None:
             return None
         return EffectExecution(
-            execution_id=row[0], asset_id=row[1], definition_id=row[2],
-            status=row[3], last_error=row[4], created_at=row[5],
+            execution_id=row[0],
+            asset_id=row[1],
+            definition_id=row[2],
+            status=row[3],
+            last_error=row[4],
+            created_at=row[5],
         )
 
     # ------------------------------------------------------------------
     # Materialization queries (notebook helpers)
     # ------------------------------------------------------------------
 
-    def list_materializations(self, asset_id: int, limit: int = 50) -> list[MaterializationRecord]:
+    def list_materializations(self, asset_id: int, limit: int = 50, offset: int = 0) -> list[MaterializationRecord]:
         """Return all materializations for an asset ordered by newest first."""
         rows = self.conn.execute(
             """SELECT id, asset_id, definition_id, run_hash, status,
                       artifact_path, artifact_format, artifact_checksum,
                       last_error, partition_key_json, created_at
                FROM materializations WHERE asset_id = ?
-               ORDER BY created_at DESC, id DESC LIMIT ?""",
-            (asset_id, limit),
+               ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?""",
+            (asset_id, limit, offset),
         ).fetchall()
         return [_mat_from_row(r) for r in rows]
 
     def latest_successful_materialization_for_partition(
-        self, asset_id: int, partition_key_json: str,
+        self,
+        asset_id: int,
+        partition_key_json: str,
     ) -> MaterializationRecord | None:
         """Return the most recent successful materialization for a specific partition key, or None."""
         row = self.conn.execute(

@@ -35,7 +35,7 @@ wheels = [
 [[package]]
 name = "barca"
 version = "0.1.0"
-source = { directory = "../../packages/barca" }
+source = { editable = "../../packages/barca" }
 dependencies = [
     { name = "croniter" },
     { name = "fastapi" },
@@ -43,6 +43,7 @@ dependencies = [
     { name = "pyturso" },
     { name = "typer" },
     { name = "uvicorn", extra = ["standard"] },
+    { name = "watchfiles" },
 ]
 
 [package.metadata]
@@ -53,6 +54,7 @@ requires-dist = [
     { name = "pyturso", specifier = ">=0.5.0" },
     { name = "typer", extras = ["all"], specifier = ">=0.9" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.34" },
+    { name = "watchfiles", specifier = ">=0.21" },
 ]
 
 [[package]]
@@ -64,7 +66,7 @@ dependencies = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "barca", directory = "../../packages/barca" }]
+requires-dist = [{ name = "barca", editable = "../../packages/barca" }]
 
 [[package]]
 name = "click"

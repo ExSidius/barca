@@ -1,6 +1,6 @@
 """W1: Basic asset lifecycle — reindex, refresh, cache, reset."""
 
-from barca._engine import reindex, refresh, reset
+from barca._engine import refresh, reindex, reset
 from barca._store import MetadataStore
 
 
@@ -27,6 +27,7 @@ def test_refresh_produces_artifact(tmp_project):
     artifact = tmp_project / mat.artifact_path
     assert artifact.exists()
     import json
+
     value = json.loads(artifact.read_text())
     assert value == {"message": "hello"}
 

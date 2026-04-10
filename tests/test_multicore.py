@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from barca._engine import reindex, refresh
+from barca._engine import refresh, reindex
 from barca._store import MetadataStore
 
 

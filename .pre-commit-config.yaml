@@ -22,20 +22,6 @@ repos:
       - id: uv-lock-check
         name: uv lock (sync check)
         language: system
-        entry: uv lock --check
+        entry: /Users/mukulram/.local/bin/uv lock --check
         pass_filenames: false
         files: ^(pyproject\.toml|uv\.lock)$
-
-      - id: cargo-fmt
-        name: cargo fmt
-        language: system
-        entry: cargo fmt --all --check
-        pass_filenames: false
-        files: \.rs$
-
-      - id: cargo-clippy
-        name: cargo clippy
-        language: system
-        entry: cargo clippy --all-targets --all-features -- -D warnings
-        pass_filenames: false
-        files: \.(rs|toml)$
