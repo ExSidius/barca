@@ -876,6 +876,33 @@ class MetadataStore:
             for r in rows
         ]
 
+    def list_all_asset_inputs(self) -> list[tuple[int, AssetInput]]:
+        """Return (downstream_asset_id, AssetInput) for all active assets in a single query."""
+        rows = self.conn.execute(
+            """SELECT a.id, ai.parameter_name, ai.upstream_asset_ref,
+                      ai.upstream_asset_id, ai.collect_mode, ai.is_partition_source
+               FROM assets a
+               JOIN asset_definitions d ON d.asset_id = a.id AND d.status = 'current'
+               JOIN asset_inputs ai ON ai.definition_id = d.id
+               WHERE a.active = 1
+                 AND ai.upstream_asset_id IS NOT NULL
+                 AND ai.upstream_asset_id != -1
+               ORDER BY a.id, ai.parameter_name"""
+        ).fetchall()
+        return [
+            (
+                r[0],
+                AssetInput(
+                    parameter_name=r[1],
+                    upstream_asset_ref=r[2],
+                    upstream_asset_id=r[3],
+                    collect_mode=bool(r[4]),
+                    is_partition_source=bool(r[5]),
+                ),
+            )
+            for r in rows
+        ]
+
     def upsert_asset_inputs(self, definition_id: int, inputs: list[AssetInput]) -> None:
         self.conn.execute(
             "DELETE FROM asset_inputs WHERE definition_id = ?",

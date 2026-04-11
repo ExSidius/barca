@@ -10,6 +10,9 @@ from barca._engine import trigger_sensor as engine_trigger_sensor
 from barca._models import (
     AssetDetail,
     AssetSummary,
+    GraphEdge,
+    GraphNode,
+    GraphResponse,
     JobDetail,
     MaterializationRecord,
     PruneResult,
@@ -118,6 +121,42 @@ def list_asset_materializations(
     offset: int = 0,
 ) -> list[MaterializationRecord]:
     return store.list_materializations(asset_id, limit=limit, offset=offset)
+
+
+def get_asset_graph(store: MetadataStore, repo_root: Path) -> GraphResponse:
+    """Build the full asset dependency graph for visualization."""
+    reindex(store, repo_root)
+    assets = store.list_assets()
+    raw_edges = store.list_all_asset_inputs()
+
+    nodes = [
+        GraphNode(
+            asset_id=a.asset_id,
+            logical_name=a.logical_name,
+            kind=a.kind,
+            module_path=a.module_path,
+            file_path=a.file_path,
+            function_name=a.function_name,
+            freshness=a.freshness,
+            purity=a.purity,
+            materialization_status=a.materialization_status,
+            materialization_created_at=a.materialization_created_at,
+            parent_asset_id=a.parent_asset_id,
+        )
+        for a in assets
+    ]
+    edges = [
+        GraphEdge(
+            source_asset_id=inp.upstream_asset_id,  # type: ignore[arg-type]
+            target_asset_id=downstream_id,
+            parameter_name=inp.parameter_name,
+            collect_mode=inp.collect_mode,
+            is_partition_source=inp.is_partition_source,
+        )
+        for downstream_id, inp in raw_edges
+        if inp.upstream_asset_id is not None
+    ]
+    return GraphResponse(nodes=nodes, edges=edges)
 
 
 def trigger_sensor(

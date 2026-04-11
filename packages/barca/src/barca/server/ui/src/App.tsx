@@ -1,10 +1,11 @@
-import { BrowserRouter, Routes, Route, NavLink, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, NavLink, Navigate, useMatch } from "react-router-dom";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useAction } from "@/hooks/useAction";
 import { Dashboard } from "@/pages/Dashboard";
 import { Assets } from "@/pages/Assets";
 import { AssetDetail } from "@/pages/AssetDetail";
+import { Dag } from "@/pages/Dag";
 import { Jobs } from "@/pages/Jobs";
 import { JobDetail } from "@/pages/JobDetail";
 import { Sensors } from "@/pages/Sensors";
@@ -39,6 +40,14 @@ function RadioIcon() {
     </svg>
   );
 }
+function GraphIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <circle cx="5" cy="12" r="2" /><circle cx="19" cy="5" r="2" /><circle cx="19" cy="19" r="2" />
+      <line x1="7" y1="12" x2="17" y2="6" /><line x1="7" y1="12" x2="17" y2="18" />
+    </svg>
+  );
+}
 function MenuIcon() {
   return (
     <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -66,6 +75,7 @@ function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const runPass = useAction("/api/run/pass");
   const prune = useAction("/api/prune");
+  const isDag = useMatch("/ui/dag");
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -87,6 +97,7 @@ function AppShell() {
           <SidebarLink to="/ui/assets" icon={<PackageIcon />} label="Assets" collapsed={!sidebarOpen} />
           <SidebarLink to="/ui/jobs" icon={<ClockIcon />} label="Jobs" collapsed={!sidebarOpen} />
           <SidebarLink to="/ui/sensors" icon={<RadioIcon />} label="Sensors" collapsed={!sidebarOpen} />
+          <SidebarLink to="/ui/dag" icon={<GraphIcon />} label="DAG" collapsed={!sidebarOpen} />
         </nav>
 
         <div className="border-t border-border p-2">
@@ -147,7 +158,7 @@ function AppShell() {
           </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto p-6">
+        <main className={`flex-1 ${isDag ? "overflow-hidden" : "overflow-y-auto p-6"}`}>
           <Routes>
             <Route path="/ui" element={<Dashboard />} />
             <Route path="/ui/assets" element={<Assets />} />
@@ -156,6 +167,7 @@ function AppShell() {
             <Route path="/ui/jobs/:id" element={<JobDetail />} />
             <Route path="/ui/sensors" element={<Sensors />} />
             <Route path="/ui/sensors/:id" element={<SensorDetail />} />
+            <Route path="/ui/dag" element={<Dag />} />
             <Route path="*" element={<Navigate to="/ui" replace />} />
           </Routes>
         </main>

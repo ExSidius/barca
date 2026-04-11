@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from barca._models import (
     AssetDetail,
     AssetSummary,
+    GraphResponse,
     JobDetail,
     MaterializationRecord,
     PruneResult,
@@ -169,6 +170,10 @@ def create_app(
             return await asyncio.to_thread(lambda: service.trigger_sensor(_store(), repo_root, sensor_id))
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
+
+    @api.get("/graph")
+    async def graph_endpoint() -> GraphResponse:
+        return await asyncio.to_thread(lambda: service.get_asset_graph(_store(), repo_root))
 
     # ------------------------------------------------------------------
     # SSE JSON watch streams  (/sse/*)

@@ -225,6 +225,39 @@ class ReconcileResult(BaseModel):
     failed: int = Field(default=0)
 
 
+class GraphNode(BaseModel):
+    """A node in the asset dependency graph."""
+
+    asset_id: int = Field(description="Primary key in the assets table")
+    logical_name: str = Field(description="Display name of the asset")
+    kind: str = Field(description="Node kind: 'asset', 'sensor', 'effect', or 'sink'")
+    module_path: str = Field(description="Dotted Python module path")
+    file_path: str = Field(description="Relative filesystem path to the source file")
+    function_name: str = Field(description="Name of the decorated function")
+    freshness: str = Field(description="Freshness policy: 'always', 'manual', or 'schedule:<cron>'")
+    purity: str = Field(description="'pure' or 'unsafe'")
+    materialization_status: str | None = Field(default=None, description="Status of the latest materialization")
+    materialization_created_at: int | None = Field(default=None, description="Unix timestamp of the latest materialization")
+    parent_asset_id: int | None = Field(default=None, description="For sinks: the parent regular asset's id")
+
+
+class GraphEdge(BaseModel):
+    """A directed dependency edge in the asset graph (source → target means source feeds target)."""
+
+    source_asset_id: int = Field(description="Upstream asset_id (the dependency being consumed)")
+    target_asset_id: int = Field(description="Downstream asset_id (the asset that declares this input)")
+    parameter_name: str = Field(description="Function parameter name on the downstream asset")
+    collect_mode: bool = Field(default=False, description="True when declared via collect()")
+    is_partition_source: bool = Field(default=False, description="True for implicit partition-source edges")
+
+
+class GraphResponse(BaseModel):
+    """Complete asset dependency graph for visualization."""
+
+    nodes: list[GraphNode] = Field(description="All active assets as graph nodes")
+    edges: list[GraphEdge] = Field(description="All dependency edges between nodes")
+
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------

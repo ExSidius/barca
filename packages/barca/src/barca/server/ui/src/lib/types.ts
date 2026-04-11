@@ -116,3 +116,30 @@ export interface PruneResult {
   removed_sink_executions: number;
   removed_artifact_files: number;
 }
+
+export interface GraphNode {
+  asset_id: number;
+  logical_name: string;
+  kind: string; // "asset" | "sensor" | "effect" | "sink"
+  module_path: string;
+  file_path: string;
+  function_name: string;
+  freshness: string;
+  purity: string;
+  materialization_status: string | null;
+  materialization_created_at: number | null;
+  parent_asset_id: number | null;
+}
+
+export interface GraphEdge {
+  source_asset_id: number;
+  target_asset_id: number;
+  parameter_name: string;
+  collect_mode: boolean;
+  is_partition_source: boolean;
+}
+
+export interface GraphResponse {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+}
