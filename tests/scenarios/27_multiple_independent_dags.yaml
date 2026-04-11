@@ -1,0 +1,35 @@
+name: multiple_independent_dags
+description: >
+  A project can contain multiple independent DAGs. They are discovered
+  automatically — no explicit graph declaration. A pass materialises
+  all of them in topological order.
+
+modules:
+  pipeline_a.py: |
+    from barca import asset
+
+    @asset()
+    def a_source():
+        return {"a": 1}
+
+    @asset(inputs={"s": a_source})
+    def a_downstream(s):
+        return {"a2": s["a"] + 1}
+
+  pipeline_b.py: |
+    from barca import asset
+
+    @asset()
+    def b_source():
+        return {"b": 10}
+
+    @asset(inputs={"s": b_source})
+    def b_downstream(s):
+        return {"b2": s["b"] + 1}
+
+steps:
+  - action: run_pass
+    expect:
+      # 4 assets across 2 independent DAGs
+      executed_assets: 4
+      failed: 0

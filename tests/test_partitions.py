@@ -8,7 +8,8 @@ from barca._store import MetadataStore
 
 def test_partition_creates_n_jobs(partition_project):
     store = MetadataStore(str(partition_project / ".barca" / "metadata.db"))
-    assets = reindex(store, partition_project)
+    reindex(store, partition_project)
+    assets = store.list_assets()
     prices_id = next(a.asset_id for a in assets if "fetch_prices" in a.logical_name)
 
     refresh(store, partition_project, prices_id)
@@ -21,7 +22,8 @@ def test_partition_creates_n_jobs(partition_project):
 
 def test_partition_kwargs_correct(partition_project):
     store = MetadataStore(str(partition_project / ".barca" / "metadata.db"))
-    assets = reindex(store, partition_project)
+    reindex(store, partition_project)
+    assets = store.list_assets()
     prices_id = next(a.asset_id for a in assets if "fetch_prices" in a.logical_name)
 
     refresh(store, partition_project, prices_id)
@@ -39,7 +41,8 @@ def test_partition_kwargs_correct(partition_project):
 
 def test_partition_run_hashes_distinct(partition_project):
     store = MetadataStore(str(partition_project / ".barca" / "metadata.db"))
-    assets = reindex(store, partition_project)
+    reindex(store, partition_project)
+    assets = store.list_assets()
     prices_id = next(a.asset_id for a in assets if "fetch_prices" in a.logical_name)
 
     refresh(store, partition_project, prices_id)
@@ -51,7 +54,8 @@ def test_partition_run_hashes_distinct(partition_project):
 
 def test_partition_artifacts_in_subdirs(partition_project):
     store = MetadataStore(str(partition_project / ".barca" / "metadata.db"))
-    assets = reindex(store, partition_project)
+    reindex(store, partition_project)
+    assets = store.list_assets()
     prices_id = next(a.asset_id for a in assets if "fetch_prices" in a.logical_name)
 
     refresh(store, partition_project, prices_id)
@@ -66,7 +70,8 @@ def test_partition_artifacts_in_subdirs(partition_project):
 
 def test_partition_second_run_cached(partition_project):
     store = MetadataStore(str(partition_project / ".barca" / "metadata.db"))
-    assets = reindex(store, partition_project)
+    reindex(store, partition_project)
+    assets = store.list_assets()
     prices_id = next(a.asset_id for a in assets if "fetch_prices" in a.logical_name)
 
     refresh(store, partition_project, prices_id)
@@ -85,7 +90,8 @@ def test_partition_second_run_cached(partition_project):
 def test_partition_parallel_execution(partition_project):
     """Partitions run in parallel with max_workers > 1 and produce correct results."""
     store = MetadataStore(str(partition_project / ".barca" / "metadata.db"))
-    assets = reindex(store, partition_project)
+    reindex(store, partition_project)
+    assets = store.list_assets()
     prices_id = next(a.asset_id for a in assets if "fetch_prices" in a.logical_name)
 
     refresh(store, partition_project, prices_id, max_workers=3)

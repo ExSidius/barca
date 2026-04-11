@@ -21,6 +21,14 @@ interface SSEAssetsData {
   assets: AssetSummary[];
 }
 
+/** Render the freshness field as a friendly string. */
+function formatFreshness(f: string): string {
+  if (f === "always") return "always";
+  if (f === "manual") return "manual";
+  if (f.startsWith("schedule:")) return `schedule(${f.slice("schedule:".length)})`;
+  return f;
+}
+
 export function Assets() {
   const initial = useAPI<AssetSummary[]>("/api/assets");
   // Live updates: server pushes a new JSON payload whenever the asset list changes
@@ -51,6 +59,7 @@ export function Assets() {
             <TabsTrigger value="asset">Assets</TabsTrigger>
             <TabsTrigger value="sensor">Sensors</TabsTrigger>
             <TabsTrigger value="effect">Effects</TabsTrigger>
+            <TabsTrigger value="sink">Sinks</TabsTrigger>
           </TabsList>
         </Tabs>
 
@@ -69,7 +78,7 @@ export function Assets() {
             <TableRow>
               <TableHead className="w-[90px]">Kind</TableHead>
               <TableHead>Name</TableHead>
-              <TableHead className="w-[120px]">Schedule</TableHead>
+              <TableHead className="w-[140px]">Freshness</TableHead>
               <TableHead className="w-[120px]">Status</TableHead>
               <TableHead className="w-[140px]">Last Run</TableHead>
             </TableRow>
@@ -100,9 +109,25 @@ export function Assets() {
                     >
                       {a.logical_name}
                     </Link>
+                    {a.purity === "unsafe" && (
+                      <span
+                        className="ml-2 inline-block rounded bg-yellow-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-yellow-600 dark:text-yellow-400"
+                        title="This asset is marked @unsafe — Barca provides no correctness guarantee"
+                      >
+                        unsafe
+                      </span>
+                    )}
+                    {a.partitions_state === "pending" && (
+                      <span
+                        className="ml-2 inline-block rounded bg-blue-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-blue-600 dark:text-blue-400"
+                        title="Partition set pending — upstream partition source hasn't materialised yet"
+                      >
+                        partitions: pending
+                      </span>
+                    )}
                   </TableCell>
                   <TableCell className="font-mono text-xs text-muted-foreground">
-                    {a.schedule}
+                    {formatFreshness(a.freshness)}
                   </TableCell>
                   <TableCell>
                     <StatusBadge status={a.materialization_status} />

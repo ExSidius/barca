@@ -1,6 +1,11 @@
-"""Iris ML pipeline — load, split, train, evaluate."""
+"""Iris ML pipeline — load, split, train, evaluate.
 
-from barca import asset
+Demonstrates a simple multi-stage pipeline with an attached ``@sink`` on
+the evaluation step so that every successful training run writes a JSON
+report to ``tmp/iris_eval.json`` for downstream tooling to consume.
+"""
+
+from barca import asset, sink
 
 
 @asset()
@@ -59,8 +64,13 @@ def trained_model(split: dict) -> dict:
 
 
 @asset(inputs={"model": trained_model, "split": train_test_split})
+@sink("tmp/iris_eval.json", serializer="json")
 def evaluation(model: dict, split: dict) -> dict:
-    """Evaluate the trained model on test data."""
+    """Evaluate the trained model on test data.
+
+    The ``@sink`` decorator writes this asset's output to
+    ``tmp/iris_eval.json`` every time it materialises successfully.
+    """
     from sklearn.metrics import accuracy_score, classification_report
 
     y_test = split["y_test"]

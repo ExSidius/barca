@@ -87,17 +87,18 @@ def sensor_project(tmp_path):
     (mod_dir / "__init__.py").write_text("")
     (mod_dir / "pipeline.py").write_text(
         textwrap.dedent("""\
-        from barca import sensor, asset, effect
+        from barca import sensor, asset, effect, Always, Schedule
 
-        @sensor(schedule="always")
+        @sensor(freshness=Schedule("* * * * *"))
         def check_file():
             return (True, {"path": "/tmp/data.csv", "rows": 42})
 
-        @asset(inputs={"data": check_file}, schedule="always")
+        @asset(inputs={"data": check_file}, freshness=Always())
         def process(data):
-            return {"processed": data["rows"] * 2}
+            update_detected, payload = data
+            return {"processed": payload["rows"] * 2}
 
-        @effect(inputs={"result": process}, schedule="always")
+        @effect(inputs={"result": process}, freshness=Always())
         def notify(result):
             pass
     """)
@@ -168,14 +169,19 @@ def test_read_asset_returns_cached_value(ml_project):
     assert value == {"features": [[1, 2], [3, 4], [5, 6]], "labels": [0, 1, 0]}
 
 
-def test_materialize_cascades_upstream(ml_project):
-    """Materializing a downstream asset auto-materializes its upstream."""
+def test_materialize_after_upstream_fresh(ml_project):
+    """Under the new refresh() semantics, upstreams are NOT auto-cascaded.
+    You materialize upstream explicitly, then downstream can read its value.
+    """
     import mlmod.pipeline as m
 
+    # Materialize upstream first
+    materialize(m.load_dataset)
+
+    # Now downstream can be materialized (upstream is fresh)
     result = materialize(m.linear_model)
     assert result == {"model": "linear", "accuracy": 0.75, "n_samples": 3}
 
-    # Upstream dataset should also be materialized
     value = read_asset(m.load_dataset)
     assert value["labels"] == [0, 1, 0]
 
@@ -204,42 +210,52 @@ def test_round_trip_call(ml_project):
 
 
 def test_load_inputs_sensor_upstream(sensor_project):
-    """load_inputs resolves sensor observations for downstream assets."""
+    """load_inputs resolves sensor observations for downstream assets.
+
+    Downstream assets receive the full (update_detected, output) tuple as
+    their input — sensors always pass the complete tuple.
+    """
     import smod.pipeline as m
 
     # Trigger the sensor so it has an observation
     store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
-    assets = reindex(store, sensor_project)
+    reindex(store, sensor_project)
+    assets = store.list_assets()
     sensor_id = next(a.asset_id for a in assets if a.function_name == "check_file")
     trigger_sensor(store, sensor_project, sensor_id)
 
     kwargs = load_inputs(m.process)
     assert "data" in kwargs
-    assert kwargs["data"] == {"path": "/tmp/data.csv", "rows": 42}
+    update_detected, payload = kwargs["data"]
+    assert update_detected is True
+    assert payload == {"path": "/tmp/data.csv", "rows": 42}
 
 
 def test_read_asset_sensor(sensor_project):
-    """read_asset returns the latest sensor observation output."""
+    """read_asset returns the latest sensor observation as the full tuple."""
     import smod.pipeline as m
 
     store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
-    assets = reindex(store, sensor_project)
+    reindex(store, sensor_project)
+    assets = store.list_assets()
     sensor_id = next(a.asset_id for a in assets if a.function_name == "check_file")
     trigger_sensor(store, sensor_project, sensor_id)
 
     value = read_asset(m.check_file)
-    assert value == {"path": "/tmp/data.csv", "rows": 42}
+    update_detected, payload = value
+    assert update_detected is True
+    assert payload == {"path": "/tmp/data.csv", "rows": 42}
 
 
 def test_load_inputs_effect(sensor_project):
     """load_inputs works for effects — they have inputs too."""
     import smod.pipeline as m
 
-    from barca._reconciler import reconcile as _reconcile
+    from barca._run import run_pass
 
-    # Reconcile runs the full pipeline: sensor → asset → effect
+    # run_pass runs the full pipeline: sensor → asset → effect
     store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
-    _reconcile(store, sensor_project)
+    run_pass(store, sensor_project)
 
     kwargs = load_inputs(m.notify)
     assert "result" in kwargs
@@ -303,7 +319,8 @@ def test_list_versions_sensor(sensor_project):
     import smod.pipeline as m
 
     store = MetadataStore(str(sensor_project / ".barca" / "metadata.db"))
-    assets = reindex(store, sensor_project)
+    reindex(store, sensor_project)
+    assets = store.list_assets()
     sensor_id = next(a.asset_id for a in assets if a.function_name == "check_file")
     trigger_sensor(store, sensor_project, sensor_id)
     trigger_sensor(store, sensor_project, sensor_id)

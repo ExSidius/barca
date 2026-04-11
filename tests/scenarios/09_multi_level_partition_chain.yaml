@@ -1,0 +1,27 @@
+name: multi_level_partition_chain
+description: >
+  Three-level partition inheritance. A partitioned → B inherits → C inherits.
+  All three should end up partitioned 1:1 along the same axis.
+
+modules:
+  assets.py: |
+    from barca import asset, partitions, Always
+
+    @asset(partitions={"date": partitions(["2024-01", "2024-02"])}, freshness=Always())
+    def raw(date: str):
+        return {"date": date, "rows": 100}
+
+    @asset(inputs={"r": raw}, freshness=Always())
+    def cleaned(r):
+        return {"date": r["date"], "clean_rows": r["rows"] - 5}
+
+    @asset(inputs={"c": cleaned}, freshness=Always())
+    def enriched(c):
+        return {"date": c["date"], "final_rows": c["clean_rows"] * 2}
+
+steps:
+  - action: run_pass
+    expect:
+      # 2 partitions × 3 assets = 6 materialisations
+      executed_assets: 6
+      failed: 0

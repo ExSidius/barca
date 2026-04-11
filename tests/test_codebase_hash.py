@@ -39,7 +39,8 @@ def test_helper_change_invalidates_hash(tmp_project):
     clear_caches()
 
     store = MetadataStore(str(tmp_project / ".barca" / "metadata.db"))
-    assets1 = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets1 = store.list_assets()
     hash1 = {a.logical_name: a.definition_hash for a in assets1}
 
     # Change the helper
@@ -53,7 +54,8 @@ def test_helper_change_invalidates_hash(tmp_project):
     _cleanup_modules("mymod")
     clear_caches()
 
-    assets2 = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets2 = store.list_assets()
     hash2 = {a.logical_name: a.definition_hash for a in assets2}
 
     computed_name = next(k for k in hash1 if "computed" in k)
@@ -63,8 +65,10 @@ def test_helper_change_invalidates_hash(tmp_project):
 def test_no_change_stable(tmp_project):
     """Reindexing without changes produces stable hashes."""
     store = MetadataStore(str(tmp_project / ".barca" / "metadata.db"))
-    assets1 = reindex(store, tmp_project)
-    assets2 = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets1 = store.list_assets()
+    reindex(store, tmp_project)
+    assets2 = store.list_assets()
 
     for a1, a2 in zip(assets1, assets2, strict=False):
         assert a1.definition_hash == a2.definition_hash

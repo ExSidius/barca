@@ -9,6 +9,9 @@ import pytest
 
 from barca._store import MetadataStore
 
+# Re-export BarcaTestContext helpers so tests can use `barca_ctx` directly.
+from tests._context import BarcaTestContext, barca_ctx, make_ctx  # noqa: F401
+
 
 def _cleanup_modules(prefix: str):
     """Remove all modules starting with prefix from sys.modules."""

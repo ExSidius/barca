@@ -65,6 +65,7 @@ For the MVP, Barca should support this decorator shape:
     inputs: dict[str, AssetRefLike] | None = None,
     partitions: dict[str, PartitionSpecLike] | None = None,
     serializer: SerializerKind | None = None,
+    freshness: Freshness = Always,
     description: str | None = None,
     tags: dict[str, str] | None = None,
 )
@@ -432,15 +433,47 @@ That preserves auditability and avoids destructive cache behavior.
 
 This is consistent with the broader Barca rule that historical definitions and materializations are append-only and should not be deleted during normal operation.
 
+## Dynamic partition resolution
+
+For `partitions_from(...)`, the partition set is resolved lazily at refresh/run time, not at index time. The partition-defining asset must be materialised before the partitioned asset can determine its partitions. Until then:
+
+- `barca assets list` shows “partitions: pending” for the partitioned asset
+- the partitioned asset cannot be materialised
+- same staleness rules apply: if the partition-defining asset is stale and `--stale-policy error` (the default), the partitioned asset cannot be refreshed
+
+## collect(asset)
+
+`collect(asset)` aggregates all partitions of a partitioned asset into a single dict, allowing a non-partitioned downstream asset to consume all partition outputs at once.
+
+```python
+from barca import asset, partitions_from, collect
+
+@asset()
+def tickers() -> list[str]:
+    return [“AAPL”, “MSFT”, “GOOG”]
+
+@asset(partitions={“ticker”: partitions_from(tickers)})
+def fetch_prices(ticker: str) -> dict[str, str]:
+    return {“ticker”: ticker, “price”: str(len(ticker) * 100)}
+
+@asset(inputs={“reports”: collect(fetch_prices)})
+def aggregate(reports: dict[tuple[str, ...], dict[str, str]]) -> dict:
+    return {“total”: len(reports)}
+```
+
+Output type: `dict[tuple[str, ...], OutputType]`. Partition keys are always tuples. Single-dimension example: `(“AAPL”,)`. Multi-dimension example: `(“2024-01”, “US”)`. Downstream assets always unpack tuples for a consistent interface regardless of partition dimensions.
+
+If any partition has failed, `collect` blocks entirely — the downstream asset does not run until all partitions succeed.
+
 ## Recommended helper APIs
 
 This workflow implies a few useful helpers:
 
 ```python
 list_partitions(fetch_prices)
-materialize(fetch_prices, partition={"ticker": "AAPL"})
+materialize(fetch_prices, partition={“ticker”: “AAPL”})
 materialize(fetch_prices)
-read_asset(fetch_prices, partition={"ticker": "AAPL"})
+read_asset(fetch_prices, partition={“ticker”: “AAPL”})
 ```
 
 For the MVP, that is enough.

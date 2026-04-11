@@ -1,0 +1,27 @@
+name: sensor_raises_exception
+description: >
+  A sensor that raises during execution should not crash run_pass.
+  The sensor is marked failed and downstream assets do not run.
+  This stresses the sensor error path which is normally assumed to
+  return a well-formed (bool, value) tuple.
+
+modules:
+  assets.py: |
+    from barca import sensor, asset, Schedule, Always
+
+    @sensor(freshness=Schedule("* * * * *"))
+    def bad_sensor():
+        raise ValueError("sensor explosion")
+
+    @asset(inputs={"s": bad_sensor}, freshness=Always())
+    def downstream(s):
+        return {"never_runs": True}
+
+steps:
+  - action: run_pass
+    expect:
+      failed: 1  # at least the sensor is marked failed
+
+  - action: assert_asset_status
+    target: downstream
+    source: null  # never attempted — should have None status

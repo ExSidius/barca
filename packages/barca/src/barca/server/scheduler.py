@@ -1,4 +1,4 @@
-"""Background reconcile loop — runs as an asyncio task."""
+"""Background run_pass loop — runs as an asyncio task."""
 
 from __future__ import annotations
 
@@ -7,15 +7,15 @@ import logging
 from pathlib import Path
 
 from barca._store import MetadataStore
-from barca.server.service import run_reconcile
+from barca.server.service import run_pass
 
 logger = logging.getLogger("barca.server.scheduler")
 
 
 def _tick(db_path: str, repo_root: Path) -> None:
-    """Run a single reconcile pass. Called inside executor thread."""
+    """Run a single run_pass. Called inside executor thread."""
     store = MetadataStore(db_path)
-    run_reconcile(store, repo_root)
+    run_pass(store, repo_root)
 
 
 async def scheduler_loop(
@@ -24,7 +24,7 @@ async def scheduler_loop(
     interval: int,
     lock: asyncio.Lock,
 ) -> None:
-    """Run reconcile() every `interval` seconds, holding `lock` during execution."""
+    """Run run_pass every ``interval`` seconds, holding ``lock`` during execution."""
     logger.info("scheduler started (interval=%ds)", interval)
     while True:
         try:

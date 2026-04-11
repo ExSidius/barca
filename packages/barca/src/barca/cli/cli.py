@@ -8,29 +8,36 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
-from rich.text import Text
 
+from barca._dev import dev_watch as do_dev_watch
 from barca._engine import refresh as do_refresh
 from barca._engine import reindex as do_reindex
 from barca._engine import reset as do_reset
 from barca._engine import trigger_sensor as do_trigger_sensor
-from barca._models import JobDetail
-from barca._reconciler import reconcile as do_reconcile
+from barca._models import JobDetail, StaleUpstreamError
+from barca._prune import prune as do_prune
+from barca._run import run_loop as do_run_loop
+from barca._run import run_pass as do_run_pass
 from barca._store import MetadataStore
-from barca.cli.display import asset_detail, assets_table, job_detail, jobs_table, reconcile_summary, sensor_observations_table
+from barca.cli.display import (
+    asset_detail,
+    assets_table,
+    job_detail,
+    jobs_table,
+    reindex_diff_panel,
+    run_pass_summary,
+    sensor_observations_table,
+)
 
 _console = Console()
 _err = Console(stderr=True)
 
 
 def _check_gil() -> None:
-    """Warn if running with the GIL enabled (parallel perf will suffer)."""
+    """Warn if running with the GIL enabled."""
     is_gil_enabled = getattr(sys, "_is_gil_enabled", None)
     if is_gil_enabled is None or not is_gil_enabled():
         return
-    # Suppress the warning if the user already set PYTHON_GIL=0 — the GIL may
-    # have been re-enabled by a C extension (e.g. turso) that hasn't declared
-    # Py_mod_gil, which is an upstream issue, not a misconfiguration.
     if os.environ.get("PYTHON_GIL") == "0":
         return
     _err.print(
@@ -62,13 +69,19 @@ def _store() -> MetadataStore:
         raise typer.Exit(1) from exc
 
 
+# ============================================================
+# Top-level commands
+# ============================================================
+
+
 @app.command()
 def reindex() -> None:
-    """Discover and index all barca assets."""
+    """Discover assets and show the three-way diff of what changed."""
     root = _repo_root()
     store = _store()
-    assets = do_reindex(store, root)
-    _console.print(assets_table(assets))
+    diff = do_reindex(store, root)
+    _console.print(reindex_diff_panel(diff))
+    _console.print(assets_table(store.list_assets()))
 
 
 @app.command()
@@ -84,31 +97,92 @@ def reset(
 
 
 @app.command()
-def reconcile(
-    watch: bool = typer.Option(False, "--watch", help="Run continuously"),
-    interval: int = typer.Option(60, "--interval", help="Seconds between reconcile passes (with --watch)"),
+def run(
+    once: bool = typer.Option(False, "--once", help="Run a single pass and exit"),
+    interval: float = typer.Option(0.5, "--interval", help="Seconds between passes in loop mode"),
 ) -> None:
-    """Run a single reconciliation pass (or loop with --watch)."""
-    import time
+    """Run production mode: maintain the DAG at declared freshness levels.
 
+    Without ``--once``, ``barca run`` is a long-running process that
+    continuously calls ``run_pass``. Use Ctrl-C to stop.
+    """
     root = _repo_root()
-    while True:
-        store = _store()
-        result = do_reconcile(store, root)
-        _console.print(reconcile_summary(result))
-        if not watch:
-            break
-        _console.print(Text(f"Sleeping {interval}s...", style="dim"))
-        time.sleep(interval)
+    store = _store()
+    if once:
+        result = do_run_pass(store, root)
+        _console.print(run_pass_summary(result))
+        return
+
+    # Long-running loop — block until Ctrl-C
+    from threading import Event
+
+    stop = Event()
+    try:
+        do_run_loop(store, root, stop_event=stop, interval=interval)
+    except KeyboardInterrupt:
+        stop.set()
+        _console.print("\n[dim]run loop stopped[/dim]")
+
+
+@app.command()
+def dev() -> None:
+    """Run development mode: watch for file changes and update staleness live.
+
+    Dev mode never materialises anything — it only tracks which assets are
+    stale. Use ``barca run`` or ``barca assets refresh`` to actually
+    materialise.
+    """
+    root = _repo_root()
+    store = _store()
+    from threading import Event
+
+    stop = Event()
+    _console.print("[dim]barca dev: watching for changes... Ctrl-C to stop[/dim]")
+    try:
+        do_dev_watch(store, root, stop_event=stop)
+    except KeyboardInterrupt:
+        stop.set()
+        _console.print("\n[dim]dev mode stopped[/dim]")
+
+
+@app.command()
+def prune(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt"),
+) -> None:
+    """Remove unreachable history and artifacts.
+
+    This is the only operation that permanently deletes materialisation
+    history. Recommended before production deployments or to recover
+    disk space.
+    """
+    root = _repo_root()
+    store = _store()
+
+    if not yes:
+        confirm = typer.confirm(
+            "barca prune will permanently delete history for removed assets. Continue?",
+            default=False,
+        )
+        if not confirm:
+            _console.print("[dim]aborted[/dim]")
+            return
+
+    result = do_prune(store, root)
+    if result.removed_assets == 0 and result.removed_materializations == 0 and result.removed_artifact_files == 0:
+        _console.print("[dim]nothing to prune[/dim]")
+    else:
+        _console.print(
+            f"pruned [bold]{result.removed_assets}[/bold] assets, [bold]{result.removed_materializations}[/bold] materializations, [bold]{result.removed_artifact_files}[/bold] artifact dirs"
+        )
 
 
 @app.command()
 def serve(
     port: int = typer.Option(8400, "--port", help="HTTP port"),
-    interval: int = typer.Option(60, "--interval", help="Seconds between reconcile passes"),
-    log_level: str = typer.Option("info", "--log-level", help="Log level (debug, info, warning, error)"),
+    interval: int = typer.Option(60, "--interval", help="Seconds between background passes"),
+    log_level: str = typer.Option("info", "--log-level", help="Log level"),
 ) -> None:
-    """Start the barca server (HTTP API + background scheduler)."""
+    """Start the barca HTTP server with background run_pass scheduler."""
     import uvicorn
 
     from barca.server.app import create_app
@@ -118,14 +192,18 @@ def serve(
     uvicorn.run(application, host="0.0.0.0", port=port)
 
 
+# ============================================================
+# assets subcommands
+# ============================================================
+
+
 @assets_app.command("list")
 def assets_list() -> None:
     """List all indexed assets."""
     root = _repo_root()
     store = _store()
     do_reindex(store, root)
-    assets = store.list_assets()
-    _console.print(assets_table(assets))
+    _console.print(assets_table(store.list_assets()))
 
 
 @assets_app.command("show")
@@ -140,14 +218,52 @@ def assets_show(asset_id: int) -> None:
 
 @assets_app.command("refresh")
 def assets_refresh(
-    asset_id: int = typer.Argument(None, help="Asset ID to refresh"),
+    asset_id: str = typer.Argument(None, help="Asset ID or function name to refresh"),
     name: str = typer.Option(None, "-n", "--name", help="Asset name substring to match"),
     jobs: int = typer.Option(None, "-j", "--jobs", help="Max parallel workers (default: cpu_count)"),
+    stale_policy: str = typer.Option(
+        "error",
+        "--stale-policy",
+        help="How to handle stale upstreams: error|warn|pass (default: error)",
+    ),
 ) -> None:
-    """Materialize an asset (and upstream deps)."""
+    """Materialize an asset explicitly.
+
+    Does NOT cascade upstream. If upstream is stale, the behaviour depends
+    on ``--stale-policy``:
+
+    - ``error`` (default): abort with an error listing stale upstreams
+    - ``warn``: proceed with stale inputs and emit a warning
+    - ``pass``: proceed silently with stale inputs
+    """
+    if stale_policy not in ("error", "warn", "pass"):
+        _err.print(
+            f"invalid --stale-policy={stale_policy!r}; must be error|warn|pass",
+            style="bold red",
+        )
+        raise typer.Exit(2)
+
     root = _repo_root()
     store = _store()
     do_reindex(store, root)
+
+    # Accept either an integer id OR a function name as a positional argument.
+    resolved_id: int | None = None
+    if asset_id is not None:
+        if isinstance(asset_id, int):
+            resolved_id = asset_id
+        else:
+            try:
+                resolved_id = int(str(asset_id))
+            except ValueError as exc:
+                matches = [a for a in store.list_assets() if a.function_name == asset_id or a.logical_name == asset_id]
+                if not matches:
+                    _err.print(f"No asset matching '{asset_id}'", style="bold red")
+                    raise typer.Exit(1) from exc
+                if len(matches) > 1:
+                    _err.print(f"Multiple assets match '{asset_id}'", style="bold red")
+                    raise typer.Exit(1) from exc
+                resolved_id = matches[0].asset_id
 
     if name is not None:
         assets = store.list_assets()
@@ -160,13 +276,23 @@ def assets_refresh(
             for m in matches:
                 _err.print(f"  {m.asset_id}: {m.logical_name}", style="dim")
             raise typer.Exit(1)
-        asset_id = matches[0].asset_id
-    elif asset_id is None:
-        _err.print("Provide an asset ID or --name", style="bold red")
+        resolved_id = matches[0].asset_id
+
+    if resolved_id is None:
+        _err.print("Provide an asset ID/name or --name", style="bold red")
         raise typer.Exit(1)
 
-    result = do_refresh(store, root, asset_id, max_workers=jobs)
+    try:
+        result = do_refresh(store, root, resolved_id, max_workers=jobs, stale_policy=stale_policy)
+    except StaleUpstreamError as exc:
+        _err.print(f"[bold red]stale upstream:[/bold red] {exc}", style="red")
+        raise typer.Exit(1) from exc
     _console.print(asset_detail(result, repo_root=root))
+
+
+# ============================================================
+# jobs subcommands
+# ============================================================
 
 
 @jobs_app.command("list")
@@ -191,6 +317,11 @@ def jobs_show(job_id: int) -> None:
     _console.print(job_detail(detail))
 
 
+# ============================================================
+# sensors subcommands
+# ============================================================
+
+
 @sensors_app.command("list")
 def sensors_list() -> None:
     """List all indexed sensors."""
@@ -210,7 +341,10 @@ def sensors_show(sensor_id: int) -> None:
     do_reindex(store, root)
     detail = store.asset_detail(sensor_id)
     if detail.asset.kind != "sensor":
-        _err.print(f"Asset #{sensor_id} is not a sensor (kind: {detail.asset.kind})", style="bold red")
+        _err.print(
+            f"Asset #{sensor_id} is not a sensor (kind: {detail.asset.kind})",
+            style="bold red",
+        )
         raise typer.Exit(1)
     _console.print(asset_detail(detail))
     observations = store.list_sensor_observations(sensor_id)

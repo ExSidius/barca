@@ -1,0 +1,46 @@
+name: kwarg_order_stability
+description: >
+  Decorator metadata order must not affect hash at the metadata layer.
+  Reordering kwargs at the Python source level DOES still change the
+  function_source text, so we test the metadata-level stability by
+  using the internal hash function directly (see
+  test_cache_stability.py::test_kwarg_order_in_metadata_does_not_matter).
+
+  This scenario verifies that a cosmetic rearrangement that does NOT
+  change the source text (e.g. semantic equivalence) hits the cache.
+
+modules:
+  assets.py: |
+    from barca import asset, Always
+
+    @asset()
+    def upstream():
+        return {"v": 1}
+
+    @asset(inputs={"u": upstream}, freshness=Always())
+    def v1(u):
+        return u["v"] * 2
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 2
+
+  # Re-writing the same file with identical content should be a cache hit
+  - action: edit_module
+    target: assets.py
+    source: |
+      from barca import asset, Always
+
+      @asset()
+      def upstream():
+          return {"v": 1}
+
+      @asset(inputs={"u": upstream}, freshness=Always())
+      def v1(u):
+          return u["v"] * 2
+
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      fresh: 2

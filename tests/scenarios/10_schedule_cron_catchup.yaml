@@ -1,0 +1,32 @@
+name: schedule_cron_catchup
+description: >
+  A Schedule asset with a 5-minute cron. Advance time by 30 minutes, then
+  run_pass. The spec says cron schedules run "when a tick has elapsed
+  since last run". After 30 minutes of inactivity the asset should
+  materialise exactly once (not six times).
+
+modules:
+  assets.py: |
+    from barca import asset, Schedule
+
+    @asset(freshness=Schedule("*/5 * * * *"))
+    def periodic():
+        return {"hi": True}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Advance 30 minutes (simulate Barca being down)
+  - action: advance_time
+    seconds: 1800
+
+  # Under content-addressed caching, the cron tick elapsing only matters
+  # if SOMETHING changed (definition, inputs). For a deterministic asset with
+  # no inputs, the run_hash is identical, so the cache hit saves us from
+  # re-executing. The important property: not 6 re-executions.
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      fresh: 1

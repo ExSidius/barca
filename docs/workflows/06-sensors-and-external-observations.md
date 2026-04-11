@@ -19,11 +19,13 @@ Recommended shape:
 ```python
 @sensor(
     name: str | None = None,
-    schedule: ScheduleLike = "manual",
+    freshness: Manual | Schedule = Manual,
     description: str | None = None,
     tags: dict[str, str] | None = None,
 )
 ```
+
+Sensors use `Manual` or `Schedule` freshness only — `Always` is not valid for sensors. Polling frequency must be declared explicitly.
 
 Sensors should:
 
@@ -31,29 +33,31 @@ Sensors should:
 - be renderable in the same DAG UI
 - produce typed outputs that assets and effects can consume
 - explicitly report whether they observed a meaningful update
-- use the same `schedule` primitive as assets and effects
+- use the `freshness` primitive
 - record versioned observation history
 
 ## Example
 
 ```python
-from barca import sensor, asset, effect, cron
+from barca import sensor, asset, effect, Schedule
 
 
-@sensor(schedule=cron("*/5 * * * *"))
+@sensor(freshness=Schedule("*/5 * * * *"))
 def inbox_files() -> tuple[bool, list[str]]:
     return True, ["inbox/a.csv", "inbox/b.csv"]
 
 
-@asset(inputs={"paths": inbox_files}, schedule="always")
-def parse_inbox(paths: list[str]) -> list[dict[str, str]]:
+@asset(inputs={"paths": inbox_files})
+def parse_inbox(paths: tuple[bool, list[str]]) -> list[dict[str, str]]:
     ...
 
 
-@effect(inputs={"rows": parse_inbox}, schedule=cron("0 * * * *"))
+@effect(inputs={"rows": parse_inbox}, freshness=Schedule("0 * * * *"))
 def publish_rows(rows: list[dict[str, str]]) -> None:
     ...
 ```
+
+The full `(update_detected, output)` tuple is passed as input to downstream assets. Downstream functions receive the complete tuple and unpack it themselves.
 
 This should render as one graph:
 
@@ -86,7 +90,7 @@ For the MVP, sensors should conceptually return:
 The simplest user-facing syntax is a 2-tuple:
 
 ```python
-@sensor(schedule=cron("*/5 * * * *"))
+@sensor(freshness=Schedule("*/5 * * * *"))
 def inbox_files() -> tuple[bool, list[str]]:
     return True, ["inbox/a.csv", "inbox/b.csv"]
 ```
@@ -96,6 +100,8 @@ Barca should interpret that as:
 ```python
 updated_detected, output = inbox_files()
 ```
+
+The full tuple `(updated_detected, output)` is passed to downstream inputs — not just `output`. Downstream functions receive and unpack the tuple.
 
 Where `output` may use the same supported value types as assets where practical:
 
@@ -226,8 +232,9 @@ For the MVP:
 
 - add `@sensor`
 - allow sensors as inputs to assets and effects
-- reuse the same `schedule` primitive
+- use `freshness` (not `schedule`) — sensors accept `Manual` or `Schedule` only
 - require sensors to return `updated_detected` plus payload
+- pass the full `(update_detected, output)` tuple to downstream inputs
 - record append-only observation history
 - keep sensors as source nodes only
 - render sensors distinctly in the DAG UI
@@ -243,3 +250,5 @@ This gives Barca an explicit and honest model for external dependencies without 
 - Sensor observations are recorded historically rather than overwritten.
 - A sensor observation with `updated_detected=True` can mark downstream assets stale.
 - Sensors are rendered as first-class nodes in the UI/TUI graph.
+- `Always` freshness is rejected for sensors.
+- The full `(update_detected, output)` tuple is passed to downstream inputs.

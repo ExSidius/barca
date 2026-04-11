@@ -72,6 +72,14 @@ export function AssetDetail() {
             <h1 className="text-xl font-semibold text-foreground font-mono">
               {asset.logical_name}
             </h1>
+            {asset.purity === "unsafe" && (
+              <span
+                className="inline-block rounded bg-yellow-500/20 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-yellow-600 dark:text-yellow-400"
+                title="This asset is marked @unsafe — Barca provides no correctness guarantee"
+              >
+                unsafe
+              </span>
+            )}
           </div>
           <Button
             variant="outline"

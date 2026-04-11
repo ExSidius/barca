@@ -54,10 +54,13 @@ For the MVP, the `@asset` decorator should support this shape:
     name: str | None = None,
     inputs: dict[str, AssetRefLike] | None = None,
     serializer: SerializerKind | None = None,
+    freshness: Freshness = Always,
     description: str | None = None,
     tags: dict[str, str] | None = None,
 )
 ```
+
+The default freshness is `Always` — the asset is kept up to date automatically during `barca run`.
 
 Where `AssetRefLike` means:
 

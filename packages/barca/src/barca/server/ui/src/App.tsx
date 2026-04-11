@@ -64,7 +64,8 @@ function HelpIcon() {
 
 function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
-  const reconcile = useAction("/api/reconcile");
+  const runPass = useAction("/api/run/pass");
+  const prune = useAction("/api/prune");
 
   return (
     <div className="flex h-screen overflow-hidden bg-background">
@@ -115,15 +116,33 @@ function AppShell() {
             <Button
               variant="outline"
               size="sm"
-              onClick={() => reconcile.execute()}
-              disabled={reconcile.loading}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    "Prune will permanently delete history and artifacts for removed assets. Continue?",
+                  )
+                ) {
+                  prune.execute();
+                }
+              }}
+              disabled={prune.loading}
+              title="Remove unreachable history and artifacts (destructive)"
             >
-              {reconcile.loading ? (
+              {prune.loading ? "Pruning..." : "Prune"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => runPass.execute()}
+              disabled={runPass.loading}
+              title="Execute one run_pass: reindex, materialise stale assets, run effects"
+            >
+              {runPass.loading ? (
                 <RefreshIcon className="mr-1.5 animate-spin" />
               ) : (
                 <RefreshIcon className="mr-1.5" />
               )}
-              {reconcile.loading ? "Reconciling..." : "Reconcile"}
+              {runPass.loading ? "Running..." : "Run Pass"}
             </Button>
           </div>
         </header>

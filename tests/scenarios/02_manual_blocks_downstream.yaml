@@ -1,0 +1,36 @@
+name: manual_blocks_downstream
+description: >
+  A Manual upstream blocks a downstream Always asset until the upstream
+  is explicitly refreshed. After explicit refresh, the block clears and
+  the downstream materialises on the next run_pass. This exercises
+  design decision D3 (opportunistic block).
+
+  Requires Phase 3 (run_pass implementation). Will fail during Phase 2.
+
+modules:
+  assets.py: |
+    from barca import asset, Manual, Always
+
+    @asset(freshness=Manual())
+    def upstream():
+        return 1
+
+    @asset(inputs={"u": upstream}, freshness=Always())
+    def downstream(u):
+        return u + 1
+
+steps:
+  - action: reindex
+
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      manual_skipped: 1
+      stale_blocked: 1
+
+  - action: refresh
+    target: upstream
+
+  - action: run_pass
+    expect:
+      executed_assets: 1

@@ -1,0 +1,34 @@
+name: purity_flip_invalidates
+description: >
+  Adding or removing @unsafe changes the hashing strategy (unsafe skips
+  the dep cone). The definition_hash must therefore change, and the
+  asset must be treated as stale on the first run after the flip.
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def v1():
+        return {"pure": True}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Add @unsafe. This changes the dep cone (empty now) which changes
+  # definition_hash.
+  - action: edit_module
+    target: assets.py
+    source: |
+      from barca import asset, unsafe
+
+      @asset()
+      @unsafe
+      def v1():
+          return {"pure": True}  # same body
+
+  - action: run_pass
+    expect:
+      executed_assets: 1  # must re-materialise, different definition_hash

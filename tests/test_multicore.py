@@ -105,7 +105,8 @@ def multicore_project(tmp_path: Path):
 def test_single_asset_multicore_succeeds(multicore_project: Path) -> None:
     """A non-partitioned asset using in-process thread parallelism materializes correctly."""
     store = MetadataStore(str(multicore_project / ".barca" / "metadata.db"))
-    assets = reindex(store, multicore_project)
+    reindex(store, multicore_project)
+    assets = store.list_assets()
     asset_id = next(a.asset_id for a in assets if "train_single" in a.logical_name)
 
     refresh(store, multicore_project, asset_id)
@@ -127,7 +128,8 @@ def test_single_asset_multicore_succeeds(multicore_project: Path) -> None:
 def test_partitioned_multicore_sequential(multicore_project: Path) -> None:
     """Partitioned multicore asset runs correctly with max_workers=1."""
     store = MetadataStore(str(multicore_project / ".barca" / "metadata.db"))
-    assets = reindex(store, multicore_project)
+    reindex(store, multicore_project)
+    assets = store.list_assets()
     asset_id = next(a.asset_id for a in assets if "train_fold" in a.logical_name)
 
     refresh(store, multicore_project, asset_id, max_workers=1)
@@ -149,7 +151,8 @@ def test_partitioned_multicore_parallel(multicore_project: Path) -> None:
     complete without deadlock and produce correct, distinct results.
     """
     store = MetadataStore(str(multicore_project / ".barca" / "metadata.db"))
-    assets = reindex(store, multicore_project)
+    reindex(store, multicore_project)
+    assets = store.list_assets()
     asset_id = next(a.asset_id for a in assets if "train_fold" in a.logical_name)
 
     # Run all 3 partitions in parallel — each partition spawns 4 internal threads
@@ -174,7 +177,8 @@ def test_partitioned_multicore_results_are_reproducible(multicore_project: Path)
     not non-deterministic garbage from thread-unsafe operations.
     """
     store = MetadataStore(str(multicore_project / ".barca" / "metadata.db"))
-    assets = reindex(store, multicore_project)
+    reindex(store, multicore_project)
+    assets = store.list_assets()
     asset_id = next(a.asset_id for a in assets if "train_fold" in a.logical_name)
 
     refresh(store, multicore_project, asset_id, max_workers=3)

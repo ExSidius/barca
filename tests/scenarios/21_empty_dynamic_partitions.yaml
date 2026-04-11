@@ -1,0 +1,28 @@
+name: empty_dynamic_partitions
+description: >
+  A dynamic partition upstream returns an empty list. What happens?
+  The partitioned downstream has no partitions to materialise — it
+  should either be a no-op or a clear error, not a crash.
+
+modules:
+  assets.py: |
+    from barca import asset, Always
+
+    @asset(freshness=Always())
+    def empty_dates():
+        return []  # no partitions
+
+    @asset(partitions={"date": empty_dates}, freshness=Always())
+    def report(date: str):
+        return {"date": date}
+
+steps:
+  - action: run_pass
+
+  # empty_dates materialises (produces [])
+  - action: assert_asset_status
+    target: empty_dates
+    source: success
+
+  # report has zero partitions — no materialisation expected, but no
+  # failure either. We assert it doesn't cause a pass-level failure.

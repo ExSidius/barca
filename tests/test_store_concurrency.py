@@ -35,7 +35,7 @@ def _make_asset(n: int) -> IndexedAsset:
         run_hash=f"run_hash_{n}",
         source_text="def f(): pass",
         module_source_text="",
-        decorator_metadata_json=json.dumps({"schedule": "manual"}),
+        decorator_metadata_json=json.dumps({"freshness": "manual"}),
         return_type=None,
         serializer_kind="json",
         python_version="3.14",

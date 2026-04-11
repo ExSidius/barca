@@ -1,0 +1,35 @@
+name: history_survives_remove
+description: >
+  Spec rule HistoryPreservedAcrossReindex. After materialising an asset
+  and then removing it from source, reindex deactivates the asset but
+  its materialisation history should still be queryable from the store.
+  Only `barca prune` deletes history.
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def doomed():
+        return {"will_die": True}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Remove the asset from source
+  - action: edit_module
+    target: assets.py
+    source: |
+      # empty module
+
+  - action: reindex
+    expect:
+      removed:
+        - doomed
+
+  # History should still exist: the file on disk is preserved until prune.
+  # We can't easily inspect DB history from YAML; this scenario is more
+  # of a "does reindex complete without error" check. Detailed history
+  # preservation is covered by test_reindex_diff.py.

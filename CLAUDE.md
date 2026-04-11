@@ -38,10 +38,11 @@ All commands must exit 0 before pushing. The `prek run --all-files` command will
 - ✅ Format code (ruff format)
 - ✅ Check trailing whitespace, YAML/TOML syntax, merge conflicts, etc.
 
-The React UI lives in `packages/barca/src/barca/server/ui/`. To rebuild it after changes:
+The React UI lives in `packages/barca/src/barca/server/ui/`. It requires **Node 24+** (pinned in `.nvmrc` and `engines` in both root and UI `package.json`). To rebuild after changes:
 
 ```bash
-cd packages/barca/src/barca/server/ui && npm run build
+# Use Node 24 (nvm users: `nvm use` picks it up from .nvmrc)
+cd packages/barca/src/barca/server/ui && npm ci && npm run build
 ```
 
 `npm run test:e2e` builds it automatically as part of the Playwright webServer config.

@@ -1,0 +1,22 @@
+name: sensor_wrong_shape
+description: >
+  A sensor must return (update_detected: bool, output: Any). If it
+  returns something else (None, a bare value, a 3-tuple), Barca should
+  reject it cleanly rather than corrupt downstream with garbage.
+
+modules:
+  assets.py: |
+    from barca import sensor, Schedule
+
+    @sensor(freshness=Schedule("* * * * *"))
+    def malformed():
+        return None  # not a tuple at all
+
+steps:
+  - action: run_pass
+    expect:
+      failed: 1  # sensor is flagged as failed because of the shape error
+
+  - action: assert_asset_status
+    target: malformed
+    source: failed

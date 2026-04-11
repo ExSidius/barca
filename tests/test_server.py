@@ -25,13 +25,13 @@ def server_project(tmp_path):
     (mod_dir / "__init__.py").write_text("")
     (mod_dir / "assets.py").write_text(
         textwrap.dedent("""\
-        from barca import asset
+        from barca import asset, Always, Manual
 
-        @asset(schedule="always")
+        @asset(freshness=Always())
         def greeting() -> dict:
             return {"message": "hello from server"}
 
-        @asset(schedule="manual")
+        @asset(freshness=Manual())
         def manual_only() -> dict:
             return {"message": "manual"}
     """)
@@ -125,13 +125,32 @@ def test_asset_detail_not_found(server_url):
     assert resp.status_code == 404
 
 
-def test_reconcile(server_url):
-    resp = niquests.post(f"{server_url}/api/reconcile")
+def test_run_pass(server_url):
+    """POST /api/run/pass triggers a single run_pass and returns a RunPassResult."""
+    resp = niquests.post(f"{server_url}/api/run/pass")
     assert resp.status_code == 200
     result = resp.json()
     assert "executed_assets" in result
     assert "executed_sensors" in result
     assert "fresh" in result
+
+
+def test_prune(server_url):
+    """POST /api/prune removes unreachable history."""
+    resp = niquests.post(f"{server_url}/api/prune")
+    assert resp.status_code == 200
+    result = resp.json()
+    assert "removed_assets" in result or "removed_materializations" in result
+
+
+def test_refresh_asset_with_stale_policy(server_url):
+    """POST /api/assets/{id}/refresh?stale_policy=warn proceeds with stale inputs."""
+    assets = niquests.get(f"{server_url}/api/assets").json()
+    asset_id = assets[0]["asset_id"]
+
+    # Default policy is error, but with no stale upstreams this should work
+    resp = niquests.post(f"{server_url}/api/assets/{asset_id}/refresh?stale_policy=warn")
+    assert resp.status_code == 200
 
 
 def test_refresh_asset(server_url):
@@ -198,19 +217,20 @@ def sensor_server_project(tmp_path):
     (mod_dir / "pipeline.py").write_text(
         textwrap.dedent(f"""\
         import os
-        from barca import sensor, asset
+        from barca import sensor, asset, Always, Schedule
 
         DATA_FILE = r"{data_file}"
 
-        @sensor(schedule="always")
+        @sensor(freshness=Schedule("* * * * *"))
         def file_watcher():
             mtime = os.path.getmtime(DATA_FILE)
             content = open(DATA_FILE).read()
             return (True, {{"mtime": mtime, "content": content}})
 
-        @asset(inputs={{"data": file_watcher}}, schedule="always")
+        @asset(inputs={{"data": file_watcher}}, freshness=Always())
         def transform(data):
-            return {{"upper": data["content"].upper(), "mtime": data["mtime"]}}
+            update_detected, payload = data
+            return {{"upper": payload["content"].upper(), "mtime": payload["mtime"]}}
     """)
     )
 
@@ -312,16 +332,19 @@ def test_sensor_trigger_rejects_non_sensor(sensor_server_url):
     assert resp.status_code == 404
 
 
-def test_e2e_sensor_reconcile_rematerialize(sensor_server_project, sensor_server_url):
-    """Full e2e: sensor observations accumulate, downstream asset materializes."""
+def test_e2e_sensor_run_pass_rematerialize(sensor_server_project, sensor_server_url):
+    """Full e2e: sensor observations accumulate, downstream asset materializes.
+
+    The sensor uses ``Schedule("* * * * *")`` (every minute). Two run_passes
+    in the same second won't cross a cron tick, so for the second pass we
+    use the explicit ``POST /sensors/{id}/trigger`` endpoint to force the
+    sensor to re-observe.
+    """
     _, data_file = sensor_server_project
 
-    # First reconcile — the scheduler may have already run one pass at startup,
-    # so we check state (not just counts from this call).
-    resp = niquests.post(f"{sensor_server_url}/api/reconcile")
+    resp = niquests.post(f"{sensor_server_url}/api/run/pass")
     assert resp.status_code == 200
 
-    # Verify sensor has at least one observation
     sensors = niquests.get(f"{sensor_server_url}/api/sensors").json()
     sensor_id = sensors[0]["asset_id"]
     observations = niquests.get(f"{sensor_server_url}/api/sensors/{sensor_id}/observations").json()
@@ -329,28 +352,28 @@ def test_e2e_sensor_reconcile_rematerialize(sensor_server_project, sensor_server
     assert observations[0]["update_detected"] is True
     initial_obs_count = len(observations)
 
-    # Verify downstream asset has been materialized (by scheduler or our reconcile)
     assets = niquests.get(f"{sensor_server_url}/api/assets").json()
     transform = next(a for a in assets if a["function_name"] == "transform")
     detail = niquests.get(f"{sensor_server_url}/api/assets/{transform['asset_id']}").json()
     assert detail["latest_materialization"] is not None
     assert detail["latest_materialization"]["status"] == "success"
 
-    # Update the data file
-    time.sleep(1)  # ensure mtime changes
+    # Update the data file and force a sensor re-observation via the
+    # explicit trigger endpoint (bypasses cron eligibility)
+    time.sleep(1)
     data_file.write_text("updated content")
 
-    # Second reconcile — sensor detects file change
-    resp = niquests.post(f"{sensor_server_url}/api/reconcile")
+    resp = niquests.post(f"{sensor_server_url}/api/sensors/{sensor_id}/trigger")
     assert resp.status_code == 200
-    result2 = resp.json()
-    assert result2["executed_sensors"] >= 1
 
-    # Verify observation count increased — sensor ran again and recorded new data
     observations2 = niquests.get(f"{sensor_server_url}/api/sensors/{sensor_id}/observations").json()
     assert len(observations2) > initial_obs_count
 
-    # Verify the latest observation captured the updated content
     latest_obs = observations2[0]
     assert latest_obs["update_detected"] is True
     assert "updated content" in (latest_obs["output_json"] or "")
+
+    # Now a subsequent run_pass should see the sensor's new observation and
+    # re-materialize the downstream
+    resp = niquests.post(f"{sensor_server_url}/api/run/pass")
+    assert resp.status_code == 200
