@@ -1,0 +1,35 @@
+name: freshness_flip_to_manual
+description: >
+  Converting an asset from freshness=Always to freshness=Manual changes
+  decorator metadata, which changes definition_hash. After the flip:
+  - run_pass should NOT auto-materialise the now-Manual asset
+  - it should show as manual_skipped, not executed
+  - any downstream Always assets become blocked
+
+modules:
+  assets.py: |
+    from barca import asset, Always
+
+    @asset(freshness=Always())
+    def target():
+        return {"v": 1}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Flip to Manual
+  - action: edit_module
+    target: assets.py
+    source: |
+      from barca import asset, Manual
+
+      @asset(freshness=Manual())
+      def target():
+          return {"v": 1}
+
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      manual_skipped: 1

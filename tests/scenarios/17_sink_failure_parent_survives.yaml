@@ -1,0 +1,21 @@
+name: sink_failure_parent_survives
+description: >
+  Spec rule SinkFailureIsProminent. A sink that can't write (unwritable
+  path) is marked failed, but the parent asset remains fresh. The sink
+  failure must be surfaced prominently (not silently).
+
+modules:
+  assets.py: |
+    from barca import asset, sink, Always
+
+    @asset(freshness=Always())
+    @sink("/nonexistent_root/writable/sink.json")
+    def resilient_producer():
+        return {"value": 1}
+
+steps:
+  - action: run_pass
+
+  - action: assert_asset_status
+    target: resilient_producer
+    source: success

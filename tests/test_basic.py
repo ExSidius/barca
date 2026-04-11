@@ -6,7 +6,8 @@ from barca._store import MetadataStore
 
 def test_reindex_discovers_assets(tmp_project):
     store = MetadataStore(str(tmp_project / ".barca" / "metadata.db"))
-    assets = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets = store.list_assets()
     names = [a.logical_name for a in assets]
     assert any("hello" in n for n in names)
     assert any("greeting" in n for n in names)
@@ -14,7 +15,8 @@ def test_reindex_discovers_assets(tmp_project):
 
 def test_refresh_produces_artifact(tmp_project):
     store = MetadataStore(str(tmp_project / ".barca" / "metadata.db"))
-    assets = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets = store.list_assets()
     hello_id = next(a.asset_id for a in assets if "hello" in a.logical_name)
 
     detail = refresh(store, tmp_project, hello_id)
@@ -34,7 +36,8 @@ def test_refresh_produces_artifact(tmp_project):
 
 def test_second_refresh_is_cached(tmp_project):
     store = MetadataStore(str(tmp_project / ".barca" / "metadata.db"))
-    assets = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets = store.list_assets()
     hello_id = next(a.asset_id for a in assets if "hello" in a.logical_name)
 
     detail1 = refresh(store, tmp_project, hello_id)
@@ -49,7 +52,8 @@ def test_second_refresh_is_cached(tmp_project):
 
 def test_reset_clears_state(tmp_project):
     store = MetadataStore(str(tmp_project / ".barca" / "metadata.db"))
-    assets = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets = store.list_assets()
     hello_id = next(a.asset_id for a in assets if "hello" in a.logical_name)
     refresh(store, tmp_project, hello_id)
 
@@ -65,7 +69,9 @@ def test_reset_clears_state(tmp_project):
 
 def test_idempotent_reindex(tmp_project):
     store = MetadataStore(str(tmp_project / ".barca" / "metadata.db"))
-    assets1 = reindex(store, tmp_project)
-    assets2 = reindex(store, tmp_project)
+    reindex(store, tmp_project)
+    assets1 = store.list_assets()
+    reindex(store, tmp_project)
+    assets2 = store.list_assets()
     assert len(assets1) == len(assets2)
     assert [a.definition_hash for a in assets1] == [a.definition_hash for a in assets2]

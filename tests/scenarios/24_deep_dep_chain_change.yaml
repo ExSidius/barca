@@ -1,0 +1,35 @@
+name: deep_dep_chain_change
+description: >
+  When a helper function imported by an asset changes, the asset's
+  dep cone hash must change, and it must re-materialise. Cascades to
+  downstream assets. This tests that the dep cone tracing actually
+  works end-to-end.
+
+modules:
+  helpers.py: |
+    def multiplier():
+        return 10
+
+  assets.py: |
+    from barca import asset
+    from tproj.helpers import multiplier
+
+    @asset()
+    def uses_helper():
+        return {"v": multiplier()}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Change the helper (same module, different value)
+  - action: edit_module
+    target: helpers.py
+    source: |
+      def multiplier():
+          return 100  # changed
+
+  - action: run_pass
+    expect:
+      executed_assets: 1  # dep cone changed → asset re-materialised

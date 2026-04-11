@@ -1,0 +1,30 @@
+name: effect_raises_exception
+description: >
+  An effect that raises should be marked failed but should NOT roll back
+  the parent asset's materialisation. Effects are leaf nodes — their
+  failure is isolated.
+
+modules:
+  assets.py: |
+    from barca import asset, effect, Always
+
+    @asset(freshness=Always())
+    def source():
+        return {"v": 1}
+
+    @effect(inputs={"s": source}, freshness=Always())
+    def bad_effect(s):
+        raise RuntimeError("effect exploded")
+
+steps:
+  - action: run_pass
+
+  # Parent asset still materialised successfully
+  - action: assert_asset_status
+    target: source
+    source: success
+
+  # Effect is failed, but doesn't retroactively fail source
+  - action: assert_asset_status
+    target: bad_effect
+    source: failed

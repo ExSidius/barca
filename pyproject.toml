@@ -8,6 +8,7 @@ requires-python = ">=3.14"
 dev = [
     "barca",
     "pytest>=8.0",
+    "syrupy>=4.7",
     "scikit-learn>=1.0",
     "niquests>=3.0",
     "mkdocs-material>=9.0",

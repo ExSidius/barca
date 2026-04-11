@@ -1,0 +1,29 @@
+name: multiple_sinks_stacked
+description: >
+  Stacking multiple @sink decorators on one asset writes the output to
+  all declared paths. Each sink is an independent leaf node.
+
+modules:
+  assets.py: |
+    from barca import asset, sink, Always
+
+    @asset(freshness=Always())
+    @sink("primary.json")
+    @sink("backup.json")
+    def dual_output():
+        return {"n": 42}
+
+steps:
+  - action: run_pass
+
+  - action: assert_file_exists
+    target: primary.json
+  - action: assert_file_exists
+    target: backup.json
+
+  - action: assert_file_contains
+    target: primary.json
+    source: "42"
+  - action: assert_file_contains
+    target: backup.json
+    source: "42"

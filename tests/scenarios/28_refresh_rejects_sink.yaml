@@ -1,0 +1,20 @@
+name: refresh_rejects_sink
+description: >
+  Spec rule ExplicitRefresh: `requires: asset.kind != Effect and
+  asset.kind != Sink`. This scenario documents the contract. The
+  detailed test (looking up the sink kind and asserting the refresh
+  error) lives in test_sink.py::test_sink_cannot_be_refreshed — the
+  YAML DSL can't easily express "look up the asset with kind=sink".
+
+modules:
+  assets.py: |
+    from barca import asset, sink, Always
+
+    @asset(freshness=Always())
+    @sink("out.json")
+    def parent():
+        return {"v": 1}
+
+steps:
+  - action: reindex
+  # See test_sink.py for the direct refresh-rejects-sink assertion.

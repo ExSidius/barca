@@ -1,0 +1,41 @@
+name: fail_then_fix_recovery
+description: >
+  The recovery loop every user hits in their first hour.
+  Asset fails → edit source to fix → run_pass → should be fresh.
+  Status transition: stale → failed → stale → fresh.
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def broken():
+        raise RuntimeError("boom")
+
+steps:
+  - action: run_pass
+    expect:
+      failed: 1
+
+  - action: assert_asset_status
+    target: broken
+    source: failed
+
+  # Fix the source
+  - action: edit_module
+    target: assets.py
+    source: |
+      from barca import asset
+
+      @asset()
+      def broken():
+          return {"fixed": True}
+
+  - action: run_pass
+    expect:
+      executed_assets: 1
+      failed: 0
+
+  - action: assert_asset_status
+    target: broken
+    source: success

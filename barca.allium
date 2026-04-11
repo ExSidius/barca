@@ -1,0 +1,509 @@
+-- allium: 3
+-- barca.allium
+
+-- Scope: Barca asset orchestrator — user-facing behavioural contract
+-- Includes: Asset kinds and lifecycle, freshness model, content-addressed caching,
+--           sensors, effects, sinks, explicit refresh, dev mode, run mode,
+--           partition mechanics, reindex diff, history and pruning
+-- Excludes: HTTP server API, internal storage format, concurrent execution details,
+--           authentication
+-- One-sentence description: A minimal orchestrator that discovers decorated Python
+--   functions, maintains their outputs at declared freshness levels, and caches
+--   results by content-addressed hash.
+
+actor Developer {
+    identified_by: project_root: Path
+}
+
+-- ---------------------------------------------------------------------------
+-- Freshness declarations
+-- ---------------------------------------------------------------------------
+
+-- Freshness is the core primitive. It declares how eagerly Barca keeps an
+-- asset's output up to date during `barca run`.
+
+entity Freshness {
+    kind: Always | Manual | Schedule
+}
+
+variant Always : Freshness {
+    -- Barca keeps this asset fresh automatically.
+    -- Any upstream change cascades through and re-materialises this asset.
+    -- Default for @asset and @effect.
+}
+
+variant Manual : Freshness {
+    -- Barca never auto-updates this asset, even when stale.
+    -- Downstream assets with Always freshness are also blocked from
+    -- auto-updating — they cannot be fresher than their upstream.
+    -- Only refreshed via explicit `barca assets refresh`.
+}
+
+variant Schedule : Freshness {
+    cron_expression: String
+    -- Barca refreshes this asset when a cron tick has elapsed since last run.
+    -- Acceptable staleness between ticks.
+}
+
+-- ---------------------------------------------------------------------------
+-- Core entities
+-- ---------------------------------------------------------------------------
+
+entity Project {
+    root: Path
+    assets: Set<Asset>
+    -- A project may contain multiple independent DAGs; Barca discovers them
+    -- automatically by tracing relationships between decorated functions.
+    -- No explicit graph declaration is required.
+}
+
+entity Asset {
+    logical_name: String        -- "{relative_file}:{function_name}" or user-supplied via name=
+    kind: Regular | Sensor | Effect | Sink
+    freshness: Freshness        -- Always by default for Regular and Effect
+    purity: Pure | Unsafe
+    definition_hash: Hash
+    inputs: List<Asset>         -- upstream dependencies; empty for source nodes
+
+    status: fresh | stale | pending | failed
+
+    -- Projections
+    latest_materialization: Materialization?
+    latest_success: Materialization?
+
+    -- Derived
+    is_source: inputs.count = 0
+    has_functional_guarantee: purity = Pure
+}
+
+variant Sensor : Asset {
+    -- Sensors observe external state. They return (update_detected: Boolean, output: Any).
+    -- The full tuple is passed as input to downstream assets.
+    -- Freshness options: Manual | Schedule only (Always is not valid for sensors —
+    -- polling frequency must be declared explicitly).
+    -- Invariant: inputs.count = 0
+}
+
+variant Effect : Asset {
+    -- Effects are standalone side-effect functions (send email, write to DB,
+    -- call external API). They take upstream inputs and produce no meaningful output.
+    -- Freshness: Always | Manual | Schedule
+    -- Invariant: no other Asset may list an Effect in its inputs.
+}
+
+variant Sink : Asset {
+    -- Sinks are output destinations declared directly on an @asset via stacked
+    -- @sink(path, serializer=) decorators. When the parent asset materialises,
+    -- all attached sinks write its output to their declared paths.
+    -- Paths are fsspec-compatible (local, S3, GCS, etc.)
+    -- Invariant: a Sink is always attached to exactly one Regular asset (its parent).
+    -- Invariant: no other Asset may list a Sink in its inputs.
+    parent: Asset               -- the Regular asset this sink is attached to
+    path: String                -- fsspec-compatible path
+    serializer: Serializer
+}
+
+entity Materialization {
+    asset: Asset
+    run_hash: Hash
+    definition_hash: Hash
+    output: Any                 -- JSON-serialisable; null for effects
+    status: success | failed
+    error: String?
+    stale_inputs_used: Boolean  -- true when materialised under warn or pass policy
+    created_at: Timestamp
+}
+
+entity SensorObservation {
+    sensor: Sensor
+    update_detected: Boolean
+    output: Any                 -- full (update_detected, output) tuple passed downstream
+    created_at: Timestamp
+}
+
+value Hash { value: String }
+
+-- Governs explicit refresh behaviour when upstream assets are stale.
+entity StalenessPolicy {
+    kind: error | warn | pass
+    -- error (default): abort — upstream must be fresh first
+    -- warn: proceed with stale inputs, record stale_inputs_used = true, emit warning
+    -- pass: proceed silently with stale inputs
+}
+
+-- ---------------------------------------------------------------------------
+-- Invariants
+-- ---------------------------------------------------------------------------
+
+invariant EffectsAreLeafNodes {
+    for a in Asset where a.kind = Effect or a.kind = Sink:
+        not exists Asset where this.inputs.any(i => i = a)
+}
+
+invariant SensorsAreSourceNodes {
+    for s in Asset where s.kind = Sensor:
+        s.inputs.count = 0
+}
+
+invariant SensorFreshnessIsNotAlways {
+    for s in Asset where s.kind = Sensor:
+        s.freshness.kind != Always
+}
+
+invariant NoCyclesInDAG {
+    not exists a in Asset where a in transitive_inputs(a)
+}
+
+invariant ManualBlocksDownstream {
+    -- An asset with Always freshness cannot be auto-materialised if any of its
+    -- transitive upstream assets has Manual freshness.
+    for a in Asset where a.freshness.kind = Always:
+        not exists upstream in transitive_inputs(a) where upstream.freshness.kind = Manual
+}
+
+-- ---------------------------------------------------------------------------
+-- Hashing rules
+-- ---------------------------------------------------------------------------
+
+rule DefinitionHashForPureAsset {
+    -- Captures: function source, decorator metadata, Python version, protocol
+    -- version, and the full transitive dependency cone of project-local functions.
+    -- Changing any transitive dependency invalidates the asset.
+    @guidance
+        -- Stdlib and third-party packages are excluded from the cone.
+        -- If AST tracing fails, the full project codebase hash is used as a
+        -- conservative fallback — this invalidates all assets.
+}
+
+rule DefinitionHashForUnsafeAsset {
+    -- Captures only the function's own source and decorator metadata.
+    -- @unsafe silences purity warnings; caching behaviour is unchanged.
+    -- Barca makes no correctness guarantee for Unsafe assets.
+    @guidance
+        -- Use @unsafe when a function references globals, performs I/O, or
+        -- otherwise violates the functional guarantee. Upstream changes still
+        -- trigger re-materialisation as normal.
+}
+
+-- ---------------------------------------------------------------------------
+-- Staleness rules
+-- ---------------------------------------------------------------------------
+
+rule AssetBecomesStaleOnDefinitionChange {
+    when: asset: Asset.definition_hash transitions_to _
+    requires: asset.latest_success?.definition_hash != asset.definition_hash
+    ensures: asset.status = stale
+}
+
+rule AssetBecomesStaleOnUpstreamRefresh {
+    when: upstream: Asset.status transitions_to fresh
+    for asset in Asset where upstream in asset.inputs:
+        ensures: asset.status = stale
+}
+
+rule AssetBlockedOnUpstreamFailure {
+    when: upstream: Asset.status transitions_to failed
+    for asset in Asset where upstream in asset.inputs:
+        ensures: asset.status = pending
+    @guidance
+        -- pending = blocked by upstream failure. No automatic retry.
+        -- Developer must fix upstream and re-trigger.
+}
+
+-- ---------------------------------------------------------------------------
+-- Materialisation rules
+-- ---------------------------------------------------------------------------
+
+rule CacheHitSkipsMaterialisation {
+    when: asset: Asset.status = stale
+    requires: prior: Materialization where
+        prior.asset = asset and
+        prior.run_hash = compute_run_hash(asset) and
+        prior.status = success
+    ensures: asset.status = fresh
+    ensures: asset.latest_success = prior
+    @guidance
+        -- run_hash = hash(definition_hash + sorted upstream materialization IDs
+        --   + partition key).
+        -- Re-typing identical source code is a cache hit.
+        -- @unsafe assets also benefit from cache hits when inputs are unchanged.
+}
+
+rule MaterialiseAsset {
+    when: asset: Asset.status = stale
+    requires: asset.kind = Regular
+    requires: not CacheHitSkipsMaterialisation(asset)
+    requires: all upstream in asset.inputs: upstream.status = fresh
+    ensures: Materialization.created(
+        asset: asset,
+        run_hash: compute_run_hash(asset),
+        definition_hash: asset.definition_hash,
+        output: asset.function(gather_inputs(asset)),
+        status: success,
+        stale_inputs_used: false,
+        created_at: now
+    )
+    ensures: asset.status = fresh
+}
+
+rule MaterialiseSensor {
+    when: sensor: Asset.status = stale
+    requires: sensor.kind = Sensor
+    let result = sensor.function()
+    ensures: SensorObservation.created(
+        sensor: sensor,
+        update_detected: result.0,
+        output: result,             -- full tuple passed to downstream inputs
+        created_at: now
+    )
+    ensures: if result.0:
+        sensor.status = fresh       -- update detected: propagates staleness downstream
+    else:
+        sensor.status = fresh       -- no update: downstream remains fresh
+}
+
+rule MaterialiseEffect {
+    when: upstream: Asset.status transitions_to fresh
+    for effect in Asset where effect.kind = Effect and upstream in effect.inputs:
+        ensures: Materialization.created(
+            asset: effect,
+            run_hash: compute_run_hash(effect),
+            definition_hash: effect.definition_hash,
+            output: null,
+            status: success,
+            stale_inputs_used: false,
+            created_at: now
+        )
+}
+
+rule MaterialiseSinks {
+    -- When a Regular asset materialises successfully, all attached Sinks run.
+    when: mat: Materialization.created
+    requires: mat.asset.kind = Regular and mat.status = success
+    for sink in Sink where sink.parent = mat.asset:
+        ensures: Materialization.created(
+            asset: sink,
+            run_hash: compute_run_hash(sink),
+            definition_hash: sink.definition_hash,
+            output: null,
+            status: success,
+            created_at: now
+        )
+    @guidance
+        -- Sinks use fsspec for path resolution, supporting local paths,
+        -- s3://, gs://, and other registered fsspec filesystems.
+        -- Sink failure does not retroactively fail the parent asset.
+}
+
+-- ---------------------------------------------------------------------------
+-- Partition mechanics
+-- ---------------------------------------------------------------------------
+
+-- Partitions allow an asset to be materialised once per value in a declared set.
+-- Partition values may be static (declared at decoration time) or dynamic
+-- (the output of an upstream asset).
+
+rule DynamicPartitionsFromUpstream {
+    -- When partitions= references an upstream asset function, that asset becomes
+    -- an implicit upstream dependency. Its output (a list of partition values)
+    -- determines the set of partitions for this asset.
+    -- If the partition-defining asset is stale, the partitioned asset cannot
+    -- determine its partition set and is blocked.
+    @guidance
+        -- Example: @asset(partitions={"date": date_range})
+        -- date_range becomes an implicit input to the partitioned asset.
+        -- Same staleness rules apply: if date_range is stale and policy=error,
+        -- the partitioned asset cannot be refreshed until date_range is fresh.
+}
+
+rule PartitionInheritance {
+    -- Default: a downstream asset that declares no partitions of its own,
+    -- but depends on a partitioned upstream, automatically inherits the same
+    -- partition set and runs once per partition value (1:1 matching by key).
+    -- Partitions are materialised in parallel.
+    @guidance
+        -- No extra syntax required. Specifying a partitioned asset as an input
+        -- is sufficient to inherit its partitions.
+}
+
+rule ExplicitPartitionSubset {
+    -- A downstream asset may declare an explicit subset of the upstream's
+    -- partition values. Barca validates the subset at index time.
+    -- Upstream partitions not consumed by any downstream node are pruned
+    -- from the active DAG (but their materialization history is preserved).
+    @guidance
+        -- If a pruned upstream partition is used by an effect or sink elsewhere
+        -- in the DAG, it is not pruned.
+}
+
+rule CollectPartitions {
+    -- collect(asset) aggregates all partitions of a partitioned asset into a
+    -- single dict, allowing a non-partitioned downstream asset to consume all
+    -- partition outputs at once.
+    --
+    -- Output type: dict[tuple[str, ...], OutputType]
+    -- Partition keys are always tuples. Single-dimension: ("2024-01",).
+    -- Multi-dimension: ("2024-01", "US").
+    -- Developers always unpack — consistent interface regardless of dimensions.
+    --
+    -- If any partition has failed, collect blocks entirely.
+    -- The downstream asset does not run until all partitions succeed.
+    @guidance
+        -- Example: @asset(inputs={"reports": collect(report)})
+        -- The downstream receives dict[tuple, ReportOutput].
+}
+
+-- ---------------------------------------------------------------------------
+-- Explicit refresh
+-- ---------------------------------------------------------------------------
+
+rule ExplicitRefresh {
+    -- Materialises a specific asset on demand. Does NOT cascade to downstream
+    -- assets. Downstream becomes implicitly stale and is picked up on next
+    -- `barca run` pass or explicit refresh.
+    when: DeveloperRefreshesAsset(asset, policy: StalenessPolicy)
+    requires: asset.kind != Effect and asset.kind != Sink
+    ensures:
+        if all upstream in asset.inputs: upstream.status = fresh:
+            MaterialiseAsset(asset)
+        else if policy.kind = error:
+            asset.status = failed
+            -- abort: "upstream <name> is stale — refresh upstream first"
+        else if policy.kind = warn:
+            MaterialiseAsset(asset) with stale_inputs_used = true
+            -- emit warning listing stale upstreams
+        else:
+            MaterialiseAsset(asset) with stale_inputs_used = true
+    @guidance
+        -- Barca does NOT automatically refresh stale upstreams on the
+        -- developer's behalf. The developer controls exactly what runs.
+        -- Default policy is error.
+}
+
+-- ---------------------------------------------------------------------------
+-- Barca dev (development mode)
+-- ---------------------------------------------------------------------------
+
+rule DevModeTracksstaleness {
+    -- `barca dev` watches for file changes and updates asset staleness state
+    -- in real time. It does NOT materialise anything.
+    -- When a file changes, all assets whose definition_hash would change are
+    -- immediately marked stale in the UI.
+    when: DeveloperRunsDevMode
+    @guidance
+        -- Dev mode is for development: see the live state of the DAG as you
+        -- edit code, without triggering any materialisation.
+        -- Use `barca assets refresh` to materialise individual assets during
+        -- development.
+}
+
+-- ---------------------------------------------------------------------------
+-- Barca run (production mode)
+-- ---------------------------------------------------------------------------
+
+rule RunMaintainsFreshness {
+    -- `barca run` is a long-running process that continuously maintains the
+    -- DAG at each asset's declared freshness level.
+    --
+    -- On each pass (topo order):
+    --   Always assets:   materialise if stale and all upstreams fresh
+    --   Schedule assets: materialise if cron tick elapsed since last run
+    --   Manual assets:   never auto-materialise
+    --   Sensors:         observe on each Schedule tick (or Manual trigger)
+    --   Effects/Sinks:   run when upstream freshens
+    --
+    -- Manual freshness blocks downstream Always assets from auto-updating.
+    when: DeveloperRunsProd
+    @guidance
+        -- If a pass is already running when the next tick arrives, the tick
+        -- is skipped (not queued). Passes do not overlap.
+        -- No retries on failure. A failed asset blocks dependents until fixed.
+}
+
+-- ---------------------------------------------------------------------------
+-- Reindex diff
+-- ---------------------------------------------------------------------------
+
+rule ReindexShowsDiff {
+    -- Every `reindex` (and every `barca run` pass) shows a three-way diff
+    -- of what changed since the last index:
+    --   Added assets:   name
+    --   Removed assets: name (pruned from active DAG, history preserved)
+    --   Renamed/moved:  old_name → new_name
+    when: DeveloperRunsReindex
+    @guidance
+        -- Rename detection uses two signals, in priority order:
+        -- 1. AST match: a removed and an added asset have identical function
+        --    bodies (covers file reorganisation, the common case).
+        -- 2. name= match: same explicit name= at a different location.
+        -- Without either signal, a rename appears as remove + add.
+        --
+        -- Removed assets are pruned from the active DAG on reindex.
+        -- Their materialisation history and artifacts are preserved until prune.
+}
+
+-- ---------------------------------------------------------------------------
+-- History and pruning
+-- ---------------------------------------------------------------------------
+
+rule HistoryPreservedAcrossReindex {
+    -- Barca preserves all materialisation history, sensor observations, and
+    -- job logs — including those for removed or renamed assets.
+    -- History is never deleted automatically.
+    @guidance
+        -- This means developers can inspect past runs even after restructuring
+        -- their project.
+}
+
+rule PruneRemovesUnreachableHistory {
+    -- `barca prune` removes all artifacts, materialisations, and DB records
+    -- that are not reachable from the current active DAG.
+    -- This includes removed assets, removed partition values, and old
+    -- definition_hash versions no longer referenced by any current asset.
+    when: DeveloperRunsPrune
+    @guidance
+        -- Prune is explicit and destructive. It is the only operation that
+        -- permanently deletes history.
+        -- Recommended before production deployments or to recover disk space.
+}
+
+-- ---------------------------------------------------------------------------
+-- Visual distinction in CLI
+-- ---------------------------------------------------------------------------
+
+rule UnsafeAssetsDistinguishedInListing {
+    -- The assets list command visually distinguishes Unsafe assets so developers
+    -- can see at a glance which parts of the graph carry no correctness guarantee.
+    @guidance
+        -- Suggested: an [unsafe] badge or distinct colour in the assets list table.
+}
+
+-- ---------------------------------------------------------------------------
+-- Partition discovery
+-- ---------------------------------------------------------------------------
+
+rule PartitionSetResolvedLazily {
+    -- The partition set for a dynamically-partitioned asset is resolved at
+    -- refresh/run time, not at index time. The partition-defining asset must
+    -- be materialised before the partitioned asset can determine its partitions.
+    -- Until then, the partition set is unknown.
+    @guidance
+        -- `barca assets list` should show "partitions: pending" for assets
+        -- whose partition-defining upstream has not yet been materialised.
+        -- Resolving at index time is not supported — the computation that
+        -- generates partition values may be expensive.
+}
+
+-- ---------------------------------------------------------------------------
+-- Sink failure
+-- ---------------------------------------------------------------------------
+
+rule SinkFailureIsProminent {
+    -- A sink failure does not block any downstream asset (sinks are leaf nodes).
+    -- However, sink failures are surfaced prominently as failures in
+    -- `assets list` and job logs — not as silent warnings.
+    -- The parent asset remains fresh; the sink must be debugged and re-run.
+    @guidance
+        -- Distinction: the core computation succeeded; the delivery failed.
+        -- Both facts should be visible to the developer.
+}

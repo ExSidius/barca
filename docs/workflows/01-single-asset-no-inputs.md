@@ -34,6 +34,8 @@ Barca adds three capabilities around it:
 2. Materialize the asset into a persisted output.
 3. Reuse the persisted output when the definition and runtime inputs have not changed.
 
+The default freshness for `@asset()` is `Always` — the asset is kept up to date automatically during `barca run`.
+
 ## Asset identity vs materialization identity
 
 We need two different identities.

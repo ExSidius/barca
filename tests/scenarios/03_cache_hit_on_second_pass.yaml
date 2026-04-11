@@ -1,0 +1,31 @@
+name: cache_hit_on_second_pass
+description: >
+  After a successful run_pass, a second run_pass with unchanged source
+  reports everything fresh and executes nothing. This is the core
+  content-addressed-cache contract.
+
+  Requires Phase 3 (run_pass implementation).
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def a():
+        return 1
+
+    @asset(inputs={"a_val": a})
+    def b(a_val):
+        return a_val + 1
+
+steps:
+  - action: reindex
+
+  - action: run_pass
+    expect:
+      executed_assets: 2
+
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      fresh: 2

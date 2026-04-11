@@ -1,0 +1,26 @@
+name: schedule_cron_not_yet_eligible
+description: >
+  A daily-5am cron schedule. After first run, advancing 5 minutes should
+  not trigger a re-run. The eligibility check must respect cron cadences.
+
+modules:
+  assets.py: |
+    from barca import asset, Schedule
+
+    @asset(freshness=Schedule("0 5 * * *"))
+    def daily():
+        return {"ts": "morning"}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Advance 5 minutes — nowhere near the next 5am tick
+  - action: advance_time
+    seconds: 300
+
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      fresh: 1

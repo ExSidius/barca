@@ -10,7 +10,8 @@ from barca._trace import clear_caches
 
 def test_reindex_stores_input_linkage(dep_project):
     store = MetadataStore(str(dep_project / ".barca" / "metadata.db"))
-    assets = reindex(store, dep_project)
+    reindex(store, dep_project)
+    assets = store.list_assets()
 
     upper_id = next(a.asset_id for a in assets if "uppercased" in a.logical_name)
     detail = store.asset_detail(upper_id)
@@ -21,11 +22,17 @@ def test_reindex_stores_input_linkage(dep_project):
     assert "fruit" in inputs[0].upstream_asset_ref
 
 
-def test_refresh_downstream_triggers_upstream(dep_project):
+def test_refresh_downstream_after_upstream_fresh(dep_project):
+    """Under the new refresh() semantics, upstreams are NOT auto-cascaded.
+    You must refresh them yourself first, then refresh the downstream."""
     store = MetadataStore(str(dep_project / ".barca" / "metadata.db"))
-    assets = reindex(store, dep_project)
+    reindex(store, dep_project)
+    assets = store.list_assets()
 
+    fruit_id = next(a.asset_id for a in assets if "fruit" in a.logical_name and "uppercased" not in a.logical_name)
     upper_id = next(a.asset_id for a in assets if "uppercased" in a.logical_name)
+
+    refresh(store, dep_project, fruit_id)
     refresh(store, dep_project, upper_id)
 
     # Both assets should be materialized
@@ -36,9 +43,13 @@ def test_refresh_downstream_triggers_upstream(dep_project):
 
 def test_downstream_receives_upstream_artifact(dep_project):
     store = MetadataStore(str(dep_project / ".barca" / "metadata.db"))
-    assets = reindex(store, dep_project)
+    reindex(store, dep_project)
+    assets = store.list_assets()
 
+    fruit_id = next(a.asset_id for a in assets if "fruit" in a.logical_name and "uppercased" not in a.logical_name)
     upper_id = next(a.asset_id for a in assets if "uppercased" in a.logical_name)
+
+    refresh(store, dep_project, fruit_id)
     detail = refresh(store, dep_project, upper_id)
 
     mat = detail.latest_materialization
@@ -49,9 +60,12 @@ def test_downstream_receives_upstream_artifact(dep_project):
 
 def test_upstream_change_invalidates_downstream_run_hash(dep_project):
     store = MetadataStore(str(dep_project / ".barca" / "metadata.db"))
-    assets = reindex(store, dep_project)
+    reindex(store, dep_project)
+    assets = store.list_assets()
+    fruit_id = next(a.asset_id for a in assets if "fruit" in a.logical_name and "uppercased" not in a.logical_name)
     upper_id = next(a.asset_id for a in assets if "uppercased" in a.logical_name)
 
+    refresh(store, dep_project, fruit_id)
     detail1 = refresh(store, dep_project, upper_id)
     mat1 = detail1.latest_materialization
 
@@ -65,22 +79,22 @@ def test_upstream_change_invalidates_downstream_run_hash(dep_project):
     _cleanup_and_reload("depmod")
     clear_caches()
 
-    assets = reindex(store, dep_project)
+    reindex(store, dep_project)
+    # Re-materialise both in order
+    refresh(store, dep_project, fruit_id)
     detail2 = refresh(store, dep_project, upper_id)
     mat2 = detail2.latest_materialization
 
-    # The fruit asset should have a new definition hash (source changed)
-    # So the uppercased asset should have a new run_hash and thus new materialization
     assert mat2.run_hash != mat1.run_hash, "run_hash should change when upstream source changes"
 
-    # New value should be "APPLE"
     value = json.loads((dep_project / mat2.artifact_path).read_text())
     assert value == "APPLE"
 
 
 def test_upstream_already_fresh_is_reused(dep_project):
     store = MetadataStore(str(dep_project / ".barca" / "metadata.db"))
-    assets = reindex(store, dep_project)
+    reindex(store, dep_project)
+    assets = store.list_assets()
 
     fruit_id = next(a.asset_id for a in assets if "fruit" in a.logical_name and "uppercased" not in a.logical_name)
     upper_id = next(a.asset_id for a in assets if "uppercased" in a.logical_name)

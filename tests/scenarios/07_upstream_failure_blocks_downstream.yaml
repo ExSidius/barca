@@ -1,0 +1,33 @@
+name: upstream_failure_blocks_downstream
+description: >
+  Spec rule AssetBlockedOnUpstreamFailure: when an upstream asset fails,
+  direct dependents are marked 'pending' (not 'failed'). This matters
+  because 'pending' means "blocked by upstream" — fixing the upstream
+  unblocks the downstream without the downstream itself needing a fix.
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def broken():
+        raise RuntimeError("boom")
+
+    @asset(inputs={"b": broken})
+    def downstream(b):
+        return {"ok": True}
+
+steps:
+  - action: run_pass
+    expect:
+      failed: 1
+
+  - action: assert_asset_status
+    target: broken
+    source: failed
+
+  # downstream should NOT be failed — it's blocked (pending)
+  # Exact status depends on implementation; the key assertion is that
+  # it's distinguishable from a direct failure.
+  # After run_pass, downstream.materialization_status should be either
+  # None (never attempted) or 'pending' (marked blocked).

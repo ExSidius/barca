@@ -18,8 +18,10 @@ from barca._models import (
     AssetSummary,
     JobDetail,
     MaterializationRecord,
-    ReconcileResult,
+    PruneResult,
+    RunPassResult,
     SensorObservation,
+    StaleUpstreamError,
 )
 from barca._store import MetadataStore
 from barca.server import service
@@ -113,11 +115,16 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(e)) from e
 
     @api.post("/assets/{asset_id}/refresh")
-    async def assets_refresh(asset_id: int) -> AssetDetail:
+    async def assets_refresh(
+        asset_id: int,
+        stale_policy: str = Query("error", regex="^(error|warn|pass)$"),
+    ) -> AssetDetail:
         try:
-            return await asyncio.to_thread(lambda: service.refresh_asset(_store(), repo_root, asset_id))
+            return await asyncio.to_thread(lambda: service.refresh_asset(_store(), repo_root, asset_id, stale_policy=stale_policy))
         except ValueError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
+        except StaleUpstreamError as e:
+            raise HTTPException(status_code=409, detail=str(e)) from e
 
     @api.get("/assets/{asset_id}/materializations")
     async def asset_materializations(
@@ -127,10 +134,15 @@ def create_app(
     ) -> list[MaterializationRecord]:
         return await asyncio.to_thread(lambda: service.list_asset_materializations(_store(), asset_id, limit=limit, offset=offset))
 
-    @api.post("/reconcile")
-    async def reconcile_endpoint() -> ReconcileResult:
+    @api.post("/run/pass")
+    async def run_pass_endpoint() -> RunPassResult:
         async with reconcile_lock:
-            return await asyncio.to_thread(lambda: service.run_reconcile(_store(), repo_root))
+            return await asyncio.to_thread(lambda: service.run_pass(_store(), repo_root))
+
+    @api.post("/prune")
+    async def prune_endpoint() -> PruneResult:
+        async with reconcile_lock:
+            return await asyncio.to_thread(lambda: service.prune(_store(), repo_root))
 
     @api.get("/jobs")
     async def jobs_list() -> list[JobDetail]:

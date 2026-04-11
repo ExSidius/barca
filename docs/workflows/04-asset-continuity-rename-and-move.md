@@ -14,12 +14,12 @@ This workflow assumes the Barca core constraints documented in [../core-constrai
 
 ## Summary
 
-For the MVP, Barca should use this continuity policy:
+Barca uses this continuity policy:
 
 - if `@asset(name="...")` is provided, that explicit name is the continuity key
 - otherwise, continuity is repo-relative file path + function name
 - old definitions and materializations are never deleted
-- rename/move detection from source similarity is advisory only, not automatic identity
+- rename/move detection uses AST matching as the primary signal, `name=` match as secondary
 
 This means:
 
@@ -27,6 +27,21 @@ This means:
 - implicit path/function identity does not
 
 That tradeoff is intentional.
+
+## Reindex diff
+
+Every `barca reindex` (and every `barca run` pass) shows a three-way diff of what changed since the last index:
+
+- **Added** assets: name
+- **Removed** assets: name (pruned from active DAG, history preserved)
+- **Renamed/moved** assets: old_name → new_name
+
+Rename detection uses two signals, in priority order:
+
+1. **AST match** (primary): a removed and an added asset have identical function bodies. This covers file reorganisation — the common case — without requiring any `name=` annotation.
+2. **`name=` match** (secondary): the same explicit `name=` appears at a different location.
+
+Without either signal, a rename appears as remove + add. The CLI does not prompt users to confirm renames — AST matching is sufficient for the common case.
 
 ## Case 1: rename or move without explicit asset name
 
@@ -76,28 +91,20 @@ The new continuity key is:
 my_project/pricing.py:fetch_prices
 ```
 
-For the MVP, Barca should treat this as:
+If the function body is identical to the old `prices` function, Barca detects this as a rename via AST match and treats it as:
+
+- one continuous logical asset lineage (old_name → new_name shown in reindex diff)
+- two definition snapshots
+- old materializations retained as historical
+
+If the function body differs (the function was both moved and changed), no AST match occurs. Barca then treats this as:
 
 - one historical asset lineage for `my_project/assets.py:prices`
 - one new live asset lineage for `my_project/pricing.py:fetch_prices`
 
-Barca may optionally show an advisory hint like:
+## Why AST match is the primary signal
 
-- “this new asset definition appears similar to a previously indexed asset”
-
-But it should not automatically merge those histories.
-
-## Why not merge automatically here
-
-It is too easy to get this wrong.
-
-Examples:
-
-- a user copies a function into a new file as the starting point for a new asset
-- two assets intentionally share nearly identical code
-- a moved function also changes purpose or semantics
-
-Silent merging would corrupt lineage more than it helps.
+AST matching covers the most common case: a developer reorganises files without changing function logic. It requires no annotation from the user. `name=` matching is a fallback for cases where the function body changed alongside the move.
 
 ## Case 2: rename or move with explicit asset name
 
@@ -257,8 +264,10 @@ Without an explicit name, Barca will preserve old history, but it will treat the
 
 ## Acceptance criteria
 
-- Moving or renaming an unnamed asset creates a new logical asset lineage while preserving the old one as historical.
-- Moving or renaming a named asset preserves one logical asset lineage with multiple definition snapshots.
+- Moving or renaming an unnamed asset with an identical function body is detected as a rename via AST match and shown as old_name → new_name in the reindex diff.
+- Moving or renaming an unnamed asset where the function body also changed creates a new logical asset lineage while preserving the old one as historical.
+- Moving or renaming a named asset (same `name=` at new location) preserves one logical asset lineage with multiple definition snapshots.
 - Old materializations remain queryable in both cases.
 - Duplicate continuity keys fail indexing.
 - UI/TUI can show definition history for a single logical asset when explicit `name` continuity is used.
+- Reindex output shows a three-way diff: added / removed / renamed.

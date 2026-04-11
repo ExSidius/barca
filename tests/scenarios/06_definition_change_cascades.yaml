@@ -1,0 +1,43 @@
+name: definition_change_cascades
+description: >
+  Spec rule AssetBecomesStaleOnDefinitionChange plus
+  AssetBecomesStaleOnUpstreamRefresh. Editing upstream source should
+  cascade: upstream re-materialises, downstream becomes stale,
+  downstream re-materialises in the same pass.
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def upstream():
+        return {"n": 1}
+
+    @asset(inputs={"u": upstream})
+    def downstream(u):
+        return {"n": u["n"] + 1}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 2
+
+  # Edit upstream only
+  - action: edit_module
+    target: assets.py
+    source: |
+      from barca import asset
+
+      @asset()
+      def upstream():
+          return {"n": 10}  # changed
+
+      @asset(inputs={"u": upstream})
+      def downstream(u):
+          return {"n": u["n"] + 1}
+
+  # Both should re-run: upstream because source changed, downstream
+  # because its upstream refreshed.
+  - action: run_pass
+    expect:
+      executed_assets: 2

@@ -1,188 +1,63 @@
-# Schedule-Driven Reconciliation And Effects
+# Freshness-Driven Run And Effects
 
-This document specifies how Barca should decide when assets, sensors, and side effects are eligible to run.
+This document specifies how Barca decides when assets, sensors, and side effects are eligible to run.
 
 The goal is to keep the orchestration model small:
 
 - assets define the graph
 - sensors bring external state into the graph
-- one reconciler loop computes staleness and eligibility
-- no pipeline DSL is required for the MVP
+- `barca run` continuously maintains each asset at its declared freshness level
+- no pipeline DSL is required
 
 This workflow assumes the Barca core constraints documented in [../core-constraints.md](../core-constraints.md).
 
 ## Summary
 
-For the MVP, Barca should attach a `schedule` policy directly to assets, sensors, and effects.
-
-Recommended shape:
+Every asset, sensor, and effect declares a `freshness` value that controls when Barca keeps it up to date during `barca run`.
 
 ```python
-@asset(schedule="manual")
-@asset(schedule="always")
-@asset(schedule=cron("0 5 * * *"))
+@asset()                                    # freshness=Always (default)
+@asset(freshness=Manual)
+@asset(freshness=Schedule("0 5 * * *"))
 
-@sensor(schedule="manual")
-@sensor(schedule="always")
-@sensor(schedule=cron("*/5 * * * *"))
+@sensor(freshness=Manual)                   # Always is not valid for sensors
+@sensor(freshness=Schedule("*/5 * * * *"))
 
-@effect(schedule="manual")
-@effect(schedule="always")
-@effect(schedule=cron("0 6 * * *"))
+@effect()                                   # freshness=Always (default)
+@effect(freshness=Manual)
+@effect(freshness=Schedule("0 6 * * *"))
 ```
 
 Where:
 
-- `schedule` controls when a stale node is eligible to run
+- `freshness` controls how eagerly Barca keeps a stale node up to date
 - staleness is still computed from provenance
-- the reconciler loop is responsible for discovering stale nodes and enqueueing runnable ones
+- `barca run` discovers stale nodes and materialises them when eligible
 
-This deliberately replaces a more complex pipeline/job architecture for the MVP.
+## Freshness kinds
 
-## Why `schedule`, not `freshness`
+### `Always`
 
-The important distinction is:
+The default for `@asset` and `@effect`. Barca keeps this asset fresh automatically — any upstream change cascades through and re-materialises it during `barca run`.
 
-- `staleness`: whether the current state is behind the desired provenance
-- `schedule`: when Barca is allowed to do something about it
+**`Manual` freshness blocks downstream**: if any transitive upstream asset has `Manual` freshness, downstream `Always` assets cannot auto-update. They remain stale until the `Manual` upstream is explicitly refreshed.
 
-Those are not the same thing.
+### `Manual`
 
-Example:
+Barca never auto-updates this asset, even when stale. Only refreshed via explicit `barca assets refresh`. Useful for source data or pinned inputs that should not change without deliberate action.
 
-- parent assets are scheduled for `0 5 * * *`
-- a downstream asset is scheduled for `0 6 * * *`
+### `Schedule("cron_expr")`
 
-At 5:15, the downstream asset may already be stale in principle, but it is not yet runnable because its schedule does not allow it until 6:00.
-
-That means the runtime model should be:
-
-- provenance-based staleness
-- schedule-based eligibility
-
-## Recommended decorator APIs
-
-For the MVP:
+Barca refreshes this asset when a cron tick has elapsed since its last run. Acceptable staleness between ticks.
 
 ```python
-@asset(
-    name: str | None = None,
-    inputs: dict[str, AssetRefLike] | None = None,
-    partitions: dict[str, PartitionSpecLike] | None = None,
-    serializer: SerializerKind | None = None,
-    schedule: ScheduleLike = "manual",
-    timeout_seconds: int = 300,
-    description: str | None = None,
-    tags: dict[str, str] | None = None,
-)
-```
+from barca import asset, Schedule
 
-```python
-@sensor(
-    name: str | None = None,
-    schedule: ScheduleLike = "manual",
-    timeout_seconds: int = 300,
-    description: str | None = None,
-    tags: dict[str, str] | None = None,
-)
-```
-
-```python
-@effect(
-    name: str | None = None,
-    inputs: dict[str, NodeRefLike] | None = None,
-    schedule: ScheduleLike = "manual",
-    timeout_seconds: int = 300,
-    description: str | None = None,
-    tags: dict[str, str] | None = None,
-)
-```
-
-Where:
-
-```python
-ScheduleLike = Literal["manual", "always"] | CronSchedule
-NodeRefLike = AssetRefLike | SensorRefLike
-```
-
-Helper:
-
-```python
-from barca import cron
-
-cron("0 5 * * *")
-```
-
-## Why `manual` should be the default
-
-`always` is useful, but it should not be the default.
-
-If `always` were the default, every asset would become an eager reconciler target, which is noisy and expensive.
-
-`manual` is the safer default because:
-
-- plain asset definitions remain passive unless selected
-- plain sensor definitions remain passive unless selected
-- downstream refresh still works when a user explicitly targets an asset
-- users opt into autonomous background behavior intentionally
-
-## Timeout policy
-
-For the MVP, assets, sensors, and effects should all support:
-
-```python
-timeout_seconds: int = 300
-```
-
-This timeout should apply per attempt.
-
-If an attempt exceeds the timeout:
-
-- Barca should terminate the worker
-- mark that attempt as timed out
-- apply the standard retry policy
-
-## Reconciler model
-
-Barca should have one manager loop that:
-
-1. indexes current definitions
-2. computes provenance-based staleness
-3. computes schedule-based eligibility
-4. enqueues runnable stale nodes
-5. dispatches workers
-6. records results and updates descendant states
-
-This loop replaces the need for a separate pipeline engine in the MVP.
-
-## State model
-
-The engine should keep the internal state model deterministic.
-
-Recommended states:
-
-- `fresh`
-- `stale_waiting_for_schedule`
-- `stale_waiting_for_upstream`
-- `runnable_stale`
-- `running`
-- `failed`
-- `historical`
-
-For UI purposes, deeper descendants of a changed node may be rendered as “likely affected” or similar, but the engine should still use deterministic states internally.
-
-## Example: staggered schedules
-
-```python
-from barca import asset, cron
-
-
-@asset(schedule=cron("0 5 * * *"))
+@asset(freshness=Schedule("0 5 * * *"))
 def prices() -> dict[str, str]:
     return {"ok": "yes"}
 
-
-@asset(inputs={"prices": prices}, schedule=cron("0 6 * * *"))
+@asset(inputs={"prices": prices}, freshness=Schedule("0 6 * * *"))
 def daily_report(prices: dict[str, str]) -> dict[str, str]:
     return {"report": prices["ok"]}
 ```
@@ -194,316 +69,175 @@ Behavior:
 - before 6:00, `daily_report` is `stale_waiting_for_schedule`
 - at 6:00, if upstream is settled, `daily_report` becomes `runnable_stale`
 
-This is the behavior you want from “update parents at 5AM, child at 6AM.”
-
-## Why this removes most need for pipelines
-
-In this model:
-
-- the asset graph already exists
-- “refresh X” means “materialize X and what it needs upstream”
-- periodic execution comes from per-node schedules
-
-That means the main historical use of pipelines, namely “define the graph and when it runs,” mostly disappears.
-
-For the MVP, that is good.
-
-Barca can avoid:
-
-- a second graph-definition DSL
-- pipeline-specific dependency semantics
-- duplicated concepts between asset graph and pipeline graph
-
-## Why this makes the UI cleaner
-
-Because Barca discovers the graph directly from decorator semantics:
-
-- the graph the user writes is the graph Barca runs
-- the graph the reconciler reasons about is the graph the UI renders
-- there is no second pipeline definition layer to reconcile against
-
-That has a few concrete advantages:
-
-- DAG views can be generated directly from indexed asset and effect metadata
-- node state can be rendered from the same stale/eligibility model the reconciler uses
-- provenance edges can be shown without translation through a separate pipeline abstraction
-- partition fan-out can be visualized as expansions of one logical asset, not as unrelated jobs
-
-This is one of the strongest arguments for keeping the orchestration model asset-first.
-
-## What still may be needed later
-
-Even if pipelines are unnecessary, a thin job or run-selection layer may still be useful later for:
-
-- selecting groups of roots
-- backfills over partition ranges
-- operator-facing run grouping
-- temporary ad hoc execution
-
-But that should be an operational convenience layer, not the core graph model.
-
-## Sensors
-
-Sensors should be first-class ingress nodes for uncontrolled external state.
-
-Recommended mental model:
-
-- `@sensor`: observes external state and emits an update signal plus a value into the graph
-- `@asset`: transforms deterministic inputs into deterministic outputs
-- `@effect`: pushes data from the graph into an external system
-
-Example:
+## Decorator APIs
 
 ```python
-from barca import sensor, asset, cron
-
-
-@sensor(schedule=cron("*/5 * * * *"))
-def inbox_files() -> tuple[bool, list[str]]:
-    return True, ["a.csv", "b.csv"]
-
-
-@asset(inputs={"paths": inbox_files}, schedule="always")
-def ingest_paths(paths: list[str]) -> list[dict[str, str]]:
-    ...
-```
-
-Sensors and assets should both be allowed as inputs to assets and effects.
-
-For the MVP, effects do not become inputs to anything.
-
-## Why sensors are not just assets
-
-Sensors are not deterministic cacheable transforms.
-
-They depend on uncontrolled external state, so Barca cannot infer correctness from code and upstream provenance alone.
-
-That means sensors should:
-
-- share the same `schedule` primitive
-- participate in the same graph rendering
-- produce versioned observation records
-- explicitly indicate whether they detected a meaningful update
-- not be treated as pure cacheable assets
-
-## Sensor freshness
-
-For a sensor, “fresh” should mean:
-
-- there exists a successful sensor observation record that satisfies the current schedule/reconciliation policy
-
-For the MVP, that is enough.
-
-Barca does not need to verify the external world continuously outside the configured schedule.
-
-## Sensor result contract
-
-For the MVP, sensors should report both:
-
-- whether an update was detected
-- the current observed payload
-
-The simplest user-facing form is:
-
-```python
-@sensor(schedule=cron("*/5 * * * *"))
-def inbox_files() -> tuple[bool, list[str]]:
-    return True, ["a.csv", "b.csv"]
-```
-
-Semantically, this means:
-
-```python
-updated_detected, output = inbox_files()
-```
-
-Where:
-
-- `updated_detected=True` means downstream nodes should treat this observation as a change candidate
-- `updated_detected=False` means the sensor checked successfully but did not observe a meaningful update
-
-### Why this is useful
-
-This gives Barca something pure assets do not need:
-
-- a clean distinction between “sensor ran” and “sensor observed a change”
-
-That is important for uncontrolled external dependencies, because polling an external source successfully is not the same as finding something new.
-
-### Recommended internal model
-
-A raw positional tuple is acceptable as MVP syntax, but Barca should normalize it immediately into an internal structured record such as:
-
-```python
-SensorResult(
-    updated_detected: bool,
-    output: SupportedValue,
+@asset(
+    name: str | None = None,
+    inputs: dict[str, AssetRefLike] | None = None,
+    partitions: dict[str, PartitionSpecLike] | None = None,
+    serializer: SerializerKind | None = None,
+    freshness: Freshness = Always,
+    timeout_seconds: int = 300,
+    description: str | None = None,
+    tags: dict[str, str] | None = None,
 )
 ```
 
-That keeps the persisted and internal model extensible even if the user-facing syntax starts as a tuple.
-
-### What happens when `updated_detected=False`
-
-When a sensor run returns `updated_detected=False`:
-
-- Barca should still record a successful sensor check
-- Barca should not mark downstream nodes stale solely because the sensor ran
-- the returned payload can still be stored with the observation record if useful for audit/debugging
-
-The important point is that downstream invalidation should be driven by detected change, not by polling cadence alone.
-
-## Effects
-
-Effects should be first-class, but separate from pure assets.
-
-Recommended mental model:
-
-- `@asset`: pure, cacheable, provenance-addressed
-- `@sensor`: external observation node
-- `@effect`: side-effecting leaf that consumes asset outputs
-
-Example:
+```python
+@sensor(
+    name: str | None = None,
+    freshness: Manual | Schedule = Manual,
+    timeout_seconds: int = 300,
+    description: str | None = None,
+    tags: dict[str, str] | None = None,
+)
+```
 
 ```python
-from barca import asset, effect, sensor, cron
+@effect(
+    name: str | None = None,
+    inputs: dict[str, NodeRefLike] | None = None,
+    freshness: Freshness = Always,
+    timeout_seconds: int = 300,
+    description: str | None = None,
+    tags: dict[str, str] | None = None,
+)
+```
 
+## Why `Always` is the default
 
-@sensor(schedule=cron("0 5 * * *"))
-def upstream_db_rows() -> list[dict[str, str]]:
-    ...
+`Always` is the right default because most assets in a pipeline should stay up to date automatically. Users opt into `Manual` or `Schedule` when they need to control when updates happen. `Manual` assets are passive by design.
 
+## Timeout policy
 
-@asset(inputs={"rows": upstream_db_rows}, schedule="always")
-def report_rows() -> list[dict[str, str]]:
-    return rows
+Assets, sensors, and effects all support:
 
+```python
+timeout_seconds: int = 300
+```
 
-@effect(inputs={"rows": report_rows}, schedule=cron("0 6 * * *"))
-def write_rows_to_db(rows: list[dict[str, str]]) -> None:
+This timeout applies per attempt. If an attempt exceeds the timeout, Barca terminates the worker and marks the attempt as timed out.
+
+## barca run model
+
+`barca run` is a long-running process. On each pass (topo order):
+
+1. Reindex current definitions
+2. Compute provenance-based staleness
+3. Compute freshness-based eligibility
+4. Enqueue runnable stale nodes
+5. Dispatch workers
+6. Record results and update descendant states
+
+`Always` assets: materialise if stale and all upstreams fresh.
+`Schedule` assets: materialise if a cron tick has elapsed since last run.
+`Manual` assets: never auto-materialise.
+Sensors: observe on each `Schedule` tick (or `Manual` trigger).
+Effects/Sinks: run when upstream freshens.
+
+If a pass is already running when the next tick arrives, the tick is skipped — passes do not overlap.
+
+## State model
+
+Recommended internal states:
+
+- `fresh`
+- `stale_waiting_for_schedule`
+- `stale_waiting_for_upstream`
+- `runnable_stale`
+- `running`
+- `failed`
+- `historical`
+
+## Sensors
+
+Sensors are first-class ingress nodes for uncontrolled external state.
+
+```python
+from barca import sensor, asset, Schedule
+
+@sensor(freshness=Schedule("*/5 * * * *"))
+def inbox_files() -> tuple[bool, list[str]]:
+    return True, ["a.csv", "b.csv"]
+
+@asset(inputs={"paths": inbox_files})
+def ingest_paths(paths: tuple[bool, list[str]]) -> list[dict[str, str]]:
     ...
 ```
 
-## Why effects can share the same `schedule` primitive
+The full `(update_detected, output)` tuple is passed as input to downstream assets — downstream receives the complete tuple, not just the output payload.
 
-This is a good simplification for the MVP.
+Sensors return `(update_detected: bool, output)`. When `update_detected=True`, downstream assets become stale. When `update_detected=False`, downstream assets do not become stale (no meaningful change was detected).
 
-There is no strong reason to invent a separate scheduling model for effects right away.
+## Effects
 
-Assets, sensors, and effects all need:
+Effects are standalone side-effect functions — sending email, writing to a database, calling an external API. Use `@effect` for arbitrary side-effects. Use `@sink` for writing asset outputs to file paths.
 
-- manual runs
-- immediate eligibility once stale
-- cron eligibility
+```python
+from barca import asset, effect, sensor, Schedule
 
-So Barca should use the same `schedule` primitive for all three.
+@sensor(freshness=Schedule("0 5 * * *"))
+def upstream_db_rows() -> tuple[bool, list[dict[str, str]]]:
+    ...
 
-## Important difference between assets and effects
+@asset(inputs={"rows": upstream_db_rows})
+def report_rows(rows: tuple[bool, list[dict[str, str]]]) -> list[dict[str, str]]:
+    _, data = rows
+    return data
 
-They should share scheduling semantics, but not caching semantics.
+@effect(inputs={"rows": report_rows}, freshness=Schedule("0 6 * * *"))
+def send_report(rows: list[dict[str, str]]) -> None:
+    ...
+```
 
-Assets:
+Effects are leaf nodes — no other asset may list an effect as an input.
 
-- are deterministically cacheable by provenance
-- can become fresh again by matching an old `run_hash`
+## Sinks
 
-Effects:
+`@sink` is a decorator stacked on `@asset` for writing outputs to file paths. Paths are fsspec-compatible (local, `s3://`, `gs://`, etc.).
 
-- are not assumed to be deterministically cacheable
-- represent external state changes
-- need execution records, not artifact reuse in the same sense
+```python
+from barca import asset, sink, Always, JsonSerializer
 
-For the MVP, Barca should still record effect provenance:
+@asset(freshness=Always)
+@sink('./report.json', serializer=JsonSerializer)
+@sink('s3://my-bucket/report.json', serializer=JsonSerializer)
+def report() -> dict:
+    return {"rows": 42}
+```
 
-- effect definition hash
-- upstream materialization IDs
-- target config
-- execution status
-- execution timestamp
+When the parent asset materialises, all attached sinks write its output to their declared paths. Sink failures are non-blocking (leaf nodes) but surface prominently as failures in `assets list` and job logs.
 
-But Barca should not pretend an effect is equivalent to a reusable pure asset materialization.
+## Partitioned assets and freshness
 
-Sensors:
-
-- produce observation records
-- can be consumed downstream like assets
-- are not assumed to be reproducible from code provenance alone
-
-## Effect freshness
-
-To keep the model simple, effects should use the same stale/eligible states as assets.
-
-The difference is in what “fresh” means.
-
-For an effect, “fresh” should mean:
-
-- there exists a successful effect execution record for the current effect definition and current upstream provenance
-
-That is enough for the MVP.
-
-Later, Barca can add richer semantics such as:
-
-- explicit idempotency keys
-- forced re-application
-- operator approval
-- external state verification
-
-## Scheduling and upstream changes
-
-When an upstream asset changes:
-
-- immediate children should be marked stale
-- if their own schedule permits and upstream is settled, they become `runnable_stale`
-- otherwise they become `stale_waiting_for_schedule` or `stale_waiting_for_upstream`
-
-The same logic applies whether the child is an asset, sensor-dependent asset, or an effect.
-
-## Partitioned assets and schedules
-
-Schedules should apply to partitioned assets too.
-
-That means:
+Freshness applies to partitioned assets per partition:
 
 - staleness is determined per partition
 - eligibility is determined per partition
-- the reconciler may enqueue many runnable partitions at once
-
-Example:
+- `barca run` may enqueue many runnable partitions at once
 
 ```python
 @asset(
     partitions={"ticker": partitions(["AAPL", "MSFT", "GOOG"])},
-    schedule=cron("0 5 * * *"),
+    freshness=Schedule("0 5 * * *"),
 )
 def fetch_prices(ticker: str) -> dict[str, str]:
     return {"ticker": ticker}
 ```
 
-At 5:00, each stale partition can become independently runnable.
-
-## Recommended implementation stance
-
-For the MVP:
-
-- add `schedule=` to both `@asset` and `@effect`
-- add `schedule=` to `@sensor`
-- support `manual`, `always`, and `cron(...)`
-- keep one reconciler loop
-- compute staleness from provenance
-- compute eligibility from schedule plus upstream state
-- use deterministic stale states internally
-- avoid a pipeline DSL
-
-This is the smallest architecture that still supports autonomous refresh behavior.
+At 5:00, each stale partition becomes independently eligible.
 
 ## Acceptance criteria
 
-- An asset with `schedule="manual"` is only refreshed when explicitly requested or when required by a targeted downstream refresh.
-- An asset with `schedule="always"` becomes runnable immediately when stale and upstream-ready.
-- A sensor with `schedule=cron(...)` records observations on its cron cadence.
-- An asset with `schedule=cron(...)` becomes runnable only when its cron window opens.
+- An asset with `freshness=Manual` is only refreshed when explicitly requested or when required by a targeted downstream refresh.
+- An asset with `freshness=Always` becomes runnable immediately when stale and upstream-ready.
+- A sensor with `freshness=Schedule(...)` records observations on its cron cadence.
+- An asset with `freshness=Schedule(...)` becomes runnable only when its cron window opens.
 - A downstream asset can be stale at 5:10 and still not runnable until its 6:00 schedule.
-- Assets and effects may consume sensors as inputs.
-- Effects use the same `schedule` primitive as assets.
+- Assets and effects may consume sensors as inputs (receiving the full tuple).
+- Effects use the same `freshness` primitive as assets.
 - Effects record successful executions against current upstream provenance.
 - Partitioned assets evaluate staleness and eligibility per partition.
+- `Manual` freshness blocks downstream `Always` assets from auto-updating.
+- `Always` is not valid for sensors.

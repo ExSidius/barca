@@ -1,0 +1,28 @@
+name: inputless_always_effect
+description: >
+  Design decision D2: an input-less Always effect runs once on first
+  success and is considered fresh thereafter. It does NOT re-run on
+  every pass.
+
+modules:
+  assets.py: |
+    from barca import effect, Always
+
+    @effect(freshness=Always())
+    def heartbeat():
+        pass
+
+steps:
+  - action: run_pass
+    expect:
+      executed_effects: 1
+
+  # Second pass: effect is already fresh, nothing to do
+  - action: run_pass
+    expect:
+      executed_effects: 0
+
+  # Third pass: still fresh
+  - action: run_pass
+    expect:
+      executed_effects: 0

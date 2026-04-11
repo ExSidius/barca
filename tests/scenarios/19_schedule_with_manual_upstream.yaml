@@ -1,0 +1,43 @@
+name: schedule_with_manual_upstream
+description: >
+  Interaction of two freshness kinds. A Schedule downstream depends on
+  a Manual upstream. While the manual upstream is stale, the schedule
+  downstream should be blocked even when its cron tick fires. Once the
+  manual upstream is refreshed, the downstream unblocks.
+
+modules:
+  assets.py: |
+    from barca import asset, Manual, Schedule
+
+    @asset(freshness=Manual())
+    def upstream():
+        return {"v": 1}
+
+    @asset(inputs={"u": upstream}, freshness=Schedule("*/5 * * * *"))
+    def downstream(u):
+        return {"v2": u["v"] + 1}
+
+steps:
+  # First pass: manual blocked; downstream can't run even if tick is due
+  - action: run_pass
+    expect:
+      executed_assets: 0
+
+  # Advance time so a schedule tick has elapsed
+  - action: advance_time
+    seconds: 600
+
+  # Still blocked — manual upstream has not been refreshed
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      stale_blocked: 1
+
+  # Explicit refresh of upstream
+  - action: refresh
+    target: upstream
+
+  # Now downstream can run (and a tick is still due from our advance)
+  - action: run_pass
+    expect:
+      executed_assets: 1

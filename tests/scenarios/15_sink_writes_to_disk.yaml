@@ -1,0 +1,25 @@
+name: sink_writes_to_disk
+description: >
+  End-to-end sink check: @asset materialises, @sink writes the value
+  to a file, the file contains the expected content.
+
+modules:
+  assets.py: |
+    from barca import asset, sink, Always
+
+    @asset(freshness=Always())
+    @sink("output.json")
+    def producer():
+        return {"message": "hello from sink"}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  - action: assert_file_exists
+    target: output.json
+
+  - action: assert_file_contains
+    target: output.json
+    source: "hello from sink"

@@ -39,6 +39,7 @@ export function KindBadge({ kind }: KindBadgeProps) {
     asset: "border-blue-500/30 bg-blue-500/10 text-blue-400",
     sensor: "border-purple-500/30 bg-purple-500/10 text-purple-400",
     effect: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+    sink: "border-cyan-500/30 bg-cyan-500/10 text-cyan-400",
   };
 
   return (

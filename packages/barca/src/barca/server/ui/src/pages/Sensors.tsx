@@ -13,6 +13,13 @@ import { useAPI } from "@/hooks/useAPI";
 import { formatTime } from "@/lib/format";
 import type { AssetSummary } from "@/lib/types";
 
+function formatFreshness(f: string): string {
+  if (f === "always") return "always";
+  if (f === "manual") return "manual";
+  if (f.startsWith("schedule:")) return `schedule(${f.slice("schedule:".length)})`;
+  return f;
+}
+
 export function Sensors() {
   const { data, loading } = useAPI<AssetSummary[]>("/api/sensors");
 
@@ -23,7 +30,7 @@ export function Sensors() {
           <TableHeader>
             <TableRow>
               <TableHead>Name</TableHead>
-              <TableHead className="w-[140px]">Schedule</TableHead>
+              <TableHead className="w-[160px]">Freshness</TableHead>
               <TableHead className="w-[120px]">Status</TableHead>
               <TableHead className="w-[140px]">Last Run</TableHead>
             </TableRow>
@@ -53,7 +60,7 @@ export function Sensors() {
                     </Link>
                   </TableCell>
                   <TableCell className="font-mono text-xs text-muted-foreground">
-                    {s.schedule}
+                    {formatFreshness(s.freshness)}
                   </TableCell>
                   <TableCell>
                     <StatusBadge status={s.materialization_status} />

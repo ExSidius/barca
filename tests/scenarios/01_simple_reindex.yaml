@@ -1,0 +1,23 @@
+name: simple_reindex
+description: >
+  Two independent assets get discovered by reindex. No upstream/downstream
+  relationship. Verifies the basic indexing path end-to-end.
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def first():
+        return {"n": 1}
+
+    @asset()
+    def second():
+        return {"n": 2}
+
+steps:
+  - action: reindex
+    expect:
+      added:
+        - "first"
+        - "second"

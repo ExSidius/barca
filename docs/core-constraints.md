@@ -96,6 +96,22 @@ The point of Barca is not only to run assets, but to preserve approximate lineag
 
 The storage model should therefore be append-only for definitions and materializations, with status flags rather than destructive updates.
 
+### Pruning
+
+History accumulates over time. `barca prune` is the only operation that permanently removes history — it deletes all artifacts, materialisations, and DB records not reachable from the current active DAG (removed assets, removed partition values, old definition hash versions no longer referenced by any current asset). It is explicit and destructive; run it before production deployments or to recover disk space.
+
+## Freshness declarations
+
+Every asset, sensor, and effect declares how eagerly Barca keeps its output up to date. The `freshness` parameter is the core primitive — not `schedule`.
+
+Three freshness kinds exist:
+
+- `Always` (default for `@asset` and `@effect`): Barca keeps this asset fresh automatically. Any upstream change cascades through and re-materialises it during `barca run`.
+- `Manual`: Barca never auto-updates this asset, even when stale. Only refreshed via explicit `barca assets refresh`. **`Manual` freshness blocks downstream**: a downstream `Always` asset cannot be auto-materialised if any of its transitive upstream assets has `Manual` freshness.
+- `Schedule("cron_expr")`: Barca refreshes this asset when a cron tick has elapsed since last run.
+
+Sensors use `Manual` or `Schedule` only — `Always` is not valid for sensors (polling frequency must be declared explicitly).
+
 ## Freshness is provenance-based, not recency-based
 
 Barca should decide freshness from provenance identity, not from whether something was run most recently.

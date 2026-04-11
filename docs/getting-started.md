@@ -32,6 +32,8 @@ def hello() -> dict:
     return {"message": "Hello from barca!"}
 ```
 
+The default freshness is `Always` — Barca keeps this asset up to date automatically during `barca run`.
+
 ## Index and Materialize
 
 ```bash
@@ -63,32 +65,46 @@ When you refresh `summary`, Barca automatically materializes `raw_data` first an
 
 ## Adding Sensors
 
-Sensors observe external state:
+Sensors observe external state. They must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors.
 
 ```python
-from barca import sensor, cron
+from barca import sensor, Schedule
 
-@sensor(schedule=cron("*/5 * * * *"))
+@sensor(freshness=Schedule("*/5 * * * *"))
 def inbox_files() -> tuple[bool, list[str]]:
     files = list(Path("inbox").glob("*.csv"))
     return len(files) > 0, [str(f) for f in files]
 ```
 
-Sensors return `(update_detected: bool, output)` tuples. During reconciliation, downstream assets only run when `update_detected` is `True`.
+Sensors return `(update_detected: bool, output)` tuples. The full tuple is passed as input to downstream assets. Downstream assets only become stale when `update_detected` is `True`.
 
 ## Adding Effects
 
-Effects are leaf nodes that produce side effects:
+Effects are standalone side-effect functions — sending email, writing to a database, calling an external API. They are leaf nodes and cannot be used as inputs to other nodes.
 
 ```python
-from barca import asset, effect
+from barca import asset, effect, Always
 
-@effect(inputs={"data": summary}, schedule="always")
+@effect(inputs={"data": summary}, freshness=Always)
 def publish(data: dict) -> None:
     print(f"Publishing: {data}")
 ```
 
-Effects cannot be used as inputs to other nodes.
+## Writing Outputs to Files
+
+Use `@sink` stacked on `@asset` to write an asset's output to a path when it materialises. Paths are fsspec-compatible (local, `s3://`, `gs://`, etc.).
+
+```python
+from barca import asset, sink, Always, JsonSerializer
+
+@asset(freshness=Always)
+@sink('./output.json', serializer=JsonSerializer)
+@sink('s3://my-bucket/output.json', serializer=JsonSerializer)
+def report() -> dict:
+    return {"rows": 42}
+```
+
+A sink failure does not fail the parent asset, but surfaces prominently in `assets list` and job logs.
 
 ## Partitioned Assets
 
@@ -106,23 +122,33 @@ def prices(ticker: str) -> dict:
 uv run barca assets refresh 1 -j 4    # 4 parallel workers
 ```
 
-## Reconciliation
+For dynamically-partitioned assets (where the partition set comes from an upstream asset), the partition set is resolved lazily at run time. Until the partition-defining asset has materialised, `assets list` shows the partition set as "pending".
 
-Run all scheduled nodes in dependency order:
+## Development Mode
+
+Use `barca dev` during development to watch for file changes and see live staleness state in the UI, without triggering any materialization.
 
 ```bash
-uv run barca reconcile                 # single pass
-uv run barca reconcile --watch         # continuous loop
-uv run barca reconcile --watch --interval 30
+uv run barca dev
+```
+
+Use `barca assets refresh` to materialize individual assets during development.
+
+## Production Mode
+
+Use `barca run` in production to continuously maintain the DAG at each asset's declared freshness level.
+
+```bash
+uv run barca run
 ```
 
 ## HTTP Server
 
-Start the optional HTTP API with a background scheduler:
+Start the optional HTTP API with a background scheduler (uses the same semantics as `barca run`):
 
 ```bash
 uv run barca serve
-uv run barca serve --port 8400 --interval 60
+uv run barca serve --port 8400
 ```
 
 See the [Server API reference](server-api.md) for all endpoints.
@@ -148,13 +174,13 @@ value = read_asset(my_asset)
 versions = list_versions(my_asset)
 ```
 
-## Schedule Types
+## Freshness Types
 
-| Schedule | Behavior |
-|----------|----------|
-| `"manual"` | Only runs via explicit `barca assets refresh` |
-| `"always"` | Runs whenever stale + upstream ready (during reconcile) |
-| `cron("0 5 * * *")` | Runs when a cron tick has occurred since last run |
+| Freshness | Behavior |
+|-----------|----------|
+| `Always` (default) | Auto-materialises whenever stale and upstreams are ready during `barca run` |
+| `Manual` | Only runs via explicit `barca assets refresh`; blocks downstream `Always` assets from auto-updating |
+| `Schedule("0 5 * * *")` | Runs when a cron tick has elapsed since last run |
 
 ## Next Steps
 

@@ -1,0 +1,48 @@
+name: cache_hit_after_revert
+description: >
+  Spec: "Re-typing identical source code is a cache hit."
+  Materialise an asset, edit its source, revert the edit, run again.
+  The run_hash should match the original materialisation and skip execution.
+
+modules:
+  assets.py: |
+    from barca import asset
+
+    @asset()
+    def stable():
+        return {"v": 1}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Edit the source: changes definition_hash, makes asset stale
+  - action: edit_module
+    target: assets.py
+    source: |
+      from barca import asset
+
+      @asset()
+      def stable():
+          return {"v": 2}
+
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Revert to the original source. The definition_hash returns to its first
+  # value, and the original materialisation should be a cache hit.
+  - action: edit_module
+    target: assets.py
+    source: |
+      from barca import asset
+
+      @asset()
+      def stable():
+          return {"v": 1}
+
+  - action: run_pass
+    expect:
+      executed_assets: 0
+      fresh: 1

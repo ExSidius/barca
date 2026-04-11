@@ -1,40 +1,49 @@
-"""@unsafe decorator — marks functions as having untraceable behavior.
+"""@unsafe decorator — mark functions as having untraceable behaviour.
 
-Inspired by Rust's `unsafe` blocks. Functions decorated with @unsafe:
-- Have their dependency hash = hash of source only (no transitive tracing)
-- Are always considered stale (re-materialized on every run)
-- Silence dependency tracing warnings
-- Propagate "always stale" to downstream dependents
+Inspired by Rust's ``unsafe`` blocks. A function decorated with ``@unsafe``:
+
+- Has its dependency_cone_hash computed from its own source only (no
+  transitive AST tracing). Editing a helper the function calls does NOT
+  invalidate the asset.
+- Silences the purity-analysis warnings (globals, I/O calls, etc).
+- Carries no correctness guarantee — Barca trusts the developer.
+
+Caching behaviour is identical to pure assets: if inputs and definition
+are unchanged, the asset is a cache hit and does not re-materialise.
+This matches design decision D10 in ``barca.allium``.
+
+The older ``@unsafe(cache=...)`` parameter has been removed. Caching is
+no longer opt-in for unsafe assets — it's always on, same as pure assets.
 """
 
 
-def unsafe(func=None, *, cache=False):
-    """Mark a function as having untraceable side effects.
+def unsafe(func=None):
+    """Mark a function as having untraceable behaviour.
 
-    @unsafe
-    def load_config():
-        return yaml.safe_load(open("config.yaml"))
+    Can be used with or without parens::
 
-    @unsafe(cache=True)  # opt into caching at your own risk
-    def load_static_config():
-        return yaml.safe_load(open("static.yaml"))
+        @unsafe
+        def load_config():
+            return yaml.safe_load(open("config.yaml"))
+
+        @unsafe()
+        def load_other():
+            return 1
     """
 
     def decorator(fn):
         fn.__unsafe__ = True
-        fn.__unsafe_cache__ = cache
         return fn
 
-    if func is not None:
+    if func is None:
+        return decorator
+    if callable(func):
         return decorator(func)
-    return decorator
+    # A non-callable, non-None first arg means the user probably passed
+    # a kwarg positionally (e.g. cache=True); tell them loudly.
+    raise TypeError(f"@unsafe does not accept arguments; got {func!r}. The `cache=` parameter was removed — unsafe assets cache identically to pure assets.")
 
 
 def is_unsafe(func):
-    """Check if a function is marked @unsafe."""
+    """Check whether a function is marked ``@unsafe``."""
     return getattr(func, "__unsafe__", False)
-
-
-def is_unsafe_cacheable(func):
-    """Check if an @unsafe function opted into caching."""
-    return getattr(func, "__unsafe_cache__", False)

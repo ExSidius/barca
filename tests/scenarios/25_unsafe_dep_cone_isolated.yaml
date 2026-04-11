@@ -1,0 +1,36 @@
+name: unsafe_dep_cone_isolated
+description: >
+  An @unsafe asset should NOT react to changes in its helper functions
+  because unsafe skips dep-cone tracing. Only the asset's own source
+  matters. Edit the helper, re-run: expect a cache hit.
+
+modules:
+  helpers.py: |
+    def helper():
+        return 1
+
+  assets.py: |
+    from barca import asset, unsafe
+    from tproj.helpers import helper
+
+    @asset()
+    @unsafe
+    def opaque():
+        return {"v": helper()}
+
+steps:
+  - action: run_pass
+    expect:
+      executed_assets: 1
+
+  # Change the helper
+  - action: edit_module
+    target: helpers.py
+    source: |
+      def helper():
+          return 999  # changed
+
+  - action: run_pass
+    expect:
+      executed_assets: 0  # cache hit — unsafe doesn't track helper
+      fresh: 1

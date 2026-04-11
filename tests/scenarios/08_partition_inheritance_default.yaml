@@ -1,0 +1,27 @@
+name: partition_inheritance_default
+description: >
+  Spec rule PartitionInheritance (the default case).
+  A downstream asset that depends on a partitioned upstream — without
+  declaring its own partitions — inherits the upstream's partition set
+  automatically. Runs 1:1 in parallel.
+
+modules:
+  assets.py: |
+    from barca import asset, partitions, Always
+
+    @asset(partitions={"region": partitions(["US", "EU", "APAC"])}, freshness=Always())
+    def sales(region: str):
+        return {"region": region, "total": 100}
+
+    # No partitions= on this downstream — should inherit from sales.
+    @asset(inputs={"s": sales}, freshness=Always())
+    def report(s):
+        # s is a single-partition dict, not a collect of all
+        return {"for_region": s["region"], "doubled": s["total"] * 2}
+
+steps:
+  - action: run_pass
+    expect:
+      # 3 sales partitions + 3 report partitions = 6 executions
+      executed_assets: 6
+      failed: 0
