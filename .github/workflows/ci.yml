@@ -23,4 +23,8 @@ jobs:
         run: uv sync
 
       - name: Tests
+        env:
+          NO_COLOR: "1"
+          TERM: dumb
+          COLUMNS: "200"
         run: uv run pytest tests/ -v
