@@ -17,6 +17,8 @@ Schema v0.4.0 changes from v0.3.0:
 from __future__ import annotations
 
 import os
+import threading
+import time
 import warnings
 
 # turso/lib.py has a `return` inside a `finally` block (SyntaxWarning) and its
@@ -152,20 +154,94 @@ CREATE TABLE IF NOT EXISTS asset_renames (
 """
 
 
+def _is_locked_error(exc: BaseException) -> bool:
+    """Return True if exc is a turso/libSQL 'database is locked' Busy error.
+
+    libSQL surfaces this as either ``turso.Busy`` or
+    ``turso.lib.OperationalError`` with the substring "database is locked".
+    We match on both rather than importing internal names.
+    """
+    name = type(exc).__name__
+    if name == "Busy":
+        return True
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database is busy" in msg
+
+
+def _retry_on_locked(fn, *, attempts: int = 40, base_sleep: float = 0.01):
+    """Call ``fn()`` and retry while the DB reports it's locked.
+
+    libSQL does not honor SQLite's ``PRAGMA busy_timeout`` — concurrent
+    writers receive ``Busy`` immediately rather than queueing — so we
+    do the waiting in Python. Total worst-case wait is roughly
+    ``attempts * base_sleep`` plus exponential growth (~10s with the
+    defaults), matching the old PRAGMA value.
+    """
+    sleep = base_sleep
+    last_exc: BaseException | None = None
+    for _ in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            if not _is_locked_error(exc):
+                raise
+            last_exc = exc
+            time.sleep(sleep)
+            sleep = min(sleep * 1.5, 0.25)
+    raise last_exc  # type: ignore[misc]
+
+
+class _RetryingConn:
+    """Wraps a turso connection so that execute()/commit() retry on Busy."""
+
+    def __init__(self, inner) -> None:
+        self._inner = inner
+
+    def execute(self, *args, **kwargs):
+        return _retry_on_locked(lambda: self._inner.execute(*args, **kwargs))
+
+    def executemany(self, *args, **kwargs):
+        return _retry_on_locked(lambda: self._inner.executemany(*args, **kwargs))
+
+    def commit(self):
+        return _retry_on_locked(lambda: self._inner.commit())
+
+    def rollback(self):
+        return self._inner.rollback()
+
+    def close(self):
+        return self._inner.close()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 def _connect(db_path: str):
     turso_url = os.environ.get("BARCA_TURSO_URL")
     if turso_url:
         from turso.sync import connect as sync_connect
 
-        conn = sync_connect(
+        raw = sync_connect(
             db_path,
             remote_url=turso_url,
             auth_token=os.environ.get("BARCA_TURSO_TOKEN", ""),
         )
     else:
-        conn = turso.connect(db_path)
-    conn.execute("PRAGMA busy_timeout = 10000")
+        raw = turso.connect(db_path)
+    conn = _RetryingConn(raw)
+    # busy_timeout is a no-op on turso (it raises Busy immediately even here),
+    # but set it anyway in case a future libSQL version honors it.
+    try:
+        conn.execute("PRAGMA busy_timeout = 10000")
+    except Exception:
+        pass
     return conn
+
+
+# Process-wide lock guarding schema init. Schema creation/migration is fast
+# but writes to many tables; serialising it across threads avoids the
+# pile-up of ALTER TABLE statements racing on a fresh DB.
+_SCHEMA_INIT_LOCK = threading.Lock()
 
 
 class MetadataStore:
@@ -176,7 +252,8 @@ class MetadataStore:
         if parent:
             os.makedirs(parent, exist_ok=True)
         self.conn = _connect(db_path)
-        self._init_schema()
+        with _SCHEMA_INIT_LOCK:
+            self._init_schema()
 
     def _init_schema(self) -> None:
         for statement in _SCHEMA.strip().split(";"):

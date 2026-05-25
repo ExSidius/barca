@@ -162,17 +162,24 @@ def test_sink_failure_does_not_fail_parent(tmp_path):
     project_dir = tmp_path / "sinkfail"
     project_dir.mkdir()
 
+    # Pick a sink path whose parent is a regular file, not a directory. Writing
+    # under it raises NotADirectoryError — an OS-level failure that root cannot
+    # bypass, so the test is hermetic across CI containers and dev machines.
+    blocker = project_dir / "blocker"
+    blocker.write_text("not a directory")
+    sink_target = blocker / "child.json"
+
     mod_dir = project_dir / "sfmod"
     mod_dir.mkdir()
     (mod_dir / "__init__.py").write_text("")
     (mod_dir / "assets.py").write_text(
-        textwrap.dedent("""\
+        textwrap.dedent(f"""\
         from barca import asset, sink, Always
 
         @asset(freshness=Always())
-        @sink("/nonexistent_root/definitely/not/writable.json", serializer="json")
+        @sink({str(sink_target)!r}, serializer="json")
         def producer():
-            return {"x": 1}
+            return {{"x": 1}}
         """)
     )
     (project_dir / "barca.toml").write_text(

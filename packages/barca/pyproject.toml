@@ -13,6 +13,13 @@ dependencies = [
     "watchfiles>=0.21",
 ]
 
+[project.optional-dependencies]
+# Datadog APM. Enable with `uv sync --extra datadog` and set DD_SERVICE,
+# DD_ENV, DD_AGENT_HOST per the standard ddtrace env contract. With the
+# extra absent, `barca._telemetry` falls back to no-op stubs so the rest
+# of the codebase can call into it unconditionally.
+datadog = ["ddtrace>=2.0"]
+
 [project.scripts]
 barca = "barca.cli.cli:app"
 

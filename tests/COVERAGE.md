@@ -9,9 +9,10 @@ update it whenever you add or remove tests.
 - 🟡 Partially covered (core case tested, edge cases missing)
 - ❌ Not covered
 
-**Current state**: 266 tests collected, 128 passing, 135 failing (red for Phase 3),
-3 skipped. Every failing test is an executable specification of what Phase 3
-must deliver.
+**Current state**: 263 tests collected, 261 passing, 2 failing. Phase 3 has
+landed — the run/dev/prune commands, freshness primitive, sinks, and the
+hashing protocol bump are all in. The two remaining failures are tracked in
+the "Known failures" section below.
 
 ---
 
@@ -138,14 +139,14 @@ specifically the "messy real-world stuff" the spec doesn't directly describe.
 | Identical source → same hash | `test_cache_stability.py::test_identical_decorator_metadata_same_hash` |
 | Source change → different hash | `test_cache_stability.py::test_source_change_changes_hash` |
 | Decorator metadata change → different hash | `test_cache_stability.py::test_decorator_metadata_change_changes_hash` |
-| **Kwarg order in metadata → stable** (currently FAILS, Phase 3 TODO: add sort_keys=True) | `test_cache_stability.py::test_kwarg_order_in_metadata_does_not_matter` |
+| Kwarg order in metadata → stable (`sort_keys=True` in `compute_definition_hash`) | `test_cache_stability.py::test_kwarg_order_in_metadata_does_not_matter` |
 | Dep cone change → different hash | `test_cache_stability.py::test_dep_cone_change_changes_hash` |
 | Python version → different hash | `test_cache_stability.py::test_python_version_change_changes_hash` |
 | Serializer kind → different hash | `test_cache_stability.py::test_serializer_kind_change_changes_hash` |
 | PROTOCOL_VERSION change → different hash | `test_cache_stability.py::test_protocol_version_baked_into_hash` |
 | run_hash stable for same inputs | `test_cache_stability.py::test_run_hash_stable_for_same_inputs` |
 | run_hash changes with upstream | `test_cache_stability.py::test_run_hash_changes_with_upstream` |
-| **run_hash upstream order → stable** (currently FAILS, Phase 3 TODO: sort before hash) | `test_cache_stability.py::test_run_hash_upstream_order_should_be_stable` |
+| run_hash upstream order → stable (`sorted()` applied in `compute_run_hash`) | `test_cache_stability.py::test_run_hash_upstream_order_should_be_stable` |
 | Partition key affects run_hash | `test_cache_stability.py::test_run_hash_partition_key_affects_hash` |
 | Comment-only edit behavior (pinned at "busts cache") | `test_cache_stability.py::test_comment_only_edit_decision_pending` |
 | Whitespace-only edit behavior (pinned at "busts cache") | `test_cache_stability.py::test_whitespace_only_edit_decision_pending` |
@@ -234,30 +235,42 @@ specifically the "messy real-world stuff" the spec doesn't directly describe.
 | YAML scenarios | `test_scenarios` | 28 |
 | **Total** | 27 files + 28 YAML | **266** |
 
-Current run: **128 passing, 135 failing, 3 skipped**. Every failing test
-is an executable specification Phase 3 must make green.
+Current run: **261 passing, 2 failing**. Phase 3 shipped in commits
+through `36264ce`. The TODO list below is preserved as a historical
+record of the Phase 3 scope and crossed-off to reflect actual landing.
 
-## Phase 3 TODO list (extracted from failing tests)
+## Known failures
 
-Implementing the source to turn all these green is the Phase 3 plan. Key items:
+1. `tests/test_sink.py::test_sink_failure_does_not_fail_parent` — sink
+   writes to an unwritable path should set `result.sink_failed >= 1`,
+   but the counter stays 0. Bug is in how `run_pass` propagates sink
+   exceptions into the `RunPassResult` tally.
+2. `tests/test_store_concurrency.py::test_concurrent_upsert_unique_assets`
+   — 20 threads upserting distinct assets get `OperationalError:
+   database is locked`. libSQL MVCC + per-thread `MetadataStore`
+   instances aren't enough; needs WAL pragma or a retry-on-lock loop
+   in the store layer.
 
-1. **`run_pass` / `run_loop`** — the entire orchestration core
-2. **`dev_watch` / `handle_file_change`** — file watcher + pure reindex dispatch
-3. **`prune`** — reachability analysis + filesystem + DB cleanup
-4. **`@sink` wiring** — parent-asset linkage, sink inspection, artifact writing via fsspec
-5. **Reindex three-way diff with rename detection** (AST match + `name=` match)
-6. **`freshness=` decorator kwarg** across `@asset`, `@sensor`, `@effect`
-7. **Default freshness = `Always`** for `@asset` and `@effect`
-8. **Sensor requires explicit freshness** at decoration time; rejects `Always`
-9. **`stale_policy` on `refresh()`** with error/warn/pass semantics
-10. **`ManualBlocksDownstream`** invariant enforcement in run_pass
-11. **`collect()` input resolution** — dict[tuple[str,...], T]
-12. **Dynamic partitions lazy resolution** + implicit upstream edge
-13. **`@unsafe` — remove `cache=` parameter** completely
-14. **Protocol version bump to 0.4.0** (invalidate all old caches)
-15. **JSON serialization sort_keys=True** in `compute_definition_hash`
-16. **Sort upstream_materialization_ids** in `compute_run_hash`
-17. **CLI commands**: `run`, `dev`, `prune`; remove `reconcile`
-18. **`--stale-policy` option** on `assets refresh`
-19. **`[unsafe]` badge** in `assets list` CLI output
-20. **Sink failure prominence** in `assets list` and job logs
+## Phase 3 TODO list (historical — all landed except as noted)
+
+1. ✅ `run_pass` / `run_loop` — orchestration core
+2. ✅ `dev_watch` / `handle_file_change` — watcher + pure reindex dispatch
+3. ✅ `prune` — reachability analysis + filesystem + DB cleanup
+4. ✅ `@sink` wiring — parent linkage, inspection, fsspec write
+5. ✅ Reindex three-way diff with rename detection (AST + `name=`)
+6. ✅ `freshness=` decorator kwarg across `@asset`, `@sensor`, `@effect`
+7. ✅ Default freshness = `Always` for `@asset` and `@effect`
+8. ✅ Sensor requires explicit freshness; rejects `Always`
+9. ✅ `stale_policy` on `refresh()` (error/warn/pass)
+10. ✅ `ManualBlocksDownstream` enforcement in `run_pass`
+11. ✅ `collect()` input resolution — `dict[tuple[str, ...], T]`
+12. ✅ Dynamic partitions lazy resolution + implicit upstream edge
+13. ✅ `@unsafe` — `cache=` parameter removed
+14. ✅ `PROTOCOL_VERSION` bumped to `0.4.0`
+15. ✅ `sort_keys=True` in `compute_definition_hash`
+16. ✅ `sorted(upstream_materialization_ids)` in `compute_run_hash`
+17. ✅ CLI commands `run`, `dev`, `prune`; `reconcile` removed
+18. ✅ `--stale-policy` on `assets refresh`
+19. ✅ `[unsafe]` badge in `assets list`
+20. 🟡 Sink failure prominence — sink runs and parent survives, but
+       `RunPassResult.sink_failed` doesn't increment. See "Known failures" #1.
