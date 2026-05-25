@@ -27,6 +27,7 @@ from typing import Any
 
 _TRACER: Any | None = None
 _ENABLED: bool = False
+_INITIALIZED: bool = False
 
 
 def init_telemetry() -> bool:
@@ -34,11 +35,13 @@ def init_telemetry() -> bool:
 
     Returns True when real tracing is active, False when the shim stays
     in no-op mode. Safe to call multiple times — subsequent calls return
-    the same answer without reconfiguring.
+    the cached answer without re-reading the environment.
     """
-    global _TRACER, _ENABLED
-    if _TRACER is not None:
+    global _TRACER, _ENABLED, _INITIALIZED
+    if _INITIALIZED:
         return _ENABLED
+
+    _INITIALIZED = True
 
     if os.environ.get("BARCA_DATADOG_ENABLED") != "1":
         _ENABLED = False
@@ -62,7 +65,13 @@ def span(name: str, **tags: Any) -> Iterator[Any]:
     When ddtrace isn't active this is a zero-allocation pass-through.
     Tag values are coerced to strings on the boundary so callers can
     pass ints / paths / pydantic models without thinking about it.
+
+    Lazily calls ``init_telemetry()`` so spans opened from CLI entry
+    points (which don't go through ``server.logging.configure_logging``)
+    still get attached to the configured tracer when the extra is on.
     """
+    if not _INITIALIZED:
+        init_telemetry()
     if not _ENABLED or _TRACER is None:
         yield None
         return

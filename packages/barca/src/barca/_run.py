@@ -43,6 +43,7 @@ from barca._models import (
     AssetSummary,
     RunPassResult,
 )
+from barca._telemetry import span
 
 if TYPE_CHECKING:
     from barca._store import MetadataStore
@@ -52,6 +53,11 @@ logger = logging.getLogger(__name__)
 
 def run_pass(store: MetadataStore, repo_root: Path) -> RunPassResult:
     """Execute a single reconciliation pass."""
+    with span("barca.run_pass", repo_root=str(repo_root)):
+        return _run_pass_impl(store, repo_root)
+
+
+def _run_pass_impl(store: MetadataStore, repo_root: Path) -> RunPassResult:
     diff = reindex(store, repo_root)
 
     result = RunPassResult(

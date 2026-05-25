@@ -59,6 +59,7 @@ from barca._models import (
     StaleUpstreamError,
 )
 from barca._store import MetadataStore
+from barca._telemetry import span
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,11 @@ def reindex(store: MetadataStore, repo_root: Path) -> ReindexDiff:
     Returns a ``ReindexDiff`` describing what changed since the last reindex.
     Spec rule: ReindexShowsDiff.
     """
+    with span("barca.reindex", repo_root=str(repo_root)):
+        return _reindex_impl(store, repo_root)
+
+
+def _reindex_impl(store: MetadataStore, repo_root: Path) -> ReindexDiff:
     config = load_config(repo_root)
     module_names = configured_modules(config)
     if not module_names:
@@ -737,6 +743,38 @@ def _refresh_partitioned(
 
 
 def _execute_materialization(
+    store: MetadataStore,
+    repo_root: Path,
+    detail: AssetDetail,
+    mat_id: int,
+    run_hash: str,
+    input_kwargs: dict,
+    upstream_mat_ids: list[int],
+    partition_key_json: str | None = None,
+    *,
+    stale_inputs_used: bool = False,
+) -> None:
+    with span(
+        "barca.materialize",
+        asset_slug=detail.asset.asset_slug,
+        logical_name=detail.asset.logical_name,
+        definition_hash=detail.asset.definition_hash,
+        run_hash=run_hash,
+    ):
+        _execute_materialization_impl(
+            store,
+            repo_root,
+            detail,
+            mat_id,
+            run_hash,
+            input_kwargs,
+            upstream_mat_ids,
+            partition_key_json,
+            stale_inputs_used=stale_inputs_used,
+        )
+
+
+def _execute_materialization_impl(
     store: MetadataStore,
     repo_root: Path,
     detail: AssetDetail,
