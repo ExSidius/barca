@@ -16,6 +16,9 @@ Architecture: Rust plans and spawns N Python worker processes per phase. Workers
 | Deep Diamond (18 assets, 5-wide) | **77ms** | 638ms | 3.9s | 8.3x |
 | Wide Layers (63 assets, 3×20 layers) | **167ms** | 919ms | 3.9s | 5.5x |
 | Mixed I/O+CPU (API calls + SHA compute) | **220ms** | 971ms | 3.9s | 4.4x |
+| Large Payloads (5-step chain, 10k rows) | **203ms** | 631ms | 6.0s | 3.1x |
+| Map/Reduce (1→50→1) | **89ms** | 917ms | 4.1s | 10.3x |
+| Multi-file Discovery (50 files, 100 assets) | **60ms** | 911ms | 4.0s | 15.1x |
 
 ## Detailed Results
 
@@ -97,6 +100,36 @@ Architecture: Rust plans and spawns N Python worker processes per phase. Workers
 | dagster | 970.5 ms ± 7.6 ms | 4.41x |
 | prefect | 3885 ms ± 48 ms | 17.7x |
 
+### 9. Large Payloads: 5-step chain with 10k-row datasets
+
+Tests JSON serialization overhead — each step passes ~1MB of data through stdout.
+
+| Command | Mean | Relative |
+|:---|---:|---:|
+| **barca** | 202.7 ms ± 3.7 ms | 1.00 |
+| dagster | 630.6 ms ± 3.0 ms | 3.11x |
+| prefect | 6032 ms ± 93 ms | 29.8x |
+
+### 10. Map/Reduce: 1 source → 50 mappers → 1 reducer
+
+Classic map/reduce fan-out/fan-in. 3 phases: source, 50 parallel mappers, reducer.
+
+| Command | Mean | Relative |
+|:---|---:|---:|
+| **barca** | 88.7 ms ± 1.4 ms | 1.00 |
+| dagster | 917.4 ms ± 43.9 ms | 10.3x |
+| prefect | 4090 ms ± 205 ms | 46.1x |
+
+### 11. Multi-file Discovery: 50 files, 100 assets
+
+Tests parsing/discovery speed at scale. Barca: ruff parses 50 files in Rust. Dagster/Prefect: Python imports 100 assets.
+
+| Command | Mean | Relative |
+|:---|---:|---:|
+| **barca** | 60.4 ms ± 3.1 ms | 1.00 |
+| dagster | 911.0 ms ± 18.1 ms | 15.1x |
+| prefect | 3959 ms ± 27 ms | 65.5x |
+
 ## Reproducing
 
 ```bash
@@ -110,4 +143,7 @@ hyperfine --warmup 1 --runs 3 benchmarks/spaceflights/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/deep_diamond/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/wide_layers/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/mixed_io_cpu/*/run.sh
+hyperfine --warmup 1 --runs 3 benchmarks/large_payloads/*/run.sh
+hyperfine --warmup 1 --runs 3 benchmarks/map_reduce/*/run.sh
+hyperfine --warmup 1 --runs 3 benchmarks/multi_file_discovery/*/run.sh
 ```
