@@ -276,21 +276,46 @@ fn build_phases(
             }
         };
 
-        // Convert chains to step lists. Partitioned nodes expand into N independent
-        // step-groups that can be distributed across streams.
+        // Convert chains to step lists. Partitioned chains produce partition-aligned
+        // work units: all steps for one partition value stay together in one stream.
         let mut work_units: Vec<Vec<StreamStep>> = Vec::new();
         for &chain_idx in &chains_in_phase {
             let steps = chain_to_steps(dag, &topology.chains[chain_idx]);
-            let has_partitions = steps.iter().any(|s| !s.partition.is_empty());
+            let partitioned_steps: Vec<&StreamStep> =
+                steps.iter().filter(|s| !s.partition.is_empty()).collect();
 
-            if has_partitions && steps.len() > 1 {
-                // Mixed chain with partitions — each expanded step is independent.
-                for step in steps {
-                    work_units.push(vec![step]);
-                }
-            } else {
-                // Non-partitioned chain or single-step partition — keep as unit.
+            if partitioned_steps.is_empty() {
+                // No partitions — keep chain as one work unit.
                 work_units.push(steps);
+            } else {
+                // Group steps by partition key → each group is one work unit.
+                let mut by_partition: HashMap<String, Vec<StreamStep>> = HashMap::new();
+                let mut unpartitioned: Vec<StreamStep> = Vec::new();
+
+                for step in steps {
+                    if step.partition.is_empty() {
+                        unpartitioned.push(step);
+                    } else {
+                        let key = step
+                            .partition
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        by_partition.entry(key).or_default().push(step);
+                    }
+                }
+
+                // Unpartitioned steps go in their own work unit.
+                if !unpartitioned.is_empty() {
+                    work_units.push(unpartitioned);
+                }
+                // Each partition's steps form one work unit (stays in one process).
+                let mut keys: Vec<String> = by_partition.keys().cloned().collect();
+                keys.sort();
+                for key in keys {
+                    work_units.push(by_partition.remove(&key).unwrap());
+                }
             }
         }
 

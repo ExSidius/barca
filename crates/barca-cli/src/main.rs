@@ -242,33 +242,43 @@ fn expand_pending_partitions(
         }
     }
 
-    // Distribute expanded steps across streams.
-    let total_steps = all_expanded_steps.len() + passthrough_steps.len();
-    let num_streams = total_steps.min(pool_size).max(1);
+    // Group expanded steps by partition key for aligned execution.
+    let mut by_partition: HashMap<String, Vec<barca_core::planner::StreamStep>> = HashMap::new();
+    for step in all_expanded_steps {
+        let key = step
+            .partition
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        by_partition.entry(key).or_default().push(step);
+    }
+
+    // Build work units: each partition group + passthrough steps.
+    let mut work_units: Vec<Vec<barca_core::planner::StreamStep>> = Vec::new();
+    if !passthrough_steps.is_empty() {
+        work_units.push(passthrough_steps);
+    }
+    let mut keys: Vec<String> = by_partition.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        work_units.push(by_partition.remove(&key).unwrap());
+    }
+
+    // Distribute work units across streams via bin-packing.
+    let num_streams = work_units.len().min(pool_size).max(1);
     let mut streams: Vec<Vec<barca_core::planner::StreamStep>> = vec![Vec::new(); num_streams];
     let mut sizes: Vec<usize> = vec![0; num_streams];
 
-    // Passthrough steps first.
-    for step in passthrough_steps {
+    for unit in work_units {
         let target = sizes
             .iter()
             .enumerate()
             .min_by_key(|(_, s)| *s)
             .map(|(i, _)| i)
             .unwrap_or(0);
-        sizes[target] += 1;
-        streams[target].push(step);
-    }
-    // Then expanded partition steps.
-    for step in all_expanded_steps {
-        let target = sizes
-            .iter()
-            .enumerate()
-            .min_by_key(|(_, s)| *s)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        sizes[target] += 1;
-        streams[target].push(step);
+        sizes[target] += unit.len();
+        streams[target].extend(unit);
     }
 
     let worker_streams: Vec<WorkerStream> = streams
@@ -305,6 +315,9 @@ fn expand_combos(dims: &HashMap<String, Vec<String>>) -> Vec<HashMap<String, Str
 }
 
 /// Determine what values need to be provided to workers in this phase.
+/// For cross-phase deps, includes the output value so workers can resolve inputs.
+/// For partition-aligned deps, `serialize_batch` rewrites input IDs to include
+/// partition suffixes, so the worker finds them in its local cache.
 fn build_provided_inputs(
     phase: &Phase,
     all_outputs: &HashMap<String, serde_json::Value>,
@@ -313,9 +326,34 @@ fn build_provided_inputs(
 
     for stream in &phase.streams {
         for step in &stream.steps {
+            // Collect all upstream IDs this step needs (with partition suffix if applicable).
+            let suffix = if step.partition.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "[{}]",
+                    step.partition
+                        .iter()
+                        .map(|(k, v)| format!("{k}={v}"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            };
+
             for upstream_id in step.inputs.values() {
-                if all_outputs.contains_key(upstream_id) && !provided.contains_key(upstream_id) {
-                    provided.insert(upstream_id.clone(), all_outputs[upstream_id].clone());
+                // Try direct match first.
+                if let Some(output) = all_outputs.get(upstream_id) {
+                    provided
+                        .entry(upstream_id.clone())
+                        .or_insert_with(|| output.clone());
+                    continue;
+                }
+                // Try partition-aligned match.
+                if !suffix.is_empty() {
+                    let aligned_id = format!("{upstream_id}{suffix}");
+                    if let Some(output) = all_outputs.get(&aligned_id) {
+                        provided.entry(aligned_id).or_insert_with(|| output.clone());
+                    }
                 }
             }
         }
@@ -400,11 +438,31 @@ fn serialize_batch(
         .steps
         .iter()
         .map(|s| {
+            // For partitioned steps, rewrite input references to include the
+            // partition suffix so the worker's cache can find them.
+            let inputs = if s.partition.is_empty() {
+                s.inputs.clone()
+            } else {
+                let suffix = s
+                    .partition
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                s.inputs
+                    .iter()
+                    .map(|(param, upstream_id)| {
+                        let aligned_id = format!("{upstream_id}[{suffix}]");
+                        (param.clone(), aligned_id)
+                    })
+                    .collect()
+            };
+
             let mut step = serde_json::json!({
                 "node_id": s.node_id,
                 "function_name": s.function_name,
                 "source_file": s.source_file,
-                "inputs": s.inputs,
+                "inputs": inputs,
             });
             if !s.partition.is_empty() {
                 step["partition"] = serde_json::json!(s.partition);
