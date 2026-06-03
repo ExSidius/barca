@@ -3,7 +3,8 @@ pub mod hash;
 pub mod model;
 pub mod parse;
 pub mod plan;
+pub mod planner;
 
 pub use dag::Dag;
 pub use model::*;
-pub use plan::ExecutionPlan;
+pub use planner::ExecutionPlan;
