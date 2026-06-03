@@ -1,88 +1,77 @@
 # Benchmark Results
 
-Last run: 2026-06-02 | Apple Silicon (M-series) | Rust release build
+Last run: 2026-06-03 | Apple Silicon (M-series) | Rust release build | Multi-process dispatch
 
-All benchmarks measure **cold-start, end-to-end wall time** — from process spawn to result persisted. Each framework writes results to its own local DB.
+Architecture: Rust plans and spawns N Python worker processes per phase. Workers communicate via stdout (JSON lines). Rust owns all DB persistence.
 
 ## 1. Trivial: Single asset (zero work)
 
-Measures pure framework overhead.
-
 | Command | Mean | Relative |
 |:---|---:|---:|
-| **barca** | 46.0 ms ± 1.8 ms | 1.00 |
-| dagster | 552.6 ms ± 24.1 ms | 12.03x |
-| prefect | 3902 ms ± 38 ms | 84.91x |
+| **barca** | 28.6 ms ± 0.5 ms | 1.00 |
+| dagster | 534.7 ms ± 14.2 ms | 18.7x |
+| prefect | 3912 ms ± 171 ms | 136.8x |
 
 ## 2. Chain 100: Linear chain of 100 assets
 
-Sequential DAG — each asset consumes the previous. Tests per-node overhead.
+1 phase, 1 stream (entire chain bundled vertically in one process).
 
 | Command | Mean | Relative |
 |:---|---:|---:|
-| **barca** | 52.8 ms ± 1.6 ms | 1.00 |
-| dagster | 1130 ms ± 23 ms | 21.42x |
-| prefect | 3952 ms ± 87 ms | 74.87x |
+| **barca** | 37.4 ms ± 1.2 ms | 1.00 |
+| dagster | 1113 ms ± 20 ms | 29.8x |
+| prefect | 4310 ms ± 840 ms | 115.2x |
 
 ## 3. Fan-out 500: 500 independent assets (zero work)
 
-All 500 assets are independent (tier 0). Tests scaling with node count.
+1 phase, 16 streams (500 assets distributed across 16 worker processes).
 
 | Command | Mean | Relative |
 |:---|---:|---:|
-| **barca** | 104.2 ms ± 2.9 ms | 1.00 |
-| dagster | 2351 ms ± 59 ms | 22.56x |
-| prefect | 3978 ms ± 34 ms | 38.17x |
+| **barca** | 86.9 ms ± 3.4 ms | 1.00 |
+| dagster | 2325 ms ± 19 ms | 26.8x |
+| prefect | 3975 ms ± 75 ms | 45.7x |
 
 ## 4. Fan-out 500 × 50ms: Parallel throughput (simulated I/O)
 
-500 independent assets, each sleeping 50ms. Sequential minimum: 25.0s. Tests parallelism.
+500 independent assets each sleeping 50ms. Sequential minimum: 25.0s.
 
-| Command | Time (single run) | Notes |
+| Command | Wall time | Notes |
 |:---|---:|:---|
-| **barca** | 1.5s | ThreadPoolExecutor parallelism (all 500 in one tier) |
-| dagster | 34.8s | Sequential in-process executor |
-| prefect | 36.9s | Sequential task execution |
+| **barca** | 1.9s | 16 worker processes, ~31 steps each |
+| dagster | 33.6s | Sequential in-process |
+| prefect | 33.5s | Sequential task execution |
 
-Barca achieves **~23x speedup** over sequential (1.5s vs 25s theoretical sequential). Limited by default ThreadPoolExecutor size, not framework overhead.
+Barca achieves **17.7x speedup** over sequential via multi-process parallelism.
 
 ## 5. Spaceflights: 10-asset diamond DAG (sklearn)
 
-Fan-out/fan-in topology with real sklearn compute. Tests framework overhead when dominated by actual work.
-
-```
-raw_shuttles ──→ prep_shuttles ──┐
-raw_companies ─→ prep_companies ─├→ master_table → split → train → evaluate
-raw_reviews ───→ prep_reviews ──┘
-```
+4 phases, 6 streams. Phase 1: 3 parallel [raw→prep] chains. Phase 2+: [master→split→train→eval].
 
 | Command | Mean | Relative |
 |:---|---:|---:|
-| **barca** | 551.3 ms ± 3.7 ms | 1.00 |
-| dagster | 1252 ms ± 23 ms | 2.27x |
-| prefect | 3992 ms ± 90 ms | 7.24x |
+| **barca** | 1087 ms ± 23 ms | 1.00 |
+| dagster | 1241 ms ± 27 ms | 1.14x |
+| prefect | 5294 ms ± 2201 ms | 4.87x |
 
-## Key observations
+## Key improvements (multi-process dispatch)
 
-- **Per-asset overhead**: barca ~0.1ms, dagster ~4ms, prefect ~8ms
-- **Parallelism**: barca parallelizes independent nodes via ThreadPoolExecutor; dagster/prefect run sequentially in these benchmarks
-- **Import tax**: prefect's ~3.9s floor is mostly import time (huge dependency tree); dagster's ~0.5s floor is similar
-- **Compute-dominated**: when sklearn dominates (spaceflights), the gap narrows to 2.3x (barca vs dagster)
-- **I/O-dominated**: when work is parallel-friendly (500×50ms), barca's parallelism gives 23x over sequential
+| Benchmark | Previous (ThreadPoolExecutor) | Current (multi-process) | Change |
+|:---|---:|---:|---:|
+| Trivial | 46ms | 29ms | **37% faster** |
+| Chain 100 | 53ms | 37ms | **30% faster** |
+| Fan-out 500 | 104ms | 87ms | **16% faster** |
+| Fan-out 500×50ms | 1.5s | 1.9s | 27% slower (process spawn overhead vs threads) |
+| Spaceflights | 551ms | 1087ms | Slower (4 phases × process spawn overhead) |
+
+Multi-process is faster for trivial/chain cases (less Python import overhead with direct stdout), but adds latency for compute-heavy multi-phase DAGs where process spawn cost exceeds the parallelism benefit. The spaceflights regression is because sklearn compute dominates and we pay 4× process spawn cost.
 
 ## Reproducing
 
 ```bash
-# Prerequisites: Rust toolchain, uv, hyperfine
 cargo build --release && maturin develop --release
-
-# Run all:
 hyperfine --warmup 3 --runs 10 benchmarks/trivial/*/run.sh
 hyperfine --warmup 2 --runs 5 benchmarks/chain_100/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/fan_out_500/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/spaceflights/*/run.sh
-# 500×50ms (too slow for hyperfine, run once):
-benchmarks/fan_out_500_50ms/barca/run.sh
-benchmarks/fan_out_500_50ms/dagster/run.sh
-benchmarks/fan_out_500_50ms/prefect/run.sh
 ```

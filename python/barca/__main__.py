@@ -1,5 +1,5 @@
-"""Allow `python -m barca` to invoke the runner."""
+"""Allow `python -m barca._worker` to invoke the worker."""
 
-from barca._runner import main
+from barca._worker import main
 
 main()

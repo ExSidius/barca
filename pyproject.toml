@@ -7,7 +7,7 @@ name = "barca"
 version = "0.1.0"
 description = "Invisible asset orchestrator"
 requires-python = ">=3.10"
-dependencies = ["pyturso>=0.5.0"]
+dependencies = []
 
 [tool.maturin]
 bindings = "bin"
