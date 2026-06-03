@@ -10,6 +10,7 @@ use crate::model::{DagNode, DeclaredInput, EdgeKind, ExtractedNode, NodeKind, No
 use crate::plan::{DagShape, KindBreakdown, PlanStats};
 
 /// The constructed DAG — validated, acyclic, ready for plan generation.
+#[derive(Debug)]
 pub struct Dag {
     pub graph: DiGraph<DagNode, EdgeKind>,
     index: HashMap<String, NodeIndex>,

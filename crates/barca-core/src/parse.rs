@@ -344,9 +344,11 @@ fn extract_partition_values(expr: &Expr) -> Vec<PartitionValue> {
             .filter_map(|e| match e {
                 Expr::StringLiteral(s) => Some(PartitionValue::Str(s.value.to_string())),
                 Expr::NumberLiteral(n) => {
-                    // Try to extract integer
-                    let s = format!("{:?}", n.value);
-                    s.parse::<i64>().ok().map(PartitionValue::Int)
+                    if let ast::Number::Int(i) = &n.value {
+                        i.as_i64().map(PartitionValue::Int)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             })
@@ -395,8 +397,9 @@ fn extract_int_kwarg(keywords: &[&Keyword], name: &str) -> Option<u32> {
         let Some(ref ident) = kw.arg else { continue };
         if ident.as_str() == name {
             if let Expr::NumberLiteral(n) = &kw.value {
-                let s = format!("{:?}", n.value);
-                return s.parse::<u32>().ok();
+                if let ast::Number::Int(i) = &n.value {
+                    return i.as_u32();
+                }
             }
         }
     }
