@@ -6,71 +6,88 @@ Last run: 2026-06-03 | Apple Silicon (M-series) | Rust release build
 
 ### Environment
 - **Hardware**: Apple Silicon (M-series), same machine for all benchmarks
-- **Barca**: Python 3.14.3 (from workspace .venv), Rust release binary
-- **Dagster**: Python 3.12.0 (latest compatible version), dagster latest
+- **Barca**: Python 3.14.3 (workspace .venv), Rust release binary
+- **Dagster**: Python 3.12.0 (latest compatible), dagster latest
 - **Prefect**: Python 3.12.0, prefect latest
-- **Python version difference**: disclosed — dagster and prefect do not yet support Python 3.14
+- **Python version note**: dagster and prefect do not yet support Python 3.14
 
-### Parallelism
-- **Barca**: multi-process dispatch (Rust spawns N Python worker processes, one per stream)
-- **Dagster**: `materialize()` API runs single-threaded in-process. Dagster's multiprocess executor requires a running dagster instance (server mode), which is a fundamentally different deployment model. Script-mode benchmarks (cold start) are inherently sequential.
-- **Prefect**: `ConcurrentTaskRunner` with `.submit()` tested for benchmarks with ≤18 independent tasks. For >50 tasks, prefect's internal SQLite state tracking crashes under concurrent load. For the tested parallel benchmarks, the per-task overhead (~150ms) exceeded any parallelism benefit.
+### Execution modes tested
 
-### What this means
-Barca's parallelism advantage is real but partly architectural: barca was designed for multi-process dispatch from the start. Dagster and Prefect were designed around server-mode execution where parallelism is handled by the server's executor pool. In cold-start script mode, both run sequentially. This is a genuine user-facing difference — barca is faster for script-invoked pipelines.
+| Framework | Mode | Parallelism |
+|---|---|---|
+| **Barca** | multi-process | Rust spawns N Python workers (pool_size = cpu_count) |
+| **Dagster** (script) | `materialize()` | Sequential in-process (only mode available in script mode) |
+| **Dagster** (server) | `dagster dev` + GraphQL | multiprocess_executor spawns subprocess per asset |
+| **Prefect** (sequential) | direct task calls | Sequential (default) |
+| **Prefect** (parallel) | `ConcurrentTaskRunner` + `.submit()` | Thread-based concurrency (max_workers=16) |
 
 ### Measurement
 - hyperfine with --warmup 3 for sub-100ms benchmarks (≥10 runs)
 - hyperfine with --warmup 1 for longer benchmarks (3-5 runs)
 - All times are wall-clock cold start (process spawn to exit)
+- Server-mode benchmarks: server pre-started (warm), timing is trigger-to-completion
 
-## Summary
+## Summary: script mode (cold start)
+
+All frameworks invoked as scripts — no pre-started servers.
 
 | # | Benchmark | barca | dagster | prefect | vs dagster |
 |---|---|---:|---:|---:|---:|
 | 1 | Trivial (1 asset) | **29ms** | 535ms | 3.9s | 18.7x |
 | 2 | Chain 100 (linear) | **37ms** | 1.1s | 4.3s | 29.8x |
-| 3 | Fan-out 500 (independent) | **87ms** | 2.3s | 4.0s | 26.8x |
-| 4 | Fan-out 500×50ms (parallel I/O) | **1.9s** | 33.6s | 33.5s | 17.7x |
-| 5 | Spaceflights (diamond, sklearn) | **574ms** | 1.2s | 3.9s | 2.1x |
-| 6 | Deep Diamond (18 assets, 5-wide) | **83ms** | 678ms | 4.0s | 8.2x |
-| 7 | Wide Layers (63 assets, 3×20) | **167ms** | 919ms | 3.9s | 5.5x |
+| 3 | Fan-out 500 (no work) | **87ms** | 2.3s | 4.0s | 26.8x |
+| 4 | Fan-out 500×50ms | **1.9s** | 33.7s | 33.4s | 17.7x |
+| 5 | Spaceflights (sklearn) | **574ms** | 1.2s | 3.9s | 2.1x |
+| 6 | Deep Diamond (18 assets) | **83ms** | 678ms | 4.0s | 8.2x |
+| 7 | Wide Layers (63 assets) | **167ms** | 919ms | 3.9s | 5.5x |
 | 8 | Mixed I/O+CPU | **231ms** | 1.1s | 4.0s | 4.6x |
-| 9 | Large Payloads (10k rows/step) | **203ms** | 631ms | 6.0s | 3.1x |
+| 9 | Large Payloads (10k rows) | **203ms** | 631ms | 6.0s | 3.1x |
 | 10 | Map/Reduce (1→50→1) | **89ms** | 917ms | 4.1s | 10.3x |
-| 11 | Multi-file (50 files, 100 assets) | **60ms** | 911ms | 4.0s | 15.1x |
+| 11 | Multi-file (50 files) | **60ms** | 911ms | 4.0s | 15.1x |
 | 12 | ETL Pipeline (100k rows) | **604ms** | 953ms | 14.2s | 1.6x |
 | 13 | Wide Join (10→1) | **58ms** | 635ms | 4.1s | 10.9x |
-| 14 | Backfill (10-step × 10 runs) | **282ms** | 6.2s | 40.1s | 22.1x |
+| 14 | Backfill (10-step × 10) | **282ms** | 6.2s | 40.1s | 22.1x |
 
-### Parallelism note
+## Parallel mode comparison (fan_out_500_50ms)
 
-Benchmarks 3, 4, 6, 7, 8, 10, 11, 13 have independent nodes that barca parallelizes across multiple processes. Dagster and Prefect run these sequentially in script mode (their parallelism requires server-mode deployment). Benchmarks 1, 2, 5, 9, 12, 14 are sequential by nature — no parallelism advantage for any framework.
+500 independent tasks, each sleeping 50ms. Sequential minimum: 25.0s. This is the benchmark where parallelism matters most.
 
-For the sequential-only benchmarks, barca's advantage comes purely from lower framework overhead (Rust planning + minimal Python import time).
+| Framework | Mode | Time | Speedup vs sequential |
+|---|---|---:|---:|
+| **Barca** | 16 worker processes | **1.9s** | 13.2x |
+| **Prefect** | ConcurrentTaskRunner (16 workers) | **4.2s** | 6.0x |
+| Dagster | script mode (sequential) | 33.7s | 1.0x |
+| Prefect | script mode (sequential) | 33.4s | 1.0x |
+| Dagster | server + multiprocess_executor | 68.5s | 0.5x (slower than sequential!) |
+
+### Why dagster server mode is slower
+
+Dagster's `multiprocess_executor` spawns a **full Python subprocess per asset**. For 500 trivial tasks, the subprocess spawn overhead (~100ms each) exceeds the 50ms of actual work. This executor is designed for long-running, heavyweight assets — not 500 lightweight ones.
+
+### Why prefect ConcurrentTaskRunner helps
+
+Prefect's ConcurrentTaskRunner uses **threads** (not processes), avoiding subprocess spawn overhead. With `max_workers=16`, it achieves 6x speedup on I/O-bound tasks. However, per-task overhead (~6ms) still limits throughput vs barca's ~0.1ms per-task overhead.
 
 ## Reproducing
 
 ```bash
 cargo build --release && maturin develop --release
 
-# Set up competitor venvs (one time):
-for bench in benchmarks/*/dagster; do
-  uv venv --python 3.12 "$bench/.venv" --clear
-  uv pip install --python "$bench/.venv/bin/python" dagster
-done
-for bench in benchmarks/*/prefect; do
-  uv venv --python 3.12 "$bench/.venv" --clear
-  uv pip install --python "$bench/.venv/bin/python" prefect
-done
-
-# Benchmarks with sklearn need it:
-uv pip install --python benchmarks/spaceflights/dagster/.venv/bin/python scikit-learn
-uv pip install --python benchmarks/spaceflights/prefect/.venv/bin/python scikit-learn
-
-# Run all:
-for bench in trivial chain_100 fan_out_500 spaceflights deep_diamond wide_layers mixed_io_cpu large_payloads map_reduce multi_file_discovery etl_duckdb wide_join incremental_backfill; do
+# Script-mode benchmarks:
+for bench in trivial chain_100 fan_out_500 fan_out_500_50ms spaceflights deep_diamond \
+             wide_layers mixed_io_cpu large_payloads map_reduce multi_file_discovery \
+             etl_duckdb wide_join incremental_backfill; do
   echo "=== $bench ==="
   hyperfine --warmup 1 --runs 3 benchmarks/$bench/*/run.sh
 done
+
+# Server-mode (dagster):
+cd benchmarks/fan_out_500_50ms/dagster_server
+DAGSTER_HOME=/tmp/dagster_bench .venv/bin/dagster dev -f definitions.py -p 3333 &
+sleep 10  # wait for server
+.venv/bin/python trigger.py
+pkill -f "dagster dev"
+
+# Parallel-mode (prefect):
+benchmarks/fan_out_500_50ms/prefect_server/run.sh
 ```

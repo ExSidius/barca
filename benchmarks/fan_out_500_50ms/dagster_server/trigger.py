@@ -4,7 +4,7 @@ import json
 import sys
 import time
 
-import niquests
+import requests
 
 GRAPHQL_URL = "http://localhost:3333/graphql"
 
@@ -30,7 +30,7 @@ def launch_run():
       }
     }
     """
-    resp = niquests.post(GRAPHQL_URL, json={"query": query})
+    resp = requests.post(GRAPHQL_URL, json={"query": query})
     data = resp.json()
     result = data["data"]["launchRun"]
     if result["__typename"] != "LaunchRunSuccess":
@@ -51,7 +51,7 @@ def wait_for_completion(run_id, timeout=300):
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        resp = niquests.post(
+        resp = requests.post(
             GRAPHQL_URL, json={"query": query, "variables": {"runId": run_id}}
         )
         run = resp.json()["data"]["runOrError"]
