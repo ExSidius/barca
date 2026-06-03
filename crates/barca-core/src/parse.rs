@@ -3,6 +3,7 @@
 use ruff_python_ast::{self as ast, Expr, Keyword, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::Ranged;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 use crate::model::{
@@ -41,7 +42,7 @@ fn try_extract_function(
 ) -> Option<ExtractedNode> {
     let mut kind = None;
     let mut keywords: Vec<&Keyword> = Vec::new();
-    let mut sinks: Vec<SinkDecl> = Vec::new();
+    let mut sinks: SmallVec<[SinkDecl; 2]> = SmallVec::new();
     let mut is_unsafe = false;
 
     for decorator in &func.decorator_list {
@@ -201,7 +202,7 @@ fn extract_freshness(keywords: &[&Keyword]) -> Option<Freshness> {
     None
 }
 
-fn extract_inputs(keywords: &[&Keyword]) -> Vec<DeclaredInput> {
+fn extract_inputs(keywords: &[&Keyword]) -> SmallVec<[DeclaredInput; 4]> {
     for kw in keywords {
         let Some(ref ident) = kw.arg else { continue };
         if ident.as_str() != "inputs" {
@@ -211,11 +212,11 @@ fn extract_inputs(keywords: &[&Keyword]) -> Vec<DeclaredInput> {
             return extract_inputs_from_dict(dict);
         }
     }
-    vec![]
+    SmallVec::new()
 }
 
-fn extract_inputs_from_dict(dict: &ast::ExprDict) -> Vec<DeclaredInput> {
-    let mut inputs = Vec::new();
+fn extract_inputs_from_dict(dict: &ast::ExprDict) -> SmallVec<[DeclaredInput; 4]> {
+    let mut inputs = SmallVec::new();
 
     for item in &dict.items {
         let Some(ref key_expr) = item.key else {

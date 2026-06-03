@@ -3,8 +3,13 @@
 //! These types represent the *declared* state of a barca project as parsed
 //! from Python source files. They are the input to DAG construction, execution
 //! planning, and hashing.
+//!
+//! Allocation strategy:
+//! - `SmallVec<[T; N]>` for small collections (inputs, sinks — usually ≤4 items, stays on stack)
+//! - `String` everywhere else (ruff's AST already gives us owned Strings; no point converting)
 
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 // ─── Node kinds ──────────────────────────────────────────────────────────────
@@ -138,12 +143,12 @@ pub struct ExtractedNode {
     pub explicit_name: Option<String>,
     /// Freshness policy.
     pub freshness: Freshness,
-    /// Declared inputs (parameter → upstream mapping).
-    pub inputs: Vec<DeclaredInput>,
+    /// Declared inputs (parameter → upstream mapping). Typically 0–4 items.
+    pub inputs: SmallVec<[DeclaredInput; 4]>,
     /// Partition dimensions.
     pub partitions: HashMap<String, PartitionSpec>,
-    /// Sink declarations (from stacked `@sink` decorators).
-    pub sinks: Vec<SinkDecl>,
+    /// Sink declarations (from stacked `@sink` decorators). Typically 0–2 items.
+    pub sinks: SmallVec<[SinkDecl; 2]>,
     /// Timeout in seconds.
     pub timeout_seconds: u32,
     /// Human-readable description.
@@ -190,12 +195,12 @@ pub struct DagNode {
     pub inputs: HashMap<String, String>,
     /// Collected inputs (fan-in): param_name → upstream_node_id.
     pub collected_inputs: HashMap<String, String>,
-    /// Partition dimensions.
-    pub partition_keys: Vec<String>,
+    /// Partition dimensions. Typically 0–2 keys.
+    pub partition_keys: SmallVec<[String; 2]>,
     /// Whether partitions are static or derived.
     pub partition_specs: HashMap<String, PartitionSpec>,
     /// Sink declarations.
-    pub sinks: Vec<SinkDecl>,
+    pub sinks: SmallVec<[SinkDecl; 2]>,
     /// Timeout.
     pub timeout_seconds: u32,
     /// Tags.
