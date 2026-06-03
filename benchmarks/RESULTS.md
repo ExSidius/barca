@@ -21,7 +21,8 @@ Last run: 2026-06-03 | Apple Silicon (M-series) | Rust release build
 | **Dagster** (server) | `dagster dev` + GraphQL | multiprocess_executor spawns subprocess per asset |
 | **Prefect** (sequential) | direct task calls | Sequential (default) |
 | **Prefect** (parallel) | `ConcurrentTaskRunner` + `.submit()` | Thread-based concurrency (max_workers=16) |
-| **Airflow** | `dags test` | Sequential (LocalExecutor in test mode) |
+| **Airflow** (dags test) | `dags test` | Sequential in-process (testing mode) |
+| **Airflow** (LocalExecutor) | scheduler + trigger | Parallel subprocesses (requires PostgreSQL — SQLite locks under concurrency) |
 
 ### Measurement
 - hyperfine with --warmup 3 for sub-100ms benchmarks (≥10 runs)
@@ -50,7 +51,7 @@ All frameworks invoked as scripts — no pre-started servers.
 | 13 | Wide Join (10→1) | **58ms** | 635ms | 4.1s | — |
 | 14 | Backfill (10-step × 10) | **282ms** | 6.2s | 40.1s | — |
 
-*Airflow `dags test` has ~800ms per-task overhead. Benchmarks with 500+ tasks take 7+ minutes. Dashes indicate benchmarks not yet run for Airflow.*
+*Airflow `dags test` has ~800ms per-task overhead. Airflow's LocalExecutor (parallel) requires PostgreSQL — SQLite locks under concurrent subprocess writes, causing all 500 tasks to fail. Dashes indicate benchmarks not yet run for Airflow.*
 
 ## Parallel mode comparison (fan_out_500_50ms)
 
