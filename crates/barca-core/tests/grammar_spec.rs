@@ -343,10 +343,9 @@ def fetch_prices(ticker: str) -> dict:
 }
 
 #[test]
-#[ignore] // Decision #6: requires Python evaluation at plan time
-fn partitions_list_comprehension() {
-    // Aspirational: list comprehension should be flagged as "dynamic-static"
-    // and evaluated by spawning Python at plan time.
+fn partitions_list_comprehension_parsed_as_dynamic() {
+    // List comprehension can't be evaluated statically — stored as Dynamic
+    // for Python evaluation at plan time.
     let src = r#"
 from barca import asset, partitions
 
@@ -356,19 +355,17 @@ def wide_asset(key: str) -> dict:
 "#;
     let nodes = extract_nodes(src, "test.py").unwrap();
     let spec = nodes[0].partitions.get("key").unwrap();
-    // Should be classified as needing Python evaluation
     match spec {
-        PartitionSpec::Static { values } => {
-            assert_eq!(values.len(), 100);
+        PartitionSpec::Dynamic { source_text } => {
+            assert!(source_text.contains("for i in range(100)"));
         }
-        _ => panic!("expected resolved static partitions"),
+        _ => panic!("expected Dynamic partition spec, got {spec:?}"),
     }
 }
 
 #[test]
-#[ignore] // Decision #6: requires Python evaluation at plan time
-fn partitions_function_call_expression() {
-    // Aspirational: function call in partition values requires Python eval
+fn partitions_function_call_parsed_as_dynamic() {
+    // Function call can't be evaluated statically — stored as Dynamic.
     let src = r#"
 from barca import asset, partitions
 
@@ -382,10 +379,10 @@ def fetch_prices(ticker: str) -> dict:
     let nodes = extract_nodes(src, "test.py").unwrap();
     let spec = nodes[0].partitions.get("ticker").unwrap();
     match spec {
-        PartitionSpec::Static { values } => {
-            assert_eq!(values.len(), 4);
+        PartitionSpec::Dynamic { source_text } => {
+            assert!(source_text.contains("get_tickers()"));
         }
-        _ => panic!("expected resolved static partitions"),
+        _ => panic!("expected Dynamic partition spec, got {spec:?}"),
     }
 }
 
@@ -637,7 +634,6 @@ def asset_b(): return {}
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore] // Decision #3: requires multi-phase plan generation
 fn partitions_from_creates_partition_source_edge() {
     use barca_core::dag::Dag;
 

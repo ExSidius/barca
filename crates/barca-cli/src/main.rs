@@ -233,12 +233,16 @@ fn serialize_batch(
         .steps
         .iter()
         .map(|s| {
-            serde_json::json!({
+            let mut step = serde_json::json!({
                 "node_id": s.node_id,
                 "function_name": s.function_name,
                 "source_file": s.source_file,
                 "inputs": s.inputs,
-            })
+            });
+            if !s.partition.is_empty() {
+                step["partition"] = serde_json::json!(s.partition);
+            }
+            step
         })
         .collect();
 

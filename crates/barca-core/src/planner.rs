@@ -57,6 +57,9 @@ pub struct StreamStep {
     pub function_name: String,
     pub source_file: String,
     pub inputs: HashMap<String, String>,
+    /// Partition key for this step (if this is a partition expansion).
+    /// Maps dimension name → value. Empty for non-partitioned steps.
+    pub partition: HashMap<String, String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -256,15 +259,27 @@ fn build_phases(
             }
         };
 
-        // Convert chains to step lists.
-        let chain_steps: Vec<Vec<StreamStep>> = chains_in_phase
-            .iter()
-            .map(|&chain_idx| chain_to_steps(dag, &topology.chains[chain_idx]))
-            .collect();
+        // Convert chains to step lists. Partitioned nodes expand into N independent
+        // step-groups that can be distributed across streams.
+        let mut work_units: Vec<Vec<StreamStep>> = Vec::new();
+        for &chain_idx in &chains_in_phase {
+            let steps = chain_to_steps(dag, &topology.chains[chain_idx]);
+            let has_partitions = steps.iter().any(|s| !s.partition.is_empty());
+
+            if has_partitions && steps.len() > 1 {
+                // Mixed chain with partitions — each expanded step is independent.
+                for step in steps {
+                    work_units.push(vec![step]);
+                }
+            } else {
+                // Non-partitioned chain or single-step partition — keep as unit.
+                work_units.push(steps);
+            }
+        }
 
         // Assign to streams via greedy bin-packing.
-        let num_streams = chains_in_phase.len().min(config.pool_size).max(1);
-        let streams = bin_pack_to_streams(chain_steps, num_streams, phase_num);
+        let num_streams = work_units.len().min(config.pool_size).max(1);
+        let streams = bin_pack_to_streams(work_units, num_streams, phase_num);
 
         phases.push(Phase { reason, streams });
     }
@@ -272,25 +287,92 @@ fn build_phases(
     phases
 }
 
-/// Convert a chain's nodes into StreamSteps.
+/// Convert a chain's nodes into StreamSteps, expanding static partitions.
 fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
-    chain
-        .nodes
-        .iter()
-        .map(|node_id| {
-            let node = dag.get_node(node_id).unwrap();
-            let mut inputs = node.resolved_inputs.clone();
-            for (k, v) in &node.resolved_collected {
-                inputs.insert(k.clone(), v.clone());
-            }
-            StreamStep {
+    let mut steps = Vec::new();
+
+    for node_id in &chain.nodes {
+        let node = dag.get_node(node_id).unwrap();
+        let mut inputs = node.resolved_inputs.clone();
+        for (k, v) in &node.resolved_collected {
+            inputs.insert(k.clone(), v.clone());
+        }
+
+        // Check for static partitions — expand into N steps.
+        let static_partitions = collect_static_partitions(&node.extracted.partitions);
+
+        if static_partitions.is_empty() {
+            // Non-partitioned: one step.
+            steps.push(StreamStep {
                 node_id: node_id.clone(),
                 function_name: node.function_name().to_string(),
                 source_file: node.source_file().to_string(),
                 inputs,
+                partition: HashMap::new(),
+            });
+        } else {
+            // Partitioned: expand into one step per partition value.
+            let combos = expand_partition_combos(&static_partitions);
+            for combo in combos {
+                let partition_suffix = combo
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                steps.push(StreamStep {
+                    node_id: format!("{node_id}[{partition_suffix}]"),
+                    function_name: node.function_name().to_string(),
+                    source_file: node.source_file().to_string(),
+                    inputs: inputs.clone(),
+                    partition: combo,
+                });
             }
-        })
-        .collect()
+        }
+    }
+
+    steps
+}
+
+/// Collect only static partition specs (already resolved values).
+/// Dynamic and DerivedFrom specs are handled at dispatch time.
+fn collect_static_partitions(
+    specs: &HashMap<String, crate::model::PartitionSpec>,
+) -> HashMap<String, Vec<String>> {
+    let mut result = HashMap::new();
+    for (dim, spec) in specs {
+        if let crate::model::PartitionSpec::Static { values } = spec {
+            let vals: Vec<String> = values
+                .iter()
+                .map(|v| match v {
+                    crate::model::PartitionValue::Str(s) => s.clone(),
+                    crate::model::PartitionValue::Int(i) => i.to_string(),
+                })
+                .collect();
+            if !vals.is_empty() {
+                result.insert(dim.clone(), vals);
+            }
+        }
+    }
+    result
+}
+
+/// Expand partition dimensions into all combinations.
+/// For single dimension {"ticker": ["A","B","C"]} → [{"ticker":"A"}, {"ticker":"B"}, {"ticker":"C"}]
+/// For multiple dimensions, produces the cartesian product.
+fn expand_partition_combos(dims: &HashMap<String, Vec<String>>) -> Vec<HashMap<String, String>> {
+    let mut combos = vec![HashMap::new()];
+    for (dim, values) in dims {
+        let mut new_combos = Vec::new();
+        for combo in &combos {
+            for val in values {
+                let mut c = combo.clone();
+                c.insert(dim.clone(), val.clone());
+                new_combos.push(c);
+            }
+        }
+        combos = new_combos;
+    }
+    combos
 }
 
 /// Distribute chains across N streams using greedy bin-packing (longest-first).
@@ -916,5 +998,134 @@ mod tests {
         let remaining: usize = p.phases[1..].iter().map(phase_step_count).sum();
         assert_eq!(remaining, 3);
         assert_eq!(p.total_steps, 18);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // PARTITION EXPANSION
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[allow(clippy::type_complexity)]
+    fn build_partitioned_dag(specs: &[(&str, &[&str], &[(&str, &[&str])])]) -> Dag {
+        let extracted: Vec<ExtractedNode> = specs
+            .iter()
+            .map(|(name, deps, partitions)| {
+                let inputs: SmallVec<[DeclaredInput; 4]> = deps
+                    .iter()
+                    .map(|&dep| DeclaredInput {
+                        param_name: dep.to_string(),
+                        upstream: NodeRef::FunctionName(dep.to_string()),
+                        collected: false,
+                    })
+                    .collect();
+                let partition_map: HashMap<String, crate::model::PartitionSpec> = partitions
+                    .iter()
+                    .map(|(dim, vals)| {
+                        (
+                            dim.to_string(),
+                            crate::model::PartitionSpec::Static {
+                                values: vals
+                                    .iter()
+                                    .map(|v| crate::model::PartitionValue::Str(v.to_string()))
+                                    .collect(),
+                            },
+                        )
+                    })
+                    .collect();
+                ExtractedNode {
+                    kind: NodeKind::Asset,
+                    function_name: name.to_string(),
+                    explicit_name: None,
+                    freshness: Freshness::Always,
+                    inputs,
+                    partitions: partition_map,
+                    sinks: SmallVec::new(),
+                    timeout_seconds: 300,
+                    description: None,
+                    tags: HashMap::new(),
+                    is_unsafe: false,
+                    source_file: "test.py".to_string(),
+                    byte_offset: 0,
+                    source_text: String::new(),
+                }
+            })
+            .collect();
+        Dag::build(&extracted).unwrap()
+    }
+
+    #[test]
+    fn plan_static_partitions_expand_to_n_steps() {
+        // fetch_prices with 3 partitions → 3 steps
+        let dag = build_partitioned_dag(&[(
+            "fetch_prices",
+            &[],
+            &[("ticker", &["AAPL", "MSFT", "GOOG"])],
+        )]);
+        let p = plan_from_dag(&dag, &cfg(10));
+
+        assert_eq!(p.total_steps, 3);
+        assert_eq!(p.phases.len(), 1);
+
+        let all_steps: Vec<&StreamStep> =
+            p.phases[0].streams.iter().flat_map(|s| &s.steps).collect();
+        assert_eq!(all_steps.len(), 3);
+
+        // Each step has a different partition value
+        let mut tickers: Vec<&str> = all_steps
+            .iter()
+            .map(|s| s.partition.get("ticker").unwrap().as_str())
+            .collect();
+        tickers.sort();
+        assert_eq!(tickers, vec!["AAPL", "GOOG", "MSFT"]);
+
+        // Node IDs include partition suffix
+        for step in &all_steps {
+            assert!(step.node_id.contains("[ticker="));
+        }
+    }
+
+    #[test]
+    fn plan_partitioned_steps_distributed_across_streams() {
+        // 100 partition values, pool_size=10 → distributed
+
+        // Actually generate unique values
+        let ticker_strings: Vec<String> = (0..100).map(|i| format!("T{i:03}")).collect();
+        let ticker_refs: Vec<&str> = ticker_strings.iter().map(|s| s.as_str()).collect();
+
+        let dag = build_partitioned_dag(&[("fetch", &[], &[("ticker", &ticker_refs)])]);
+        let p = plan_from_dag(&dag, &cfg(10));
+
+        assert_eq!(p.total_steps, 100);
+        assert_eq!(p.phases[0].streams.len(), 10);
+        for stream in &p.phases[0].streams {
+            assert_eq!(stream.steps.len(), 10);
+        }
+    }
+
+    #[test]
+    fn plan_chain_with_partitioned_node() {
+        // source → partitioned_fetch(3 partitions) → aggregate
+        // source is non-partitioned, fetch expands to 3 steps
+        let dag = build_partitioned_dag(&[
+            ("source", &[], &[]),
+            (
+                "fetch",
+                &["source"],
+                &[("ticker", &["AAPL", "MSFT", "GOOG"])],
+            ),
+        ]);
+        let p = plan_from_dag(&dag, &cfg(10));
+
+        // source = 1 step, fetch = 3 steps = 4 total
+        assert_eq!(p.total_steps, 4);
+    }
+
+    #[test]
+    fn plan_non_partitioned_remains_single_step() {
+        // Regular asset without partitions → 1 step, no partition field
+        let dag = build_partitioned_dag(&[("simple", &[], &[])]);
+        let p = plan_from_dag(&dag, &cfg(10));
+
+        assert_eq!(p.total_steps, 1);
+        assert!(p.phases[0].streams[0].steps[0].partition.is_empty());
     }
 }

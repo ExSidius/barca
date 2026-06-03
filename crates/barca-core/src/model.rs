@@ -62,7 +62,11 @@ pub struct CronExpr(pub String);
 pub enum PartitionSpec {
     /// Inline static list: `partitions(["AAPL", "MSFT", "GOOG"])`.
     Static { values: Vec<PartitionValue> },
+    /// Dynamic expression that needs Python evaluation at plan time.
+    /// e.g., `partitions([f"p{i}" for i in range(100)])` or `partitions(get_tickers())`
+    Dynamic { source_text: String },
     /// Derived from upstream asset: `partitions_from(tickers)`.
+    /// Resolved at execution time — source asset must materialize first.
     DerivedFrom { source_ref: NodeRef },
 }
 

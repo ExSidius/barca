@@ -79,7 +79,7 @@ fn try_extract_function(
 
     let freshness = extract_freshness(&keywords).unwrap_or(Freshness::default_for(kind));
     let inputs = extract_inputs(&keywords);
-    let partitions = extract_partitions(&keywords);
+    let partitions = extract_partitions(&keywords, source);
     let explicit_name = extract_string_kwarg(&keywords, "name");
     let description = extract_string_kwarg(&keywords, "description");
     let timeout_seconds = extract_int_kwarg(&keywords, "timeout_seconds").unwrap_or(300);
@@ -280,7 +280,7 @@ fn extract_inputs_from_dict(dict: &ast::ExprDict) -> SmallVec<[DeclaredInput; 4]
     inputs
 }
 
-fn extract_partitions(keywords: &[&Keyword]) -> HashMap<String, PartitionSpec> {
+fn extract_partitions(keywords: &[&Keyword], source: &str) -> HashMap<String, PartitionSpec> {
     let mut result = HashMap::new();
 
     for kw in keywords {
@@ -302,15 +302,7 @@ fn extract_partitions(keywords: &[&Keyword]) -> HashMap<String, PartitionSpec> {
                     Expr::Call(call) => {
                         if let Expr::Name(n) = call.func.as_ref() {
                             match n.id.as_str() {
-                                "partitions" => {
-                                    let values = call
-                                        .arguments
-                                        .args
-                                        .first()
-                                        .map(extract_partition_values)
-                                        .unwrap_or_default();
-                                    PartitionSpec::Static { values }
-                                }
+                                "partitions" => extract_partition_spec(call, source),
                                 "partitions_from" => {
                                     let source_ref = call.arguments.args.first().and_then(|a| {
                                         if let Expr::Name(n) = a {
@@ -319,8 +311,6 @@ fn extract_partitions(keywords: &[&Keyword]) -> HashMap<String, PartitionSpec> {
                                             None
                                         }
                                     });
-                                    // Skip if we can't resolve the reference — DAG
-                                    // validation will catch missing deps later.
                                     if let Some(source_ref) = source_ref {
                                         PartitionSpec::DerivedFrom { source_ref }
                                     } else {
@@ -342,6 +332,27 @@ fn extract_partitions(keywords: &[&Keyword]) -> HashMap<String, PartitionSpec> {
     }
 
     result
+}
+
+/// Extract a PartitionSpec from a `partitions(...)` call.
+/// If the argument is a literal list, extract values statically.
+/// Otherwise, extract the source text for dynamic Python evaluation at plan time.
+fn extract_partition_spec(call: &ast::ExprCall, source: &str) -> PartitionSpec {
+    let Some(first_arg) = call.arguments.args.first() else {
+        return PartitionSpec::Static { values: vec![] };
+    };
+
+    // Try static extraction first (literal list).
+    if let Expr::List(_) = first_arg {
+        let values = extract_partition_values(first_arg);
+        return PartitionSpec::Static { values };
+    }
+
+    // Non-literal (ListComp, Call, etc.) — extract source text for Python eval.
+    let start = first_arg.range().start().to_usize();
+    let end = first_arg.range().end().to_usize();
+    let source_text = source[start..end].to_string();
+    PartitionSpec::Dynamic { source_text }
 }
 
 fn extract_partition_values(expr: &Expr) -> Vec<PartitionValue> {

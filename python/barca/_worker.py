@@ -50,6 +50,10 @@ def run_batch(batch):
                     f"Available: {list(cache.keys())}"
                 )
 
+        # Inject partition values as kwargs (e.g., ticker="AAPL").
+        if "partition" in step:
+            kwargs.update(step["partition"])
+
         # User's print() goes to stdout (visible in terminal).
         # Protocol messages go to stderr (Rust reads this).
         t0 = time.perf_counter()
