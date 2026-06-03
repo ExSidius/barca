@@ -42,8 +42,9 @@ Thumbs.db
 .mypy_cache/
 .pytest_cache/
 
-# Benchmark results (generated)
-benchmarks/**/results.md
+# Benchmark auto-generated hyperfine output (per-benchmark dir)
+benchmarks/trivial/results.md
+benchmarks/chain_100/results.md
 
 # MkDocs
 site/
