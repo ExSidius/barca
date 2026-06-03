@@ -1,0 +1,15 @@
+[package]
+name = "barca-core"
+version = "0.1.0"
+edition = "2024"
+description = "Core library — models, parsing, DAG, execution planning, hashing"
+
+[dependencies]
+ruff_python_parser = { workspace = true }
+ruff_python_ast = { workspace = true }
+ruff_text_size = { workspace = true }
+petgraph = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = "0.10"

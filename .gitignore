@@ -10,11 +10,9 @@ build/
 
 # Rust
 /target/
+Cargo.lock
 **/*.rs.bk
 *.pdb
-
-# Tailwind standalone binary (platform-specific)
-bin/
 
 # Environments
 .env
@@ -25,10 +23,6 @@ bin/
 .barca/
 .barcafiles/
 tmp/
-
-# Staged CLI binary for wheel builds (created by CI / `just build-py`)
-crates/barca-py/data/scripts/*
-!crates/barca-py/data/scripts/.gitkeep
 
 # Vendored dependencies
 vendor/
@@ -48,18 +42,8 @@ Thumbs.db
 .mypy_cache/
 .pytest_cache/
 
-# Marimo
-marimo/_static/
-marimo/_lsp/
-__marimo__/
-*.dSYM/
-
-node_modules
-test-results
-playwright-report/
-
-# Vite build output (React UI)
-packages/barca/src/barca/server/ui/dist/
+# Benchmark results (generated)
+benchmarks/**/results.md
 
 # MkDocs
 site/
