@@ -1,95 +1,87 @@
-# Pipeline Benchmarks
+# Benchmarks
 
-Aspirational benchmark suite for stress-testing barca's orchestration. Ordered by complexity.
+Barca ships with a comprehensive benchmark suite that compares execution overhead against Dagster and Prefect. All benchmarks use [hyperfine](https://github.com/sharkdp/hyperfine) for measurement.
 
-## Current benchmarks
+## Running benchmarks
 
-### `iris_pipeline` (implemented)
-- **Topology**: 4-node linear chain
-- **Pattern**: `raw_data → train_test_split → trained_model → evaluation`
-- **Tests**: Sequential deps, caching, far-off dependency invalidation
-- **Compute**: scikit-learn (load, split, fit, evaluate)
+```bash
+cd benchmarks/<name>
+./bench.sh 10    # 10 measured runs (3 warmup runs)
+```
 
-### `spaceflights` — Full diamond, adapted from Kedro (implemented)
+Each benchmark directory contains:
+- `barca/` -- barca implementation + run script
+- `dagster/` -- equivalent Dagster implementation
+- `prefect/` -- equivalent Prefect implementation
+- `bench.sh` -- hyperfine wrapper that runs all three
+- `results.md` -- markdown table with latest results
+
+## Results
+
+### Trivial (1 asset, zero work)
+
+Measures pure framework overhead.
+
+| Framework | Mean | Min | Max | Relative |
+|-----------|------|-----|-----|----------|
+| **barca (Rust+Python)** | **38.0 ms** | 37.4 ms | 38.9 ms | **1.00x** |
+| dagster | 538.1 ms | 517.8 ms | 556.1 ms | 14.2x |
+| prefect | 3977.7 ms | 3899.2 ms | 4244.4 ms | 104.7x |
+
+## Benchmark suite
+
+### Overhead & scaling
+
+| Benchmark | Assets | Topology | What it tests |
+|-----------|--------|----------|--------------|
+| `trivial` | 1 | single node | Pure framework startup + teardown cost |
+| `chain_100` | 100 | linear chain (A→B→C→...→Z) | Sequential phasing, 100 dependency hops |
+| `fan_out_500` | 500 | 500 independent nodes | Wide parallelism, worker spawning overhead |
+| `fan_out_500_50ms` | 500 | 500 independent + 50ms sleep each | Parallelism gains under I/O-bound workloads |
+
+### DAG topologies
+
+| Benchmark | Assets | Topology | What it tests |
+|-----------|--------|----------|--------------|
+| `deep_diamond` | 18 | 5 parallel 3-step pipelines → merge → 2-step tail | Fan-out/fan-in with real compute (filter, normalize, hash) |
+| `wide_layers` | varies | parallel tiers | Tier-based parallel execution |
+| `map_reduce` | varies | scatter → gather | Map-reduce pattern |
+
+### Real workloads
+
+| Benchmark | Assets | Topology | What it tests |
+|-----------|--------|----------|--------------|
+| `spaceflights` | 10 | 3-wide source → prep → merge → train → evaluate | Full ML pipeline (adapted from Kedro spaceflights) |
+| `iris_pipeline` | varies | linear ML chain | Iris dataset classification pipeline |
+| `mixed_io_cpu` | varies | mixed | Interleaved I/O-bound and CPU-bound assets |
+
+### Edge cases
+
+| Benchmark | Assets | Topology | What it tests |
+|-----------|--------|----------|--------------|
+| `large_payloads` | varies | varied | JSON serialization overhead with large return values |
+| `multi_file_discovery` | varies | multi-file | Parsing and DAG construction across multiple Python files |
+
+## Spaceflights topology
+
+Adapted from [Kedro spaceflights](https://github.com/kedro-org/kedro-starters):
+
 ```
 raw_shuttles ──→ prep_shuttles ──┐
 raw_companies ─→ prep_companies ─├→ master_table → split → train → evaluate
 raw_reviews ───→ prep_reviews ──┘
 ```
-- **Depth**: 6 levels, width 3
-- **Pattern**: 3 independent sources, each preprocessed, merged into master table, then linear ML chain
-- **Tests**: Mixed fan-out/fan-in, deep chain after merge, all caching behaviors
-- **Compute**: pandas joins + sklearn RandomForestRegressor
-- **Source**: Adapted from [kedro-org/kedro-starters/spaceflights](https://github.com/kedro-org/kedro-starters)
-- **Benchmarked across**: Barca, Dagster, Prefect (see `benchmarks/`)
 
-## Planned benchmarks
+6 levels deep, 3 wide at the source layer. Uses `random` for data generation and `sklearn` for model training.
 
-### `linear_chain` — Deep sequential pipeline
-```
-ingest → clean → feature_eng → split → train → evaluate → report
-```
-- **Depth**: 7 levels
-- **Pattern**: Pure linear chain, no fan-out
-- **Tests**: Ordering correctness at depth, re-queue wait behavior
-- **Compute**: pandas transforms + sklearn
-- **Source data**: Kaggle House Prices or Titanic
+## Deep diamond topology
 
-### `diamond` — Fan-out / fan-in
 ```
-raw_data → numerical_features ──┐
-                                 ├→ combined_features → model → evaluation
-raw_data → categorical_features ┘
+src_0 → prep_0 → feat_0 ──┐
+src_1 → prep_1 → feat_1 ──┤
+src_2 → prep_2 → feat_2 ──├→ merge → transform → output
+src_3 → prep_3 → feat_3 ──┤
+src_4 → prep_4 → feat_4 ──┘
 ```
-- **Depth**: 4 levels
-- **Pattern**: Classic diamond (A → B, A → C, B+C → D)
-- **Tests**: Parallel fan-out, correct merge, upstream-runs-once guarantee
-- **Compute**: sklearn ColumnTransformer equivalent in pandas
 
-### `ensemble` — Wide fan-out + merge
-```
-features → model_xgboost ───┐
-features → model_rf ─────────├→ ensemble_blend → evaluation
-features → model_lr ─────────┘
-```
-- **Depth**: 4 levels, width 3
-- **Pattern**: One asset feeds 3 independent models, results merged
-- **Tests**: Parallel model training, correct blend
-- **Compute**: sklearn RandomForest, LogisticRegression + simple average blend
-
-### `partitioned_timeseries` — Mixed partitioned + non-partitioned
-```
-raw_events (daily partitioned)
-  → daily_aggregates (daily partitioned)
-    → monthly_rollup (non-partitioned)
-      → forecast_model (non-partitioned)
-```
-- **Depth**: 4 levels
-- **Pattern**: Partitioned assets feeding non-partitioned downstream
-- **Tests**: Partition fan-out, cross-partition merge, mixed partition types
-- **Compute**: pandas groupby + simple forecasting
-
-### `full_ml_pipeline` — All patterns combined
-```
-raw_train ─→ clean ─→ num_features ──────────────────┐
-                   └→ cat_features → encoded ─────────┤
-                                                       ├→ combined → split → xgb ────┐
-raw_config ─→ hyperparams ────────────────────────────┘                → rf ─────┼→ blend → eval → report
-                                                                        → lr ─────┘
-raw_train (partitioned by fold) → cv_scores (partitioned) → cv_summary ─┘
-```
-- **Depth**: 8+ levels, width 5+
-- **Pattern**: Diamond + fan-out + partitioned + deep chain
-- **Tests**: Everything — the "does it all work together" benchmark
-- **Compute**: Full sklearn pipeline
-
-## Reference sources
-
-| Source | Patterns | Link |
-|--------|----------|------|
-| Kedro spaceflights | Diamond + deep chain | `kedro-org/kedro-starters` |
-| Dagster project_fully_featured | Partitioned + IO managers | `dagster-io/dagster/examples/` |
-| Dagster Hacker News | Fan-out + real API data | `dagster-io/dagster/examples/` |
-| MLflow multistep_workflow | Explicit multi-step DAG | `mlflow/mlflow/examples/` |
-| dbt jaffle_shop | Staging → intermediate → marts | `dbt-labs/jaffle_shop` |
-| TPC-DI specification | Industry-standard ETL benchmark | `tpc.org/tpcdi` |
+18 assets, 5-wide parallelism, 6 levels deep. Each step does real compute (list filtering, normalization, hashing).

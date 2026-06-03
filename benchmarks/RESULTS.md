@@ -19,6 +19,9 @@ Architecture: Rust plans and spawns N Python worker processes per phase. Workers
 | Large Payloads (5-step chain, 10k rows) | **203ms** | 631ms | 6.0s | 3.1x |
 | Map/Reduce (1→50→1) | **89ms** | 917ms | 4.1s | 10.3x |
 | Multi-file Discovery (50 files, 100 assets) | **60ms** | 911ms | 4.0s | 15.1x |
+| ETL Pipeline (12 assets, 100k rows) | **604ms** | 953ms | 14.2s | 1.6x |
+| Wide Join (10 dims → 1 fact) | **58ms** | 635ms | 4.1s | 10.9x |
+| Incremental Backfill (10-step × 10 runs) | **282ms** | 6.2s | 40.1s | 22.1x |
 
 ## Detailed Results
 
@@ -130,6 +133,38 @@ Tests parsing/discovery speed at scale. Barca: ruff parses 50 files in Rust. Dag
 | dagster | 911.0 ms ± 18.1 ms | 15.1x |
 | prefect | 3959 ms ± 27 ms | 65.5x |
 
+### 12. ETL Pipeline: 100k-row dbt-style transforms
+
+3 raw sources (100k orders, 10k customers, 500 products) → staging → intermediate aggregations → mart summary. 12 assets, diamond topology, realistic data volume.
+
+| Command | Mean | Relative |
+|:---|---:|---:|
+| **barca** | 603.6 ms ± 10.8 ms | 1.00 |
+| dagster | 952.7 ms ± 20.1 ms | 1.58x |
+| prefect | 14158 ms ± 82 ms | 23.5x |
+
+### 13. Wide Join: 10 dimensions → 1 fact table
+
+10 independent dimension generators → single fan-in join. Tests 10-way fan-in overhead.
+
+| Command | Mean | Relative |
+|:---|---:|---:|
+| **barca** | 58.1 ms ± 0.4 ms | 1.00 |
+| dagster | 635.4 ms ± 26.9 ms | 10.9x |
+| prefect | 4141 ms ± 250 ms | 71.3x |
+
+### 14. Incremental Backfill: 10-step pipeline × 10 invocations
+
+Tests per-invocation overhead when the same DAG is run repeatedly. 10 sequential runs of a 10-step linear chain. Total: 100 step executions.
+
+| Command | Mean | Relative |
+|:---|---:|---:|
+| **barca** | 282.4 ms ± 3.5 ms | 1.00 |
+| dagster | 6246 ms ± 22 ms | 22.1x |
+| prefect | 40090 ms ± 560 ms | 142x |
+
+Barca: 28ms per invocation. Dagster: 625ms per invocation. Prefect: 4s per invocation.
+
 ## Reproducing
 
 ```bash
@@ -146,4 +181,7 @@ hyperfine --warmup 1 --runs 3 benchmarks/mixed_io_cpu/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/large_payloads/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/map_reduce/*/run.sh
 hyperfine --warmup 1 --runs 3 benchmarks/multi_file_discovery/*/run.sh
+hyperfine --warmup 1 --runs 3 benchmarks/etl_duckdb/*/run.sh
+hyperfine --warmup 1 --runs 3 benchmarks/wide_join/*/run.sh
+hyperfine --warmup 1 --runs 3 benchmarks/incremental_backfill/*/run.sh
 ```
