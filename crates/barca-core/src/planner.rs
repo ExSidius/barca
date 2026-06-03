@@ -40,7 +40,14 @@ pub struct Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhaseReason {
     Initial,
-    FanIn { node_id: String },
+    FanIn {
+        node_id: String,
+    },
+    /// Partition source must materialize before downstream can expand.
+    /// The dispatch loop reads the source output and expands partition steps.
+    PartitionResolution {
+        source_node_id: String,
+    },
 }
 
 /// A worker stream — ordered steps for one Python process.
@@ -60,6 +67,9 @@ pub struct StreamStep {
     /// Partition key for this step (if this is a partition expansion).
     /// Maps dimension name → value. Empty for non-partitioned steps.
     pub partition: HashMap<String, String>,
+    /// Pending partition resolution: dimension → source_node_id.
+    /// The dispatch loop reads the source output and expands into N steps.
+    pub pending_partitions: HashMap<String, String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -137,15 +147,16 @@ fn detect_chains(dag: &Dag) -> Vec<Chain> {
         let mut nodes = vec![node_id.to_string()];
         visited.insert(node_id.to_string());
 
-        // Extend forward: follow single-succ + single-pred edges.
+        // Extend forward: follow single-succ + single-pred execution edges.
+        // PartitionSource edges are excluded — they force phase breaks.
         let mut current = node_id.to_string();
         loop {
-            let succs = dag.downstream(&current);
+            let succs = dag.execution_downstream(&current);
             if succs.len() != 1 {
                 break;
             }
             let next = succs[0];
-            if dag.upstream(next).len() != 1 {
+            if dag.execution_upstream(next).len() != 1 {
                 break;
             }
             if visited.contains(next) {
@@ -191,7 +202,13 @@ fn merge_single_stream_phases(phases: Vec<Phase>) -> Vec<Phase> {
     let mut merged: Vec<Phase> = Vec::new();
 
     for phase in phases {
-        let can_merge = phase.streams.len() == 1
+        // Don't merge if this phase has steps with pending partition resolution.
+        let has_pending = phase
+            .streams
+            .iter()
+            .any(|s| s.steps.iter().any(|st| !st.pending_partitions.is_empty()));
+        let can_merge = !has_pending
+            && phase.streams.len() == 1
             && merged
                 .last()
                 .is_some_and(|prev: &Phase| prev.streams.len() == 1);
@@ -300,18 +317,11 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
 
         // Check for static partitions — expand into N steps.
         let static_partitions = collect_static_partitions(&node.extracted.partitions);
+        // Check for derived partitions — mark for resolution at dispatch time.
+        let derived_partitions = collect_derived_partitions(&node.extracted.partitions);
 
-        if static_partitions.is_empty() {
-            // Non-partitioned: one step.
-            steps.push(StreamStep {
-                node_id: node_id.clone(),
-                function_name: node.function_name().to_string(),
-                source_file: node.source_file().to_string(),
-                inputs,
-                partition: HashMap::new(),
-            });
-        } else {
-            // Partitioned: expand into one step per partition value.
+        if !static_partitions.is_empty() {
+            // Static partitioned: expand into one step per partition value.
             let combos = expand_partition_combos(&static_partitions);
             for combo in combos {
                 let partition_suffix = combo
@@ -325,12 +335,47 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                     source_file: node.source_file().to_string(),
                     inputs: inputs.clone(),
                     partition: combo,
+                    pending_partitions: HashMap::new(),
                 });
             }
+        } else if !derived_partitions.is_empty() {
+            // DerivedFrom: create ONE placeholder step with pending_partitions.
+            // The dispatch loop will expand it after the source materializes.
+            steps.push(StreamStep {
+                node_id: node_id.clone(),
+                function_name: node.function_name().to_string(),
+                source_file: node.source_file().to_string(),
+                inputs,
+                partition: HashMap::new(),
+                pending_partitions: derived_partitions,
+            });
+        } else {
+            // Non-partitioned: one step.
+            steps.push(StreamStep {
+                node_id: node_id.clone(),
+                function_name: node.function_name().to_string(),
+                source_file: node.source_file().to_string(),
+                inputs,
+                partition: HashMap::new(),
+                pending_partitions: HashMap::new(),
+            });
         }
     }
 
     steps
+}
+
+/// Collect DerivedFrom partition specs: dimension → source_node_id.
+fn collect_derived_partitions(
+    specs: &HashMap<String, crate::model::PartitionSpec>,
+) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    for (dim, spec) in specs {
+        if let crate::model::PartitionSpec::DerivedFrom { source_ref } = spec {
+            result.insert(dim.clone(), source_ref.resolution_name().to_string());
+        }
+    }
+    result
 }
 
 /// Collect only static partition specs (already resolved values).

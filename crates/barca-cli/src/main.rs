@@ -40,10 +40,17 @@ fn main() {
     }
 }
 
+fn find_python() -> PathBuf {
+    let self_exe = env::current_exe().expect("cannot determine own path");
+    let bin_dir = self_exe.parent().expect("binary has no parent dir");
+    bin_dir.join("python")
+}
+
 fn run_command(file_args: &[String]) {
     let t0 = Instant::now();
+    let python = find_python();
 
-    let dag = build_dag(file_args);
+    let dag = build_dag(file_args, &python);
     let node_count = dag.node_count();
     let edge_count = dag.edge_count();
 
@@ -61,34 +68,37 @@ fn run_command(file_args: &[String]) {
     let db_path = ensure_db_dir();
     init_db_sync(&db_path);
 
-    // Dispatch and collect.
-    let self_exe = env::current_exe().expect("cannot determine own path");
-    let bin_dir = self_exe.parent().expect("binary has no parent dir");
-    let python = bin_dir.join("python");
-
     let t_exec = Instant::now();
-    let all_outputs = dispatch_plan(&exec_plan, &python, &db_path);
+    let all_outputs = dispatch_plan(&exec_plan, &python, &db_path, pool_size);
     let exec_time = t_exec.elapsed();
 
     // Persist all outputs to Turso.
     persist_outputs_sync(&db_path, &all_outputs);
 
-    // Print final result.
-    let last_node_id = exec_plan
+    // Print final result — find the last step from the last phase.
+    // For expanded partitions, match any output whose node_id starts with the planned step's id.
+    let total_executed = all_outputs.len();
+    let last_planned_id = exec_plan
         .phases
         .last()
         .and_then(|p| p.streams.last())
         .and_then(|s| s.steps.last())
-        .map(|s| s.node_id.as_str());
-
-    if let Some(node_id) = last_node_id
-        && let Some(output) = all_outputs.get(node_id)
-    {
+        .map(|s| s.node_id.as_str())
+        .unwrap_or("");
+    let last_output = all_outputs.get(last_planned_id).or_else(|| {
+        // Try prefix match for expanded partition steps.
+        all_outputs
+            .iter()
+            .filter(|(k, _)| k.starts_with(last_planned_id))
+            .map(|(_, v)| v)
+            .last()
+    });
+    if let Some(output) = last_output {
         println!(
             "{}",
             serde_json::json!({
                 "elapsed_seconds": exec_time.as_secs_f64(),
-                "steps_executed": exec_plan.total_steps,
+                "steps_executed": total_executed,
                 "phases": exec_plan.phases.len(),
                 "final_output": output,
             })
@@ -117,16 +127,20 @@ fn dispatch_plan(
     plan: &ExecutionPlan,
     python: &PathBuf,
     _db_path: &str,
+    pool_size: usize,
 ) -> HashMap<String, serde_json::Value> {
     let mut all_outputs: HashMap<String, serde_json::Value> = HashMap::new();
 
     for phase in &plan.phases {
-        // Build provided_inputs for this phase: any step input that references
-        // a node_id already in all_outputs needs to be embedded.
-        let provided = build_provided_inputs(phase, &all_outputs);
+        // Expand any pending_partitions using outputs from prior phases.
+        let expanded_phase = expand_pending_partitions(phase, &all_outputs, pool_size);
+        let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
+
+        // Build provided_inputs for this phase.
+        let provided = build_provided_inputs(phase_ref, &all_outputs);
 
         // Spawn workers, collect their stdout.
-        let phase_outputs = execute_phase(phase, &provided, python);
+        let phase_outputs = execute_phase(phase_ref, &provided, python);
 
         // Merge into global outputs.
         for (node_id, value) in phase_outputs {
@@ -135,6 +149,159 @@ fn dispatch_plan(
     }
 
     all_outputs
+}
+
+/// Expand steps with pending_partitions using materialized source outputs.
+/// Returns None if no expansion needed, or a new Phase with expanded steps.
+fn expand_pending_partitions(
+    phase: &Phase,
+    all_outputs: &HashMap<String, serde_json::Value>,
+    pool_size: usize,
+) -> Option<Phase> {
+    use barca_core::planner::WorkerStream;
+
+    let has_pending = phase
+        .streams
+        .iter()
+        .any(|s| s.steps.iter().any(|st| !st.pending_partitions.is_empty()));
+
+    if !has_pending {
+        return None;
+    }
+
+    // Expand all pending steps.
+    let mut all_expanded_steps: Vec<barca_core::planner::StreamStep> = Vec::new();
+    let mut passthrough_steps: Vec<barca_core::planner::StreamStep> = Vec::new();
+
+    for stream in &phase.streams {
+        for step in &stream.steps {
+            if step.pending_partitions.is_empty() {
+                passthrough_steps.push(step.clone());
+                continue;
+            }
+
+            // For each pending dimension, look up the source output.
+            let mut dim_values: HashMap<String, Vec<String>> = HashMap::new();
+            for (dim, source_name) in &step.pending_partitions {
+                // Find the source node's output (try exact match, then search by function name).
+                let source_output = all_outputs
+                    .iter()
+                    .find(|(k, _)| k.ends_with(&format!(":{source_name}")))
+                    .map(|(_, v)| v);
+
+                if let Some(output) = source_output {
+                    // Extract partition values from the output (expect a JSON array).
+                    let values: Vec<String> = match output {
+                        serde_json::Value::Array(arr) => arr
+                            .iter()
+                            .filter_map(|v| match v {
+                                serde_json::Value::String(s) => Some(s.clone()),
+                                serde_json::Value::Number(n) => Some(n.to_string()),
+                                _ => None,
+                            })
+                            .collect(),
+                        _ => {
+                            eprintln!(
+                                "[barca] Warning: partition source '{}' did not return an array",
+                                source_name
+                            );
+                            continue;
+                        }
+                    };
+                    dim_values.insert(dim.clone(), values);
+                } else {
+                    eprintln!(
+                        "[barca] Warning: partition source '{}' not found in outputs",
+                        source_name
+                    );
+                }
+            }
+
+            if dim_values.is_empty() {
+                passthrough_steps.push(step.clone());
+                continue;
+            }
+
+            // Expand into N steps (cartesian product of all dimensions).
+            let combos = expand_combos(&dim_values);
+            for combo in combos {
+                let suffix = combo
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                all_expanded_steps.push(barca_core::planner::StreamStep {
+                    node_id: format!("{}[{suffix}]", step.node_id),
+                    function_name: step.function_name.clone(),
+                    source_file: step.source_file.clone(),
+                    inputs: step.inputs.clone(),
+                    partition: combo,
+                    pending_partitions: HashMap::new(),
+                });
+            }
+        }
+    }
+
+    // Distribute expanded steps across streams.
+    let total_steps = all_expanded_steps.len() + passthrough_steps.len();
+    let num_streams = total_steps.min(pool_size).max(1);
+    let mut streams: Vec<Vec<barca_core::planner::StreamStep>> = vec![Vec::new(); num_streams];
+    let mut sizes: Vec<usize> = vec![0; num_streams];
+
+    // Passthrough steps first.
+    for step in passthrough_steps {
+        let target = sizes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| *s)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        sizes[target] += 1;
+        streams[target].push(step);
+    }
+    // Then expanded partition steps.
+    for step in all_expanded_steps {
+        let target = sizes
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, s)| *s)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        sizes[target] += 1;
+        streams[target].push(step);
+    }
+
+    let worker_streams: Vec<WorkerStream> = streams
+        .into_iter()
+        .enumerate()
+        .filter(|(_, s)| !s.is_empty())
+        .map(|(i, steps)| WorkerStream {
+            stream_id: format!("expanded-w{i}"),
+            steps,
+        })
+        .collect();
+
+    Some(Phase {
+        reason: phase.reason.clone(),
+        streams: worker_streams,
+    })
+}
+
+/// Expand partition dimension values into cartesian product combinations.
+fn expand_combos(dims: &HashMap<String, Vec<String>>) -> Vec<HashMap<String, String>> {
+    let mut combos = vec![HashMap::new()];
+    for (dim, values) in dims {
+        let mut new_combos = Vec::new();
+        for combo in &combos {
+            for val in values {
+                let mut c = combo.clone();
+                c.insert(dim.clone(), val.clone());
+                new_combos.push(c);
+            }
+        }
+        combos = new_combos;
+    }
+    combos
 }
 
 /// Determine what values need to be provided to workers in this phase.
@@ -255,7 +422,8 @@ fn serialize_batch(
 }
 
 fn plan_command(file_args: &[String]) {
-    let dag = build_dag(file_args);
+    let python = find_python();
+    let dag = build_dag(file_args, &python);
     let config = ResourceConfig {
         pool_size: 10,
         concurrency_groups: HashMap::new(),
@@ -291,7 +459,7 @@ fn plan_command(file_args: &[String]) {
     );
 }
 
-fn build_dag(file_args: &[String]) -> Dag {
+fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
     for path in &paths {
@@ -304,10 +472,85 @@ fn build_dag(file_args: &[String]) -> Dag {
         });
         all_nodes.extend(nodes);
     }
+
+    // Resolve Dynamic partition specs by spawning Python to evaluate expressions.
+    resolve_dynamic_partitions(&mut all_nodes, python);
+
     Dag::build(&all_nodes).unwrap_or_else(|e| {
         eprintln!("DAG error: {e}");
         std::process::exit(1);
     })
+}
+
+/// Resolve PartitionSpec::Dynamic by evaluating Python expressions.
+/// Mutates nodes in place: Dynamic → Static.
+fn resolve_dynamic_partitions(nodes: &mut [barca_core::model::ExtractedNode], python: &PathBuf) {
+    for node in nodes.iter_mut() {
+        let mut resolved: Vec<(String, Vec<barca_core::model::PartitionValue>)> = Vec::new();
+
+        for (dim, spec) in &node.partitions {
+            if let barca_core::model::PartitionSpec::Dynamic { source_text } = spec {
+                // Spawn Python to evaluate the expression within the user's module context.
+                let module_path = std::path::Path::new(&node.source_file)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(&node.source_file));
+                let script = format!(
+                    "import json, importlib.util; \
+                     _spec = importlib.util.spec_from_file_location('_m', '{path}'); \
+                     _mod = importlib.util.module_from_spec(_spec); \
+                     _spec.loader.exec_module(_mod); \
+                     _ns = vars(_mod); _ns['__builtins__'] = __builtins__; \
+                     print(json.dumps(eval('{expr}', _ns)))",
+                    path = module_path.display(),
+                    expr = source_text.replace('\'', "\\'"),
+                );
+                let output = Command::new(python)
+                    .args(["-c", &script])
+                    .output()
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "Failed to evaluate partition expression for {}: {e}",
+                            node.function_name
+                        )
+                    });
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    eprintln!(
+                        "Warning: failed to evaluate partition expression '{}' for {}: {}",
+                        source_text,
+                        node.function_name,
+                        stderr.trim()
+                    );
+                    continue;
+                }
+
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let values: Vec<serde_json::Value> =
+                    serde_json::from_str(stdout.trim()).unwrap_or_default();
+                let partition_values: Vec<barca_core::model::PartitionValue> = values
+                    .into_iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => {
+                            Some(barca_core::model::PartitionValue::Str(s))
+                        }
+                        serde_json::Value::Number(n) => {
+                            n.as_i64().map(barca_core::model::PartitionValue::Int)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+
+                resolved.push((dim.clone(), partition_values));
+            }
+        }
+
+        // Replace Dynamic specs with Static.
+        for (dim, values) in resolved {
+            node.partitions
+                .insert(dim, barca_core::model::PartitionSpec::Static { values });
+        }
+    }
 }
 
 fn ensure_db_dir() -> String {

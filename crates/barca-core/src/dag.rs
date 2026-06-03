@@ -4,6 +4,7 @@
 use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
+use petgraph::visit::EdgeRef;
 use std::collections::HashMap;
 
 use crate::model::{DagNode, EdgeKind, ExtractedNode, NodeKind};
@@ -180,6 +181,38 @@ impl Dag {
             .neighbors_directed(idx, Direction::Outgoing)
             .map(|succ| self.graph[succ].id.as_str())
             .collect()
+    }
+
+    /// Get upstream node IDs, excluding PartitionSource edges.
+    /// Used by the planner for chain detection — partition source deps
+    /// should force phase breaks, not chain bundling.
+    pub fn execution_upstream(&self, id: &str) -> Vec<&str> {
+        let Some(&idx) = self.index.get(id) else {
+            return vec![];
+        };
+        let mut result = Vec::new();
+        for edge in self.graph.edges_directed(idx, Direction::Incoming) {
+            if *edge.weight() != EdgeKind::PartitionSource {
+                let source_idx = edge.source();
+                result.push(self.graph[source_idx].id.as_str());
+            }
+        }
+        result
+    }
+
+    /// Get downstream node IDs, excluding PartitionSource edges.
+    pub fn execution_downstream(&self, id: &str) -> Vec<&str> {
+        let Some(&idx) = self.index.get(id) else {
+            return vec![];
+        };
+        let mut result = Vec::new();
+        for edge in self.graph.edges_directed(idx, Direction::Outgoing) {
+            if *edge.weight() != EdgeKind::PartitionSource {
+                let target_idx = edge.target();
+                result.push(self.graph[target_idx].id.as_str());
+            }
+        }
+        result
     }
 
     /// Node count.
