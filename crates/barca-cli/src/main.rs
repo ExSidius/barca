@@ -4,7 +4,7 @@
 
 use barca_core::dag::Dag;
 use barca_core::parse::extract_nodes;
-use barca_core::plan::ResourceConfig;
+use barca_core::planner::ResourceConfig;
 use barca_core::planner::{self, ExecutionPlan, Phase, WorkerStream};
 use std::collections::HashMap;
 use std::env;

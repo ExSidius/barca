@@ -209,32 +209,6 @@ pub struct DagNode {
     pub is_unsafe: bool,
 }
 
-// ─── Staleness & scheduling state ────────────────────────────────────────────
-
-/// The state of a node with respect to materialization and scheduling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NodeState {
-    /// Has a current successful materialization.
-    Fresh,
-    /// Stale, but cron tick hasn't occurred yet.
-    StaleWaitingForSchedule,
-    /// Stale, but a transitive upstream is Manual and not yet refreshed.
-    StaleWaitingForUpstream,
-    /// Stale AND eligible for execution (all conditions met).
-    RunnableStale,
-    /// Currently executing.
-    Running,
-    /// Last execution failed.
-    Failed,
-    /// Exceeded timeout_seconds.
-    TimedOut,
-    /// User cancelled execution.
-    Cancelled,
-    /// Superseded by a newer definition (no longer in source).
-    Historical,
-}
-
 // ─── Edge kinds ──────────────────────────────────────────────────────────────
 
 /// How two nodes are related in the DAG.

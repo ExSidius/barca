@@ -7,7 +7,6 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
 
 use crate::model::{DagNode, EdgeKind, ExtractedNode, NodeKind};
-use crate::plan::{DagShape, KindBreakdown, PlanStats};
 
 /// The constructed DAG — validated, acyclic, ready for plan generation.
 #[derive(Debug)]
@@ -184,120 +183,6 @@ impl Dag {
             .into_iter()
             .map(|(idx, tier)| (self.graph[idx].id.clone(), tier))
             .collect()
-    }
-
-    /// Classify the DAG shape for optimization purposes.
-    pub fn classify_shape(&self) -> DagShape {
-        let n = self.graph.node_count();
-        let e = self.graph.edge_count();
-
-        if n == 0 {
-            return DagShape::LinearChain;
-        }
-
-        // Linear chain: N nodes, N-1 edges, max in-degree and out-degree = 1.
-        if e == n - 1 {
-            let max_in = self
-                .graph
-                .node_indices()
-                .map(|i| {
-                    self.graph
-                        .neighbors_directed(i, Direction::Incoming)
-                        .count()
-                })
-                .max()
-                .unwrap_or(0);
-            let max_out = self
-                .graph
-                .node_indices()
-                .map(|i| {
-                    self.graph
-                        .neighbors_directed(i, Direction::Outgoing)
-                        .count()
-                })
-                .max()
-                .unwrap_or(0);
-
-            if max_in <= 1 && max_out <= 1 {
-                return DagShape::LinearChain;
-            }
-            return DagShape::Tree;
-        }
-
-        // Wide fan-out: many roots (no incoming edges), shallow depth.
-        let tiers = self.compute_tiers();
-        let max_tier = tiers.values().copied().max().unwrap_or(0);
-        let roots = self
-            .graph
-            .node_indices()
-            .filter(|&i| {
-                self.graph
-                    .neighbors_directed(i, Direction::Incoming)
-                    .count()
-                    == 0
-            })
-            .count();
-
-        if max_tier <= 2 && roots > n / 2 {
-            return DagShape::WideFanOut;
-        }
-
-        // Diamond: has at least one node with in-degree > 1 (fan-in).
-        let has_fanin = self.graph.node_indices().any(|i| {
-            self.graph
-                .neighbors_directed(i, Direction::Incoming)
-                .count()
-                > 1
-        });
-        let has_fanout = self.graph.node_indices().any(|i| {
-            self.graph
-                .neighbors_directed(i, Direction::Outgoing)
-                .count()
-                > 1
-        });
-
-        if has_fanin && has_fanout {
-            return DagShape::Diamond;
-        }
-
-        DagShape::Complex
-    }
-
-    /// Compute plan statistics.
-    pub fn stats(&self) -> PlanStats {
-        let tiers = self.compute_tiers();
-        let max_tier = tiers.values().copied().max().map(|t| t + 1).unwrap_or(0);
-
-        // Count steps per tier for max parallelism.
-        let mut tier_counts: HashMap<usize, usize> = HashMap::new();
-        for tier in tiers.values() {
-            *tier_counts.entry(*tier).or_default() += 1;
-        }
-        let max_parallelism = tier_counts.values().copied().max().unwrap_or(0);
-
-        // Count by kind.
-        let mut assets = 0;
-        let mut sensors = 0;
-        let mut effects = 0;
-        for idx in self.graph.node_indices() {
-            match self.graph[idx].kind {
-                NodeKind::Asset => assets += 1,
-                NodeKind::Sensor => sensors += 1,
-                NodeKind::Effect => effects += 1,
-            }
-        }
-
-        PlanStats {
-            total_steps: self.graph.node_count(),
-            skippable_steps: 0, // determined at runtime via cache lookup
-            max_parallelism,
-            critical_path_length: max_tier,
-            by_kind: KindBreakdown {
-                assets,
-                sensors,
-                effects,
-            },
-        }
     }
 
     /// Get a node by ID.

@@ -5,10 +5,19 @@
 //! 1. decompose: identify chains, fan-out points, fan-in points
 //! 2. plan: assign chains to phases and streams based on topology + resource config
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::dag::Dag;
-use crate::plan::ResourceConfig;
+
+/// Resource configuration — the knobs the user controls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceConfig {
+    /// Max concurrent workers (default: cpu_count).
+    pub pool_size: usize,
+    /// Per-group concurrency limits from `tags={"concurrency_group": "..."}`.
+    pub concurrency_groups: HashMap<String, usize>,
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Output types
