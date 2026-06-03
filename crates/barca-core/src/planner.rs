@@ -41,7 +41,6 @@ pub struct Phase {
 pub enum PhaseReason {
     Initial,
     FanIn { node_id: String },
-    PartitionResolution { source_node_id: String },
 }
 
 /// A worker stream — ordered steps for one Python process.
@@ -280,14 +279,14 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
         .iter()
         .map(|node_id| {
             let node = dag.get_node(node_id).unwrap();
-            let mut inputs = node.inputs.clone();
-            for (k, v) in &node.collected_inputs {
+            let mut inputs = node.resolved_inputs.clone();
+            for (k, v) in &node.resolved_collected {
                 inputs.insert(k.clone(), v.clone());
             }
             StreamStep {
                 node_id: node_id.clone(),
-                function_name: node.function_name.clone(),
-                source_file: node.source_file.clone(),
+                function_name: node.function_name().to_string(),
+                source_file: node.source_file().to_string(),
                 inputs,
             }
         })

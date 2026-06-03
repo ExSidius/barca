@@ -178,35 +178,31 @@ impl ExtractedNode {
 
 // ─── DAG node (enriched after construction) ──────────────────────────────────
 
-/// A node in the constructed DAG — enriched with resolved information.
+/// A node in the constructed DAG. Wraps the original `ExtractedNode` and adds
+/// resolved dependency information (upstream node IDs, not raw function names).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DagNode {
-    /// Stable identity.
+    /// Stable identity (continuity key).
     pub id: String,
-    /// Node kind.
-    pub kind: NodeKind,
-    /// Function name.
-    pub function_name: String,
-    /// Source file path.
-    pub source_file: String,
-    /// Freshness policy.
-    pub freshness: Freshness,
+    /// The original parsed node (all declared metadata).
+    pub extracted: ExtractedNode,
     /// Resolved inputs: param_name → upstream_node_id.
-    pub inputs: HashMap<String, String>,
+    pub resolved_inputs: HashMap<String, String>,
     /// Collected inputs (fan-in): param_name → upstream_node_id.
-    pub collected_inputs: HashMap<String, String>,
-    /// Partition dimensions. Typically 0–2 keys.
-    pub partition_keys: SmallVec<[String; 2]>,
-    /// Whether partitions are static or derived.
-    pub partition_specs: HashMap<String, PartitionSpec>,
-    /// Sink declarations.
-    pub sinks: SmallVec<[SinkDecl; 2]>,
-    /// Timeout.
-    pub timeout_seconds: u32,
-    /// Tags.
-    pub tags: HashMap<String, String>,
-    /// Whether @unsafe.
-    pub is_unsafe: bool,
+    pub resolved_collected: HashMap<String, String>,
+}
+
+impl DagNode {
+    // Convenience accessors that forward to the extracted node.
+    pub fn kind(&self) -> NodeKind {
+        self.extracted.kind
+    }
+    pub fn function_name(&self) -> &str {
+        &self.extracted.function_name
+    }
+    pub fn source_file(&self) -> &str {
+        &self.extracted.source_file
+    }
 }
 
 // ─── Edge kinds ──────────────────────────────────────────────────────────────

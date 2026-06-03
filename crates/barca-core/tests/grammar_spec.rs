@@ -733,14 +733,14 @@ def evaluate(model, data): return {}
     // 3 raw→prep edges + 3 prep→master + master→split + split→train + train→eval + split→eval
     assert_eq!(dag.edge_count(), 10);
 
-    let tiers = dag.compute_tiers();
-    // raw sources at tier 0, preps at tier 1, master at tier 2, split at 3, train at 4, eval at 5
-    assert_eq!(tiers["test.py:raw_shuttles"], 0);
-    assert_eq!(tiers["test.py:prep_shuttles"], 1);
-    assert_eq!(tiers["test.py:master_table"], 2);
-    assert_eq!(tiers["test.py:split"], 3);
-    assert_eq!(tiers["test.py:train"], 4);
-    assert_eq!(tiers["test.py:evaluate"], 5);
+    // Verify topology: raw sources have no upstream, evaluate depends on train + split
+    assert!(dag.upstream("test.py:raw_shuttles").is_empty());
+    assert_eq!(
+        dag.downstream("test.py:raw_shuttles"),
+        vec!["test.py:prep_shuttles"]
+    );
+    let eval_upstream = dag.upstream("test.py:evaluate");
+    assert_eq!(eval_upstream.len(), 2); // train + split
 }
 
 #[test]

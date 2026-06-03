@@ -58,7 +58,7 @@ impl Dag {
                 let existing: &DagNode = &graph[*existing_idx];
                 return Err(DagError::DuplicateKey {
                     key: id,
-                    first: existing.source_file.clone(),
+                    first: existing.source_file().to_string(),
                     second: node.source_file.clone(),
                 });
             }
@@ -70,18 +70,9 @@ impl Dag {
 
             let dag_node = DagNode {
                 id: id.clone(),
-                kind: node.kind,
-                function_name: node.function_name.clone(),
-                source_file: node.source_file.clone(),
-                freshness: node.freshness.clone(),
-                inputs: HashMap::new(),
-                collected_inputs: HashMap::new(),
-                partition_keys: node.partitions.keys().cloned().collect(),
-                partition_specs: node.partitions.clone(),
-                sinks: node.sinks.clone(),
-                timeout_seconds: node.timeout_seconds,
-                tags: node.tags.clone(),
-                is_unsafe: node.is_unsafe,
+                extracted: node.clone(),
+                resolved_inputs: HashMap::new(),
+                resolved_collected: HashMap::new(),
             };
 
             let idx = graph.add_node(dag_node);
@@ -107,7 +98,7 @@ impl Dag {
                 let upstream_idx = index[upstream_key.as_str()];
 
                 // Validate: effects cannot be inputs.
-                if graph[upstream_idx].kind == NodeKind::Effect {
+                if graph[upstream_idx].kind() == NodeKind::Effect {
                     return Err(DagError::EffectAsInput {
                         effect: upstream_key.clone(),
                         downstream: downstream_key.clone(),
@@ -124,11 +115,11 @@ impl Dag {
                 // Record the resolved mapping on the node.
                 if input.collected {
                     graph[downstream_idx]
-                        .collected_inputs
+                        .resolved_collected
                         .insert(input.param_name.clone(), upstream_key.clone());
                 } else {
                     graph[downstream_idx]
-                        .inputs
+                        .resolved_inputs
                         .insert(input.param_name.clone(), upstream_key.clone());
                 }
             }
@@ -161,27 +152,6 @@ impl Dag {
         sorted
             .iter()
             .map(|idx| self.graph[*idx].id.as_str())
-            .collect()
-    }
-
-    /// Compute parallelism tiers: tier[i] = max(tier[predecessors]) + 1.
-    pub fn compute_tiers(&self) -> HashMap<String, usize> {
-        let sorted = toposort(&self.graph, None).expect("verified acyclic");
-        let mut tiers: HashMap<NodeIndex, usize> = HashMap::new();
-
-        for &idx in &sorted {
-            let tier = self
-                .graph
-                .neighbors_directed(idx, Direction::Incoming)
-                .map(|pred| tiers[&pred] + 1)
-                .max()
-                .unwrap_or(0);
-            tiers.insert(idx, tier);
-        }
-
-        tiers
-            .into_iter()
-            .map(|(idx, tier)| (self.graph[idx].id.clone(), tier))
             .collect()
     }
 
