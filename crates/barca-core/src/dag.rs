@@ -7,6 +7,7 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 use std::collections::HashMap;
 
+use crate::hash;
 use crate::model::{DagNode, EdgeKind, ExtractedNode, NodeKind};
 
 /// The constructed DAG — validated, acyclic, ready for plan generation.
@@ -69,11 +70,22 @@ impl Dag {
                 return Err(DagError::SensorWithInputs { sensor: id.clone() });
             }
 
+            // Compute definition_hash from source text + metadata.
+            // For now, cone_source is empty (dependency cone analysis not yet wired).
+            let metadata = serde_json::json!({
+                "kind": node.kind,
+                "freshness": node.freshness,
+                "inputs": node.inputs.iter().map(|i| &i.param_name).collect::<Vec<_>>(),
+            })
+            .to_string();
+            let def_hash = hash::definition_hash(&node.source_text, "", &metadata);
+
             let dag_node = DagNode {
                 id: id.clone(),
                 extracted: node.clone(),
                 resolved_inputs: HashMap::new(),
                 resolved_collected: HashMap::new(),
+                definition_hash: def_hash,
             };
 
             let idx = graph.add_node(dag_node);
@@ -145,6 +157,36 @@ impl Dag {
         }
 
         Ok(dag)
+    }
+
+    /// Get the subgraph of all nodes upstream of (and including) target.
+    /// Returns node IDs in topological order (dependencies first).
+    pub fn subgraph(&self, target_id: &str) -> Vec<&str> {
+        let Some(&target_idx) = self.index.get(target_id) else {
+            return vec![];
+        };
+
+        // BFS backwards from target to find all ancestors.
+        let mut visited = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(target_idx);
+        visited.insert(target_idx);
+
+        while let Some(idx) = queue.pop_front() {
+            for pred in self.graph.neighbors_directed(idx, Direction::Incoming) {
+                if visited.insert(pred) {
+                    queue.push_back(pred);
+                }
+            }
+        }
+
+        // Return in topo order (filtered to subgraph).
+        let sorted = toposort(&self.graph, None).expect("verified acyclic");
+        sorted
+            .into_iter()
+            .filter(|idx| visited.contains(idx))
+            .map(|idx| self.graph[idx].id.as_str())
+            .collect()
     }
 
     /// Topologically sorted node IDs.

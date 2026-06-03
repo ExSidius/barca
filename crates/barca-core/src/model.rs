@@ -194,6 +194,9 @@ pub struct DagNode {
     pub resolved_inputs: HashMap<String, String>,
     /// Collected inputs (fan-in): param_name → upstream_node_id.
     pub resolved_collected: HashMap<String, String>,
+    /// Content hash of this node's definition (source + metadata).
+    /// Changes when the function body, helpers, constants, or decorator args change.
+    pub definition_hash: String,
 }
 
 impl DagNode {
