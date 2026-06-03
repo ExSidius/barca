@@ -9,7 +9,8 @@ Last run: 2026-06-03 | Apple Silicon (M-series) | Rust release build
 - **Barca**: Python 3.14.3 (workspace .venv), Rust release binary
 - **Dagster**: Python 3.12.0 (latest compatible), dagster latest
 - **Prefect**: Python 3.12.0, prefect latest
-- **Python version note**: dagster and prefect do not yet support Python 3.14
+- **Airflow**: Python 3.12.0, apache-airflow latest (3.2.2)
+- **Python version note**: dagster, prefect, and airflow do not yet support Python 3.14
 
 ### Execution modes tested
 
@@ -20,6 +21,7 @@ Last run: 2026-06-03 | Apple Silicon (M-series) | Rust release build
 | **Dagster** (server) | `dagster dev` + GraphQL | multiprocess_executor spawns subprocess per asset |
 | **Prefect** (sequential) | direct task calls | Sequential (default) |
 | **Prefect** (parallel) | `ConcurrentTaskRunner` + `.submit()` | Thread-based concurrency (max_workers=16) |
+| **Airflow** | `dags test` | Sequential (LocalExecutor in test mode) |
 
 ### Measurement
 - hyperfine with --warmup 3 for sub-100ms benchmarks (≥10 runs)
@@ -31,22 +33,24 @@ Last run: 2026-06-03 | Apple Silicon (M-series) | Rust release build
 
 All frameworks invoked as scripts — no pre-started servers.
 
-| # | Benchmark | barca | dagster | prefect | vs dagster |
+| # | Benchmark | barca | dagster | prefect | airflow |
 |---|---|---:|---:|---:|---:|
-| 1 | Trivial (1 asset) | **29ms** | 535ms | 3.9s | 18.7x |
-| 2 | Chain 100 (linear) | **37ms** | 1.1s | 4.3s | 29.8x |
-| 3 | Fan-out 500 (no work) | **87ms** | 2.3s | 4.0s | 26.8x |
-| 4 | Fan-out 500×50ms | **1.9s** | 33.7s | 33.4s | 17.7x |
-| 5 | Spaceflights (sklearn) | **574ms** | 1.2s | 3.9s | 2.1x |
-| 6 | Deep Diamond (18 assets) | **83ms** | 678ms | 4.0s | 8.2x |
-| 7 | Wide Layers (63 assets) | **167ms** | 919ms | 3.9s | 5.5x |
-| 8 | Mixed I/O+CPU | **231ms** | 1.1s | 4.0s | 4.6x |
-| 9 | Large Payloads (10k rows) | **203ms** | 631ms | 6.0s | 3.1x |
-| 10 | Map/Reduce (1→50→1) | **89ms** | 917ms | 4.1s | 10.3x |
-| 11 | Multi-file (50 files) | **60ms** | 911ms | 4.0s | 15.1x |
-| 12 | ETL Pipeline (100k rows) | **604ms** | 953ms | 14.2s | 1.6x |
-| 13 | Wide Join (10→1) | **58ms** | 635ms | 4.1s | 10.9x |
-| 14 | Backfill (10-step × 10) | **282ms** | 6.2s | 40.1s | 22.1x |
+| 1 | Trivial (1 asset) | **29ms** | 535ms | 3.9s | 3.5s |
+| 2 | Chain 100 (linear) | **37ms** | 1.1s | 4.3s | 83s |
+| 3 | Fan-out 500 (no work) | **87ms** | 2.3s | 4.0s | — |
+| 4 | Fan-out 500×50ms | **1.9s** | 33.7s | 33.4s | 461s |
+| 5 | Spaceflights (sklearn) | **574ms** | 1.2s | 3.9s | — |
+| 6 | Deep Diamond (18 assets) | **83ms** | 678ms | 4.0s | 17s |
+| 7 | Wide Layers (63 assets) | **167ms** | 919ms | 3.9s | — |
+| 8 | Mixed I/O+CPU | **231ms** | 1.1s | 4.0s | — |
+| 9 | Large Payloads (10k rows) | **203ms** | 631ms | 6.0s | — |
+| 10 | Map/Reduce (1→50→1) | **89ms** | 917ms | 4.1s | — |
+| 11 | Multi-file (50 files) | **60ms** | 911ms | 4.0s | — |
+| 12 | ETL Pipeline (100k rows) | **604ms** | 953ms | 14.2s | — |
+| 13 | Wide Join (10→1) | **58ms** | 635ms | 4.1s | — |
+| 14 | Backfill (10-step × 10) | **282ms** | 6.2s | 40.1s | — |
+
+*Airflow `dags test` has ~800ms per-task overhead. Benchmarks with 500+ tasks take 7+ minutes. Dashes indicate benchmarks not yet run for Airflow.*
 
 ## Parallel mode comparison (fan_out_500_50ms)
 
