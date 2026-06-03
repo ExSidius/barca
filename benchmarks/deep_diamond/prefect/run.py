@@ -6,6 +6,7 @@ import random
 import time
 
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
 
 
 # ── 5 independent sources ──
@@ -190,34 +191,34 @@ def output(data):
     }
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=16))
 def deep_diamond_flow():
     # Sources (parallel)
-    s0 = src_0()
-    s1 = src_1()
-    s2 = src_2()
-    s3 = src_3()
-    s4 = src_4()
+    s0 = src_0.submit()
+    s1 = src_1.submit()
+    s2 = src_2.submit()
+    s3 = src_3.submit()
+    s4 = src_4.submit()
 
     # Prep (parallel, each depends on its source)
-    p0 = prep_0(s0)
-    p1 = prep_1(s1)
-    p2 = prep_2(s2)
-    p3 = prep_3(s3)
-    p4 = prep_4(s4)
+    p0 = prep_0.submit(s0)
+    p1 = prep_1.submit(s1)
+    p2 = prep_2.submit(s2)
+    p3 = prep_3.submit(s3)
+    p4 = prep_4.submit(s4)
 
     # Features (parallel, each depends on its prep)
-    f0 = feat_0(p0)
-    f1 = feat_1(p1)
-    f2 = feat_2(p2)
-    f3 = feat_3(p3)
-    f4 = feat_4(p4)
+    f0 = feat_0.submit(p0)
+    f1 = feat_1.submit(p1)
+    f2 = feat_2.submit(p2)
+    f3 = feat_3.submit(p3)
+    f4 = feat_4.submit(p4)
 
     # Merge (fan-in)
-    merged = merge(f0, f1, f2, f3, f4)
+    merged = merge.submit(f0, f1, f2, f3, f4)
 
     # Post-processing chain
-    transformed = transform(merged)
+    transformed = transform.submit(merged)
     result = output(transformed)
     return result
 

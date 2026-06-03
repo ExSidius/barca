@@ -5,6 +5,7 @@ import json
 import time
 
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
 
 
 # ── I/O-bound steps (simulated API calls, 50ms each) ──
@@ -75,20 +76,20 @@ def summarize(data):
     return {"total_hashes": data["count"], "unique": unique}
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=16))
 def mixed_io_cpu_flow():
     # I/O-bound (parallel)
-    a0 = api_call_0()
-    a1 = api_call_1()
-    a2 = api_call_2()
-    a3 = api_call_3()
-    a4 = api_call_4()
+    a0 = api_call_0.submit()
+    a1 = api_call_1.submit()
+    a2 = api_call_2.submit()
+    a3 = api_call_3.submit()
+    a4 = api_call_4.submit()
 
     # Fan-in merge
-    combined = combine(a0, a1, a2, a3, a4)
+    combined = combine.submit(a0, a1, a2, a3, a4)
 
     # CPU-bound
-    computed = heavy_compute(combined)
+    computed = heavy_compute.submit(combined)
 
     # Post-processing
     result = summarize(computed)
