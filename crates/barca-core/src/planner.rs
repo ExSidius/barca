@@ -159,6 +159,7 @@ fn detect_chains(dag: &Dag) -> Vec<Chain> {
 pub fn plan(dag: &Dag, topology: &Topology, config: &ResourceConfig) -> ExecutionPlan {
     let phase_assignment = assign_phases(topology);
     let phases = build_phases(dag, topology, &phase_assignment, config);
+    let phases = merge_single_stream_phases(phases);
 
     let total_steps = phases
         .iter()
@@ -170,6 +171,31 @@ pub fn plan(dag: &Dag, topology: &Topology, config: &ResourceConfig) -> Executio
         phases,
         total_steps,
     }
+}
+
+/// Merge consecutive phases that each have exactly 1 stream into a single phase.
+/// This avoids spawning a new process for each sequential phase when there's
+/// no parallelism opportunity.
+fn merge_single_stream_phases(phases: Vec<Phase>) -> Vec<Phase> {
+    let mut merged: Vec<Phase> = Vec::new();
+
+    for phase in phases {
+        let can_merge = phase.streams.len() == 1
+            && merged
+                .last()
+                .is_some_and(|prev: &Phase| prev.streams.len() == 1);
+
+        if can_merge {
+            // Append this phase's single stream's steps to the previous phase's single stream.
+            let prev = merged.last_mut().unwrap();
+            let new_steps = phase.streams.into_iter().next().unwrap().steps;
+            prev.streams[0].steps.extend(new_steps);
+        } else {
+            merged.push(phase);
+        }
+    }
+
+    merged
 }
 
 /// Assign each chain to a phase number based on inter-chain dependencies.
