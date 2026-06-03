@@ -294,7 +294,10 @@ fn build_dag(file_args: &[String]) -> Dag {
         let source = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("Error reading {}: {e}", path.display()));
         let file_str = path.to_string_lossy().to_string();
-        let nodes = extract_nodes(&source, &file_str);
+        let nodes = extract_nodes(&source, &file_str).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
         all_nodes.extend(nodes);
     }
     Dag::build(&all_nodes).unwrap_or_else(|e| {

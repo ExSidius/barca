@@ -1,4 +1,7 @@
 //! Python source parsing — extracts decorated nodes using ruff's AST.
+//!
+//! Pure function: `(source, file_path) → Result<Vec<ExtractedNode>, ParseError>`.
+//! No I/O, no side effects.
 
 use ruff_python_ast::{self as ast, Expr, Keyword, Stmt};
 use ruff_python_parser::parse_module;
@@ -11,15 +14,22 @@ use crate::model::{
     PartitionValue, SerializerKind, SinkDecl,
 };
 
+/// Error from parsing a Python source file.
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error("syntax error in {file}: {message}")]
+    SyntaxError { file: String, message: String },
+}
+
 /// Parse a Python source file and extract all barca-decorated nodes.
-pub fn extract_nodes(source: &str, file_path: &str) -> Vec<ExtractedNode> {
-    let parsed = match parse_module(source) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Parse error in {file_path}: {e}");
-            return vec![];
-        }
-    };
+///
+/// Pure function — no I/O, no side effects. Returns `Err` for unparseable Python.
+/// Returns `Ok(vec![])` for valid Python with no barca decorators.
+pub fn extract_nodes(source: &str, file_path: &str) -> Result<Vec<ExtractedNode>, ParseError> {
+    let parsed = parse_module(source).map_err(|e| ParseError::SyntaxError {
+        file: file_path.to_string(),
+        message: e.to_string(),
+    })?;
 
     let module = parsed.into_syntax();
     let mut nodes = Vec::new();
@@ -32,7 +42,7 @@ pub fn extract_nodes(source: &str, file_path: &str) -> Vec<ExtractedNode> {
         }
     }
 
-    nodes
+    Ok(nodes)
 }
 
 fn try_extract_function(
@@ -302,19 +312,20 @@ fn extract_partitions(keywords: &[&Keyword]) -> HashMap<String, PartitionSpec> {
                                     PartitionSpec::Static { values }
                                 }
                                 "partitions_from" => {
-                                    let source_ref = call
-                                        .arguments
-                                        .args
-                                        .first()
-                                        .and_then(|a| {
-                                            if let Expr::Name(n) = a {
-                                                Some(NodeRef::FunctionName(n.id.to_string()))
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .unwrap_or(NodeRef::FunctionName("unknown".into()));
-                                    PartitionSpec::DerivedFrom { source_ref }
+                                    let source_ref = call.arguments.args.first().and_then(|a| {
+                                        if let Expr::Name(n) = a {
+                                            Some(NodeRef::FunctionName(n.id.to_string()))
+                                        } else {
+                                            None
+                                        }
+                                    });
+                                    // Skip if we can't resolve the reference — DAG
+                                    // validation will catch missing deps later.
+                                    if let Some(source_ref) = source_ref {
+                                        PartitionSpec::DerivedFrom { source_ref }
+                                    } else {
+                                        continue;
+                                    }
                                 }
                                 _ => continue,
                             }
@@ -422,7 +433,7 @@ from barca import asset
 def single_asset() -> dict:
     return {"status": "ok"}
 "#;
-        let nodes = extract_nodes(src, "test.py");
+        let nodes = extract_nodes(src, "test.py").unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].kind, NodeKind::Asset);
         assert_eq!(nodes[0].function_name, "single_asset");
@@ -438,7 +449,7 @@ from barca import asset
 def bare() -> dict:
     return {}
 "#;
-        let nodes = extract_nodes(src, "test.py");
+        let nodes = extract_nodes(src, "test.py").unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].function_name, "bare");
     }
@@ -456,7 +467,7 @@ def a() -> str:
 def b(a: str) -> str:
     return a.upper()
 "#;
-        let nodes = extract_nodes(src, "test.py");
+        let nodes = extract_nodes(src, "test.py").unwrap();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[1].inputs.len(), 1);
         assert_eq!(nodes[1].inputs[0].param_name, "a");
@@ -476,7 +487,7 @@ def my_sensor():
 def my_effect(data):
     print(data)
 "#;
-        let nodes = extract_nodes(src, "test.py");
+        let nodes = extract_nodes(src, "test.py").unwrap();
         assert_eq!(nodes[0].kind, NodeKind::Sensor);
         assert_eq!(
             nodes[0].freshness,
@@ -496,7 +507,7 @@ from barca import asset, sink
 def my_asset() -> dict:
     return {}
 "#;
-        let nodes = extract_nodes(src, "test.py");
+        let nodes = extract_nodes(src, "test.py").unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].sinks.len(), 2);
         assert_eq!(nodes[0].sinks[0].path, "tmp/out.json");

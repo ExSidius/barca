@@ -20,7 +20,7 @@ from barca import asset
 def my_asset() -> dict:
     return {"x": 1}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].kind, NodeKind::Asset);
     assert_eq!(nodes[0].freshness, Freshness::Always);
@@ -35,7 +35,7 @@ from barca import asset
 def my_asset() -> dict:
     return {"x": 1}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].kind, NodeKind::Asset);
 }
@@ -49,7 +49,7 @@ from barca import sensor
 def check_inbox():
     return (True, {"files": ["a.csv"]})
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].kind, NodeKind::Sensor);
     // Sensors default to Manual freshness
@@ -65,7 +65,7 @@ from barca import effect
 def send_email():
     pass
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes.len(), 1);
     assert_eq!(nodes[0].kind, NodeKind::Effect);
     assert_eq!(nodes[0].freshness, Freshness::Always);
@@ -83,7 +83,7 @@ from barca import asset, Always
 @asset(freshness=Always())
 def a(): pass
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].freshness, Freshness::Always);
 }
 
@@ -96,7 +96,7 @@ from barca import asset, Always
 @asset(freshness=Always)
 def a(): pass
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].freshness, Freshness::Always);
 }
 
@@ -108,7 +108,7 @@ from barca import asset, Manual
 @asset(freshness=Manual())
 def a(): pass
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].freshness, Freshness::Manual);
 }
 
@@ -120,7 +120,7 @@ from barca import asset, Manual
 @asset(freshness=Manual)
 def a(): pass
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].freshness, Freshness::Manual);
 }
 
@@ -132,7 +132,7 @@ from barca import asset, Schedule
 @asset(freshness=Schedule("0 5 * * *"))
 def daily_job(): pass
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(
         nodes[0].freshness,
         Freshness::Schedule(CronExpr("0 5 * * *".into()))
@@ -155,7 +155,7 @@ def raw_data(): return {}
 def processed(raw_data: dict) -> dict:
     return raw_data
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[1].inputs[0].param_name, "raw_data");
     assert_eq!(
         nodes[1].inputs[0].upstream,
@@ -176,7 +176,7 @@ def fetch_raw_prices(): return {"AAPL": 150}
 def normalize(data: dict) -> dict:
     return data
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[1].inputs[0].param_name, "data");
     assert_eq!(
         nodes[1].inputs[0].upstream,
@@ -199,7 +199,7 @@ def volumes(): return {}
 def combined(p: dict, v: dict) -> dict:
     return {**p, **v}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[2].inputs.len(), 2);
     assert_eq!(nodes[2].inputs[0].param_name, "p");
     assert_eq!(nodes[2].inputs[1].param_name, "v");
@@ -218,7 +218,7 @@ def fetch_prices(ticker: str) -> dict:
 def summary(all_prices: dict) -> dict:
     return {"count": len(all_prices)}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[1].inputs[0].param_name, "all_prices");
     assert!(nodes[1].inputs[0].collected);
     assert_eq!(
@@ -236,7 +236,7 @@ from barca import asset, asset_ref
 def process(data: dict) -> dict:
     return data
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].inputs[0].param_name, "data");
     assert_eq!(
         nodes[0].inputs[0].upstream,
@@ -263,7 +263,7 @@ def inbox_sensor():
 def process_inbox(files: list) -> dict:
     return {"processed": len(files)}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].kind, NodeKind::Sensor);
     assert_eq!(nodes[1].kind, NodeKind::Asset);
     assert_eq!(nodes[1].inputs[0].param_name, "files");
@@ -286,7 +286,7 @@ from barca import asset, partitions
 def fetch_prices(ticker: str) -> dict:
     return {"ticker": ticker}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let spec = nodes[0].partitions.get("ticker").unwrap();
     match spec {
         PartitionSpec::Static { values } => {
@@ -308,7 +308,7 @@ from barca import asset, partitions
 def annual_report(year: int) -> dict:
     return {"year": year}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let spec = nodes[0].partitions.get("year").unwrap();
     match spec {
         PartitionSpec::Static { values } => {
@@ -332,7 +332,7 @@ def ticker_universe() -> list:
 def fetch_prices(ticker: str) -> dict:
     return {"ticker": ticker}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let spec = nodes[1].partitions.get("ticker").unwrap();
     match spec {
         PartitionSpec::DerivedFrom { source_ref } => {
@@ -354,7 +354,7 @@ from barca import asset, partitions
 def wide_asset(key: str) -> dict:
     return {"key": key}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let spec = nodes[0].partitions.get("key").unwrap();
     // Should be classified as needing Python evaluation
     match spec {
@@ -379,7 +379,7 @@ def get_tickers():
 def fetch_prices(ticker: str) -> dict:
     return {"ticker": ticker}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let spec = nodes[0].partitions.get("ticker").unwrap();
     match spec {
         PartitionSpec::Static { values } => {
@@ -403,7 +403,7 @@ from barca import asset, sink
 def report() -> dict:
     return {"rows": 42}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].sinks.len(), 1);
     assert_eq!(nodes[0].sinks[0].path, "output/report.json");
     assert_eq!(nodes[0].sinks[0].serializer, Some(SerializerKind::Json));
@@ -421,7 +421,7 @@ from barca import asset, sink
 def report() -> dict:
     return {"rows": 42}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].sinks.len(), 3);
     assert_eq!(nodes[0].sinks[0].serializer, Some(SerializerKind::Json));
     assert_eq!(nodes[0].sinks[1].serializer, Some(SerializerKind::Parquet));
@@ -438,7 +438,7 @@ from barca import asset, sink
 def my_data() -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].sinks.len(), 1);
     assert_eq!(nodes[0].sinks[0].serializer, None);
 }
@@ -456,7 +456,7 @@ from barca import asset
 def fetch_latest_prices() -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].explicit_name, Some("prices".into()));
     assert_eq!(nodes[0].continuity_key(), "prices");
 }
@@ -470,7 +470,7 @@ from barca import asset
 def my_asset() -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "project/assets.py");
+    let nodes = extract_nodes(src, "project/assets.py").unwrap();
     assert_eq!(nodes[0].continuity_key(), "project/assets.py:my_asset");
 }
 
@@ -483,7 +483,7 @@ from barca import asset
 def fetch_prices() -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(
         nodes[0].description,
         Some("Fetches daily price data from the exchange API".into())
@@ -499,7 +499,7 @@ from barca import asset
 def api_call() -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].tags.get("team").unwrap(), "data-eng");
     assert_eq!(nodes[0].tags.get("concurrency_group").unwrap(), "network");
 }
@@ -513,7 +513,7 @@ from barca import asset
 def slow_train() -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].timeout_seconds, 600);
 }
 
@@ -526,7 +526,7 @@ from barca import asset
 def normal_asset() -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes[0].timeout_seconds, 300);
 }
 
@@ -544,7 +544,7 @@ from barca import asset, unsafe
 def dynamic_config() -> dict:
     return eval("{'key': 'value'}")
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert!(nodes[0].is_unsafe);
 }
 
@@ -559,7 +559,7 @@ from barca import asset, unsafe
 def dynamic_config() -> dict:
     return eval("{'key': 'value'}")
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert!(nodes[0].is_unsafe);
 }
 
@@ -582,7 +582,7 @@ def send_email():
 def bad_asset(email) -> dict:
     return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let result = Dag::build(&nodes);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -603,7 +603,7 @@ def data(): return {}
 def bad_sensor(data):
     return (True, {})
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let result = Dag::build(&nodes);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -623,7 +623,7 @@ def asset_a(): return {}
 @asset(name="shared_name")
 def asset_b(): return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let result = Dag::build(&nodes);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
@@ -651,7 +651,7 @@ def b(a): return a + 1
 @asset(inputs={"b": b})
 def c(b): return b + 1
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let dag = Dag::build(&nodes).unwrap();
     assert_eq!(dag.classify_shape(), DagShape::LinearChain);
 }
@@ -675,7 +675,7 @@ def d(): return 4
 @asset()
 def e(): return 5
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let dag = Dag::build(&nodes).unwrap();
     assert_eq!(dag.classify_shape(), DagShape::WideFanOut);
 }
@@ -700,7 +700,7 @@ def branch_b(s): return s
 @asset(inputs={"a": branch_a, "b": branch_b})
 def merge(a, b): return {**a, **b}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let dag = Dag::build(&nodes).unwrap();
     assert_eq!(dag.classify_shape(), DagShape::Diamond);
 }
@@ -725,7 +725,7 @@ def ticker_universe() -> list:
 def fetch_prices(ticker: str) -> dict:
     return {"ticker": ticker}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let dag = Dag::build(&nodes).unwrap();
 
     // The partition source edge should be visible in the DAG
@@ -752,7 +752,7 @@ def per_ticker(ticker: str) -> dict:
 def aggregate(all_data) -> dict:
     return {"total": sum(v["price"] for v in all_data.values())}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let agg = &nodes[1];
     assert_eq!(agg.inputs[0].param_name, "all_data");
     assert!(agg.inputs[0].collected);
@@ -799,7 +799,7 @@ def train(data): return {}
 @asset(inputs={"model": train, "data": split})
 def evaluate(model, data): return {}
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     let dag = Dag::build(&nodes).unwrap();
 
     assert_eq!(dag.node_count(), 10);
@@ -850,7 +850,7 @@ def regional_export(region: str) -> dict:
 def notify(data):
     pass
 "#;
-    let nodes = extract_nodes(src, "test.py");
+    let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes.len(), 5);
 
     // Sensor
@@ -878,4 +878,150 @@ def notify(data):
 
     // Effect
     assert_eq!(nodes[4].kind, NodeKind::Effect);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// 14. Negative tests / edge cases — error handling and graceful degradation
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn malformed_python_returns_err() {
+    let src = "def broken(:\n    pass";
+    let result = extract_nodes(src, "bad.py");
+    assert!(result.is_err());
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("syntax error"));
+    assert!(err.contains("bad.py"));
+}
+
+#[test]
+fn empty_file_returns_empty_vec() {
+    let nodes = extract_nodes("", "empty.py").unwrap();
+    assert!(nodes.is_empty());
+}
+
+#[test]
+fn file_with_no_barca_decorators() {
+    let src = r#"
+def regular_function():
+    return 42
+
+class MyClass:
+    pass
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert!(nodes.is_empty());
+}
+
+#[test]
+fn inputs_not_a_dict_is_ignored() {
+    let src = r#"
+from barca import asset
+
+@asset(inputs="not_a_dict")
+def bad_inputs() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert!(nodes[0].inputs.is_empty()); // gracefully ignored
+}
+
+#[test]
+fn timeout_not_an_int_falls_back_to_default() {
+    let src = r#"
+from barca import asset
+
+@asset(timeout_seconds="not_an_int")
+def bad_timeout() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].timeout_seconds, 300); // default
+}
+
+#[test]
+fn empty_partition_list() {
+    let src = r#"
+from barca import asset, partitions
+
+@asset(partitions={"key": partitions([])})
+def empty_partitions(key: str) -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes.len(), 1);
+    let spec = nodes[0].partitions.get("key").unwrap();
+    match spec {
+        PartitionSpec::Static { values } => assert!(values.is_empty()),
+        _ => panic!("expected static partitions"),
+    }
+}
+
+#[test]
+fn decorator_on_class_is_ignored() {
+    let src = r#"
+from barca import asset
+
+@asset()
+class NotAFunction:
+    pass
+
+@asset()
+def real_asset() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes.len(), 1); // only the function, not the class
+    assert_eq!(nodes[0].function_name, "real_asset");
+}
+
+#[test]
+fn aliased_import_not_detected() {
+    // Documented limitation: parser matches exact decorator names.
+    // Aliased imports are not supported.
+    let src = r#"
+from barca import asset as a
+
+@a()
+def aliased() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert!(nodes.is_empty()); // not detected — known limitation
+}
+
+#[test]
+fn comments_and_docstrings_dont_break_parsing() {
+    let src = r#"
+# This is a comment
+"""This is a module docstring."""
+
+from barca import asset
+
+# Another comment
+@asset()
+def my_asset() -> dict:
+    """Asset docstring."""
+    # inline comment
+    return {"value": 1}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes.len(), 1);
+}
+
+#[test]
+fn unknown_decorator_kwargs_are_ignored() {
+    let src = r#"
+from barca import asset
+
+@asset(unknown_param="hello", another=42)
+def my_asset() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes.len(), 1);
+    // Unknown kwargs silently ignored — only known params extracted
+    assert_eq!(nodes[0].freshness, Freshness::Always); // default
 }
