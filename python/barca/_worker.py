@@ -1,10 +1,11 @@
-"""Barca worker — executes a batch of steps sequentially, communicates via stdout.
+"""Barca worker — executes a batch of steps sequentially.
 
 Invoked by Rust: python -m barca._worker <batch.json>
 
 Protocol:
   - Input: batch JSON file with steps and provided_inputs
-  - Output: one JSON line per completed step to stdout
+  - Protocol output: JSON lines on STDERR (Rust reads this)
+  - User output: stdout passes through to terminal (print() works normally)
   - No DB access — Rust owns all persistence
 """
 
@@ -49,18 +50,21 @@ def run_batch(batch):
                     f"Available: {list(cache.keys())}"
                 )
 
+        # User's print() goes to stdout (visible in terminal).
+        # Protocol messages go to stderr (Rust reads this).
         t0 = time.perf_counter()
         result = fn(**kwargs) if kwargs else fn()
         elapsed = time.perf_counter() - t0
 
         cache[step["node_id"]] = result
 
-        # Emit result as JSON line to stdout.
+        # Emit result as JSON line to stderr (protocol channel).
         print(
             json.dumps(
                 {"node_id": step["node_id"], "output": result, "elapsed": elapsed},
                 default=str,
             ),
+            file=sys.stderr,
             flush=True,
         )
 

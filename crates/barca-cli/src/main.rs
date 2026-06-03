@@ -157,7 +157,8 @@ fn build_provided_inputs(
     provided
 }
 
-/// Execute a single phase: spawn N workers in parallel, collect all stdout.
+/// Execute a single phase: spawn N workers in parallel, collect results from stderr.
+/// User stdout passes through to the terminal.
 fn execute_phase(
     phase: &Phase,
     provided_inputs: &HashMap<String, serde_json::Value>,
@@ -176,23 +177,25 @@ fn execute_phase(
         let child = Command::new(python)
             .args(["-m", "barca._worker"])
             .arg(&path)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit()) // User prints pass through to terminal
+            .stderr(Stdio::piped()) // Protocol messages (JSON lines) on stderr
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn worker: {e}"));
 
         children.push((child, path));
     }
 
-    // Collect outputs from all workers.
+    // Collect protocol outputs from all workers' stderr.
     let mut phase_outputs: HashMap<String, serde_json::Value> = HashMap::new();
 
     for (mut child, batch_path) in children {
-        let stdout = child.stdout.take().expect("no stdout");
-        let reader = BufReader::new(stdout);
+        let stderr = child.stderr.take().expect("no stderr");
+        let reader = BufReader::new(stderr);
 
+        // Separate protocol lines (JSON) from error messages.
+        let mut error_lines: Vec<String> = Vec::new();
         for line in reader.lines() {
-            let line = line.expect("failed to read worker stdout");
+            let line = line.expect("failed to read worker stderr");
             if line.is_empty() {
                 continue;
             }
@@ -203,18 +206,15 @@ fn execute_phase(
                 )
             {
                 phase_outputs.insert(node_id.to_string(), output.clone());
+            } else {
+                // Not a protocol message — it's an actual error/traceback.
+                error_lines.push(line);
             }
         }
 
         let status = child.wait().expect("failed to wait on worker");
         if !status.success() {
-            let mut stderr_content = String::new();
-            if let Some(mut stderr) = child.stderr.take() {
-                use std::io::Read;
-                stderr.read_to_string(&mut stderr_content).ok();
-            }
-            eprintln!("[barca] Worker failed:\n{}", stderr_content.trim());
-            // Clean up temp file
+            eprintln!("[barca] Worker failed:\n{}", error_lines.join("\n"));
             std::fs::remove_file(&batch_path).ok();
             std::process::exit(1);
         }
