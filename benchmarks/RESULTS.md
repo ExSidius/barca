@@ -51,7 +51,7 @@ All frameworks invoked as scripts — no pre-started servers.
 | 13 | Wide Join (10→1) | **58ms** | 635ms | 4.1s | — |
 | 14 | Backfill (10-step × 10) | **282ms** | 6.2s | 40.1s | — |
 
-*Airflow `dags test` has ~800ms per-task overhead. Airflow's LocalExecutor (parallel) requires PostgreSQL — SQLite locks under concurrent subprocess writes, causing all 500 tasks to fail. Dashes indicate benchmarks not yet run for Airflow.*
+*Airflow `dags test` has ~800ms per-task overhead. Airflow 3's LocalExecutor was tested with both SQLite and PostgreSQL — SQLite fails on concurrent writes, PostgreSQL fails because Airflow 3's task runner requires an API server connection (`httpx.ConnectError: Connection refused`). The `dags test` in-process mode is the only reliable local execution path for Airflow 3.x. Dashes indicate benchmarks not yet run for Airflow.*
 
 ## Parallel mode comparison (fan_out_500_50ms)
 
