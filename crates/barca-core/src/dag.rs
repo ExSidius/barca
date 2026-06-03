@@ -6,7 +6,7 @@ use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use std::collections::HashMap;
 
-use crate::model::{DagNode, DeclaredInput, EdgeKind, ExtractedNode, NodeKind, NodeRef};
+use crate::model::{DagNode, EdgeKind, ExtractedNode, NodeKind};
 use crate::plan::{DagShape, KindBreakdown, PlanStats};
 
 /// The constructed DAG — validated, acyclic, ready for plan generation.
@@ -135,7 +135,7 @@ impl Dag {
             }
 
             // Add partition_source edges for partitions_from.
-            for (_dim, spec) in &node.partitions {
+            for spec in node.partitions.values() {
                 if let crate::model::PartitionSpec::DerivedFrom { source_ref } = spec {
                     let source_name = source_ref.resolution_name();
                     if let Some(source_key) = name_to_key.get(source_name) {

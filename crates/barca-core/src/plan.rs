@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::model::{EdgeKind, Freshness, NodeKind, PartitionSpec, SerializerKind};
+use crate::model::{NodeKind, SerializerKind};
 
 /// A fully resolved execution plan — ready to be sent to a Python worker pool.
 #[derive(Debug, Clone, Serialize, Deserialize)]

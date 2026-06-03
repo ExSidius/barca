@@ -1,6 +1,6 @@
 //! Python source parsing — extracts decorated nodes using ruff's AST.
 
-use ruff_python_ast::{self as ast, Decorator, Expr, Keyword, Stmt};
+use ruff_python_ast::{self as ast, Expr, Keyword, Stmt};
 use ruff_python_parser::parse_module;
 use ruff_text_size::Ranged;
 use std::collections::HashMap;
@@ -24,10 +24,10 @@ pub fn extract_nodes(source: &str, file_path: &str) -> Vec<ExtractedNode> {
     let mut nodes = Vec::new();
 
     for stmt in &module.body {
-        if let Stmt::FunctionDef(func) = stmt {
-            if let Some(extracted) = try_extract_function(func, file_path, source) {
-                nodes.push(extracted);
-            }
+        if let Stmt::FunctionDef(func) = stmt
+            && let Some(extracted) = try_extract_function(func, file_path, source)
+        {
+            nodes.push(extracted);
         }
     }
 
@@ -101,23 +101,22 @@ fn is_unsafe_decorator(expr: &Expr) -> bool {
 }
 
 fn try_extract_sink(expr: &Expr) -> Option<SinkDecl> {
-    if let Expr::Call(call) = expr {
-        if let Expr::Name(n) = call.func.as_ref() {
-            if n.id.as_str() == "sink" {
-                let path = call
-                    .arguments
-                    .args
-                    .first()
-                    .and_then(|a| extract_string_literal(a))?;
-                let serializer = call
-                    .arguments
-                    .keywords
-                    .iter()
-                    .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("serializer"))
-                    .and_then(|kw| extract_serializer_kind(&kw.value));
-                return Some(SinkDecl { path, serializer });
-            }
-        }
+    if let Expr::Call(call) = expr
+        && let Expr::Name(n) = call.func.as_ref()
+        && n.id.as_str() == "sink"
+    {
+        let path = call
+            .arguments
+            .args
+            .first()
+            .and_then(extract_string_literal)?;
+        let serializer = call
+            .arguments
+            .keywords
+            .iter()
+            .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("serializer"))
+            .and_then(|kw| extract_serializer_kind(&kw.value));
+        return Some(SinkDecl { path, serializer });
     }
     None
 }
@@ -183,7 +182,7 @@ fn extract_freshness(keywords: &[&Keyword]) -> Option<Freshness> {
                             .arguments
                             .args
                             .first()
-                            .and_then(|a| extract_string_literal(a))
+                            .and_then(extract_string_literal)
                             .unwrap_or_default();
                         Freshness::Schedule(CronExpr(cron))
                     }
@@ -233,12 +232,8 @@ fn extract_inputs_from_dict(dict: &ast::ExprDict) -> Vec<DeclaredInput> {
                 let is_collect =
                     matches!(call.func.as_ref(), Expr::Name(n) if n.id.as_str() == "collect");
                 if is_collect {
-                    if let Some(first_arg) = call.arguments.args.first() {
-                        if let Expr::Name(n) = first_arg {
-                            (NodeRef::FunctionName(n.id.to_string()), true)
-                        } else {
-                            continue;
-                        }
+                    if let Some(Expr::Name(n)) = call.arguments.args.first() {
+                        (NodeRef::FunctionName(n.id.to_string()), true)
                     } else {
                         continue;
                     }
@@ -301,7 +296,7 @@ fn extract_partitions(keywords: &[&Keyword]) -> HashMap<String, PartitionSpec> {
                                         .arguments
                                         .args
                                         .first()
-                                        .map(|a| extract_partition_values(a))
+                                        .map(extract_partition_values)
                                         .unwrap_or_default();
                                     PartitionSpec::Static { values }
                                 }
@@ -395,12 +390,11 @@ fn extract_string_kwarg(keywords: &[&Keyword], name: &str) -> Option<String> {
 fn extract_int_kwarg(keywords: &[&Keyword], name: &str) -> Option<u32> {
     for kw in keywords {
         let Some(ref ident) = kw.arg else { continue };
-        if ident.as_str() == name {
-            if let Expr::NumberLiteral(n) = &kw.value {
-                if let ast::Number::Int(i) = &n.value {
-                    return i.as_u32();
-                }
-            }
+        if ident.as_str() == name
+            && let Expr::NumberLiteral(n) = &kw.value
+            && let ast::Number::Int(i) = &n.value
+        {
+            return i.as_u32();
         }
     }
     None

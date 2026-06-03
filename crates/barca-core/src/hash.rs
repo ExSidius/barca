@@ -4,7 +4,6 @@
 //! - definition_hash: identity of the code (function source + deps + metadata)
 //! - run_hash: identity of a specific execution (definition + inputs + partition)
 
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 /// Protocol version — bump when hash computation changes.
