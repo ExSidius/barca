@@ -32,6 +32,7 @@ bindings = "bin"
 python-source = "python"
 module-name = "barca"
 manifest-path = "crates/barca-cli/Cargo.toml"
+include = ["LICENSE"]
 
 [tool.ruff]
 line-length = 100
