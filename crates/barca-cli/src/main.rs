@@ -48,14 +48,14 @@ enum Cli {
 }
 
 fn main() {
-    // Support `barca file.py` as shorthand for `barca run file.py`.
+    // Support `barca file.py [--flags]` as shorthand for `barca run file.py [--flags]`.
     let cli = Cli::try_parse().unwrap_or_else(|_| {
         let args: Vec<String> = std::env::args().collect();
         if args.len() > 1 && !args[1].starts_with('-') && args[1].ends_with(".py") {
-            Cli::Run {
-                files: args[1..].iter().map(PathBuf::from).collect(),
-                output: OutputMode::Json,
-            }
+            // Insert "run" after the program name so clap handles all flags.
+            let mut rewritten = vec![args[0].clone(), "run".to_string()];
+            rewritten.extend_from_slice(&args[1..]);
+            Cli::parse_from(rewritten)
         } else {
             Cli::parse() // re-parse to show proper clap error
         }
