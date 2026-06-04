@@ -18,6 +18,10 @@ from pathlib import Path
 
 def load_module(source_file):
     path = Path(source_file).resolve()
+    # Add the file's directory to sys.path so cross-file imports work.
+    module_dir = str(path.parent)
+    if module_dir not in sys.path:
+        sys.path.insert(0, module_dir)
     spec = importlib.util.spec_from_file_location(f"_barca_{path.stem}", str(path))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)

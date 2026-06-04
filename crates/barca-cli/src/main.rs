@@ -237,10 +237,15 @@ fn get_command(args: &[String]) {
             for step in &stream.steps {
                 // Get the base node (without partition suffix) for definition_hash.
                 let base_id = step.node_id.split('[').next().unwrap_or(&step.node_id);
-                let def_hash = dag
-                    .get_node(base_id)
-                    .map(|n| n.definition_hash.as_str())
-                    .unwrap_or("");
+                let base_node = dag.get_node(base_id);
+
+                // Sensors always re-run (they observe external state — never cached).
+                if base_node.is_some_and(|n| n.kind() == barca_core::NodeKind::Sensor) {
+                    uncached_steps.push(step.clone());
+                    continue;
+                }
+
+                let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
 
                 // Compute run_hash for this specific step.
                 let partition_key = if step.partition.is_empty() {
@@ -257,7 +262,20 @@ fn get_command(args: &[String]) {
                 let upstream_hashes: Vec<&str> = step
                     .inputs
                     .values()
-                    .filter_map(|uid| cached_run_hashes.get(uid).map(|s| s.as_str()))
+                    .filter_map(|uid| {
+                        // Direct lookup first.
+                        if let Some(h) = cached_run_hashes.get(uid) {
+                            return Some(h.as_str());
+                        }
+                        // Partition-aligned: if this step has a partition, try uid[partition_suffix].
+                        if let Some(ref pk) = partition_key {
+                            let aligned = format!("{uid}[{pk}]");
+                            if let Some(h) = cached_run_hashes.get(&aligned) {
+                                return Some(h.as_str());
+                            }
+                        }
+                        None
+                    })
                     .collect();
                 let run_h = barca_core::hash::run_hash(
                     def_hash,
@@ -350,7 +368,20 @@ fn get_command(args: &[String]) {
                 .map(|n| {
                     n.resolved_inputs
                         .values()
-                        .filter_map(|uid| cached_run_hashes.get(uid).map(|s| s.as_str()))
+                        .filter_map(|uid| {
+                            // Direct lookup.
+                            if let Some(h) = cached_run_hashes.get(uid) {
+                                return Some(h.as_str());
+                            }
+                            // Partition-aligned lookup.
+                            if let Some(ref pk) = partition_key {
+                                let aligned = format!("{uid}[{pk}]");
+                                if let Some(h) = cached_run_hashes.get(&aligned) {
+                                    return Some(h.as_str());
+                                }
+                            }
+                            None
+                        })
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -798,6 +829,8 @@ fn plan_command(file_args: &[String]) {
 fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
+    let mut file_sources: HashMap<String, String> = HashMap::new();
+
     for path in &paths {
         let source = fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("Error reading {}: {e}", path.display()));
@@ -806,7 +839,56 @@ fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
             eprintln!("{e}");
             std::process::exit(1);
         });
+        // Store source for cross-file cone resolution.
+        // Key by stem (module name) for import lookup.
+        let stem = path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        file_sources.insert(stem, source.clone());
+        // Also key by the directory-relative module path if available.
+        if let Some(parent) = path.parent() {
+            // Scan sibling .py files for cross-file imports.
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let ep = entry.path();
+                    if ep.extension().map(|e| e == "py").unwrap_or(false) && ep != *path {
+                        let estem = ep
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string();
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            file_sources.entry(estem)
+                            && let Ok(content) = fs::read_to_string(&ep)
+                        {
+                            e.insert(content);
+                        }
+                    }
+                }
+            }
+        }
         all_nodes.extend(nodes);
+    }
+
+    // Recompute cone_hashes with cross-file import resolution.
+    for node in &mut all_nodes {
+        let stem_from_path = node
+            .source_file
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .replace(".py", "");
+        let source = file_sources.get(&stem_from_path).or_else(|| {
+            let stem = PathBuf::from(&node.source_file);
+            let s = stem.file_stem()?.to_str()?;
+            file_sources.get(s)
+        });
+        if let Some(src) = source {
+            node.cone_hash =
+                barca_core::cone::cone_hash_with_imports(src, &node.function_name, &file_sources);
+        }
     }
 
     // Resolve Dynamic partition specs by spawning Python to evaluate expressions.

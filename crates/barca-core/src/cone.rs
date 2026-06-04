@@ -13,11 +13,23 @@ use std::collections::{HashMap, HashSet};
 /// Compute the dependency cone hash for a function within a source file.
 ///
 /// Walks the function body, finds all names that resolve to module-level
-/// definitions (helpers, constants), traces them transitively, and hashes
-/// the combined source text.
+/// definitions (helpers, constants, imports), traces them transitively, and
+/// hashes the combined source text.
+///
+/// `other_sources` maps module names to their source content (for cross-file resolution).
+/// e.g., `{"helpers": "def compute(x): return x * 2\n"}`.
 ///
 /// Returns empty string if the function has no module-level dependencies.
 pub fn cone_hash(source: &str, function_name: &str) -> String {
+    cone_hash_with_imports(source, function_name, &HashMap::new())
+}
+
+/// Cone hash with cross-file import resolution.
+pub fn cone_hash_with_imports(
+    source: &str,
+    function_name: &str,
+    other_sources: &HashMap<String, String>,
+) -> String {
     let defs = collect_module_definitions(source);
     let Some(target) = defs.get(function_name) else {
         return String::new();
@@ -68,8 +80,67 @@ pub fn cone_hash(source: &str, function_name: &str) -> String {
                     }
                 }
             }
-            ModuleDef::Import { .. } => {
-                cone_parts.push((name.clone(), name.clone()));
+            ModuleDef::Import { module } => {
+                // Resolve cross-file import: look up the module's source,
+                // find the specific imported function/constant, trace its cone.
+                if let Some(module_source) = other_sources.get(module) {
+                    let imported_defs = collect_module_definitions(module_source);
+                    if let Some(imported_def) = imported_defs.get(&name) {
+                        match imported_def {
+                            ModuleDef::Function {
+                                source_text,
+                                references,
+                            } => {
+                                cone_parts.push((format!("{module}:{name}"), source_text.clone()));
+                                // Trace transitive deps within the imported module.
+                                let mut import_queue: Vec<String> = references
+                                    .iter()
+                                    .filter(|r| imported_defs.contains_key(r.as_str()))
+                                    .cloned()
+                                    .collect();
+                                while let Some(dep) = import_queue.pop() {
+                                    let dep_key = format!("{module}:{dep}");
+                                    if visited.contains(&dep_key) {
+                                        continue;
+                                    }
+                                    visited.insert(dep_key.clone());
+                                    if let Some(
+                                        ModuleDef::Function {
+                                            source_text,
+                                            references,
+                                        }
+                                        | ModuleDef::Assignment {
+                                            source_text,
+                                            references,
+                                        },
+                                    ) = imported_defs.get(&dep)
+                                    {
+                                        cone_parts.push((dep_key, source_text.clone()));
+                                        for r in references {
+                                            if !visited.contains(&format!("{module}:{r}"))
+                                                && imported_defs.contains_key(r.as_str())
+                                            {
+                                                import_queue.push(r.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            ModuleDef::Assignment { source_text, .. } => {
+                                cone_parts.push((format!("{module}:{name}"), source_text.clone()));
+                            }
+                            _ => {
+                                cone_parts.push((name.clone(), name.clone()));
+                            }
+                        }
+                    } else {
+                        // Imported name not found in module — hash the import statement itself.
+                        cone_parts.push((name.clone(), format!("import:{module}:{name}")));
+                    }
+                } else {
+                    // Module source not available — hash the import reference.
+                    cone_parts.push((name.clone(), format!("import:{module}:{name}")));
+                }
             }
         }
     }
