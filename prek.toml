@@ -23,4 +23,5 @@ hooks = [
 repo = "local"
 hooks = [
     { id = "cargo-fmt", name = "cargo fmt", language = "system", entry = "cargo fmt --all --check", pass_filenames = false, types = ["rust"] },
+    { id = "ty", name = "ty", language = "system", entry = "ty check python/barca/", pass_filenames = false, types = ["python"] },
 ]
