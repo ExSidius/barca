@@ -4,8 +4,9 @@ Invoked by Rust: python -m barca._worker <batch.json>
 
 Protocol:
   - Input: batch JSON file with steps and provided_inputs
-  - Protocol output: JSON lines on STDERR (Rust reads this)
+  - Protocol output: prefixed JSON lines on STDERR: BARCA:1:{...}
   - User output: stdout passes through to terminal (print() works normally)
+  - Non-prefixed stderr lines are treated as errors/tracebacks
   - No DB access — Rust owns all persistence
 """
 
@@ -14,6 +15,15 @@ import json
 import sys
 import time
 from pathlib import Path
+
+
+_PROTOCOL_VERSION = 1
+
+
+def _emit(msg_type, **fields):
+    """Emit a protocol message on stderr: BARCA:<version>:<json>"""
+    payload = json.dumps({"type": msg_type, **fields}, default=str)
+    print(f"BARCA:{_PROTOCOL_VERSION}:{payload}", file=sys.stderr, flush=True)
 
 
 def load_module(source_file):
@@ -64,17 +74,16 @@ def run_batch(batch):
         result = fn(**kwargs) if kwargs else fn()
         elapsed = time.perf_counter() - t0
 
-        cache[step["node_id"]] = result
+        # Sensors return (updated: bool, data) tuples — unpack for downstream.
+        if (
+            step.get("kind") == "sensor"
+            and isinstance(result, tuple)
+            and len(result) == 2
+        ):
+            _updated, result = result
 
-        # Emit result as JSON line to stderr (protocol channel).
-        print(
-            json.dumps(
-                {"node_id": step["node_id"], "output": result, "elapsed": elapsed},
-                default=str,
-            ),
-            file=sys.stderr,
-            flush=True,
-        )
+        cache[step["node_id"]] = result
+        _emit("result", node_id=step["node_id"], output=result, elapsed=elapsed)
 
 
 def main():

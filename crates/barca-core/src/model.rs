@@ -10,7 +10,8 @@
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
 // ─── Node kinds ──────────────────────────────────────────────────────────────
 
@@ -76,6 +77,128 @@ pub enum PartitionSpec {
 pub enum PartitionValue {
     Str(String),
     Int(i64),
+}
+
+// ─── Partition key (runtime) ─────────────────────────────────────────────────
+
+/// A partition coordinate — maps dimension names to values, deterministically ordered.
+/// This is the *runtime* partition identity for a step, not the declaration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartitionKey(pub BTreeMap<String, String>);
+
+impl PartitionKey {
+    pub fn empty() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The canonical suffix string: `"k1=v1,k2=v2"`. Empty string if no partitions.
+    pub fn suffix(&self) -> String {
+        if self.0.is_empty() {
+            return String::new();
+        }
+        self.0
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Format as `"base[k1=v1,k2=v2]"` or just `"base"` if empty.
+    pub fn display_id(&self, base: &str) -> String {
+        if self.0.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}[{}]", self.suffix())
+        }
+    }
+
+    /// Parse a node_id string into (base, PartitionKey).
+    /// `"test.py:foo[region=us,tier=1]"` → `("test.py:foo", PartitionKey({region: "us", tier: "1"}))`
+    /// `"test.py:foo"` → `("test.py:foo", PartitionKey({}))`
+    pub fn parse_from_id(id: &str) -> (&str, PartitionKey) {
+        if let Some(bracket) = id.find('[') {
+            let base = &id[..bracket];
+            let inner = id[bracket + 1..].trim_end_matches(']');
+            let map: BTreeMap<String, String> = inner
+                .split(',')
+                .filter_map(|pair| {
+                    let mut parts = pair.splitn(2, '=');
+                    Some((parts.next()?.to_string(), parts.next()?.to_string()))
+                })
+                .collect();
+            (base, PartitionKey(map))
+        } else {
+            (id, PartitionKey::empty())
+        }
+    }
+}
+
+impl From<HashMap<String, String>> for PartitionKey {
+    fn from(map: HashMap<String, String>) -> Self {
+        Self(map.into_iter().collect())
+    }
+}
+
+impl fmt::Display for PartitionKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.suffix())
+    }
+}
+
+// ─── Step identity ──────────────────────────────────────────────────────────
+
+/// A step identity — base node ID + optional partition coordinate.
+/// Separates node identity from partition coordinates at the type level.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepId {
+    /// The base node identity (continuity key), e.g. `"test.py:fetch"`.
+    pub base: String,
+    /// The partition coordinate for this step. Empty for non-partitioned steps.
+    pub partition: PartitionKey,
+}
+
+impl StepId {
+    pub fn new(base: impl Into<String>, partition: PartitionKey) -> Self {
+        Self {
+            base: base.into(),
+            partition,
+        }
+    }
+
+    pub fn unpartitioned(base: impl Into<String>) -> Self {
+        Self {
+            base: base.into(),
+            partition: PartitionKey::empty(),
+        }
+    }
+
+    pub fn base_id(&self) -> &str {
+        &self.base
+    }
+
+    /// The display string: `"base[k1=v1]"` or just `"base"`.
+    pub fn display(&self) -> String {
+        self.partition.display_id(&self.base)
+    }
+
+    /// Parse from a display string.
+    pub fn parse(id: &str) -> Self {
+        let (base, partition) = PartitionKey::parse_from_id(id);
+        Self {
+            base: base.to_string(),
+            partition,
+        }
+    }
+}
+
+impl fmt::Display for StepId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.display())
+    }
 }
 
 // ─── Input references ────────────────────────────────────────────────────────

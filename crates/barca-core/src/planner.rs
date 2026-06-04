@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::dag::Dag;
+use crate::model::{PartitionKey, StepId};
 
 /// Resource configuration — the knobs the user controls.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,13 +61,13 @@ pub struct WorkerStream {
 /// A step within a stream.
 #[derive(Debug, Clone)]
 pub struct StreamStep {
-    pub node_id: String,
+    /// Step identity: base node ID + partition coordinate.
+    pub step_id: StepId,
+    /// The kind of node (asset, sensor, effect).
+    pub kind: crate::model::NodeKind,
     pub function_name: String,
     pub source_file: String,
     pub inputs: HashMap<String, String>,
-    /// Partition key for this step (if this is a partition expansion).
-    /// Maps dimension name → value. Empty for non-partitioned steps.
-    pub partition: HashMap<String, String>,
     /// Pending partition resolution: dimension → source_node_id.
     /// The dispatch loop reads the source output and expands into N steps.
     pub pending_partitions: HashMap<String, String>,
@@ -281,8 +282,10 @@ fn build_phases(
         let mut work_units: Vec<Vec<StreamStep>> = Vec::new();
         for &chain_idx in &chains_in_phase {
             let steps = chain_to_steps(dag, &topology.chains[chain_idx]);
-            let partitioned_steps: Vec<&StreamStep> =
-                steps.iter().filter(|s| !s.partition.is_empty()).collect();
+            let partitioned_steps: Vec<&StreamStep> = steps
+                .iter()
+                .filter(|s| !s.step_id.partition.is_empty())
+                .collect();
 
             if partitioned_steps.is_empty() {
                 // No partitions — keep chain as one work unit.
@@ -293,15 +296,10 @@ fn build_phases(
                 let mut unpartitioned: Vec<StreamStep> = Vec::new();
 
                 for step in steps {
-                    if step.partition.is_empty() {
+                    if step.step_id.partition.is_empty() {
                         unpartitioned.push(step);
                     } else {
-                        let key = step
-                            .partition
-                            .iter()
-                            .map(|(k, v)| format!("{k}={v}"))
-                            .collect::<Vec<_>>()
-                            .join(",");
+                        let key = step.step_id.partition.suffix();
                         by_partition.entry(key).or_default().push(step);
                     }
                 }
@@ -349,39 +347,32 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             // Static partitioned: expand into one step per partition value.
             let combos = expand_partition_combos(&static_partitions);
             for combo in combos {
-                let partition_suffix = combo
-                    .iter()
-                    .map(|(k, v)| format!("{k}={v}"))
-                    .collect::<Vec<_>>()
-                    .join(",");
+                let pk = PartitionKey::from(combo);
                 steps.push(StreamStep {
-                    node_id: format!("{node_id}[{partition_suffix}]"),
+                    step_id: StepId::new(node_id.clone(), pk),
+                    kind: node.kind(),
                     function_name: node.function_name().to_string(),
                     source_file: node.source_file().to_string(),
                     inputs: inputs.clone(),
-                    partition: combo,
                     pending_partitions: HashMap::new(),
                 });
             }
         } else if !derived_partitions.is_empty() {
-            // DerivedFrom: create ONE placeholder step with pending_partitions.
-            // The dispatch loop will expand it after the source materializes.
             steps.push(StreamStep {
-                node_id: node_id.clone(),
+                step_id: StepId::unpartitioned(node_id.clone()),
+                kind: node.kind(),
                 function_name: node.function_name().to_string(),
                 source_file: node.source_file().to_string(),
                 inputs,
-                partition: HashMap::new(),
                 pending_partitions: derived_partitions,
             });
         } else {
-            // Non-partitioned: one step.
             steps.push(StreamStep {
-                node_id: node_id.clone(),
+                step_id: StepId::unpartitioned(node_id.clone()),
+                kind: node.kind(),
                 function_name: node.function_name().to_string(),
                 source_file: node.source_file().to_string(),
                 inputs,
-                partition: HashMap::new(),
                 pending_partitions: HashMap::new(),
             });
         }
@@ -429,7 +420,9 @@ fn collect_static_partitions(
 /// Expand partition dimensions into all combinations.
 /// For single dimension {"ticker": ["A","B","C"]} → [{"ticker":"A"}, {"ticker":"B"}, {"ticker":"C"}]
 /// For multiple dimensions, produces the cartesian product.
-fn expand_partition_combos(dims: &HashMap<String, Vec<String>>) -> Vec<HashMap<String, String>> {
+pub fn expand_partition_combos(
+    dims: &HashMap<String, Vec<String>>,
+) -> Vec<HashMap<String, String>> {
     let mut combos = vec![HashMap::new()];
     for (dim, values) in dims {
         let mut new_combos = Vec::new();
@@ -569,9 +562,9 @@ mod tests {
         }
     }
 
-    /// Helper: get step node_ids from a stream.
-    fn step_ids(stream: &WorkerStream) -> Vec<&str> {
-        stream.steps.iter().map(|s| s.node_id.as_str()).collect()
+    /// Helper: get step display IDs from a stream.
+    fn step_ids(stream: &WorkerStream) -> Vec<String> {
+        stream.steps.iter().map(|s| s.step_id.display()).collect()
     }
 
     /// Helper: total steps across all streams in a phase.
@@ -1145,14 +1138,14 @@ mod tests {
         // Each step has a different partition value
         let mut tickers: Vec<&str> = all_steps
             .iter()
-            .map(|s| s.partition.get("ticker").unwrap().as_str())
+            .map(|s| s.step_id.partition.0.get("ticker").unwrap().as_str())
             .collect();
         tickers.sort();
         assert_eq!(tickers, vec!["AAPL", "GOOG", "MSFT"]);
 
         // Node IDs include partition suffix
         for step in &all_steps {
-            assert!(step.node_id.contains("[ticker="));
+            assert!(step.step_id.display().contains("[ticker="));
         }
     }
 
@@ -1199,6 +1192,6 @@ mod tests {
         let p = plan_from_dag(&dag, &cfg(10));
 
         assert_eq!(p.total_steps, 1);
-        assert!(p.phases[0].streams[0].steps[0].partition.is_empty());
+        assert!(p.phases[0].streams[0].steps[0].step_id.partition.is_empty());
     }
 }

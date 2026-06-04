@@ -78,8 +78,7 @@ def check_inbox():
 
 @asset(inputs={"inbox": check_inbox})
 def process(inbox) -> dict:
-    _, data = inbox
-    return {"processed": len(data["files"])}
+    return {"processed": len(inbox["files"])}
 PYEOF
 
 rm -f "$REPO_ROOT/.barca/metadata.db"

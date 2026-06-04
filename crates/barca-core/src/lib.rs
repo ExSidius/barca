@@ -7,4 +7,4 @@ pub mod planner;
 
 pub use dag::Dag;
 pub use model::*;
-pub use planner::{ExecutionPlan, ResourceConfig};
+pub use planner::{ExecutionPlan, ResourceConfig, expand_partition_combos};

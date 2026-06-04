@@ -141,6 +141,43 @@ PYEOF
 OUTPUT=$($BARCA run "$TMPDIR/file1.py" "$TMPDIR/file2.py" 2>/dev/null)
 echo "$OUTPUT" | grep -q "steps_executed.*2\|steps_executed\":2" && pass "multi-file runs both assets" || fail "multi-file result: $OUTPUT"
 
+# ─── Test: noisy stderr doesn't corrupt protocol ────────────────────────────
+echo "=== Noisy stderr safety ==="
+
+cat > "$TMPDIR/noisy.py" << 'PYEOF'
+import sys, json
+from barca import asset
+
+@asset()
+def noisy() -> dict:
+    # Simulate a library logging structured JSON to stderr
+    print(json.dumps({"node_id": "fake", "output": "injected"}), file=sys.stderr)
+    print('{"node_id": "fake2", "output": "injected2"}', file=sys.stderr)
+    return {"real": True}
+PYEOF
+
+OUTPUT=$($BARCA run "$TMPDIR/noisy.py" 2>/dev/null)
+echo "$OUTPUT" | grep -q '"real":true\|"real": true' && pass "real output survives noisy stderr" || fail "noisy stderr broke output: $OUTPUT"
+echo "$OUTPUT" | grep -q '"injected"' && fail "FAKE OUTPUT LEAKED into results" || pass "fake stderr JSON ignored"
+
+# ─── Test: sensor payload unpacking ──────────────────────────────────────────
+echo "=== Sensor payload unpacking ==="
+
+cat > "$TMPDIR/sensor_pipe.py" << 'PYEOF'
+from barca import asset, sensor
+
+@sensor()
+def check_temp() -> tuple:
+    return (True, {"temp": 72})
+
+@asset(inputs={"data": check_temp})
+def process(data: dict) -> dict:
+    return {"value": data["temp"] * 2}
+PYEOF
+
+OUTPUT=$($BARCA run "$TMPDIR/sensor_pipe.py" 2>/dev/null)
+echo "$OUTPUT" | grep -q '"value":144' && pass "sensor payload unpacked correctly" || fail "sensor payload wrong: $OUTPUT"
+
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
