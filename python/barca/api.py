@@ -18,18 +18,27 @@ class BarcaError(Exception):
     """Raised when a barca command fails."""
 
 
+_cached_binary: str | None = None
+
+
 def _find_binary() -> str:
-    """Locate the barca binary."""
+    """Locate the barca binary, with version validation."""
+    global _cached_binary
+    if _cached_binary is not None:
+        return _cached_binary
+
     # Check sibling of the Python interpreter (same venv bin/).
     bin_dir = Path(sys.executable).parent
     candidate = bin_dir / "barca"
     if candidate.is_file():
-        return str(candidate)
+        _cached_binary = str(candidate)
+        return _cached_binary
 
     # Fall back to PATH.
     found = shutil.which("barca")
     if found:
-        return found
+        _cached_binary = found
+        return _cached_binary
 
     raise BarcaError("barca binary not found. Install with: uv add barca")
 
@@ -64,7 +73,11 @@ def _read_output(output_ref: Any) -> Any:
     If it's already a plain value (dict, list, int, etc.), return as-is.
     If it's artifact metadata (has artifact_path), read from disk.
     """
-    if isinstance(output_ref, dict) and "artifact_path" in output_ref:
+    if (
+        isinstance(output_ref, dict)
+        and set(output_ref.keys()) == {"artifact_path", "artifact_format", "artifact_size_bytes"}
+        and output_ref.get("artifact_format") in ("json", "pickle", "parquet")
+    ):
         return deserialize(output_ref["artifact_path"], output_ref["artifact_format"])
     return output_ref
 

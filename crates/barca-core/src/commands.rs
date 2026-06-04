@@ -329,13 +329,14 @@ pub fn get(
     });
 
     let final_output = all_outputs.get(&target_id).cloned().or_else(|| {
+        // For partitioned targets, sort by key for deterministic output.
         let prefix = format!("{target_id}[");
-        all_outputs
+        let mut matches: Vec<_> = all_outputs
             .iter()
             .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(_, v)| v)
-            .last()
-            .cloned()
+            .collect();
+        matches.sort_by_key(|(k, _)| k.clone());
+        matches.last().map(|(_, v)| (*v).clone())
     });
 
     Ok(GetResult {
