@@ -20,7 +20,7 @@ python/barca/
   __init__.py           ← No-op decorator stubs (identity functions)
   _worker.py            ← Batch worker (invoked by Rust via `python -m barca._worker`)
   _artifacts.py         ← Serialization: json, pickle, parquet format detection + I/O
-  __main__.py           ← Entry point for `python -m barca._worker`
+  __main__.py           ← Entry point for `python -m barca` (delegates to `_worker.main()`)
   py.typed              ← PEP 561 marker
 pyproject.toml          ← Maturin build config (binary + Python stubs in one wheel)
 ```
