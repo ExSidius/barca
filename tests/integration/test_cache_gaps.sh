@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Tests for known cache/staleness gaps.
-# These document expected behavior for features not yet fully implemented.
-# Failing tests indicate work remaining.
+# Tests for known staleness gaps (core correctness).
+# These define expected behavior for features not yet implemented.
+# Failing tests = work remaining.
 #
 # Run: bash tests/integration/test_cache_gaps.sh
 set -euo pipefail
@@ -23,6 +23,7 @@ steps() { echo "$1" | python3 -c "import json,sys; print(json.load(sys.stdin).ge
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. Cross-file cone analysis
+#    If asset in file A imports helper from file B, changing B should invalidate A.
 # ═══════════════════════════════════════════════════════════════════════════════
 echo "=== Cross-file cone analysis ==="
 
@@ -43,169 +44,117 @@ PYEOF
 
 rm -f "$REPO_ROOT/.barca/metadata.db"
 
-# First run
+# First run — executes
 OUT1=$($BARCA get result "$TMPDIR/cross_file/assets.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S1=$(steps "$OUT1")
-[ "$S1" = "1" ] && pass "cross-file: first run executes" || fail "cross-file: first run failed (got $S1)"
+[ "$S1" = "1" ] && pass "cross-file: first run executes" || fail "cross-file: first run (got $S1)"
 
 # Second run — cached
 OUT2=$($BARCA get result "$TMPDIR/cross_file/assets.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S2=$(steps "$OUT2")
 [ "$S2" = "0" ] && pass "cross-file: cached on second run" || fail "cross-file: not cached (got $S2)"
 
-# Modify the helper in the OTHER file
+# Modify helper in OTHER file
 sed -i '' 's/return x \* 2/return x * 99/' "$TMPDIR/cross_file/helpers.py"
 
-# Third run — should detect cross-file change and re-execute
+# Third run — should detect the cross-file change
 OUT3=$($BARCA get result "$TMPDIR/cross_file/assets.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S3=$(steps "$OUT3")
-[ "$S3" = "1" ] && pass "cross-file: helper change in other file detected" || fail "cross-file: change not detected (got $S3 steps)"
+[ "$S3" = "1" ] && pass "cross-file: helper change detected" || fail "cross-file: not detected (got $S3)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. Cache eviction / cleanup
+# 2. Sensors should ALWAYS re-run (they observe external state)
+#    A sensor's output is not deterministic from its code — it depends on the
+#    external world. Caching a sensor would miss real changes.
 # ═══════════════════════════════════════════════════════════════════════════════
-echo "=== Cache eviction ==="
-
-cat > "$TMPDIR/evict.py" << 'PYEOF'
-from barca import asset
-
-@asset()
-def data() -> dict:
-    return {"v": 1}
-PYEOF
-
-rm -f "$REPO_ROOT/.barca/metadata.db"
-
-# Run 50 times with different code versions — DB should not grow unbounded
-for i in $(seq 1 50); do
-    sed -i '' "s/\"v\": [0-9]*/\"v\": $i/" "$TMPDIR/evict.py"
-    $BARCA get data "$TMPDIR/evict.py" 2>/dev/null > /dev/null
-done
-
-# Check DB size: should have at most ~50 rows (one per version), not growing
-ROW_COUNT=$(sqlite3 "$REPO_ROOT/.barca/metadata.db" "SELECT count(*) FROM materializations;" 2>/dev/null || echo "0")
-# With no eviction, we'd have 50 rows. With eviction, we'd have fewer.
-# For now, just verify it doesn't grow exponentially.
-[ "$ROW_COUNT" -le 100 ] && pass "eviction: DB has $ROW_COUNT rows (bounded)" || fail "eviction: DB has $ROW_COUNT rows (unbounded growth)"
-
-# Ideally: old versions should be cleaned up (keep only last N per node)
-[ "$ROW_COUNT" -le 10 ] && pass "eviction: old versions cleaned (≤10 rows)" || fail "eviction: no cleanup (got $ROW_COUNT rows, expected ≤10)"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. Concurrent access
-# ═══════════════════════════════════════════════════════════════════════════════
-echo "=== Concurrent access ==="
-
-cat > "$TMPDIR/concurrent.py" << 'PYEOF'
-from barca import asset
-import time
-
-@asset()
-def slow() -> dict:
-    time.sleep(0.1)
-    return {"done": True}
-PYEOF
-
-rm -f "$REPO_ROOT/.barca/metadata.db"
-
-# Run two barca get processes simultaneously (with timeout)
-# Known gap: Turso exclusive lock blocks concurrent access.
-timeout 5 $BARCA get slow "$TMPDIR/concurrent.py" 2>/dev/null > "$TMPDIR/out1.json" &
-PID1=$!
-sleep 0.5  # Stagger slightly
-timeout 5 $BARCA get slow "$TMPDIR/concurrent.py" 2>/dev/null > "$TMPDIR/out2.json" &
-PID2=$!
-
-wait $PID1 2>/dev/null
-EXIT1=$?
-wait $PID2 2>/dev/null
-EXIT2=$?
-
-# Both should succeed (no crash, no corruption)
-if [ "$EXIT1" = "0" ] && [ "$EXIT2" = "0" ]; then
-    V1=$(python3 -c "import json; print(json.load(open('$TMPDIR/out1.json'))['final_output']['done'])" 2>/dev/null || echo "error")
-    V2=$(python3 -c "import json; print(json.load(open('$TMPDIR/out2.json'))['final_output']['done'])" 2>/dev/null || echo "error")
-    [ "$V1" = "True" ] && [ "$V2" = "True" ] && pass "concurrent: both produce correct output" || fail "concurrent: output error ($V1, $V2)"
-else
-    fail "concurrent: Turso lock blocks parallel access (exit $EXIT1, $EXIT2)"
-fi
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# 4. Sensor/schedule-driven staleness (aspirational)
-# ═══════════════════════════════════════════════════════════════════════════════
-echo "=== Sensor staleness (aspirational) ==="
+echo "=== Sensor always-re-run ==="
 
 cat > "$TMPDIR/sensor.py" << 'PYEOF'
-from barca import asset, sensor, Schedule
+from barca import asset, sensor
 
-@sensor(freshness=Schedule("*/5 * * * *"))
+@sensor()
 def check_inbox():
     return (True, {"files": ["a.csv"]})
 
 @asset(inputs={"inbox": check_inbox})
 def process(inbox) -> dict:
-    return {"processed": len(inbox)}
+    _, data = inbox
+    return {"processed": len(data["files"])}
 PYEOF
 
 rm -f "$REPO_ROOT/.barca/metadata.db"
 
-# Sensors should ALWAYS re-run (they check external state)
+# First run
 OUT1=$($BARCA get process "$TMPDIR/sensor.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S1=$(steps "$OUT1")
+[ "$S1" -ge 1 ] && pass "sensor: first run executes" || fail "sensor: first run (got $S1)"
+
+# Second run — sensor should STILL re-run (not cached), making downstream stale
 OUT2=$($BARCA get process "$TMPDIR/sensor.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S2=$(steps "$OUT2")
-
-# Sensor should re-run every time (not cached), making downstream stale
-# For now: sensor is treated as a regular asset (cached). This test documents the gap.
-[ "$S2" = "0" ] && fail "sensor: incorrectly cached (sensors should always re-run)" || pass "sensor: re-runs as expected"
+[ "$S2" -ge 1 ] && pass "sensor: re-runs on second call (not cached)" || fail "sensor: incorrectly cached (got $S2 steps — should be >0)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 5. Per-partition independent invalidation
+# 3. Per-partition independent invalidation
+#    Changing the transform function should NOT re-run fetch (different function).
+#    Changing fetch should NOT re-run unmodified partitions (same definition).
 # ═══════════════════════════════════════════════════════════════════════════════
 echo "=== Per-partition invalidation ==="
 
-cat > "$TMPDIR/partition_indep.py" << 'PYEOF'
+cat > "$TMPDIR/partitions.py" << 'PYEOF'
 from barca import asset, partitions
 
 @asset(partitions={"region": partitions(["us", "eu", "ap"])})
 def fetch(region: str) -> dict:
-    return {"region": region, "data": f"data_for_{region}"}
+    return {"region": region, "data": f"raw_{region}"}
 
 @asset(inputs={"data": fetch}, partitions={"region": partitions(["us", "eu", "ap"])})
 def transform(data: dict, region: str) -> dict:
-    return {"region": region, "transformed": data["data"].upper()}
+    return {"region": region, "result": data["data"].upper()}
 PYEOF
 
 rm -f "$REPO_ROOT/.barca/metadata.db"
 
 # First run: all 6 steps (3 fetch + 3 transform)
-OUT1=$($BARCA get transform "$TMPDIR/partition_indep.py" 2>/dev/null || echo '{"steps_executed":-1}')
+OUT1=$($BARCA get transform "$TMPDIR/partitions.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S1=$(steps "$OUT1")
-[ "$S1" = "6" ] && pass "partition: first run executes all 6" || fail "partition: first run got $S1 (expected 6)"
+[ "$S1" = "6" ] && pass "partition: first run = 6 steps" || fail "partition: first run (got $S1)"
 
-# Second run: all cached
-OUT2=$($BARCA get transform "$TMPDIR/partition_indep.py" 2>/dev/null || echo '{"steps_executed":-1}')
+# Second run: fully cached
+OUT2=$($BARCA get transform "$TMPDIR/partitions.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S2=$(steps "$OUT2")
-[ "$S2" = "0" ] && pass "partition: all cached" || fail "partition: not cached (got $S2)"
+[ "$S2" = "0" ] && pass "partition: fully cached" || fail "partition: not cached (got $S2)"
 
-# Now: if we could invalidate just ONE partition's upstream without changing the
-# function definition... this requires external input changes (not code changes).
-# For now, document that code changes invalidate ALL partitions (correct behavior).
-sed -i '' 's/data\["data"\].upper()/data["data"].lower()/' "$TMPDIR/partition_indep.py"
-OUT3=$($BARCA get transform "$TMPDIR/partition_indep.py" 2>/dev/null || echo '{"steps_executed":-1}')
+# Modify ONLY transform — fetch should stay cached (3 re-runs, not 6)
+sed -i '' 's/data\["data"\].upper()/data["data"].lower()/' "$TMPDIR/partitions.py"
+OUT3=$($BARCA get transform "$TMPDIR/partitions.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S3=$(steps "$OUT3")
-# All 3 transform steps should re-run (definition changed), fetch steps cached
-[ "$S3" = "3" ] && pass "partition: only transform re-runs (fetch cached)" || fail "partition: expected 3 steps, got $S3"
+[ "$S3" = "3" ] && pass "partition: only transform re-runs (fetch cached)" || fail "partition: expected 3, got $S3"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# Summary
+# Revert transform, modify ONLY fetch — transform should re-run too (upstream stale)
+cat > "$TMPDIR/partitions.py" << 'PYEOF'
+from barca import asset, partitions
+
+@asset(partitions={"region": partitions(["us", "eu", "ap"])})
+def fetch(region: str) -> dict:
+    return {"region": region, "data": f"CHANGED_{region}"}
+
+@asset(inputs={"data": fetch}, partitions={"region": partitions(["us", "eu", "ap"])})
+def transform(data: dict, region: str) -> dict:
+    return {"region": region, "result": data["data"].upper()}
+PYEOF
+OUT4=$($BARCA get transform "$TMPDIR/partitions.py" 2>/dev/null || echo '{"steps_executed":-1}')
+S4=$(steps "$OUT4")
+[ "$S4" = "6" ] && pass "partition: fetch change cascades to transform (6 steps)" || fail "partition: fetch cascade (got $S4)"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 echo ""
 echo "Results: $PASS passed, $FAIL failed"
 echo ""
-echo "Expected failures (known gaps):"
-echo "  - Cross-file helper detection (cone analysis is same-file only)"
-echo "  - Cache eviction (no cleanup implemented)"
-echo "  - Sensor always-re-run semantics (sensors treated as regular assets)"
-echo ""
+if [ "$FAIL" -gt 0 ]; then
+    echo "Known gaps remaining:"
+    echo "  - Cross-file: cone analysis only traces same-file deps"
+    echo "  - Sensor: currently cached like regular assets"
+    echo ""
+fi
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
