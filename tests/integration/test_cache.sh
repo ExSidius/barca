@@ -7,7 +7,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BARCA="$REPO_ROOT/.venv/bin/barca"
+BARCA="${REPO_ROOT}/.venv/bin/barca"
+[ -x "$BARCA" ] || BARCA="$(command -v barca)"
 PASS=0
 FAIL=0
 TMPDIR=$(mktemp -d)
@@ -50,9 +51,10 @@ OUT2=$($BARCA get c "$TMPDIR/chain.py" 2>/dev/null)
 S2=$(steps "$OUT2")
 [ "$S2" = "0" ] && pass "second get is fully cached" || fail "second get: expected 0 steps, got $S2"
 
-# Output should match
-V1=$(echo "$OUT1" | python3 -c "import json,sys; print(json.load(sys.stdin)['final_output']['value'])")
-V2=$(echo "$OUT2" | python3 -c "import json,sys; print(json.load(sys.stdin)['final_output']['value'])")
+# Output should match — read artifact files and compare
+artifact_path() { echo "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)['final_output']['artifact_path'])"; }
+V1=$(cat "$(artifact_path "$OUT1")")
+V2=$(cat "$(artifact_path "$OUT2")")
 [ "$V1" = "$V2" ] && pass "cached output matches" || fail "output mismatch: $V1 vs $V2"
 
 # ─── Target subgraph: unrelated assets don't execute ────────────────────────

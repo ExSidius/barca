@@ -8,7 +8,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BARCA="$REPO_ROOT/.venv/bin/barca"
+BARCA="${REPO_ROOT}/.venv/bin/barca"
+[ -x "$BARCA" ] || BARCA="$(command -v barca)"
 ITERATIONS=${1:-20}
 PASS=0
 FAIL=0

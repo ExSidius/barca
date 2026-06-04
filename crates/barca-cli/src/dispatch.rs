@@ -3,19 +3,28 @@
 use barca_core::planner::{
     ExecutionPlan, Phase, StreamStep, WorkerStream, expand_partition_combos,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Dispatch all phases, collecting outputs. Returns node_id → output value.
+/// Reference to a materialized artifact on disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OutputRef {
+    pub path: String,
+    pub format: String,
+    pub size_bytes: u64,
+}
+
+/// Dispatch all phases, collecting outputs. Returns node_id → artifact reference.
 pub fn dispatch_plan(
     plan: &ExecutionPlan,
     python: &PathBuf,
     _db_path: &str,
     pool_size: usize,
-) -> HashMap<String, serde_json::Value> {
-    let mut all_outputs: HashMap<String, serde_json::Value> = HashMap::new();
+) -> HashMap<String, OutputRef> {
+    let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
 
     for phase in &plan.phases {
         let expanded_phase = expand_pending_partitions(phase, &all_outputs, pool_size);
@@ -36,7 +45,7 @@ pub fn dispatch_plan(
 /// Returns None if no expansion needed, or a new Phase with expanded steps.
 pub fn expand_pending_partitions(
     phase: &Phase,
-    all_outputs: &HashMap<String, serde_json::Value>,
+    all_outputs: &HashMap<String, OutputRef>,
     pool_size: usize,
 ) -> Option<Phase> {
     let has_pending = phase
@@ -60,13 +69,33 @@ pub fn expand_pending_partitions(
 
             let mut dim_values: HashMap<String, Vec<String>> = HashMap::new();
             for (dim, source_name) in &step.pending_partitions {
-                let source_output = all_outputs
+                let source_ref = all_outputs
                     .iter()
                     .find(|(k, _)| k.ends_with(&format!(":{source_name}")))
                     .map(|(_, v)| v);
 
-                if let Some(output) = source_output {
-                    let values: Vec<String> = match output {
+                if let Some(oref) = source_ref {
+                    if oref.format != "json" {
+                        eprintln!(
+                            "[barca] Error: partition source '{}' must be JSON format, got '{}'",
+                            source_name, oref.format
+                        );
+                        continue;
+                    }
+                    // Read the JSON artifact file from disk.
+                    let json_str = match std::fs::read_to_string(&oref.path) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!(
+                                "[barca] Error: failed to read partition artifact '{}': {e}",
+                                oref.path
+                            );
+                            continue;
+                        }
+                    };
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&json_str).unwrap_or_default();
+                    let values: Vec<String> = match parsed {
                         serde_json::Value::Array(arr) => arr
                             .iter()
                             .filter_map(|v| match v {
@@ -165,9 +194,9 @@ pub fn expand_pending_partitions(
 /// Determine what values need to be provided to workers in this phase.
 pub fn build_provided_inputs(
     phase: &Phase,
-    all_outputs: &HashMap<String, serde_json::Value>,
-) -> HashMap<String, serde_json::Value> {
-    let mut provided: HashMap<String, serde_json::Value> = HashMap::new();
+    all_outputs: &HashMap<String, OutputRef>,
+) -> HashMap<String, OutputRef> {
+    let mut provided: HashMap<String, OutputRef> = HashMap::new();
 
     for stream in &phase.streams {
         for step in &stream.steps {
@@ -200,9 +229,9 @@ pub fn build_provided_inputs(
 /// Execute a single phase: spawn N workers in parallel, collect results from stderr.
 pub fn execute_phase(
     phase: &Phase,
-    provided_inputs: &HashMap<String, serde_json::Value>,
+    provided_inputs: &HashMap<String, OutputRef>,
     python: &PathBuf,
-) -> HashMap<String, serde_json::Value> {
+) -> HashMap<String, OutputRef> {
     let mut children: Vec<(std::process::Child, PathBuf)> = Vec::new();
 
     for stream in &phase.streams {
@@ -224,7 +253,7 @@ pub fn execute_phase(
         children.push((child, path));
     }
 
-    let mut phase_outputs: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut phase_outputs: HashMap<String, OutputRef> = HashMap::new();
 
     for (mut child, batch_path) in children {
         let stderr = child.stderr.take().expect("no stderr");
@@ -247,14 +276,12 @@ pub fn execute_phase(
     phase_outputs
 }
 
-const PROTOCOL_PREFIX: &str = "BARCA:1:";
+const PROTOCOL_PREFIX_V2: &str = "BARCA:2:";
 
 /// Parse worker stderr output into protocol messages and error lines.
-/// Protocol messages are prefixed with `BARCA:1:` followed by a JSON object.
-pub fn parse_worker_output(
-    reader: impl BufRead,
-) -> (HashMap<String, serde_json::Value>, Vec<String>) {
-    let mut outputs: HashMap<String, serde_json::Value> = HashMap::new();
+/// Protocol messages are prefixed with `BARCA:2:` followed by a JSON object.
+pub fn parse_worker_output(reader: impl BufRead) -> (HashMap<String, OutputRef>, Vec<String>) {
+    let mut outputs: HashMap<String, OutputRef> = HashMap::new();
     let mut error_lines: Vec<String> = Vec::new();
 
     for line in reader.lines() {
@@ -262,18 +289,34 @@ pub fn parse_worker_output(
         if line.is_empty() {
             continue;
         }
-        if let Some(json_str) = line.strip_prefix(PROTOCOL_PREFIX) {
+        if let Some(json_str) = line.strip_prefix(PROTOCOL_PREFIX_V2) {
             let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
                 eprintln!("[barca] malformed protocol message: {line}");
                 continue;
             };
             match parsed.get("type").and_then(|v| v.as_str()) {
                 Some("result") => {
-                    if let (Some(node_id), Some(output)) = (
+                    if let (Some(node_id), Some(artifact)) = (
                         parsed.get("node_id").and_then(|v| v.as_str()),
-                        parsed.get("output"),
+                        parsed.get("artifact"),
                     ) {
-                        outputs.insert(node_id.to_string(), output.clone());
+                        let oref = OutputRef {
+                            path: artifact
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            format: artifact
+                                .get("format")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            size_bytes: artifact
+                                .get("size_bytes")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                        };
+                        outputs.insert(node_id.to_string(), oref);
                     }
                 }
                 Some(_) => {
@@ -293,11 +336,13 @@ pub fn parse_worker_output(
     (outputs, error_lines)
 }
 
-/// Serialize a worker stream batch to JSON, including provided inputs.
+/// Serialize a worker stream batch to JSON, including provided inputs and artifact_dir.
 pub fn serialize_batch(
     stream: &WorkerStream,
-    provided_inputs: &HashMap<String, serde_json::Value>,
+    provided_inputs: &HashMap<String, OutputRef>,
 ) -> String {
+    let artifact_dir = ".barca/artifacts";
+
     let steps: Vec<serde_json::Value> = stream
         .steps
         .iter()
@@ -329,9 +374,25 @@ pub fn serialize_batch(
         })
         .collect();
 
+    // Serialize provided_inputs as OutputRef objects (path + format + size_bytes).
+    let pi_json: HashMap<String, serde_json::Value> = provided_inputs
+        .iter()
+        .map(|(k, oref)| {
+            (
+                k.clone(),
+                serde_json::json!({
+                    "path": oref.path,
+                    "format": oref.format,
+                    "size_bytes": oref.size_bytes,
+                }),
+            )
+        })
+        .collect();
+
     serde_json::json!({
         "stream_id": stream.stream_id,
-        "provided_inputs": provided_inputs,
+        "artifact_dir": artifact_dir,
+        "provided_inputs": pi_json,
         "steps": steps,
     })
     .to_string()
@@ -343,25 +404,25 @@ mod tests {
     use barca_core::planner::PhaseReason;
 
     #[test]
-    fn parse_worker_output_separates_protocol_from_errors() {
-        let input = "BARCA:1:{\"type\":\"result\",\"node_id\":\"test.py:foo\",\"output\":42,\"elapsed\":0.01}\n\
+    fn parse_worker_output_v2_separates_protocol_from_errors() {
+        let input = "BARCA:2:{\"type\":\"result\",\"node_id\":\"test.py:foo\",\"artifact\":{\"path\":\"foo.json\",\"format\":\"json\",\"size_bytes\":10},\"elapsed\":0.01}\n\
 some error message\n\
-BARCA:1:{\"type\":\"result\",\"node_id\":\"test.py:bar\",\"output\":{\"x\":1},\"elapsed\":0.02}\n\
+BARCA:2:{\"type\":\"result\",\"node_id\":\"test.py:bar\",\"artifact\":{\"path\":\"bar.json\",\"format\":\"json\",\"size_bytes\":20},\"elapsed\":0.02}\n\
 Traceback (most recent call last):\n\
   File \"test.py\", line 5\n";
         let reader = std::io::Cursor::new(input);
         let (outputs, errors) = parse_worker_output(reader);
 
         assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs["test.py:foo"], serde_json::json!(42));
-        assert_eq!(outputs["test.py:bar"], serde_json::json!({"x": 1}));
+        assert_eq!(outputs["test.py:foo"].format, "json");
+        assert_eq!(outputs["test.py:bar"].format, "json");
         assert_eq!(errors.len(), 3);
         assert!(errors[0].contains("some error message"));
     }
 
     #[test]
     fn parse_worker_output_ignores_empty_lines() {
-        let input = "\n\nBARCA:1:{\"type\":\"result\",\"node_id\":\"a\",\"output\":1}\n\n";
+        let input = "\n\nBARCA:2:{\"type\":\"result\",\"node_id\":\"a\",\"artifact\":{\"path\":\"a.json\",\"format\":\"json\",\"size_bytes\":5}}\n\n";
         let reader = std::io::Cursor::new(input);
         let (outputs, errors) = parse_worker_output(reader);
         assert_eq!(outputs.len(), 1);
@@ -381,7 +442,7 @@ Traceback (most recent call last):\n\
 
     #[test]
     fn parse_worker_output_unknown_type_ignored() {
-        let input = "BARCA:1:{\"type\":\"progress\",\"node_id\":\"a\",\"pct\":50}\n";
+        let input = "BARCA:2:{\"type\":\"progress\",\"node_id\":\"a\",\"pct\":50}\n";
         let reader = std::io::Cursor::new(input);
         let (outputs, errors) = parse_worker_output(reader);
         assert!(outputs.is_empty());
@@ -397,7 +458,25 @@ Traceback (most recent call last):\n\
         assert!(errors.is_empty()); // version mismatch is logged, not an error line
     }
 
+    #[test]
+    fn parse_worker_output_v1_is_unsupported() {
+        // v1 messages should now be treated as unsupported version, not parsed.
+        let input = "BARCA:1:{\"type\":\"result\",\"node_id\":\"a\",\"output\":1}\n";
+        let reader = std::io::Cursor::new(input);
+        let (outputs, errors) = parse_worker_output(reader);
+        assert!(outputs.is_empty());
+        assert!(errors.is_empty());
+    }
+
     use barca_core::{NodeKind, PartitionKey, StepId};
+
+    fn test_output_ref(path: &str, format: &str) -> OutputRef {
+        OutputRef {
+            path: path.to_string(),
+            format: format.to_string(),
+            size_bytes: 100,
+        }
+    }
 
     #[test]
     fn build_provided_inputs_direct_match() {
@@ -416,10 +495,10 @@ Traceback (most recent call last):\n\
             }],
         };
         let mut all_outputs = HashMap::new();
-        all_outputs.insert("f:a".to_string(), serde_json::json!(10));
+        all_outputs.insert("f:a".to_string(), test_output_ref("f--a.json", "json"));
 
         let provided = build_provided_inputs(&phase, &all_outputs);
-        assert_eq!(provided["f:a"], serde_json::json!(10));
+        assert_eq!(provided["f:a"].path, "f--a.json");
     }
 
     #[test]
@@ -440,10 +519,13 @@ Traceback (most recent call last):\n\
             }],
         };
         let mut all_outputs = HashMap::new();
-        all_outputs.insert("f:a[t=X]".to_string(), serde_json::json!(99));
+        all_outputs.insert(
+            "f:a[t=X]".to_string(),
+            test_output_ref("f--a_t_X.json", "json"),
+        );
 
         let provided = build_provided_inputs(&phase, &all_outputs);
-        assert_eq!(provided["f:a[t=X]"], serde_json::json!(99));
+        assert_eq!(provided["f:a[t=X]"].path, "f--a_t_X.json");
     }
 
     #[test]
@@ -462,11 +544,18 @@ Traceback (most recent call last):\n\
                 }],
             }],
         };
-        assert!(expand_pending_partitions(&phase, &HashMap::new(), 4).is_none());
+        assert!(
+            expand_pending_partitions(&phase, &HashMap::<String, OutputRef>::new(), 4).is_none()
+        );
     }
 
     #[test]
     fn expand_pending_partitions_expands_derived() {
+        // Create a temporary JSON artifact file containing partition values.
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir.path().join("regions.json");
+        std::fs::write(&artifact_path, r#"["us","eu"]"#).unwrap();
+
         let phase = Phase {
             reason: PhaseReason::Initial,
             streams: vec![WorkerStream {
@@ -485,7 +574,14 @@ Traceback (most recent call last):\n\
             }],
         };
         let mut outputs = HashMap::new();
-        outputs.insert("f:get_regions".to_string(), serde_json::json!(["us", "eu"]));
+        outputs.insert(
+            "f:get_regions".to_string(),
+            OutputRef {
+                path: artifact_path.to_string_lossy().to_string(),
+                format: "json".to_string(),
+                size_bytes: 12,
+            },
+        );
 
         let expanded = expand_pending_partitions(&phase, &outputs, 4).unwrap();
         let all_steps: Vec<String> = expanded
@@ -513,9 +609,247 @@ Traceback (most recent call last):\n\
             }],
         };
 
-        let json_str = serialize_batch(&stream, &HashMap::new());
+        let json_str = serialize_batch(&stream, &HashMap::<String, OutputRef>::new());
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         let step_inputs = &parsed["steps"][0]["inputs"];
         assert_eq!(step_inputs["data"], "f:a[t=X]");
+    }
+
+    // ─── v2 protocol + OutputRef tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_v2_result_with_artifact() {
+        let input = "BARCA:2:{\"type\":\"result\",\"node_id\":\"test.py:foo\",\"artifact\":{\"path\":\".barca/artifacts/test.py--foo.json\",\"format\":\"json\",\"size_bytes\":42},\"elapsed\":0.01}\n";
+        let reader = std::io::Cursor::new(input);
+        let (outputs, errors) = parse_worker_output(reader);
+
+        assert_eq!(outputs.len(), 1);
+        let output = &outputs["test.py:foo"];
+        assert_eq!(
+            *output,
+            OutputRef {
+                path: ".barca/artifacts/test.py--foo.json".to_string(),
+                format: "json".to_string(),
+                size_bytes: 42,
+            }
+        );
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_v2_mixed_with_errors() {
+        let input = "BARCA:2:{\"type\":\"result\",\"node_id\":\"a\",\"artifact\":{\"path\":\"a.json\",\"format\":\"json\",\"size_bytes\":10}}\n\
+            some error line\n\
+            BARCA:2:{\"type\":\"result\",\"node_id\":\"b\",\"artifact\":{\"path\":\"b.pkl\",\"format\":\"pickle\",\"size_bytes\":200}}\n\
+            Traceback:\n";
+        let reader = std::io::Cursor::new(input);
+        let (outputs, errors) = parse_worker_output(reader);
+
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs["a"].format, "json");
+        assert_eq!(outputs["b"].format, "pickle");
+        assert_eq!(errors.len(), 2);
+    }
+
+    #[test]
+    fn parse_v2_malformed_skipped() {
+        let input = "BARCA:2:not-json\n\
+            BARCA:2:{\"type\":\"result\",\"node_id\":\"a\",\"artifact\":{\"path\":\"a.json\",\"format\":\"json\",\"size_bytes\":10}}\n";
+        let reader = std::io::Cursor::new(input);
+        let (outputs, errors) = parse_worker_output(reader);
+        assert_eq!(outputs.len(), 1);
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_v2_unknown_type_ignored() {
+        let input = "BARCA:2:{\"type\":\"progress\",\"pct\":50}\n";
+        let reader = std::io::Cursor::new(input);
+        let (outputs, errors) = parse_worker_output(reader);
+        assert!(outputs.is_empty());
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn parse_v2_parquet_artifact() {
+        let input = "BARCA:2:{\"type\":\"result\",\"node_id\":\"pipeline.py:df\",\"artifact\":{\"path\":\".barca/artifacts/pipeline.py--df.parquet\",\"format\":\"parquet\",\"size_bytes\":8192},\"elapsed\":0.5}\n";
+        let reader = std::io::Cursor::new(input);
+        let (outputs, _) = parse_worker_output(reader);
+
+        assert_eq!(outputs.len(), 1);
+        let output = &outputs["pipeline.py:df"];
+        assert_eq!(output.format, "parquet");
+        assert_eq!(output.size_bytes, 8192);
+    }
+
+    #[test]
+    fn parse_v2_pickle_artifact() {
+        let input = "BARCA:2:{\"type\":\"result\",\"node_id\":\"m.py:obj\",\"artifact\":{\"path\":\".barca/artifacts/m.py--obj.pkl\",\"format\":\"pickle\",\"size_bytes\":512},\"elapsed\":0.02}\n";
+        let reader = std::io::Cursor::new(input);
+        let (outputs, _) = parse_worker_output(reader);
+
+        assert_eq!(outputs["m.py:obj"].format, "pickle");
+        assert_eq!(outputs["m.py:obj"].size_bytes, 512);
+    }
+
+    #[test]
+    fn build_provided_inputs_with_output_ref_direct() {
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![StreamStep {
+                    step_id: StepId::unpartitioned("f:b"),
+                    kind: NodeKind::Asset,
+                    function_name: "b".to_string(),
+                    source_file: "f".to_string(),
+                    inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
+                    pending_partitions: HashMap::new(),
+                }],
+            }],
+        };
+        let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
+        all_outputs.insert(
+            "f:a".to_string(),
+            OutputRef {
+                path: ".barca/artifacts/f--a.json".to_string(),
+                format: "json".to_string(),
+                size_bytes: 100,
+            },
+        );
+
+        let provided = build_provided_inputs(&phase, &all_outputs);
+        assert_eq!(provided["f:a"].path, ".barca/artifacts/f--a.json");
+    }
+
+    #[test]
+    fn build_provided_inputs_with_output_ref_partition_aligned() {
+        let pk = PartitionKey::from(HashMap::from([("t".to_string(), "X".to_string())]));
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![StreamStep {
+                    step_id: StepId::new("f:b", pk),
+                    kind: NodeKind::Asset,
+                    function_name: "b".to_string(),
+                    source_file: "f".to_string(),
+                    inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
+                    pending_partitions: HashMap::new(),
+                }],
+            }],
+        };
+        let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
+        all_outputs.insert(
+            "f:a[t=X]".to_string(),
+            OutputRef {
+                path: ".barca/artifacts/f--a_t_X.parquet".to_string(),
+                format: "parquet".to_string(),
+                size_bytes: 5000,
+            },
+        );
+
+        let provided = build_provided_inputs(&phase, &all_outputs);
+        assert_eq!(provided["f:a[t=X]"].format, "parquet");
+    }
+
+    #[test]
+    fn serialize_batch_with_output_ref_provided_inputs() {
+        let stream = WorkerStream {
+            stream_id: "w0".to_string(),
+            steps: vec![StreamStep {
+                step_id: StepId::unpartitioned("f:b"),
+                kind: NodeKind::Asset,
+                function_name: "b".to_string(),
+                source_file: "f".to_string(),
+                inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
+                pending_partitions: HashMap::new(),
+            }],
+        };
+        let mut provided: HashMap<String, OutputRef> = HashMap::new();
+        provided.insert(
+            "f:a".to_string(),
+            OutputRef {
+                path: ".barca/artifacts/f--a.json".to_string(),
+                format: "json".to_string(),
+                size_bytes: 100,
+            },
+        );
+
+        let json_str = serialize_batch(&stream, &provided);
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        // provided_inputs should serialize OutputRef as object with path/format
+        let pi = &parsed["provided_inputs"]["f:a"];
+        assert_eq!(pi["path"], ".barca/artifacts/f--a.json");
+        assert_eq!(pi["format"], "json");
+        assert_eq!(pi["size_bytes"], 100);
+    }
+
+    #[test]
+    fn serialize_batch_includes_artifact_dir() {
+        let stream = WorkerStream {
+            stream_id: "w0".to_string(),
+            steps: vec![StreamStep {
+                step_id: StepId::unpartitioned("f:a"),
+                kind: NodeKind::Asset,
+                function_name: "a".to_string(),
+                source_file: "f".to_string(),
+                inputs: HashMap::new(),
+                pending_partitions: HashMap::new(),
+            }],
+        };
+
+        let json_str = serialize_batch(&stream, &HashMap::<String, OutputRef>::new());
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        // artifact_dir should be present in the batch JSON
+        assert!(parsed.get("artifact_dir").is_some());
+    }
+
+    #[test]
+    fn expand_pending_partitions_reads_json_artifact() {
+        // Create a temporary JSON artifact file containing partition values.
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir.path().join("regions.json");
+        std::fs::write(&artifact_path, r#"["us","eu","ap"]"#).unwrap();
+
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![StreamStep {
+                    step_id: StepId::unpartitioned("f:transform"),
+                    kind: NodeKind::Asset,
+                    function_name: "transform".to_string(),
+                    source_file: "f".to_string(),
+                    inputs: HashMap::new(),
+                    pending_partitions: HashMap::from([(
+                        "region".to_string(),
+                        "get_regions".to_string(),
+                    )]),
+                }],
+            }],
+        };
+
+        let mut outputs: HashMap<String, OutputRef> = HashMap::new();
+        outputs.insert(
+            "f:get_regions".to_string(),
+            OutputRef {
+                path: artifact_path.to_string_lossy().to_string(),
+                format: "json".to_string(),
+                size_bytes: 14,
+            },
+        );
+
+        let expanded = expand_pending_partitions(&phase, &outputs, 4).unwrap();
+        let all_steps: Vec<String> = expanded
+            .streams
+            .iter()
+            .flat_map(|s| s.steps.iter().map(|st| st.step_id.display()))
+            .collect();
+        assert!(all_steps.contains(&"f:transform[region=us]".to_string()));
+        assert!(all_steps.contains(&"f:transform[region=eu]".to_string()));
+        assert!(all_steps.contains(&"f:transform[region=ap]".to_string()));
+        assert_eq!(all_steps.len(), 3);
     }
 }

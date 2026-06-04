@@ -3,8 +3,8 @@
 Invoked by Rust: python -m barca._worker <batch.json>
 
 Protocol:
-  - Input: batch JSON file with steps and provided_inputs
-  - Protocol output: prefixed JSON lines on STDERR: BARCA:1:{...}
+  - Input: batch JSON file with steps, provided_inputs, and artifact_dir
+  - Protocol output: prefixed JSON lines on STDERR: BARCA:2:{...}
   - User output: stdout passes through to terminal (print() works normally)
   - Non-prefixed stderr lines are treated as errors/tracebacks
   - No DB access — Rust owns all persistence
@@ -16,13 +16,15 @@ import sys
 import time
 from pathlib import Path
 
+from barca._artifacts import artifact_path, deserialize, detect_format, serialize
 
-_PROTOCOL_VERSION = 1
+
+_PROTOCOL_VERSION = 2
 
 
 def _emit(msg_type, **fields):
     """Emit a protocol message on stderr: BARCA:<version>:<json>"""
-    payload = json.dumps({"type": msg_type, **fields}, default=str)
+    payload = json.dumps({"type": msg_type, **fields})
     print(f"BARCA:{_PROTOCOL_VERSION}:{payload}", file=sys.stderr, flush=True)
 
 
@@ -32,19 +34,36 @@ def load_module(source_file):
     module_dir = str(path.parent)
     if module_dir not in sys.path:
         sys.path.insert(0, module_dir)
-    spec = importlib.util.spec_from_file_location(f"_barca_{path.stem}", str(path))
+    mod_name = f"_barca_{path.stem}"
+    spec = importlib.util.spec_from_file_location(mod_name, str(path))
     mod = importlib.util.module_from_spec(spec)
+    # Register in sys.modules so pickle can find classes defined in user code.
+    sys.modules[mod_name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def _resolve_input(raw_value):
+    """Resolve a provided input: artifact ref → deserialized value, else raw."""
+    if isinstance(raw_value, dict) and "path" in raw_value and "format" in raw_value:
+        return deserialize(raw_value["path"], raw_value["format"])
+    return raw_value
 
 
 def run_batch(batch):
     cache = {}
     modules = {}
 
+    # Artifact directory for writing outputs.
+    art_dir = batch.get("artifact_dir")
+    if art_dir:
+        Path(art_dir).mkdir(parents=True, exist_ok=True)
+
     # Pre-load provided inputs (cross-phase values injected by Rust).
+    # Values may be artifact references — resolve them lazily when accessed.
     provided = batch.get("provided_inputs", {})
-    cache.update(provided)
+    for key, value in provided.items():
+        cache[key] = _resolve_input(value)
 
     for step in batch["steps"]:
         source = str(Path(step["source_file"]).resolve())
@@ -83,7 +102,19 @@ def run_batch(batch):
             _updated, result = result
 
         cache[step["node_id"]] = result
-        _emit("result", node_id=step["node_id"], output=result, elapsed=elapsed)
+
+        # Serialize to artifact file.
+        explicit_fmt = step.get("serializer")
+        fmt = detect_format(result, explicit=explicit_fmt)
+        path = artifact_path(art_dir, step["node_id"], fmt)
+        size = serialize(result, path, fmt)
+
+        _emit(
+            "result",
+            node_id=step["node_id"],
+            artifact={"path": str(path), "format": fmt, "size_bytes": size},
+            elapsed=elapsed,
+        )
 
 
 def main():

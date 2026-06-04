@@ -44,7 +44,7 @@ class Schedule:
 # ─── Decorators ───────────────────────────────────────────────────────────────
 
 
-def asset(fn=None, **kwargs):
+def asset(fn=None, *, serializer=None, **kwargs):
     """Declare a cached asset node."""
     if fn is not None:
         return fn

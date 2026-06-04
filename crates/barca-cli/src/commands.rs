@@ -71,14 +71,18 @@ pub fn run_command(file_args: &[String]) {
             .map(|(_, v)| v)
             .last()
     });
-    if let Some(output) = last_output {
+    if let Some(oref) = last_output {
         println!(
             "{}",
             serde_json::json!({
                 "elapsed_seconds": exec_time.as_secs_f64(),
                 "steps_executed": total_executed,
                 "phases": exec_plan.phases.len(),
-                "final_output": output,
+                "final_output": {
+                    "artifact_path": oref.path,
+                    "artifact_format": oref.format,
+                    "artifact_size_bytes": oref.size_bytes,
+                },
             })
         );
     }
@@ -147,9 +151,9 @@ pub fn get_command(args: &[String]) {
     let db = rt.block_on(async { Builder::new_local(&db_path).build().await.unwrap() });
     let conn = db.connect().unwrap();
 
-    let mut cached_outputs: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
-    let mut all_outputs: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     let mut steps_executed = 0;
 
     for phase in &exec_plan.phases {
@@ -186,23 +190,27 @@ pub fn get_command(args: &[String]) {
                     &cached_run_hashes,
                 );
 
-                // Check DB (reusing single connection).
+                // Check DB for cached artifact (reusing single connection).
                 let cached = rt.block_on(async {
                     let mut rows = conn
                         .query(
-                            "SELECT output_json FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
+                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
                             [display_id.clone(), run_h.clone()],
                         )
                         .await
                         .unwrap();
-                    rows.next().await.unwrap().map(|row| row.get::<String>(0).unwrap())
+                    rows.next().await.unwrap().and_then(|row| {
+                        Some(dispatch::OutputRef {
+                            path: row.get::<String>(0).ok()?,
+                            format: row.get::<String>(1).ok()?,
+                            size_bytes: row.get::<i64>(2).ok()? as u64,
+                        })
+                    })
                 });
 
-                if let Some(output_json) = cached {
-                    let value: serde_json::Value =
-                        serde_json::from_str(&output_json).unwrap_or_default();
-                    all_outputs.insert(display_id.clone(), value.clone());
-                    cached_outputs.insert(display_id.clone(), value);
+                if let Some(oref) = cached {
+                    all_outputs.insert(display_id.clone(), oref);
+                    cached_node_ids.insert(display_id.clone());
                     cached_run_hashes.insert(display_id, run_h);
                 } else {
                     uncached_steps.push(step.clone());
@@ -242,7 +250,7 @@ pub fn get_command(args: &[String]) {
             .flat_map(|s| s.steps.iter().map(|st| st.step_id.display()))
             .collect();
         for node_id in step_order {
-            let Some(value) = phase_outputs.get(&node_id).cloned() else {
+            let Some(oref) = phase_outputs.get(&node_id).cloned() else {
                 continue;
             };
             let sid = barca_core::StepId::parse(&node_id);
@@ -273,23 +281,28 @@ pub fn get_command(args: &[String]) {
                 &cached_run_hashes,
             );
             cached_run_hashes.insert(node_id.clone(), run_h);
-            all_outputs.insert(node_id, value);
+            all_outputs.insert(node_id, oref);
         }
     }
 
     // Persist newly executed outputs (reusing single connection).
     rt.block_on(async {
-        for (node_id, output) in &all_outputs {
-            if cached_outputs.contains_key(node_id) {
+        for (node_id, oref) in &all_outputs {
+            if cached_node_ids.contains(node_id) {
                 continue;
             }
             let Some(run_h) = cached_run_hashes.get(node_id) else {
                 continue;
             };
-            let output_json = serde_json::to_string(output).unwrap_or_default();
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, output_json) VALUES (?1, ?2, ?3)",
-                [node_id.clone(), run_h.clone(), output_json],
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+                [
+                    node_id.clone(),
+                    run_h.clone(),
+                    oref.path.clone(),
+                    oref.format.clone(),
+                    oref.size_bytes.to_string(),
+                ],
             )
             .await
             .ok();
@@ -304,7 +317,11 @@ pub fn get_command(args: &[String]) {
             "elapsed_seconds": t0.elapsed().as_secs_f64(),
             "steps_executed": steps_executed,
             "cached": false,
-            "final_output": final_output,
+            "final_output": final_output.map(|oref| serde_json::json!({
+                "artifact_path": oref.path,
+                "artifact_format": oref.format,
+                "artifact_size_bytes": oref.size_bytes,
+            })),
         })
     );
 }

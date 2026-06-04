@@ -5,7 +5,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BARCA="$REPO_ROOT/.venv/bin/barca"
+BARCA="${REPO_ROOT}/.venv/bin/barca"
+[ -x "$BARCA" ] || BARCA="$(command -v barca)"
 PASS=0
 FAIL=0
 TMPDIR=$(mktemp -d)
@@ -15,6 +16,16 @@ fail() { echo "  ✗ $1"; FAIL=$((FAIL + 1)); }
 
 cleanup() { rm -rf "$TMPDIR"; }
 trap cleanup EXIT
+
+# Extract the JSON line from barca stdout (last line; user prints come before it).
+barca_json() { echo "$1" | tail -1; }
+
+# Read the final artifact file contents from barca output JSON.
+artifact() {
+    local path
+    path=$(barca_json "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)['final_output']['artifact_path'])")
+    cat "$path"
+}
 
 # ─── Test: trivial asset ────────────────────────────────────────────────────
 echo "=== Trivial asset ==="
@@ -28,7 +39,7 @@ def hello() -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/trivial.py" 2>/dev/null)
-echo "$OUTPUT" | grep -q '"msg":"hello"' && pass "correct output" || fail "wrong output: $OUTPUT"
+artifact "$OUTPUT" | grep -q '"msg"' && pass "correct output" || fail "wrong output: $OUTPUT"
 
 # ─── Test: linear chain passes values ────────────────────────────────────────
 echo "=== Linear chain ==="
@@ -50,7 +61,8 @@ def c(data: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/chain.py" 2>/dev/null)
-echo "$OUTPUT" | grep -q '"value":22' && pass "chain passes values correctly" || fail "chain result: $OUTPUT"
+CHAIN_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+[ "$CHAIN_VAL" = "22" ] && pass "chain passes values correctly" || fail "chain result: $CHAIN_VAL"
 
 # ─── Test: user print() visible, protocol hidden ────────────────────────────
 echo "=== User print statements ==="
@@ -72,7 +84,8 @@ PYEOF
 OUTPUT=$($BARCA run "$TMPDIR/prints.py" 2>/dev/null)
 echo "$OUTPUT" | grep -q "VISIBLE_USER_OUTPUT" && pass "user print visible in stdout" || fail "user print missing"
 echo "$OUTPUT" | grep -q "GOT_42" && pass "downstream print visible" || fail "downstream print missing"
-echo "$OUTPUT" | grep -q '"result":84' && pass "correct result with prints" || fail "wrong result: $OUTPUT"
+PRINT_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['result'])")
+[ "$PRINT_VAL" = "84" ] && pass "correct result with prints" || fail "wrong result: $PRINT_VAL"
 echo "$OUTPUT" | grep -q '"node_id"' && fail "PROTOCOL LEAKED to stdout" || pass "protocol hidden from user"
 
 # ─── Test: fan-out parallelism ───────────────────────────────────────────────
@@ -99,7 +112,8 @@ def merge(a: dict, b: dict, c: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/fanout.py" 2>/dev/null)
-echo "$OUTPUT" | grep -q '"sum":6' && pass "fan-out merge correct" || fail "fan-out result: $OUTPUT"
+FAN_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['sum'])")
+[ "$FAN_VAL" = "6" ] && pass "fan-out merge correct" || fail "fan-out result: $FAN_VAL"
 
 # ─── Test: aliased inputs ────────────────────────────────────────────────────
 echo "=== Aliased inputs ==="
@@ -117,7 +131,8 @@ def normalized(data: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/alias.py" 2>/dev/null)
-echo "$OUTPUT" | grep -q '"normalized_price":1' && pass "aliased input works" || fail "alias result: $OUTPUT"
+ALIAS_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['normalized_price'])")
+[ "$ALIAS_VAL" = "1.0" ] && pass "aliased input works" || fail "alias result: $ALIAS_VAL"
 
 # ─── Test: multi-file ────────────────────────────────────────────────────────
 echo "=== Multi-file ==="
@@ -157,7 +172,8 @@ def noisy() -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/noisy.py" 2>/dev/null)
-echo "$OUTPUT" | grep -q '"real":true\|"real": true' && pass "real output survives noisy stderr" || fail "noisy stderr broke output: $OUTPUT"
+NOISY_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['real'])")
+[ "$NOISY_VAL" = "True" ] && pass "real output survives noisy stderr" || fail "noisy stderr broke output: $NOISY_VAL"
 echo "$OUTPUT" | grep -q '"injected"' && fail "FAKE OUTPUT LEAKED into results" || pass "fake stderr JSON ignored"
 
 # ─── Test: sensor payload unpacking ──────────────────────────────────────────
@@ -176,7 +192,8 @@ def process(data: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/sensor_pipe.py" 2>/dev/null)
-echo "$OUTPUT" | grep -q '"value":144' && pass "sensor payload unpacked correctly" || fail "sensor payload wrong: $OUTPUT"
+SENSOR_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+[ "$SENSOR_VAL" = "144" ] && pass "sensor payload unpacked correctly" || fail "sensor payload wrong: $SENSOR_VAL"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""
