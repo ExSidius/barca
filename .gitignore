@@ -27,10 +27,11 @@ tmp/
 # Vendored dependencies
 vendor/
 
-# Editors / OS
+# Editors / OS / AI
 .vscode/
 .idea/
 .cursor/
+.claude/
 *.swp
 *.swo
 *~
