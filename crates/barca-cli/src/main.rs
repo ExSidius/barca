@@ -287,7 +287,6 @@ fn get_command(args: &[String]) {
                     cached_outputs.insert(step.node_id.clone(), value);
                     cached_run_hashes.insert(step.node_id.clone(), run_h);
                 } else {
-                    // Stale — this step and all subsequent in this stream must execute.
                     uncached_steps.push(step.clone());
                     // Also push remaining steps in this stream (they depend on this one).
                     // Actually no — they'll be checked individually. Just push this one.
@@ -321,7 +320,17 @@ fn get_command(args: &[String]) {
 
         let provided = build_provided_inputs(&filtered_phase, &all_outputs);
         let phase_outputs = execute_phase(&filtered_phase, &provided, &python);
-        for (node_id, value) in phase_outputs {
+        // Process outputs in stream-step order (topo order), not HashMap order.
+        // This ensures upstream run_hashes are computed before downstream.
+        let step_order: Vec<String> = filtered_phase
+            .streams
+            .iter()
+            .flat_map(|s| s.steps.iter().map(|st| st.node_id.clone()))
+            .collect();
+        for node_id in step_order {
+            let Some(value) = phase_outputs.get(&node_id).cloned() else {
+                continue;
+            };
             // Compute and store run_hash for this newly executed step.
             let base_id = node_id.split('[').next().unwrap_or(&node_id);
             let def_hash = dag
@@ -356,10 +365,8 @@ fn get_command(args: &[String]) {
         }
     }
 
-    // Persist newly executed outputs using the run_hashes from cached_run_hashes
-    // (populated during cache check for both cache hits AND newly computed hashes).
-    // For newly executed steps, we need to compute their run_hash the same way lookup does.
-    // Since lookup populates cached_run_hashes only for hits, we compute for misses here.
+    // Persist newly executed outputs. Use run_hashes already computed during execution
+    // (stored in cached_run_hashes at line 354 above).
     rt.block_on(async {
         let db = Builder::new_local(&db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
@@ -367,44 +374,13 @@ fn get_command(args: &[String]) {
             if cached_outputs.contains_key(node_id) {
                 continue;
             }
-            // Recompute run_hash identically to lookup.
-            let base_id = node_id.split('[').next().unwrap_or(node_id);
-            let def_hash = dag
-                .get_node(base_id)
-                .map(|n| n.definition_hash.as_str())
-                .unwrap_or("");
-            let partition_key = if node_id.contains('[') {
-                node_id
-                    .split('[')
-                    .nth(1)
-                    .map(|s| s.trim_end_matches(']').to_string())
-            } else {
-                None
+            let Some(run_h) = cached_run_hashes.get(node_id) else {
+                continue;
             };
-            // Upstream hashes: look up run_hashes of this step's inputs.
-            // For the persist path, get them from cached_run_hashes (populated during
-            // cache check for hits) or from the just-computed hashes for this run.
-            let upstream_hashes: Vec<&str> = dag
-                .get_node(base_id)
-                .map(|n| {
-                    n.resolved_inputs
-                        .values()
-                        .filter_map(|uid| cached_run_hashes.get(uid).map(|s| s.as_str()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let run_h = barca_core::hash::run_hash(
-                def_hash,
-                partition_key.as_deref(),
-                &upstream_hashes,
-                None,
-            );
-            // Store run_hash so downstream persist can reference it.
-            cached_run_hashes.insert(node_id.clone(), run_h.clone());
             let output_json = serde_json::to_string(output).unwrap_or_default();
             conn.execute(
                 "INSERT INTO materializations (node_id, run_hash, output_json) VALUES (?1, ?2, ?3)",
-                [node_id.clone(), run_h, output_json],
+                [node_id.clone(), run_h.clone(), output_json],
             )
             .await
             .ok();
