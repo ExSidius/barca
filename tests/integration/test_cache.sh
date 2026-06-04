@@ -95,7 +95,7 @@ echo "=== Staleness: modify leaf ==="
 $BARCA get c "$TMPDIR/chain.py" 2>/dev/null > /dev/null
 
 # Modify c's function body
-sed -i '' 's/data\["value"\] \* 2/data["value"] * 3/' "$TMPDIR/chain.py"
+sed -i.bak 's/data\["value"\] \* 2/data["value"] * 3/' "$TMPDIR/chain.py"
 
 OUT=$($BARCA get c "$TMPDIR/chain.py" 2>/dev/null)
 S=$(steps "$OUT")
@@ -125,7 +125,7 @@ PYEOF
 $BARCA get c "$TMPDIR/chain.py" 2>/dev/null > /dev/null
 
 # Modify a's function body
-sed -i '' 's/{"value": 1}/{"value": 99}/' "$TMPDIR/chain.py"
+sed -i.bak 's/{"value": 1}/{"value": 99}/' "$TMPDIR/chain.py"
 
 OUT=$($BARCA get c "$TMPDIR/chain.py" 2>/dev/null)
 S=$(steps "$OUT")
@@ -154,7 +154,7 @@ PYEOF
 $BARCA get c "$TMPDIR/chain.py" 2>/dev/null > /dev/null
 
 # Modify b only
-sed -i '' 's/data\["value"\] + 10/data["value"] + 999/' "$TMPDIR/chain.py"
+sed -i.bak 's/data\["value"\] + 10/data["value"] + 999/' "$TMPDIR/chain.py"
 
 OUT=$($BARCA get c "$TMPDIR/chain.py" 2>/dev/null)
 S=$(steps "$OUT")
@@ -177,7 +177,7 @@ PYEOF
 $BARCA get result "$TMPDIR/helper.py" 2>/dev/null > /dev/null
 
 # Modify helper
-sed -i '' 's/return x \* 2/return x * 3/' "$TMPDIR/helper.py"
+sed -i.bak 's/return x \* 2/return x * 3/' "$TMPDIR/helper.py"
 
 OUT=$($BARCA get result "$TMPDIR/helper.py" 2>/dev/null)
 S=$(steps "$OUT")
@@ -199,7 +199,7 @@ PYEOF
 $BARCA get check "$TMPDIR/global.py" 2>/dev/null > /dev/null
 
 # Modify constant
-sed -i '' 's/THRESHOLD = 0.5/THRESHOLD = 100/' "$TMPDIR/global.py"
+sed -i.bak 's/THRESHOLD = 0.5/THRESHOLD = 100/' "$TMPDIR/global.py"
 
 OUT=$($BARCA get check "$TMPDIR/global.py" 2>/dev/null)
 S=$(steps "$OUT")
@@ -220,11 +220,11 @@ PYEOF
 OUT_V1=$($BARCA get x "$TMPDIR/revert.py" 2>/dev/null)
 
 # Modify to v2
-sed -i '' 's/"version": 1/"version": 2/' "$TMPDIR/revert.py"
+sed -i.bak 's/"version": 1/"version": 2/' "$TMPDIR/revert.py"
 $BARCA get x "$TMPDIR/revert.py" 2>/dev/null > /dev/null
 
 # Revert to v1
-sed -i '' 's/"version": 2/"version": 1/' "$TMPDIR/revert.py"
+sed -i.bak 's/"version": 2/"version": 1/' "$TMPDIR/revert.py"
 OUT_REVERTED=$($BARCA get x "$TMPDIR/revert.py" 2>/dev/null)
 S=$(steps "$OUT_REVERTED")
 [ "$S" = "0" ] && pass "revert: uses old cache (0 steps)" || fail "revert: expected 0 steps, got $S"
@@ -249,7 +249,7 @@ S2=$(steps "$OUT2")
 [ "$S2" = "0" ] && pass "partitioned second run: cached" || fail "partitioned second: expected 0, got $S2"
 
 # Modify function → all partitions re-execute
-sed -i '' 's/"fetched": True/"fetched": False/' "$TMPDIR/partitioned.py"
+sed -i.bak 's/"fetched": True/"fetched": False/' "$TMPDIR/partitioned.py"
 OUT3=$($BARCA get fetch "$TMPDIR/partitioned.py" 2>/dev/null)
 S3=$(steps "$OUT3")
 [ "$S3" = "3" ] && pass "partitioned stale: all 3 re-execute" || fail "partitioned stale: expected 3, got $S3"

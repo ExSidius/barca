@@ -54,7 +54,47 @@ pub fn run_command(file_args: &[String]) {
     let all_outputs = dispatch::dispatch_plan(&exec_plan, &python, &db_path, pool_size);
     let exec_time = t_exec.elapsed();
 
-    db::persist_outputs_sync(&db_path, &all_outputs);
+    // Compute run hashes for all outputs so `barca get` can reuse them.
+    let mut run_hashes: HashMap<String, String> = HashMap::new();
+    // Process outputs in topo order so upstream hashes are available.
+    let topo: Vec<String> = dag
+        .topo_order()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    for base_id in &topo {
+        if let Some(node) = dag.get_node(base_id) {
+            // Collect all output keys for this node (unpartitioned + partitioned).
+            let display_ids: Vec<String> = all_outputs
+                .keys()
+                .filter(|k| *k == base_id || k.starts_with(&format!("{base_id}[")))
+                .cloned()
+                .collect();
+            for display_id in display_ids {
+                let sid = barca_core::StepId::parse(&display_id);
+                let partition_key = if sid.partition.is_empty() {
+                    None
+                } else {
+                    Some(sid.partition.suffix())
+                };
+                let upstream_ids: Vec<String> = node
+                    .resolved_inputs
+                    .values()
+                    .chain(node.resolved_collected.values())
+                    .cloned()
+                    .collect();
+                let run_h = cache::compute_run_hash(
+                    &node.definition_hash,
+                    partition_key.as_deref(),
+                    upstream_ids.iter(),
+                    &run_hashes,
+                );
+                run_hashes.insert(display_id, run_h);
+            }
+        }
+    }
+
+    db::persist_outputs_sync(&db_path, &all_outputs, &run_hashes);
 
     let total_executed = all_outputs.len();
     let last_planned_id = exec_plan
@@ -122,7 +162,11 @@ pub fn get_command(args: &[String]) {
     let target_id = dag
         .topo_order()
         .into_iter()
-        .find(|id| id.ends_with(&format!(":{target_name}")))
+        .find(|id| {
+            id.ends_with(&format!(":{target_name}"))
+                || *id == target_name.as_str()
+                || id.ends_with(target_name.as_str())
+        })
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
             eprintln!("Asset '{}' not found", target_name);
@@ -491,18 +535,27 @@ fn resolve_dynamic_partitions(nodes: &mut [barca_core::model::ExtractedNode], py
                 let module_path = std::path::Path::new(&node.source_file)
                     .canonicalize()
                     .unwrap_or_else(|_| PathBuf::from(&node.source_file));
+                // Write the evaluation script to a temp file to avoid shell escaping
+                // issues with paths or expressions containing quotes/backslashes.
                 let script = format!(
-                    "import json, importlib.util; \
-                     _spec = importlib.util.spec_from_file_location('_m', '{path}'); \
-                     _mod = importlib.util.module_from_spec(_spec); \
-                     _spec.loader.exec_module(_mod); \
-                     _ns = vars(_mod); _ns['__builtins__'] = __builtins__; \
-                     print(json.dumps(eval('{expr}', _ns)))",
-                    path = module_path.display(),
-                    expr = source_text.replace('\'', "\\'"),
+                    "import json, importlib.util, sys\n\
+                     _spec = importlib.util.spec_from_file_location('_m', sys.argv[1])\n\
+                     _mod = importlib.util.module_from_spec(_spec)\n\
+                     _spec.loader.exec_module(_mod)\n\
+                     _ns = vars(_mod); _ns['__builtins__'] = __builtins__\n\
+                     print(json.dumps(eval(sys.argv[2], _ns)))\n"
                 );
+                let mut script_file =
+                    tempfile::NamedTempFile::new().expect("failed to create temp file");
+                use std::io::Write;
+                script_file
+                    .write_all(script.as_bytes())
+                    .expect("failed to write script");
+                let script_path = script_file.path().to_path_buf();
                 let output = Command::new(python)
-                    .args(["-c", &script])
+                    .arg(&script_path)
+                    .arg(module_path.to_string_lossy().as_ref())
+                    .arg(source_text)
                     .output()
                     .unwrap_or_else(|e| {
                         panic!(

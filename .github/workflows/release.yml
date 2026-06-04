@@ -65,7 +65,9 @@ jobs:
 
       - name: Package standalone CLI binary
         run: |
-          cp target/${{ matrix.target }}/release/barca barca-${{ matrix.name }}
+          BIN="target/${{ matrix.target }}/release/barca"
+          [ -f "$BIN" ] || BIN="target/release/barca"
+          cp "$BIN" barca-${{ matrix.name }}
           chmod +x barca-${{ matrix.name }}
           tar czf barca-${{ matrix.name }}.tar.gz barca-${{ matrix.name }}
 
@@ -115,7 +117,7 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
-          prerelease: ${{ contains(github.ref, 'rc') }}
+          prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'dev') }}
           body: |
             ## Install
 

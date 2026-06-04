@@ -71,7 +71,10 @@ pub fn expand_pending_partitions(
             for (dim, source_name) in &step.pending_partitions {
                 let source_ref = all_outputs
                     .iter()
-                    .find(|(k, _)| k.ends_with(&format!(":{source_name}")))
+                    .find(|(k, _)| {
+                        k.ends_with(&format!(":{source_name}"))
+                            || k.as_str() == source_name.as_str()
+                    })
                     .map(|(_, v)| v);
 
                 if let Some(oref) = source_ref {
@@ -191,12 +194,20 @@ pub fn expand_pending_partitions(
     })
 }
 
+/// A provided input — either a single artifact or a collected list of partition artifacts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProvidedInput {
+    Single(OutputRef),
+    Collected(Vec<OutputRef>),
+}
+
 /// Determine what values need to be provided to workers in this phase.
 pub fn build_provided_inputs(
     phase: &Phase,
     all_outputs: &HashMap<String, OutputRef>,
-) -> HashMap<String, OutputRef> {
-    let mut provided: HashMap<String, OutputRef> = HashMap::new();
+) -> HashMap<String, ProvidedInput> {
+    let mut provided: HashMap<String, ProvidedInput> = HashMap::new();
 
     for stream in &phase.streams {
         for step in &stream.steps {
@@ -210,14 +221,31 @@ pub fn build_provided_inputs(
                 if let Some(output) = all_outputs.get(upstream_id) {
                     provided
                         .entry(upstream_id.clone())
-                        .or_insert_with(|| output.clone());
+                        .or_insert_with(|| ProvidedInput::Single(output.clone()));
                     continue;
                 }
                 if !suffix.is_empty() {
                     let aligned_id = format!("{upstream_id}{suffix}");
                     if let Some(output) = all_outputs.get(&aligned_id) {
-                        provided.entry(aligned_id).or_insert_with(|| output.clone());
+                        provided
+                            .entry(aligned_id)
+                            .or_insert_with(|| ProvidedInput::Single(output.clone()));
+                        continue;
                     }
+                }
+                // Fan-in collect(): upstream is partitioned but consumer is unpartitioned.
+                // Gather all partition-suffixed outputs for this base id.
+                let prefix = format!("{upstream_id}[");
+                let mut collected: Vec<OutputRef> = all_outputs
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                if !collected.is_empty() {
+                    collected.sort_by(|a, b| a.path.cmp(&b.path));
+                    provided
+                        .entry(upstream_id.clone())
+                        .or_insert(ProvidedInput::Collected(collected));
                 }
             }
         }
@@ -229,7 +257,7 @@ pub fn build_provided_inputs(
 /// Execute a single phase: spawn N workers in parallel, collect results from stderr.
 pub fn execute_phase(
     phase: &Phase,
-    provided_inputs: &HashMap<String, OutputRef>,
+    provided_inputs: &HashMap<String, ProvidedInput>,
     python: &PathBuf,
 ) -> HashMap<String, OutputRef> {
     let mut children: Vec<(std::process::Child, PathBuf)> = Vec::new();
@@ -253,13 +281,27 @@ pub fn execute_phase(
         children.push((child, path));
     }
 
-    let mut phase_outputs: HashMap<String, OutputRef> = HashMap::new();
+    // Drain stderr from all workers in parallel via reader threads to avoid
+    // 64KB pipe buffer deadlocks when workers produce significant output.
+    let mut handles: Vec<(
+        std::thread::JoinHandle<(HashMap<String, OutputRef>, Vec<String>)>,
+        std::process::Child,
+        PathBuf,
+    )> = Vec::new();
 
     for (mut child, batch_path) in children {
         let stderr = child.stderr.take().expect("no stderr");
-        let reader = BufReader::new(stderr);
+        let handle = std::thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            parse_worker_output(reader)
+        });
+        handles.push((handle, child, batch_path));
+    }
 
-        let (outputs, error_lines) = parse_worker_output(reader);
+    let mut phase_outputs: HashMap<String, OutputRef> = HashMap::new();
+
+    for (handle, mut child, batch_path) in handles {
+        let (outputs, error_lines) = handle.join().expect("reader thread panicked");
         for (node_id, output) in outputs {
             phase_outputs.insert(node_id, output);
         }
@@ -339,7 +381,7 @@ pub fn parse_worker_output(reader: impl BufRead) -> (HashMap<String, OutputRef>,
 /// Serialize a worker stream batch to JSON, including provided inputs and artifact_dir.
 pub fn serialize_batch(
     stream: &WorkerStream,
-    provided_inputs: &HashMap<String, OutputRef>,
+    provided_inputs: &HashMap<String, ProvidedInput>,
 ) -> String {
     let artifact_dir = ".barca/artifacts";
 
@@ -374,18 +416,25 @@ pub fn serialize_batch(
         })
         .collect();
 
-    // Serialize provided_inputs as OutputRef objects (path + format + size_bytes).
+    // Serialize provided_inputs — single artifacts or collected lists.
     let pi_json: HashMap<String, serde_json::Value> = provided_inputs
         .iter()
-        .map(|(k, oref)| {
-            (
-                k.clone(),
-                serde_json::json!({
+        .map(|(k, pi)| {
+            let val = match pi {
+                ProvidedInput::Single(oref) => serde_json::json!({
                     "path": oref.path,
                     "format": oref.format,
                     "size_bytes": oref.size_bytes,
                 }),
-            )
+                ProvidedInput::Collected(orefs) => serde_json::json!({
+                    "_collected": true,
+                    "artifacts": orefs.iter().map(|o| serde_json::json!({
+                        "path": o.path,
+                        "format": o.format,
+                    })).collect::<Vec<_>>(),
+                }),
+            };
+            (k.clone(), val)
         })
         .collect();
 
@@ -498,7 +547,10 @@ Traceback (most recent call last):\n\
         all_outputs.insert("f:a".to_string(), test_output_ref("f--a.json", "json"));
 
         let provided = build_provided_inputs(&phase, &all_outputs);
-        assert_eq!(provided["f:a"].path, "f--a.json");
+        match &provided["f:a"] {
+            ProvidedInput::Single(oref) => assert_eq!(oref.path, "f--a.json"),
+            other => panic!("expected Single, got {other:?}"),
+        }
     }
 
     #[test]
@@ -525,7 +577,10 @@ Traceback (most recent call last):\n\
         );
 
         let provided = build_provided_inputs(&phase, &all_outputs);
-        assert_eq!(provided["f:a[t=X]"].path, "f--a_t_X.json");
+        match &provided["f:a[t=X]"] {
+            ProvidedInput::Single(oref) => assert_eq!(oref.path, "f--a_t_X.json"),
+            other => panic!("expected Single, got {other:?}"),
+        }
     }
 
     #[test]
@@ -609,7 +664,7 @@ Traceback (most recent call last):\n\
             }],
         };
 
-        let json_str = serialize_batch(&stream, &HashMap::<String, OutputRef>::new());
+        let json_str = serialize_batch(&stream, &HashMap::<String, ProvidedInput>::new());
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         let step_inputs = &parsed["steps"][0]["inputs"];
         assert_eq!(step_inputs["data"], "f:a[t=X]");
@@ -719,7 +774,10 @@ Traceback (most recent call last):\n\
         );
 
         let provided = build_provided_inputs(&phase, &all_outputs);
-        assert_eq!(provided["f:a"].path, ".barca/artifacts/f--a.json");
+        match &provided["f:a"] {
+            ProvidedInput::Single(oref) => assert_eq!(oref.path, ".barca/artifacts/f--a.json"),
+            _ => panic!("expected Single"),
+        }
     }
 
     #[test]
@@ -750,7 +808,10 @@ Traceback (most recent call last):\n\
         );
 
         let provided = build_provided_inputs(&phase, &all_outputs);
-        assert_eq!(provided["f:a[t=X]"].format, "parquet");
+        match &provided["f:a[t=X]"] {
+            ProvidedInput::Single(oref) => assert_eq!(oref.format, "parquet"),
+            _ => panic!("expected Single"),
+        }
     }
 
     #[test]
@@ -766,14 +827,14 @@ Traceback (most recent call last):\n\
                 pending_partitions: HashMap::new(),
             }],
         };
-        let mut provided: HashMap<String, OutputRef> = HashMap::new();
+        let mut provided: HashMap<String, ProvidedInput> = HashMap::new();
         provided.insert(
             "f:a".to_string(),
-            OutputRef {
+            ProvidedInput::Single(OutputRef {
                 path: ".barca/artifacts/f--a.json".to_string(),
                 format: "json".to_string(),
                 size_bytes: 100,
-            },
+            }),
         );
 
         let json_str = serialize_batch(&stream, &provided);
@@ -800,7 +861,7 @@ Traceback (most recent call last):\n\
             }],
         };
 
-        let json_str = serialize_batch(&stream, &HashMap::<String, OutputRef>::new());
+        let json_str = serialize_batch(&stream, &HashMap::<String, ProvidedInput>::new());
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         // artifact_dir should be present in the batch JSON
         assert!(parsed.get("artifact_dir").is_some());

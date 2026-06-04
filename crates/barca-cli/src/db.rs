@@ -57,7 +57,11 @@ pub fn init_db_sync(db_path: &str) {
     });
 }
 
-pub fn persist_outputs_sync(db_path: &str, outputs: &HashMap<String, OutputRef>) {
+pub fn persist_outputs_sync(
+    db_path: &str,
+    outputs: &HashMap<String, OutputRef>,
+    run_hashes: &HashMap<String, String>,
+) {
     if outputs.is_empty() {
         return;
     }
@@ -69,10 +73,12 @@ pub fn persist_outputs_sync(db_path: &str, outputs: &HashMap<String, OutputRef>)
         let db = Builder::new_local(db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
         for (node_id, oref) in outputs {
+            let run_hash = run_hashes.get(node_id).cloned().unwrap_or_default();
             conn.execute(
-                "INSERT INTO materializations (node_id, artifact_path, artifact_format, artifact_size_bytes) VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
                 [
                     node_id.clone(),
+                    run_hash,
                     oref.path.clone(),
                     oref.format.clone(),
                     oref.size_bytes.to_string(),
@@ -86,7 +92,7 @@ pub fn persist_outputs_sync(db_path: &str, outputs: &HashMap<String, OutputRef>)
 
 /// Alias for backward compat in tests — delegates to persist_outputs_sync.
 pub fn persist_output_refs_sync(db_path: &str, outputs: &HashMap<String, OutputRef>) {
-    persist_outputs_sync(db_path, outputs);
+    persist_outputs_sync(db_path, outputs, &HashMap::new());
 }
 
 #[cfg(test)]
@@ -109,7 +115,7 @@ mod tests {
                 size_bytes: 15,
             },
         );
-        persist_outputs_sync(&db_path, &outputs);
+        persist_outputs_sync(&db_path, &outputs, &HashMap::new());
 
         // Read it back.
         let rt = tokio::runtime::Builder::new_current_thread()

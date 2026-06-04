@@ -294,6 +294,10 @@ fn collect_stmt_names(stmt: &Stmt, names: &mut HashSet<String>) {
         Stmt::Assign(s) => {
             collect_expr_names(&s.value, names);
         }
+        Stmt::AugAssign(s) => {
+            collect_expr_names(&s.target, names);
+            collect_expr_names(&s.value, names);
+        }
         Stmt::AnnAssign(s) => {
             if let Some(v) = &s.value {
                 collect_expr_names(v, names);
@@ -336,6 +340,62 @@ fn collect_stmt_names(stmt: &Stmt, names: &mut HashSet<String>) {
         Stmt::FunctionDef(s) => {
             for st in &s.body {
                 collect_stmt_names(st, names);
+            }
+        }
+        Stmt::Try(s) => {
+            for st in &s.body {
+                collect_stmt_names(st, names);
+            }
+            for handler in &s.handlers {
+                if let Some(h) = handler.as_except_handler() {
+                    for st in &h.body {
+                        collect_stmt_names(st, names);
+                    }
+                }
+            }
+            for st in &s.orelse {
+                collect_stmt_names(st, names);
+            }
+            for st in &s.finalbody {
+                collect_stmt_names(st, names);
+            }
+        }
+        Stmt::Match(s) => {
+            collect_expr_names(&s.subject, names);
+            for case in &s.cases {
+                if let Some(guard) = &case.guard {
+                    collect_expr_names(guard, names);
+                }
+                for st in &case.body {
+                    collect_stmt_names(st, names);
+                }
+            }
+        }
+        Stmt::ClassDef(s) => {
+            for arg in s.arguments.iter().flat_map(|a| a.args.iter()) {
+                collect_expr_names(arg, names);
+            }
+            for st in &s.body {
+                collect_stmt_names(st, names);
+            }
+        }
+        Stmt::Raise(s) => {
+            if let Some(exc) = &s.exc {
+                collect_expr_names(exc, names);
+            }
+            if let Some(cause) = &s.cause {
+                collect_expr_names(cause, names);
+            }
+        }
+        Stmt::Assert(s) => {
+            collect_expr_names(&s.test, names);
+            if let Some(msg) = &s.msg {
+                collect_expr_names(msg, names);
+            }
+        }
+        Stmt::Delete(s) => {
+            for target in &s.targets {
+                collect_expr_names(target, names);
             }
         }
         _ => {}
@@ -402,6 +462,75 @@ fn collect_expr_names(expr: &Expr, names: &mut HashSet<String>) {
         }
         Expr::Lambda(l) => collect_expr_names(&l.body, names),
         Expr::Starred(s) => collect_expr_names(&s.value, names),
+        Expr::ListComp(c) => {
+            collect_expr_names(&c.elt, names);
+            for comp in &c.generators {
+                collect_expr_names(&comp.iter, names);
+                for cond in &comp.ifs {
+                    collect_expr_names(cond, names);
+                }
+            }
+        }
+        Expr::SetComp(c) => {
+            collect_expr_names(&c.elt, names);
+            for comp in &c.generators {
+                collect_expr_names(&comp.iter, names);
+                for cond in &comp.ifs {
+                    collect_expr_names(cond, names);
+                }
+            }
+        }
+        Expr::DictComp(c) => {
+            if let Some(k) = &c.key {
+                collect_expr_names(k, names);
+            }
+            collect_expr_names(&c.value, names);
+            for comp in &c.generators {
+                collect_expr_names(&comp.iter, names);
+                for cond in &comp.ifs {
+                    collect_expr_names(cond, names);
+                }
+            }
+        }
+        Expr::Generator(g) => {
+            collect_expr_names(&g.elt, names);
+            for comp in &g.generators {
+                collect_expr_names(&comp.iter, names);
+                for cond in &comp.ifs {
+                    collect_expr_names(cond, names);
+                }
+            }
+        }
+        Expr::FString(f) => {
+            for part in &f.value {
+                if let ruff_python_ast::FStringPart::FString(fstr) = part {
+                    for interp in fstr.elements.interpolations() {
+                        collect_expr_names(&interp.expression, names);
+                    }
+                }
+            }
+        }
+        Expr::Named(n) => {
+            collect_expr_names(&n.value, names);
+        }
+        Expr::Await(a) => collect_expr_names(&a.value, names),
+        Expr::Yield(y) => {
+            if let Some(v) = &y.value {
+                collect_expr_names(v, names);
+            }
+        }
+        Expr::YieldFrom(y) => collect_expr_names(&y.value, names),
+        Expr::Slice(s) => {
+            if let Some(l) = &s.lower {
+                collect_expr_names(l, names);
+            }
+            if let Some(u) = &s.upper {
+                collect_expr_names(u, names);
+            }
+            if let Some(st) = &s.step {
+                collect_expr_names(st, names);
+            }
+        }
         _ => {}
     }
 }

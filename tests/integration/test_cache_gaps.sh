@@ -56,7 +56,7 @@ S2=$(steps "$OUT2")
 [ "$S2" = "0" ] && pass "cross-file: cached on second run" || fail "cross-file: not cached (got $S2)"
 
 # Modify helper in OTHER file
-sed -i '' 's/return x \* 2/return x * 99/' "$TMPDIR/cross_file/helpers.py"
+sed -i.bak 's/return x \* 2/return x * 99/' "$TMPDIR/cross_file/helpers.py"
 
 # Third run — should detect the cross-file change
 OUT3=$($BARCA get result "$TMPDIR/cross_file/assets.py" 2>/dev/null || echo '{"steps_executed":-1}')
@@ -126,7 +126,7 @@ S2=$(steps "$OUT2")
 [ "$S2" = "0" ] && pass "partition: fully cached" || fail "partition: not cached (got $S2)"
 
 # Modify ONLY transform — fetch should stay cached (3 re-runs, not 6)
-sed -i '' 's/data\["data"\].upper()/data["data"].lower()/' "$TMPDIR/partitions.py"
+sed -i.bak 's/data\["data"\].upper()/data["data"].lower()/' "$TMPDIR/partitions.py"
 OUT3=$($BARCA get transform "$TMPDIR/partitions.py" 2>/dev/null || echo '{"steps_executed":-1}')
 S3=$(steps "$OUT3")
 [ "$S3" = "3" ] && pass "partition: only transform re-runs (fetch cached)" || fail "partition: expected 3, got $S3"

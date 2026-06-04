@@ -41,14 +41,7 @@ pub struct Phase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PhaseReason {
     Initial,
-    FanIn {
-        node_id: String,
-    },
-    /// Partition source must materialize before downstream can expand.
-    /// The dispatch loop reads the source output and expands partition steps.
-    PartitionResolution {
-        source_node_id: String,
-    },
+    FanIn { node_id: String },
 }
 
 /// A worker stream — ordered steps for one Python process.

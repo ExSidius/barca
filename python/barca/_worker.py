@@ -44,9 +44,15 @@ def load_module(source_file):
 
 
 def _resolve_input(raw_value):
-    """Resolve a provided input: artifact ref → deserialized value, else raw."""
-    if isinstance(raw_value, dict) and "path" in raw_value and "format" in raw_value:
-        return deserialize(raw_value["path"], raw_value["format"])
+    """Resolve a provided input: artifact ref → deserialized value, else raw.
+
+    For collected (fan-in) inputs, deserializes each partition artifact into a list.
+    """
+    if isinstance(raw_value, dict):
+        if raw_value.get("_collected") and "artifacts" in raw_value:
+            return [deserialize(a["path"], a["format"]) for a in raw_value["artifacts"]]
+        if "path" in raw_value and "format" in raw_value:
+            return deserialize(raw_value["path"], raw_value["format"])
     return raw_value
 
 

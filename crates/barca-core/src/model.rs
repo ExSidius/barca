@@ -123,13 +123,34 @@ impl PartitionKey {
         if let Some(bracket) = id.find('[') {
             let base = &id[..bracket];
             let inner = id[bracket + 1..].trim_end_matches(']');
-            let map: BTreeMap<String, String> = inner
-                .split(',')
-                .filter_map(|pair| {
-                    let mut parts = pair.splitn(2, '=');
-                    Some((parts.next()?.to_string(), parts.next()?.to_string()))
-                })
-                .collect();
+            // Parse key=value pairs. Keys (dimension names) never contain `=` or `,`,
+            // but values might. We detect pair boundaries by finding `,<ident>=` patterns:
+            // a comma followed by text containing `=` before the next comma.
+            let mut map = BTreeMap::new();
+            let mut remaining = inner;
+            while !remaining.is_empty() {
+                let Some(eq_pos) = remaining.find('=') else {
+                    break;
+                };
+                let key = &remaining[..eq_pos];
+                let after_eq = &remaining[eq_pos + 1..];
+                // Find where this value ends: at a `,` that's followed by another `key=`.
+                let val_end = after_eq
+                    .find(',')
+                    .and_then(|comma| {
+                        let rest = &after_eq[comma + 1..];
+                        let next_eq = rest.find('=')?;
+                        let next_comma = rest.find(',').unwrap_or(rest.len());
+                        (next_eq < next_comma).then_some(comma)
+                    })
+                    .unwrap_or(after_eq.len());
+                map.insert(key.to_string(), after_eq[..val_end].to_string());
+                remaining = if val_end < after_eq.len() {
+                    &after_eq[val_end + 1..]
+                } else {
+                    ""
+                };
+            }
             (base, PartitionKey(map))
         } else {
             (id, PartitionKey::empty())
