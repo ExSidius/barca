@@ -1,5 +1,6 @@
 //! Engine commands — run, get, plan. Return typed results; callers handle display.
 
+use crate::BarcaError;
 use crate::cache;
 use crate::dag::Dag;
 use crate::db;
@@ -54,9 +55,21 @@ pub struct PlanStream {
 // ─── Shared setup ────────────────────────────────────────────────────────────
 
 pub fn find_python() -> PathBuf {
-    let self_exe = env::current_exe().expect("cannot determine own path");
-    let bin_dir = self_exe.parent().expect("binary has no parent dir");
-    bin_dir.join("python")
+    // Look for sibling python in the same bin/ directory as the barca binary.
+    if let Ok(self_exe) = env::current_exe() {
+        if let Some(bin_dir) = self_exe.parent() {
+            let candidate = bin_dir.join("python");
+            if candidate.exists() {
+                return candidate;
+            }
+            let candidate3 = bin_dir.join("python3");
+            if candidate3.exists() {
+                return candidate3;
+            }
+        }
+    }
+    // Fall back to PATH.
+    PathBuf::from("python3")
 }
 
 fn default_pool_size() -> usize {
@@ -67,10 +80,10 @@ fn default_pool_size() -> usize {
 
 // ─── run ─────────────────────────────────────────────────────────────────────
 
-pub fn run(file_args: &[String], python: &PathBuf) -> RunResult {
+pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaError> {
     let t0 = Instant::now();
 
-    let dag = build_dag(file_args, python);
+    let dag = build_dag(file_args, python)?;
 
     let pool_size = default_pool_size();
     let config = ResourceConfig {
@@ -84,7 +97,6 @@ pub fn run(file_args: &[String], python: &PathBuf) -> RunResult {
 
     let all_outputs = dispatch::dispatch_plan(&exec_plan, python, &db_path, pool_size);
 
-    // Compute run hashes for all outputs so `barca get` can reuse them.
     let run_hashes = compute_run_hashes(&dag, &all_outputs);
     db::persist_outputs_sync(&db_path, &all_outputs, &run_hashes);
 
@@ -107,20 +119,24 @@ pub fn run(file_args: &[String], python: &PathBuf) -> RunResult {
         })
         .cloned();
 
-    RunResult {
+    Ok(RunResult {
         elapsed_seconds: t0.elapsed().as_secs_f64(),
         steps_executed: total_executed,
         phases: exec_plan.phases.len(),
         final_output,
-    }
+    })
 }
 
 // ─── get ─────────────────────────────────────────────────────────────────────
 
-pub fn get(target_name: &str, file_args: &[String], python: &PathBuf) -> GetResult {
+pub fn get(
+    target_name: &str,
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
 
-    let dag = build_dag(file_args, python);
+    let dag = build_dag(file_args, python)?;
 
     let target_id = dag
         .topo_order()
@@ -131,15 +147,10 @@ pub fn get(target_name: &str, file_args: &[String], python: &PathBuf) -> GetResu
                 || id.ends_with(target_name)
         })
         .map(|s| s.to_string())
-        .unwrap_or_else(|| {
+        .ok_or_else(|| {
             let available: Vec<&str> = dag.topo_order();
-            eprintln!(
-                "Asset '{}' not found. Available: {}",
-                target_name,
-                available.join(", ")
-            );
-            std::process::exit(1);
-        });
+            BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
+        })?;
 
     let subgraph_ids = dag.subgraph(&target_id);
 
@@ -317,9 +328,7 @@ pub fn get(target_name: &str, file_args: &[String], python: &PathBuf) -> GetResu
         }
     });
 
-    // Find final output — exact match or collect partitioned outputs.
     let final_output = all_outputs.get(&target_id).cloned().or_else(|| {
-        // For partitioned targets, return the last partition's output.
         let prefix = format!("{target_id}[");
         all_outputs
             .iter()
@@ -329,24 +338,24 @@ pub fn get(target_name: &str, file_args: &[String], python: &PathBuf) -> GetResu
             .cloned()
     });
 
-    GetResult {
+    Ok(GetResult {
         elapsed_seconds: t0.elapsed().as_secs_f64(),
         steps_executed,
         final_output,
-    }
+    })
 }
 
 // ─── plan ────────────────────────────────────────────────────────────────────
 
-pub fn plan(file_args: &[String], python: &PathBuf) -> PlanResult {
-    let dag = build_dag(file_args, python);
+pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaError> {
+    let dag = build_dag(file_args, python)?;
     let config = ResourceConfig {
         pool_size: 10,
         concurrency_groups: HashMap::new(),
     };
     let plan = planner::plan_from_dag(&dag, &config);
 
-    PlanResult {
+    Ok(PlanResult {
         total_steps: plan.total_steps,
         phases: plan
             .phases
@@ -363,12 +372,11 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> PlanResult {
                     .collect(),
             })
             .collect(),
-    }
+    })
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Compute run hashes for all outputs in topological order.
 fn compute_run_hashes(
     dag: &Dag,
     all_outputs: &HashMap<String, OutputRef>,
@@ -412,7 +420,6 @@ fn compute_run_hashes(
     run_hashes
 }
 
-/// Filter an execution plan to only include steps in the target's subgraph.
 fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> ExecutionPlan {
     let subgraph_set: std::collections::HashSet<&str> = subgraph_ids.iter().copied().collect();
     let exec_plan = ExecutionPlan {
@@ -458,19 +465,16 @@ fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> Execut
 
 // ─── DAG construction ────────────────────────────────────────────────────────
 
-pub fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
+pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
 
     for path in &paths {
-        let source = fs::read_to_string(path)
-            .unwrap_or_else(|e| panic!("Error reading {}: {e}", path.display()));
+        let source = fs::read_to_string(path)?;
         let file_str = path.to_string_lossy().to_string();
-        let nodes = extract_nodes(&source, &file_str).unwrap_or_else(|e| {
-            eprintln!("{e}");
-            std::process::exit(1);
-        });
+        let nodes =
+            extract_nodes(&source, &file_str).map_err(|e| BarcaError::Parse(e.to_string()))?;
         let stem = path
             .file_stem()
             .unwrap_or_default()
@@ -520,10 +524,7 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
 
     resolve_dynamic_partitions(&mut all_nodes, python);
 
-    Dag::build(&all_nodes).unwrap_or_else(|e| {
-        eprintln!("DAG error: {e}");
-        std::process::exit(1);
-    })
+    Ok(Dag::build(&all_nodes)?)
 }
 
 fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python: &PathBuf) {

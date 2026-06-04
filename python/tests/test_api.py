@@ -15,14 +15,16 @@ from barca.api import BarcaError
 
 
 @pytest.fixture(autouse=True)
-def clean_db():
-    """Remove .barca/metadata.db before each test for isolation."""
-    db = Path(".barca/metadata.db")
-    if db.exists():
-        db.unlink()
+def clean_barca_dir():
+    """Remove entire .barca/ directory before and after each test for isolation."""
+    import shutil
+
+    barca_dir = Path(".barca")
+    if barca_dir.exists():
+        shutil.rmtree(barca_dir)
     yield
-    if db.exists():
-        db.unlink()
+    if barca_dir.exists():
+        shutil.rmtree(barca_dir)
 
 
 def write_module(tmp_path, filename, code):

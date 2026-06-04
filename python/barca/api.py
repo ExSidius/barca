@@ -44,10 +44,7 @@ def _exec(args: list[str]) -> dict:
     )
     if result.returncode != 0:
         stderr = result.stderr.strip()
-        # Filter out barca's own status lines.
-        error_lines = [line for line in stderr.splitlines() if not line.startswith("[barca]")]
-        msg = "\n".join(error_lines) if error_lines else stderr
-        raise BarcaError(msg)
+        raise BarcaError(stderr)
 
     stdout = result.stdout.strip()
     if not stdout:

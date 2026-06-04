@@ -6,7 +6,7 @@
 <p align="center">
   <a href="https://github.com/recursia-io/barca/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/recursia-io/barca/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <a href="https://pypi.org/project/barca/"><img alt="PyPI" src="https://img.shields.io/pypi/v/barca?style=flat-square&color=3572A5" /></a>
-  <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.10-3572A5?style=flat-square" />
+  <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.12-3572A5?style=flat-square" />
   <img alt="Rust" src="https://img.shields.io/badge/rust-2024_edition-dea584?style=flat-square" />
   <a href="https://github.com/recursia-io/barca/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/recursia-io/barca?style=flat-square" /></a>
 </p>
@@ -37,22 +37,31 @@ No config files. No YAML. No daemon. Just functions and a fast binary.
 
 ## Install
 
+Barca is designed for use with [uv](https://docs.astral.sh/uv/):
+
 ```bash
-pip install barca
+uv add barca
 ```
 
 This gives you:
 - The `barca` CLI binary (compiled Rust)
-- Python decorator stubs for `@asset`, `@sensor`, `@effect` (IDE autocomplete + type checking)
-- The execution worker (`barca._worker`)
+- Python API: `barca.run()`, `barca.get()`, `barca.plan()`
+- Decorator stubs for `@asset`, `@sensor`, `@effect` (IDE autocomplete + type checking)
 
-All in one wheel, built with [maturin](https://www.maturin.rs/).
+For optional parquet (DataFrame) support:
+
+```bash
+uv add 'barca[parquet]'
+```
+
+All in one wheel, built with [maturin](https://www.maturin.rs/). Requires Python >= 3.12.
 
 ### From source
 
 ```bash
-git clone https://github.com/recursia-io/barca.git
+git clone https://github.com/ExSidius/barca.git
 cd barca
+uv sync
 cargo build --release
 maturin develop --release    # installs into current .venv
 ```
@@ -191,10 +200,33 @@ def prices(ticker: str) -> dict:
 ## CLI
 
 ```
-barca run <file.py> [file.py ...]     Parse, plan, and execute
-barca plan <file.py> [file.py ...]    Emit execution plan as JSON
-barca --help                          Show help
+barca run <file.py> [file.py ...]          Parse, plan, and execute
+barca get <target> <file.py> [file.py ...] Get a single asset (cache-aware)
+barca plan <file.py> [file.py ...]         Emit execution plan as JSON
+barca --help                               Show help
 ```
+
+Shorthand: `barca pipeline.py` works as `barca run pipeline.py`.
+
+## Python API
+
+```python
+import barca
+
+# Execute all assets, get the final output
+result = barca.run("pipeline.py")
+print(result["final_output"])  # {"count": 3, "total": 6}
+
+# Get a specific asset's value (cache-aware)
+value = barca.get("summary", "pipeline.py")
+print(value)  # {"count": 3, "total": 6}
+
+# Inspect the execution plan
+plan = barca.plan("pipeline.py")
+print(plan["total_steps"])  # 2
+```
+
+All output formats work transparently: dicts, lists, sets, DataFrames, and arbitrary Python objects are serialized as JSON, pickle, or parquet and deserialized automatically.
 
 ### `barca plan` -- inspect without running
 
@@ -279,11 +311,13 @@ Each benchmark includes equivalent Dagster and Prefect implementations for apple
 ```
 Cargo.toml                  Rust workspace root
 crates/
-  barca-core/               Core library: models, parser, DAG, planner, hashing
-  barca-cli/                CLI binary (the `barca` command)
+  barca-core/               Engine: parser, DAG, planner, dispatch, DB, cache
+  barca-cli/                Thin CLI shell (clap → barca-core)
 python/barca/
-  __init__.py               No-op decorator stubs (identity functions)
+  __init__.py               Decorator stubs + API exports
+  api.py                    Python API (run/get/plan via subprocess)
   _worker.py                Execution worker (invoked by Rust binary)
+  _artifacts.py             Artifact serialization (json/pickle/parquet)
   py.typed                  PEP 561 marker
 pyproject.toml              Maturin build config
 ```
@@ -298,7 +332,7 @@ pyproject.toml              Maturin build config
 | Serialization | [serde](https://serde.rs/) + serde_json |
 | Hashing | SHA-256 (content-addressed artifacts) |
 | Build | [maturin](https://www.maturin.rs/) (Rust binary + Python stubs in one wheel) |
-| Python runtime | Any Python >= 3.10 |
+| Python runtime | Python >= 3.12 |
 
 ### Node kinds
 

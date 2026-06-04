@@ -1,8 +1,8 @@
 [package]
 name = "barca-core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
-description = "Core library — models, parsing, DAG, execution planning, hashing"
+description = "Core library — models, parsing, DAG, execution planning, hashing, dispatch, caching"
 
 [dependencies]
 ruff_python_parser = { workspace = true }
