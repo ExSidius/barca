@@ -24,13 +24,13 @@ pub fn compute_run_hash(
             None
         })
         .collect();
-    barca_core::hash::run_hash(def_hash, partition_key, &upstream_hashes, None)
+    crate::hash::run_hash(def_hash, partition_key, &upstream_hashes, None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use barca_core::{PartitionKey, StepId};
+    use crate::{PartitionKey, StepId};
 
     #[test]
     fn step_id_parse_unpartitioned() {
