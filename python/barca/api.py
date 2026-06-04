@@ -75,6 +75,9 @@ def _exec(args: list[str]) -> dict:
     )
     if result.returncode != 0:
         stderr = result.stderr.strip()
+        # Strip any leading "Error: " prefix to avoid doubling.
+        if stderr.startswith("Error: "):
+            stderr = stderr[len("Error: ") :]
         raise BarcaError(stderr)
 
     stdout = result.stdout.strip()

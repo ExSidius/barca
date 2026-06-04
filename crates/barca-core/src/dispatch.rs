@@ -307,7 +307,8 @@ pub fn execute_phase(
 
         let status = child.wait().expect("failed to wait on worker");
         if !status.success() {
-            eprintln!("[barca] Worker failed:\n{}", error_lines.join("\n"));
+            let cleaned = filter_traceback(&error_lines);
+            eprintln!("{cleaned}");
             std::fs::remove_file(&batch_path).ok();
             std::process::exit(1);
         }
@@ -447,6 +448,92 @@ pub fn serialize_batch(
         "steps": steps,
     })
     .to_string()
+}
+
+/// Filter a Python traceback to show only user-relevant frames.
+/// Strips frames from barca internal files (_worker.py, _runner.py, etc.)
+/// and Python frozen internals (<frozen ...>) while keeping user code frames
+/// and the final exception line.
+fn filter_traceback(lines: &[String]) -> String {
+    // Find the last "Traceback" line to locate the traceback section.
+    let tb_start = lines
+        .iter()
+        .rposition(|l| l.starts_with("Traceback (most recent call last)"));
+
+    let Some(tb_idx) = tb_start else {
+        // No traceback — return all lines as-is.
+        return lines.join("\n");
+    };
+
+    let mut result: Vec<&str> = Vec::new();
+
+    // Keep any lines before the traceback section.
+    for line in &lines[..tb_idx] {
+        result.push(line);
+    }
+
+    result.push("Traceback (most recent call last):");
+
+    // Walk frame groups inside the traceback. Each frame is:
+    //   File "path", line N, in func_name
+    //     code_line
+    //     ~~~~^^^^^   (optional, Python 3.13+)
+    // After all frames, the exception line appears.
+    let tb_lines = &lines[tb_idx + 1..];
+    let mut i = 0;
+    while i < tb_lines.len() {
+        let trimmed = tb_lines[i].trim();
+
+        if trimmed.starts_with("File \"") {
+            let is_internal = trimmed.contains("barca/_worker.py")
+                || trimmed.contains("barca\\_worker.py")
+                || trimmed.contains("barca/_runner.py")
+                || trimmed.contains("barca\\_runner.py")
+                || trimmed.contains("<frozen ");
+
+            if is_internal {
+                // Skip this frame header + all following non-frame lines (code + underlines).
+                i += 1;
+                while i < tb_lines.len() && !tb_lines[i].trim().starts_with("File \"") {
+                    // Check if this is the exception line (not indented or not a code/underline line).
+                    let next = tb_lines[i].trim();
+                    if !next.is_empty()
+                        && !next.starts_with('~')
+                        && !tb_lines[i].starts_with("    ")
+                        && !tb_lines[i].starts_with('\t')
+                    {
+                        break;
+                    }
+                    i += 1;
+                }
+                // Don't increment i — we need to re-examine the current line.
+                continue;
+            } else {
+                // User frame — keep the File line and all following code/underline lines.
+                result.push(&tb_lines[i]);
+                i += 1;
+                while i < tb_lines.len() && !tb_lines[i].trim().starts_with("File \"") {
+                    let next = tb_lines[i].trim();
+                    if !next.is_empty()
+                        && !next.starts_with('~')
+                        && !tb_lines[i].starts_with("    ")
+                        && !tb_lines[i].starts_with('\t')
+                    {
+                        break;
+                    }
+                    result.push(&tb_lines[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        } else {
+            // Exception line (e.g. "ZeroDivisionError: division by zero").
+            result.push(&tb_lines[i]);
+            i += 1;
+        }
+    }
+
+    result.join("\n")
 }
 
 #[cfg(test)]

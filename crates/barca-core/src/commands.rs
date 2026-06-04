@@ -114,7 +114,7 @@ pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaErr
             .filter(|(k, _)| k.starts_with(&last_planned_id))
             .collect();
         matches.sort_by_key(|(k, _)| k.clone());
-        matches.last().map(|(_, v)| (*v).clone())
+        matches.first().map(|(_, v)| (*v).clone())
     });
 
     Ok(RunResult {
@@ -334,7 +334,7 @@ pub fn get(
             .filter(|(k, _)| k.starts_with(&prefix))
             .collect();
         matches.sort_by_key(|(k, _)| k.clone());
-        matches.last().map(|(_, v)| (*v).clone())
+        matches.first().map(|(_, v)| (*v).clone())
     });
 
     Ok(GetResult {
@@ -470,7 +470,8 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
     let mut file_sources: HashMap<String, String> = HashMap::new();
 
     for path in &paths {
-        let source = fs::read_to_string(path)?;
+        let source = fs::read_to_string(path)
+            .map_err(|e| BarcaError::Other(format!("{}: {e}", path.display())))?;
         let file_str = path.to_string_lossy().to_string();
         let nodes =
             extract_nodes(&source, &file_str).map_err(|e| BarcaError::Parse(e.to_string()))?;
