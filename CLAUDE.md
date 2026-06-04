@@ -18,7 +18,9 @@ crates/
   barca-cli/            ← CLI binary (the `barca` command)
 python/barca/
   __init__.py           ← No-op decorator stubs (identity functions)
-  _runner.py            ← Execution runner (invoked by Rust binary)
+  _worker.py            ← Batch worker (invoked by Rust via `python -m barca._worker`)
+  _artifacts.py         ← Serialization: json, pickle, parquet format detection + I/O
+  __main__.py           ← Entry point for `python -m barca` (delegates to `_worker.main()`)
   py.typed              ← PEP 561 marker
 pyproject.toml          ← Maturin build config (binary + Python stubs in one wheel)
 ```
@@ -29,15 +31,16 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
    - Parses Python using ruff's AST (no import, pure static analysis)
    - Builds a petgraph DAG from `@asset`/`@sensor`/`@effect` decorators
    - Generates a tiered execution plan (JSON)
-   - Persists plan to local Turso/libSQL database (`.barca/metadata.db`)
-   - Spawns the sibling Python interpreter to execute the plan
+   - Persists plan + results to local Turso/libSQL database (`.barca/metadata.db`)
+   - Spawns Python worker processes per batch (`python -m barca._worker`)
 
-2. **Python runner** (`python -m barca._runner <plan.json> [db_path]`):
-   - Reads the execution plan
+2. **Python worker** (`python -m barca._worker <batch.json>`):
+   - Receives a batch of steps + artifact references from Rust
    - Imports user modules via `importlib.util.spec_from_file_location`
-   - Executes steps in tier order (parallel within tiers via ThreadPoolExecutor)
-   - Uses LRU cache for in-process result passing between steps
-   - Persists each materialization to Turso via `pyturso`
+   - Executes steps sequentially within a batch (Rust parallelises across batches)
+   - Serializes results to artifact files (json/pickle/parquet)
+   - Reports results back to Rust via a stderr JSON protocol (`BARCA:2:{...}`)
+   - No DB access — Rust owns all persistence
 
 3. **Python stubs** (`from barca import asset, ...`):
    - Pure no-ops — decorators return the function unchanged
@@ -46,7 +49,7 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
 ### Dependencies
 
 - **Rust**: ruff_python_parser (AST), petgraph (DAG), turso (DB), serde/serde_json, sha2
-- **Python**: pyturso (DB persistence)
+- **Python**: no runtime dependencies (stdlib only; pyarrow optional for parquet)
 - **Build**: maturin (packages Rust binary + Python stubs into one wheel)
 
 ## Commands
@@ -74,5 +77,5 @@ benchmarks/chain_100/bench.sh 5   # (coming soon)
 2. **Static analysis** — never import user code in the planning phase
 3. **Rust for planning, Python for execution** — each does what it's best at
 4. **Single install** — `uv add barca` gives users everything
-5. **Turso for persistence** — same DB on both Rust and Python sides
-6. **LRU cache for hot path** — in-process memory for within-run result passing
+5. **Turso for persistence** — Rust owns the DB; Python has no DB access
+6. **Artifact-based data passing** — serialized files (json/pickle/parquet) between worker batches
