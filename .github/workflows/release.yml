@@ -96,6 +96,23 @@ jobs:
         with:
           path: artifacts/
 
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        run: pip install git-cliff
+
+      - name: Generate release notes
+        run: |
+          git cliff --config cliff.toml --latest --strip header > RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo "## Install" >> RELEASE_NOTES.md
+          echo "" >> RELEASE_NOTES.md
+          echo '```bash' >> RELEASE_NOTES.md
+          echo "uv add barca" >> RELEASE_NOTES.md
+          echo '```' >> RELEASE_NOTES.md
+
       - name: Collect release assets
         run: |
           mkdir -p release/
@@ -107,16 +124,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
-          generate_release_notes: true
           prerelease: ${{ contains(github.ref, 'rc') || contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'dev') }}
-          body: |
-            ## Install
-
-            ```bash
-            uv add barca
-            ```
-
-            This installs both the `barca` CLI and the Python `@asset()` decorator.
+          body_path: RELEASE_NOTES.md
 
   publish-pypi:
     needs: [build-wheels, build-sdist]
