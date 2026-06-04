@@ -1,0 +1,17 @@
+[package]
+name = "barca"
+version = "0.1.0"
+edition = "2024"
+description = "Invisible asset orchestrator"
+
+[[bin]]
+name = "barca"
+path = "src/main.rs"
+
+[dependencies]
+barca-core = { path = "../barca-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"
+turso = { version = "0.7.0-pre.5", default-features = false }
+tokio = { version = "1", features = ["rt", "macros"] }

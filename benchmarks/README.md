@@ -1,119 +1,72 @@
 # Benchmarks
 
-Compares Barca, Prefect, and Dagster on orchestration overhead and parallel throughput.
+Compares Barca, Dagster, and Prefect on orchestration overhead and parallel throughput.
 
-## Quick start
+All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RESULTS.md](RESULTS.md) for the latest numbers.
 
-```bash
-# Prerequisites: uv, Python 3.14+ (free-threaded recommended)
-# One-time setup:
-cd benchmarks/barca_bench && uv sync && cd ..
-cd prefect_bench && uv venv && uv pip install "prefect>=3.0" "scikit-learn" && cd ..
-cd dagster_bench && uv venv && uv pip install "dagster>=1.9" "scikit-learn" && cd ..
+## Methodology
 
-# Run all benchmarks (3 iterations each):
-bash run_all.sh 3
-```
+### What's controlled
+- **Same machine**: all benchmarks run on the same hardware
+- **Same workload**: each benchmark implements identical logic across all three frameworks
+- **Cold start**: every run starts a fresh process (no warm caches)
+- **Parallel where applicable**: benchmarks with independent nodes enable parallelism in all frameworks
 
-## Benchmarks
+### What differs
+- **Python version**: Barca uses Python 3.14 (from workspace .venv). Dagster and Prefect use Python 3.12 (latest compatible with both)
+- **Parallelism model**: Barca uses multi-process (Rust spawns N Python workers). Dagster uses multiprocess executor. Prefect uses ConcurrentTaskRunner
+- **DB persistence**: Barca writes to Turso/libSQL. Dagster and Prefect use their own internal SQLite stores
 
-| # | Name | What it measures |
-|---|------|-----------------|
-| 1a | 500 trivial jobs | Pure framework overhead (no-op tasks) |
-| 1b | 500 jobs x 50ms | Parallel throughput with simulated I/O |
-| 2 | Cold start | Time to materialize 1 asset from scratch |
-| 3 | Spaceflights | 10-asset diamond DAG with sklearn (adapted from Kedro) |
-| 4a | Server startup | Time from process start to first successful API response |
-| 4b | Server API latency | Time from HTTP request to materialization complete |
+### Parallelism configuration
+- **Barca**: pool_size = cpu_count (automatic)
+- **Dagster**: `multiprocess_executor` with `max_concurrent = cpu_count` for parallel benchmarks
+- **Prefect**: `ConcurrentTaskRunner` with `.submit()` for parallel benchmarks
 
-## Execution models
+## Benchmark suite
 
-| Framework | Model | Parallelism |
-|-----------|-------|-------------|
-| Barca (`-j N`) | N concurrent threads (free-threaded Python) | True thread parallelism, no GIL |
-| Barca (`-j 1`) | Sequential in-process | One at a time |
-| Prefect | ThreadPoolTaskRunner (64 threads) | Thread parallelism in 1 process |
-| Dagster | In-process executor | Sequential, no parallelism |
+### Overhead & scaling
 
-## Server comparison
+| Benchmark | Assets | Topology | Parallelism |
+|---|---|---|---|
+| `trivial` | 1 | single node | N/A |
+| `chain_100` | 100 | linear chain | None (sequential) |
+| `fan_out_500` | 500 | independent | All frameworks parallel |
+| `fan_out_500_50ms` | 500 | independent + 50ms I/O | All frameworks parallel |
+| `incremental_backfill` | 10 × 10 | linear chain × 10 runs | None (sequential) |
+| `multi_file_discovery` | 98 | independent (50 files) | All frameworks parallel |
 
-| Framework | Server command | API style | Asset trigger |
-|-----------|---------------|-----------|---------------|
-| Barca | `barca serve` | REST (FastAPI) | `POST /assets/{id}/refresh` |
-| Prefect | `prefect server start` | REST | Flow run via client SDK |
-| Dagster | `dagster dev` | GraphQL | `launchRun` mutation |
+### DAG topologies
 
-### What the server benchmarks measure
+| Benchmark | Assets | Topology | Parallelism |
+|---|---|---|---|
+| `deep_diamond` | 18 | 5-wide → merge → chain | Parallel fan-out |
+| `wide_layers` | 63 | 3 × 20 + aggregation | Parallel within layers |
+| `map_reduce` | 52 | 1 → 50 → 1 | Parallel mappers |
+| `wide_join` | 11 | 10 dims → 1 fact | Parallel dims |
 
-**Benchmark 4a — Startup time**: Measures the wall-clock time from spawning the
-server process to the first successful health/API response. This captures
-framework initialization, database setup, and HTTP server startup.
+### Real workloads
 
-**Benchmark 4b — API latency**: Measures the round-trip time from sending an
-HTTP request to trigger a materialization until the materialization completes.
-For Barca this is synchronous (the POST blocks until done). For Dagster and
-Prefect this involves launching a run and polling until it reaches a terminal
-state.
+| Benchmark | Assets | Topology | Parallelism |
+|---|---|---|---|
+| `spaceflights` | 10 | diamond + sklearn | Parallel sources |
+| `mixed_io_cpu` | 8 | 5 API calls → merge → compute | Parallel API calls |
+| `etl_duckdb` | 12 | raw → staging → marts | Parallel sources |
+| `large_payloads` | 5 | linear chain, 10k rows/step | None (sequential) |
 
-### Execution details
-
-- **Barca**: FastAPI + uvicorn. `POST /assets/{id}/refresh` runs the
-  materialization synchronously via `asyncio.to_thread()` and returns the
-  result. `POST /reconcile` runs a full DAG walk. Background scheduler disabled
-  during benchmarks (interval=3600s).
-
-- **Dagster**: `dagster dev` starts a webserver with GraphQL API. Materialization
-  triggered via `launchRun` mutation, polled via `runOrError` query.
-
-- **Prefect**: `prefect server start` starts the API server. Flow runs triggered
-  via the Prefect client SDK (which talks to the server). The server tracks run
-  state while execution happens in the client process.
-
-## Free-threaded Python
-
-Barca defaults to Python 3.14t (free-threaded build, GIL disabled). This gives
-`ThreadPoolExecutor` true parallelism without subprocess overhead. The `-j N`
-flag controls concurrency (default: cpu_count).
-
-To opt out and use regular Python 3.14+, change `.python-version` from `3.14t`
-to `3.14`. Threads will still work for I/O-bound tasks (GIL is released during
-I/O), but CPU-bound partitions won't get true parallelism.
-
-## Individual scripts
-
-Each benchmark can be run standalone:
+## Running benchmarks
 
 ```bash
-# Barca (args: runs [concurrency])
-cd barca_bench
-python bench.py 3        # default concurrency (= nproc)
-python bench.py 3 1      # sequential (-j 1)
-python bench.py 3 64     # 64 concurrent
-python bench_trivial.py 3
-python bench_cold_start.py 5
-python bench_spaceflights.py 3  # 10-asset diamond DAG
-python bench_server.py 5        # all server benchmarks
-python bench_server.py 5 startup    # startup only
-python bench_server.py 5 refresh    # refresh latency only
-python bench_server.py 5 reconcile  # reconcile latency only
+# Prerequisites: Rust toolchain, uv, hyperfine
+cargo build --release && maturin develop --release
 
-# Prefect
-cd prefect_bench
-.venv/bin/python bench.py 3
-.venv/bin/python bench_trivial.py 3
-.venv/bin/python bench_cold_start.py 5
-.venv/bin/python bench_spaceflights.py 3
-.venv/bin/python bench_server.py 5          # all server benchmarks
-.venv/bin/python bench_server.py 5 startup  # startup only
-.venv/bin/python bench_server.py 5 flow     # flow run latency only
+# Run individual benchmark (sets up venvs on first run):
+benchmarks/trivial/bench.sh 10
 
-# Dagster
-cd dagster_bench
-.venv/bin/python bench.py 3
-.venv/bin/python bench_trivial.py 3
-.venv/bin/python bench_cold_start.py 5
-.venv/bin/python bench_spaceflights.py 3
-.venv/bin/python bench_server.py 5           # all server benchmarks
-.venv/bin/python bench_server.py 5 startup   # startup only
-.venv/bin/python bench_server.py 5 refresh   # materialization latency only
+# Or run manually with hyperfine:
+hyperfine --warmup 3 --runs 10 benchmarks/trivial/*/run.sh
 ```
+
+Each benchmark directory contains:
+- `barca/` — barca implementation + `run.sh`
+- `dagster/` — equivalent Dagster implementation + `run.sh`
+- `prefect/` — equivalent Prefect implementation + `run.sh`

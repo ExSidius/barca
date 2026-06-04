@@ -1,0 +1,19 @@
+version = 1
+revision = 3
+requires-python = ">=3.10"
+
+[[package]]
+name = "barca"
+version = "0.1.0"
+source = { directory = "../../../" }
+
+[[package]]
+name = "bench-barca"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "barca" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "barca", directory = "../../../" }]

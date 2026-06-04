@@ -1,0 +1,26 @@
+# Configuration for prek (pre-commit in Rust)
+
+[[repos]]
+repo = "builtin"
+hooks = [
+    { id = "trailing-whitespace" },
+    { id = "end-of-file-fixer" },
+    { id = "check-yaml" },
+    { id = "check-toml" },
+    { id = "check-merge-conflict" },
+    { id = "mixed-line-ending", args = ["--fix=lf"] },
+]
+
+[[repos]]
+repo = "https://github.com/astral-sh/ruff-pre-commit"
+rev = "v0.11.13"
+hooks = [
+    { id = "ruff", args = ["--fix"] },
+    { id = "ruff-format" },
+]
+
+[[repos]]
+repo = "local"
+hooks = [
+    { id = "cargo-fmt", name = "cargo fmt", language = "system", entry = "cargo fmt --all --check", pass_filenames = false, types = ["rust"] },
+]
