@@ -116,8 +116,10 @@ fn read_final_output(oref: &barca_core::dispatch::OutputRef) -> serde_json::Valu
 
 fn artifact_metadata(oref: &barca_core::dispatch::OutputRef) -> serde_json::Value {
     serde_json::json!({
-        "artifact_path": oref.path,
-        "artifact_format": oref.format,
-        "artifact_size_bytes": oref.size_bytes,
+        "_barca_artifact": {
+            "path": oref.path,
+            "format": oref.format,
+            "size_bytes": oref.size_bytes,
+        }
     })
 }

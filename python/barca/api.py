@@ -22,25 +22,47 @@ _cached_binary: str | None = None
 
 
 def _find_binary() -> str:
-    """Locate the barca binary, with version validation."""
+    """Locate the barca binary and validate version on first call."""
     global _cached_binary
     if _cached_binary is not None:
         return _cached_binary
+
+    binary = None
 
     # Check sibling of the Python interpreter (same venv bin/).
     bin_dir = Path(sys.executable).parent
     candidate = bin_dir / "barca"
     if candidate.is_file():
-        _cached_binary = str(candidate)
-        return _cached_binary
+        binary = str(candidate)
 
     # Fall back to PATH.
-    found = shutil.which("barca")
-    if found:
-        _cached_binary = found
-        return _cached_binary
+    if binary is None:
+        binary = shutil.which("barca")
 
-    raise BarcaError("barca binary not found. Install with: uv add barca")
+    if binary is None:
+        raise BarcaError("barca binary not found. Install with: uv add barca")
+
+    # Validate version matches the Python package.
+    try:
+        import barca
+
+        result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=5)
+        if result.returncode == 0:
+            bin_version = result.stdout.strip().split()[-1]
+            if bin_version != barca.__version__:
+                import warnings
+
+                warnings.warn(
+                    f"barca binary version ({bin_version}) differs from Python package "
+                    f"({barca.__version__}). This may cause protocol errors. "
+                    f"Binary: {binary}",
+                    stacklevel=2,
+                )
+    except Exception:
+        pass  # Don't block on version check failures.
+
+    _cached_binary = binary
+    return _cached_binary
 
 
 def _exec(args: list[str]) -> dict:
@@ -71,14 +93,11 @@ def _read_output(output_ref: Any) -> Any:
     """Deserialize a final_output value.
 
     If it's already a plain value (dict, list, int, etc.), return as-is.
-    If it's artifact metadata (has artifact_path), read from disk.
+    If it's a sentinel-wrapped artifact reference, read from disk.
     """
-    if (
-        isinstance(output_ref, dict)
-        and set(output_ref.keys()) == {"artifact_path", "artifact_format", "artifact_size_bytes"}
-        and output_ref.get("artifact_format") in ("json", "pickle", "parquet")
-    ):
-        return deserialize(output_ref["artifact_path"], output_ref["artifact_format"])
+    if isinstance(output_ref, dict) and "_barca_artifact" in output_ref:
+        meta = output_ref["_barca_artifact"]
+        return deserialize(meta["path"], meta["format"])
     return output_ref
 
 

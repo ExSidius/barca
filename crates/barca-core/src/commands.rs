@@ -108,16 +108,14 @@ pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaErr
         .and_then(|s| s.steps.last())
         .map(|s| s.step_id.display())
         .unwrap_or_default();
-    let final_output = all_outputs
-        .get(&last_planned_id)
-        .or_else(|| {
-            all_outputs
-                .iter()
-                .filter(|(k, _)| k.starts_with(&last_planned_id))
-                .map(|(_, v)| v)
-                .last()
-        })
-        .cloned();
+    let final_output = all_outputs.get(&last_planned_id).cloned().or_else(|| {
+        let mut matches: Vec<_> = all_outputs
+            .iter()
+            .filter(|(k, _)| k.starts_with(&last_planned_id))
+            .collect();
+        matches.sort_by_key(|(k, _)| k.clone());
+        matches.last().map(|(_, v)| (*v).clone())
+    });
 
     Ok(RunResult {
         elapsed_seconds: t0.elapsed().as_secs_f64(),
