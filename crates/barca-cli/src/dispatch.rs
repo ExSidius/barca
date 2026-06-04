@@ -139,6 +139,7 @@ pub fn expand_pending_partitions(
                     source_file: step.source_file.clone(),
                     inputs: step.inputs.clone(),
                     pending_partitions: HashMap::new(),
+                    serializer: step.serializer.clone(),
                 });
             }
         }
@@ -412,6 +413,9 @@ pub fn serialize_batch(
             if !s.step_id.partition.is_empty() {
                 step["partition"] = serde_json::json!(s.step_id.partition.0);
             }
+            if let Some(ref ser) = s.serializer {
+                step["serializer"] = serde_json::json!(ser);
+            }
             step
         })
         .collect();
@@ -540,6 +544,7 @@ Traceback (most recent call last):\n\
                     source_file: "f".to_string(),
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
+                    serializer: None,
                 }],
             }],
         };
@@ -567,6 +572,7 @@ Traceback (most recent call last):\n\
                     source_file: "f".to_string(),
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
+                    serializer: None,
                 }],
             }],
         };
@@ -596,6 +602,7 @@ Traceback (most recent call last):\n\
                     source_file: "f".to_string(),
                     inputs: HashMap::new(),
                     pending_partitions: HashMap::new(),
+                    serializer: None,
                 }],
             }],
         };
@@ -625,6 +632,7 @@ Traceback (most recent call last):\n\
                         "region".to_string(),
                         "get_regions".to_string(),
                     )]),
+                    serializer: None,
                 }],
             }],
         };
@@ -661,6 +669,7 @@ Traceback (most recent call last):\n\
                 source_file: "f".to_string(),
                 inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                 pending_partitions: HashMap::new(),
+                serializer: None,
             }],
         };
 
@@ -760,6 +769,7 @@ Traceback (most recent call last):\n\
                     source_file: "f".to_string(),
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
+                    serializer: None,
                 }],
             }],
         };
@@ -794,6 +804,7 @@ Traceback (most recent call last):\n\
                     source_file: "f".to_string(),
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
+                    serializer: None,
                 }],
             }],
         };
@@ -825,6 +836,7 @@ Traceback (most recent call last):\n\
                 source_file: "f".to_string(),
                 inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                 pending_partitions: HashMap::new(),
+                serializer: None,
             }],
         };
         let mut provided: HashMap<String, ProvidedInput> = HashMap::new();
@@ -858,6 +870,7 @@ Traceback (most recent call last):\n\
                 source_file: "f".to_string(),
                 inputs: HashMap::new(),
                 pending_partitions: HashMap::new(),
+                serializer: None,
             }],
         };
 
@@ -888,6 +901,7 @@ Traceback (most recent call last):\n\
                         "region".to_string(),
                         "get_regions".to_string(),
                     )]),
+                    serializer: None,
                 }],
             }],
         };

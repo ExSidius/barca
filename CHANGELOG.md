@@ -1,35 +1,32 @@
 # Changelog
 
-## [Unreleased]
-
-### Added
-
-- Notebook helpers: `load_inputs()`, `materialize()`, `read_asset()`, `list_versions()` for interactive/notebook workflows (workflow 07)
-- `_notebook.py` module with project bootstrapping and upstream value resolution
-- 14 notebook workflow tests (shared upstream reuse, sensor upstream, effects, error cases, list_versions)
-- Sensors as first-class nodes: dedicated `barca sensors list/show/trigger` CLI commands, `GET /sensors`, `GET /sensors/{id}/observations`, `POST /sensors/{id}/trigger` API endpoints
-- `trigger_sensor()` engine function for manual sensor execution
-- `list_sensor_observations()` for observation history retrieval
-- `AssetDetail.latest_observation` populated for sensor nodes
-- Sensor-aware CLI display (observation info instead of materialization info)
-- 10 new tests (5 sensor unit + 5 server integration including e2e)
-
 ## [0.1.0] - 2025
 
+Complete rewrite from Python to Rust. The orchestrator is now a compiled binary
+shipped as a maturin-built wheel with thin Python decorator stubs.
+
 ### Added
 
-- Pure Python uv workspace architecture (3 packages: barca-core, barca-cli, barca-server)
-- `@asset()` decorator with dependency tracking, partitions, and content-addressed caching
-- `@sensor()` decorator for external state observation with `(update_detected, output)` return contract
-- `@effect()` decorator for side-effect leaf nodes
-- Schedule-driven reconciliation: `"manual"`, `"always"`, `cron("...")` schedules
-- Single-pass and continuous (`--watch`) reconcile modes
-- AST-based dependency tracing with per-function dependency cone hashing
-- Partitioned assets with `ThreadPoolExecutor` parallelism (free-threaded Python 3.14t)
-- Asset continuity via `@asset(name="stable_name")`
-- SQLite metadata store with optional Turso/libSQL remote support
-- Typer CLI: `reindex`, `assets`, `sensors`, `jobs`, `reconcile`, `serve`, `reset`
-- FastAPI HTTP server with background scheduler
-- 61 pytest tests covering all features
-- Benchmark suite comparing Barca, Prefect, and Dagster
-- Spaceflights benchmark (10-asset diamond DAG adapted from Kedro)
+- Rust workspace: `barca-core` (parse, DAG, planner, cone analysis, hashing) and
+  `barca-cli` (commands, dispatch, cache, DB)
+- `barca run <file.py>` — parse, plan, and execute an asset graph
+- `barca get <target> <file.py>` — execute a single asset's subgraph with caching
+- `barca plan <file.py>` — emit the execution plan as JSON
+- `@asset()` decorator with dependency tracking via `inputs={}` parameter
+- `@sensor()` for external state observation with `(updated, data)` return contract
+- `@effect()` for side-effect leaf nodes
+- `@sink(path, serializer=)` for output file declaration
+- `@asset(serializer="json"|"pickle"|"parquet")` for explicit artifact format control
+- Static partitions via `partitions()`, dynamic via expressions, derived via `partitions_from()`
+- `collect()` fan-in: aggregate all partitions of an upstream asset
+- Freshness markers: `Always`, `Manual`, `Schedule(cron="...")`
+- Content-addressed caching: definition hash (function source + dependency cone) and
+  run hash (definition + partition + upstream hashes) persisted to `.barca/metadata.db`
+- Dependency cone analysis with same-file and cross-file helper/constant tracking
+- File-based artifact persistence: outputs serialize to `.barca/artifacts/` as JSON,
+  pickle, or parquet (auto-detected from value type)
+- Protocol v2: workers emit lightweight artifact receipts on stderr, Rust records metadata
+- Parallel worker dispatch with per-phase streaming and partition-aligned execution
+- Python stubs: no-op decorators for IDE autocomplete and standalone execution
+- Integration test suite (CLI, cache, staleness, cross-file, sensor, partitions)
+- Benchmark suite comparing against Dagster, Prefect, and Airflow

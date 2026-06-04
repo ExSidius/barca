@@ -315,6 +315,8 @@ pub struct ExtractedNode {
     /// and imports that this function references (transitively).
     /// Includes same-file definitions. Cross-file deps tracked by source_file content.
     pub cone_hash: String,
+    /// Explicit artifact serializer override from `@asset(serializer="parquet")`.
+    pub artifact_serializer: Option<SerializerKind>,
 }
 
 impl ExtractedNode {

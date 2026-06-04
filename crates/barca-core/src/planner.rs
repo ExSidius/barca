@@ -64,6 +64,8 @@ pub struct StreamStep {
     /// Pending partition resolution: dimension → source_node_id.
     /// The dispatch loop reads the source output and expands into N steps.
     pub pending_partitions: HashMap<String, String>,
+    /// Explicit artifact serializer from `@asset(serializer="parquet")`.
+    pub serializer: Option<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -335,6 +337,10 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
         let static_partitions = collect_static_partitions(&node.extracted.partitions);
         // Check for derived partitions — mark for resolution at dispatch time.
         let derived_partitions = collect_derived_partitions(&node.extracted.partitions);
+        let serializer = node
+            .extracted
+            .artifact_serializer
+            .map(|s| format!("{s:?}").to_lowercase());
 
         if !static_partitions.is_empty() {
             // Static partitioned: expand into one step per partition value.
@@ -348,6 +354,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                     source_file: node.source_file().to_string(),
                     inputs: inputs.clone(),
                     pending_partitions: HashMap::new(),
+                    serializer: serializer.clone(),
                 });
             }
         } else if !derived_partitions.is_empty() {
@@ -358,6 +365,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 source_file: node.source_file().to_string(),
                 inputs,
                 pending_partitions: derived_partitions,
+                serializer: serializer.clone(),
             });
         } else {
             steps.push(StreamStep {
@@ -367,6 +375,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 source_file: node.source_file().to_string(),
                 inputs,
                 pending_partitions: HashMap::new(),
+                serializer,
             });
         }
     }
@@ -542,6 +551,7 @@ mod tests {
                     byte_offset: 0,
                     source_text: String::new(),
                     cone_hash: String::new(),
+                    artifact_serializer: None,
                 }
             })
             .collect();
@@ -970,6 +980,7 @@ mod tests {
                 byte_offset: 0,
                 source_text: String::new(),
                 cone_hash: String::new(),
+                artifact_serializer: None,
             })
             .collect();
         let dag = Dag::build(&extracted).unwrap();
@@ -1105,6 +1116,7 @@ mod tests {
                     byte_offset: 0,
                     source_text: String::new(),
                     cone_hash: String::new(),
+                    artifact_serializer: None,
                 }
             })
             .collect();

@@ -86,6 +86,10 @@ fn try_extract_function(
     let description = extract_string_kwarg(&keywords, "description");
     let timeout_seconds = extract_int_kwarg(&keywords, "timeout_seconds").unwrap_or(300);
     let tags = extract_tags(&keywords);
+    let artifact_serializer = keywords
+        .iter()
+        .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("serializer"))
+        .and_then(|kw| extract_serializer_kind(&kw.value));
 
     let start = func.range().start().to_usize();
     let end = func.range().end().to_usize();
@@ -107,6 +111,7 @@ fn try_extract_function(
         byte_offset: start,
         source_text,
         cone_hash: String::new(), // computed after extraction in extract_nodes()
+        artifact_serializer,
     })
 }
 
