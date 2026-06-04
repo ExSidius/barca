@@ -36,8 +36,10 @@ pub fn extract_nodes(source: &str, file_path: &str) -> Result<Vec<ExtractedNode>
 
     for stmt in &module.body {
         if let Stmt::FunctionDef(func) = stmt
-            && let Some(extracted) = try_extract_function(func, file_path, source)
+            && let Some(mut extracted) = try_extract_function(func, file_path, source)
         {
+            // Compute dependency cone hash for this function.
+            extracted.cone_hash = crate::cone::cone_hash(source, &extracted.function_name);
             nodes.push(extracted);
         }
     }
@@ -104,6 +106,7 @@ fn try_extract_function(
         source_file: file_path.to_string(),
         byte_offset: start,
         source_text,
+        cone_hash: String::new(), // computed after extraction in extract_nodes()
     })
 }
 

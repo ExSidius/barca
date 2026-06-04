@@ -1,3 +1,4 @@
+pub mod cone;
 pub mod dag;
 pub mod hash;
 pub mod model;

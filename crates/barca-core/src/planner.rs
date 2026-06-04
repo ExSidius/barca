@@ -555,6 +555,7 @@ mod tests {
                     source_file: "test.py".to_string(),
                     byte_offset: 0,
                     source_text: String::new(),
+                    cone_hash: String::new(),
                 }
             })
             .collect();
@@ -982,6 +983,7 @@ mod tests {
                 source_file: "test.py".to_string(),
                 byte_offset: 0,
                 source_text: String::new(),
+                cone_hash: String::new(),
             })
             .collect();
         let dag = Dag::build(&extracted).unwrap();
@@ -1116,6 +1118,7 @@ mod tests {
                     source_file: "test.py".to_string(),
                     byte_offset: 0,
                     source_text: String::new(),
+                    cone_hash: String::new(),
                 }
             })
             .collect();

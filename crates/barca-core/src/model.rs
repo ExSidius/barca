@@ -167,6 +167,10 @@ pub struct ExtractedNode {
     pub byte_offset: usize,
     /// The raw source text of the function (for hashing).
     pub source_text: String,
+    /// Hash of the dependency cone: source text of all helpers, constants,
+    /// and imports that this function references (transitively).
+    /// Includes same-file definitions. Cross-file deps tracked by source_file content.
+    pub cone_hash: String,
 }
 
 impl ExtractedNode {

@@ -70,15 +70,14 @@ impl Dag {
                 return Err(DagError::SensorWithInputs { sensor: id.clone() });
             }
 
-            // Compute definition_hash from source text + metadata.
-            // For now, cone_source is empty (dependency cone analysis not yet wired).
+            // Compute definition_hash from source text + dependency cone + metadata.
             let metadata = serde_json::json!({
                 "kind": node.kind,
                 "freshness": node.freshness,
                 "inputs": node.inputs.iter().map(|i| &i.param_name).collect::<Vec<_>>(),
             })
             .to_string();
-            let def_hash = hash::definition_hash(&node.source_text, "", &metadata);
+            let def_hash = hash::definition_hash(&node.source_text, &node.cone_hash, &metadata);
 
             let dag_node = DagNode {
                 id: id.clone(),
