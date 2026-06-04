@@ -1,8 +1,13 @@
-//! CLI commands — run, get, plan, and shared setup.
+//! Engine commands — run, get, plan. Return typed results; callers handle display.
 
-use barca_core::dag::Dag;
-use barca_core::parse::extract_nodes;
-use barca_core::planner::{self, ExecutionPlan, Phase, ResourceConfig};
+use crate::cache;
+use crate::dag::Dag;
+use crate::db;
+use crate::dispatch;
+use crate::dispatch::OutputRef;
+use crate::parse::extract_nodes;
+use crate::planner::{self, ExecutionPlan, Phase, ResourceConfig};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -11,9 +16,40 @@ use std::process::Command;
 use std::time::Instant;
 use turso::Builder;
 
-use crate::cache;
-use crate::db;
-use crate::dispatch;
+// ─── Result types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunResult {
+    pub elapsed_seconds: f64,
+    pub steps_executed: usize,
+    pub phases: usize,
+    pub final_output: Option<OutputRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetResult {
+    pub elapsed_seconds: f64,
+    pub steps_executed: usize,
+    pub final_output: Option<OutputRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub total_steps: usize,
+    pub phases: Vec<PlanPhase>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanPhase {
+    pub reason: String,
+    pub streams: Vec<PlanStream>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanStream {
+    pub stream_id: String,
+    pub steps: Vec<String>,
+}
 
 // ─── Shared setup ────────────────────────────────────────────────────────────
 
@@ -31,13 +67,10 @@ fn default_pool_size() -> usize {
 
 // ─── run ─────────────────────────────────────────────────────────────────────
 
-pub fn run_command(file_args: &[String]) {
+pub fn run(file_args: &[String], python: &PathBuf) -> RunResult {
     let t0 = Instant::now();
-    let python = find_python();
 
-    let dag = build_dag(file_args, &python);
-    let node_count = dag.node_count();
-    let edge_count = dag.edge_count();
+    let dag = build_dag(file_args, python);
 
     let pool_size = default_pool_size();
     let config = ResourceConfig {
@@ -45,55 +78,14 @@ pub fn run_command(file_args: &[String]) {
         concurrency_groups: HashMap::new(),
     };
     let exec_plan = planner::plan_from_dag(&dag, &config);
-    let plan_time = t0.elapsed();
 
     let db_path = db::ensure_db_dir();
     db::init_db_sync(&db_path);
 
-    let t_exec = Instant::now();
-    let all_outputs = dispatch::dispatch_plan(&exec_plan, &python, &db_path, pool_size);
-    let exec_time = t_exec.elapsed();
+    let all_outputs = dispatch::dispatch_plan(&exec_plan, python, &db_path, pool_size);
 
     // Compute run hashes for all outputs so `barca get` can reuse them.
-    let mut run_hashes: HashMap<String, String> = HashMap::new();
-    // Process outputs in topo order so upstream hashes are available.
-    let topo: Vec<String> = dag
-        .topo_order()
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-    for base_id in &topo {
-        if let Some(node) = dag.get_node(base_id) {
-            // Collect all output keys for this node (unpartitioned + partitioned).
-            let display_ids: Vec<String> = all_outputs
-                .keys()
-                .filter(|k| *k == base_id || k.starts_with(&format!("{base_id}[")))
-                .cloned()
-                .collect();
-            for display_id in display_ids {
-                let sid = barca_core::StepId::parse(&display_id);
-                let partition_key = if sid.partition.is_empty() {
-                    None
-                } else {
-                    Some(sid.partition.suffix())
-                };
-                let upstream_ids: Vec<String> = node
-                    .resolved_inputs
-                    .values()
-                    .chain(node.resolved_collected.values())
-                    .cloned()
-                    .collect();
-                let run_h = cache::compute_run_hash(
-                    &node.definition_hash,
-                    partition_key.as_deref(),
-                    upstream_ids.iter(),
-                    &run_hashes,
-                );
-                run_hashes.insert(display_id, run_h);
-            }
-        }
-    }
-
+    let run_hashes = compute_run_hashes(&dag, &all_outputs);
     db::persist_outputs_sync(&db_path, &all_outputs, &run_hashes);
 
     let total_executed = all_outputs.len();
@@ -104,72 +96,48 @@ pub fn run_command(file_args: &[String]) {
         .and_then(|s| s.steps.last())
         .map(|s| s.step_id.display())
         .unwrap_or_default();
-    let last_output = all_outputs.get(&last_planned_id).or_else(|| {
-        all_outputs
-            .iter()
-            .filter(|(k, _)| k.starts_with(&last_planned_id))
-            .map(|(_, v)| v)
-            .last()
-    });
-    if let Some(oref) = last_output {
-        println!(
-            "{}",
-            serde_json::json!({
-                "elapsed_seconds": exec_time.as_secs_f64(),
-                "steps_executed": total_executed,
-                "phases": exec_plan.phases.len(),
-                "final_output": {
-                    "artifact_path": oref.path,
-                    "artifact_format": oref.format,
-                    "artifact_size_bytes": oref.size_bytes,
-                },
-            })
-        );
-    }
+    let final_output = all_outputs
+        .get(&last_planned_id)
+        .or_else(|| {
+            all_outputs
+                .iter()
+                .filter(|(k, _)| k.starts_with(&last_planned_id))
+                .map(|(_, v)| v)
+                .last()
+        })
+        .cloned();
 
-    let total_time = t0.elapsed();
-    eprintln!(
-        "[barca] {} nodes, {} edges, {} phases, {} streams | plan: {:?} | exec: {:?} | total: {:?}",
-        node_count,
-        edge_count,
-        exec_plan.phases.len(),
-        exec_plan
-            .phases
-            .iter()
-            .map(|p| p.streams.len())
-            .sum::<usize>(),
-        plan_time,
-        exec_time,
-        total_time
-    );
+    RunResult {
+        elapsed_seconds: t0.elapsed().as_secs_f64(),
+        steps_executed: total_executed,
+        phases: exec_plan.phases.len(),
+        final_output,
+    }
 }
 
 // ─── get ─────────────────────────────────────────────────────────────────────
 
-pub fn get_command(args: &[String]) {
-    if args.len() < 2 {
-        eprintln!("Usage: barca get <target_function> <file>");
-        std::process::exit(1);
-    }
-
-    let target_name = &args[0];
-    let file_args = &args[1..];
+pub fn get(target_name: &str, file_args: &[String], python: &PathBuf) -> GetResult {
     let t0 = Instant::now();
-    let python = find_python();
 
-    let dag = build_dag(file_args, &python);
+    let dag = build_dag(file_args, python);
 
     let target_id = dag
         .topo_order()
         .into_iter()
         .find(|id| {
             id.ends_with(&format!(":{target_name}"))
-                || *id == target_name.as_str()
-                || id.ends_with(target_name.as_str())
+                || *id == target_name
+                || id.ends_with(target_name)
         })
         .map(|s| s.to_string())
         .unwrap_or_else(|| {
-            eprintln!("Asset '{}' not found", target_name);
+            let available: Vec<&str> = dag.topo_order();
+            eprintln!(
+                "Asset '{}' not found. Available: {}",
+                target_name,
+                available.join(", ")
+            );
             std::process::exit(1);
         });
 
@@ -191,7 +159,6 @@ pub fn get_command(args: &[String]) {
     let full_plan = planner::plan_from_dag(&dag, &config);
     let exec_plan = filter_plan_to_subgraph(full_plan, &subgraph_ids);
 
-    // Open DB connection once for all cache checks + persist.
     let db = rt.block_on(async { Builder::new_local(&db_path).build().await.unwrap() });
     let conn = db.connect().unwrap();
 
@@ -204,18 +171,17 @@ pub fn get_command(args: &[String]) {
         let expanded_phase = dispatch::expand_pending_partitions(phase, &all_outputs, pool_size);
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
 
-        let mut uncached_streams: Vec<barca_core::planner::WorkerStream> = Vec::new();
+        let mut uncached_streams: Vec<crate::planner::WorkerStream> = Vec::new();
 
         for stream in &phase_ref.streams {
-            let mut uncached_steps: Vec<barca_core::planner::StreamStep> = Vec::new();
+            let mut uncached_steps: Vec<crate::planner::StreamStep> = Vec::new();
 
             for step in &stream.steps {
                 let base_id = step.step_id.base_id();
                 let display_id = step.step_id.display();
                 let base_node = dag.get_node(base_id);
 
-                // Sensors always re-run.
-                if base_node.is_some_and(|n| n.kind() == barca_core::NodeKind::Sensor) {
+                if base_node.is_some_and(|n| n.kind() == crate::NodeKind::Sensor) {
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -234,7 +200,6 @@ pub fn get_command(args: &[String]) {
                     &cached_run_hashes,
                 );
 
-                // Check DB for cached artifact (reusing single connection).
                 let cached = rt.block_on(async {
                     let mut rows = conn
                         .query(
@@ -262,7 +227,7 @@ pub fn get_command(args: &[String]) {
             }
 
             if !uncached_steps.is_empty() {
-                uncached_streams.push(barca_core::planner::WorkerStream {
+                uncached_streams.push(crate::planner::WorkerStream {
                     stream_id: stream.stream_id.clone(),
                     steps: uncached_steps,
                 });
@@ -285,9 +250,8 @@ pub fn get_command(args: &[String]) {
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
-        let phase_outputs = dispatch::execute_phase(&filtered_phase, &provided, &python);
+        let phase_outputs = dispatch::execute_phase(&filtered_phase, &provided, python);
 
-        // Process in stream-step order (topo order) so upstream hashes are computed first.
         let step_order: Vec<String> = filtered_phase
             .streams
             .iter()
@@ -297,7 +261,7 @@ pub fn get_command(args: &[String]) {
             let Some(oref) = phase_outputs.get(&node_id).cloned() else {
                 continue;
             };
-            let sid = barca_core::StepId::parse(&node_id);
+            let sid = crate::StepId::parse(&node_id);
             let def_hash = dag
                 .get_node(sid.base_id())
                 .map(|n| n.definition_hash.as_str())
@@ -329,7 +293,7 @@ pub fn get_command(args: &[String]) {
         }
     }
 
-    // Persist newly executed outputs (reusing single connection).
+    // Persist newly executed outputs.
     rt.block_on(async {
         for (node_id, oref) in &all_outputs {
             if cached_node_ids.contains(node_id) {
@@ -353,21 +317,99 @@ pub fn get_command(args: &[String]) {
         }
     });
 
-    let final_output = all_outputs.get(&target_id);
+    // Find final output — exact match or collect partitioned outputs.
+    let final_output = all_outputs.get(&target_id).cloned().or_else(|| {
+        // For partitioned targets, return the last partition's output.
+        let prefix = format!("{target_id}[");
+        all_outputs
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .map(|(_, v)| v)
+            .last()
+            .cloned()
+    });
 
-    println!(
-        "{}",
-        serde_json::json!({
-            "elapsed_seconds": t0.elapsed().as_secs_f64(),
-            "steps_executed": steps_executed,
-            "cached": false,
-            "final_output": final_output.map(|oref| serde_json::json!({
-                "artifact_path": oref.path,
-                "artifact_format": oref.format,
-                "artifact_size_bytes": oref.size_bytes,
-            })),
-        })
-    );
+    GetResult {
+        elapsed_seconds: t0.elapsed().as_secs_f64(),
+        steps_executed,
+        final_output,
+    }
+}
+
+// ─── plan ────────────────────────────────────────────────────────────────────
+
+pub fn plan(file_args: &[String], python: &PathBuf) -> PlanResult {
+    let dag = build_dag(file_args, python);
+    let config = ResourceConfig {
+        pool_size: 10,
+        concurrency_groups: HashMap::new(),
+    };
+    let plan = planner::plan_from_dag(&dag, &config);
+
+    PlanResult {
+        total_steps: plan.total_steps,
+        phases: plan
+            .phases
+            .iter()
+            .map(|p| PlanPhase {
+                reason: format!("{:?}", p.reason),
+                streams: p
+                    .streams
+                    .iter()
+                    .map(|s| PlanStream {
+                        stream_id: s.stream_id.clone(),
+                        steps: s.steps.iter().map(|st| st.step_id.display()).collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Compute run hashes for all outputs in topological order.
+fn compute_run_hashes(
+    dag: &Dag,
+    all_outputs: &HashMap<String, OutputRef>,
+) -> HashMap<String, String> {
+    let mut run_hashes: HashMap<String, String> = HashMap::new();
+    let topo: Vec<String> = dag
+        .topo_order()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    for base_id in &topo {
+        if let Some(node) = dag.get_node(base_id) {
+            let display_ids: Vec<String> = all_outputs
+                .keys()
+                .filter(|k| *k == base_id || k.starts_with(&format!("{base_id}[")))
+                .cloned()
+                .collect();
+            for display_id in display_ids {
+                let sid = crate::StepId::parse(&display_id);
+                let partition_key = if sid.partition.is_empty() {
+                    None
+                } else {
+                    Some(sid.partition.suffix())
+                };
+                let upstream_ids: Vec<String> = node
+                    .resolved_inputs
+                    .values()
+                    .chain(node.resolved_collected.values())
+                    .cloned()
+                    .collect();
+                let run_h = cache::compute_run_hash(
+                    &node.definition_hash,
+                    partition_key.as_deref(),
+                    upstream_ids.iter(),
+                    &run_hashes,
+                );
+                run_hashes.insert(display_id, run_h);
+            }
+        }
+    }
+    run_hashes
 }
 
 /// Filter an execution plan to only include steps in the target's subgraph.
@@ -378,10 +420,10 @@ fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> Execut
             .phases
             .into_iter()
             .map(|phase| {
-                let filtered_streams: Vec<barca_core::planner::WorkerStream> = phase
+                let filtered_streams: Vec<crate::planner::WorkerStream> = phase
                     .streams
                     .into_iter()
-                    .map(|s| barca_core::planner::WorkerStream {
+                    .map(|s| crate::planner::WorkerStream {
                         stream_id: s.stream_id,
                         steps: s
                             .steps
@@ -412,46 +454,6 @@ fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> Execut
             .sum(),
         ..exec_plan
     }
-}
-
-// ─── plan ────────────────────────────────────────────────────────────────────
-
-pub fn plan_command(file_args: &[String]) {
-    let python = find_python();
-    let dag = build_dag(file_args, &python);
-    let config = ResourceConfig {
-        pool_size: 10,
-        concurrency_groups: HashMap::new(),
-    };
-    let plan = planner::plan_from_dag(&dag, &config);
-    let phases: Vec<serde_json::Value> = plan
-        .phases
-        .iter()
-        .map(|p| {
-            let streams: Vec<serde_json::Value> = p
-                .streams
-                .iter()
-                .map(|s| {
-                    serde_json::json!({
-                        "stream_id": s.stream_id,
-                        "steps": s.steps.iter().map(|st| st.step_id.display()).collect::<Vec<_>>(),
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "reason": format!("{:?}", p.reason),
-                "streams": streams,
-            })
-        })
-        .collect();
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "total_steps": plan.total_steps,
-            "phases": phases,
-        }))
-        .unwrap()
-    );
 }
 
 // ─── DAG construction ────────────────────────────────────────────────────────
@@ -498,7 +500,6 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
         all_nodes.extend(nodes);
     }
 
-    // Recompute cone_hashes with cross-file import resolution.
     for node in &mut all_nodes {
         let stem_from_path = node
             .source_file
@@ -513,7 +514,7 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
         });
         if let Some(src) = source {
             node.cone_hash =
-                barca_core::cone::cone_hash_with_imports(src, &node.function_name, &file_sources);
+                crate::cone::cone_hash_with_imports(src, &node.function_name, &file_sources);
         }
     }
 
@@ -525,18 +526,15 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Dag {
     })
 }
 
-/// Resolve PartitionSpec::Dynamic by evaluating Python expressions.
-fn resolve_dynamic_partitions(nodes: &mut [barca_core::model::ExtractedNode], python: &PathBuf) {
+fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python: &PathBuf) {
     for node in nodes.iter_mut() {
-        let mut resolved: Vec<(String, Vec<barca_core::model::PartitionValue>)> = Vec::new();
+        let mut resolved: Vec<(String, Vec<crate::model::PartitionValue>)> = Vec::new();
 
         for (dim, spec) in &node.partitions {
-            if let barca_core::model::PartitionSpec::Dynamic { source_text } = spec {
+            if let crate::model::PartitionSpec::Dynamic { source_text } = spec {
                 let module_path = std::path::Path::new(&node.source_file)
                     .canonicalize()
                     .unwrap_or_else(|_| PathBuf::from(&node.source_file));
-                // Write the evaluation script to a temp file to avoid shell escaping
-                // issues with paths or expressions containing quotes/backslashes.
                 let script = format!(
                     "import json, importlib.util, sys\n\
                      _spec = importlib.util.spec_from_file_location('_m', sys.argv[1])\n\
@@ -578,14 +576,12 @@ fn resolve_dynamic_partitions(nodes: &mut [barca_core::model::ExtractedNode], py
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let values: Vec<serde_json::Value> =
                     serde_json::from_str(stdout.trim()).unwrap_or_default();
-                let partition_values: Vec<barca_core::model::PartitionValue> = values
+                let partition_values: Vec<crate::model::PartitionValue> = values
                     .into_iter()
                     .filter_map(|v| match v {
-                        serde_json::Value::String(s) => {
-                            Some(barca_core::model::PartitionValue::Str(s))
-                        }
+                        serde_json::Value::String(s) => Some(crate::model::PartitionValue::Str(s)),
                         serde_json::Value::Number(n) => {
-                            n.as_i64().map(barca_core::model::PartitionValue::Int)
+                            n.as_i64().map(crate::model::PartitionValue::Int)
                         }
                         _ => None,
                     })
@@ -597,7 +593,7 @@ fn resolve_dynamic_partitions(nodes: &mut [barca_core::model::ExtractedNode], py
 
         for (dim, values) in resolved {
             node.partitions
-                .insert(dim, barca_core::model::PartitionSpec::Static { values });
+                .insert(dim, crate::model::PartitionSpec::Static { values });
         }
     }
 }

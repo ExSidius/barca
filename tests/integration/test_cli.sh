@@ -20,12 +20,8 @@ trap cleanup EXIT
 # Extract the JSON line from barca stdout (last line; user prints come before it).
 barca_json() { echo "$1" | tail -1; }
 
-# Read the final artifact file contents from barca output JSON.
-artifact() {
-    local path
-    path=$(barca_json "$1" | python3 -c "import json,sys; print(json.load(sys.stdin)['final_output']['artifact_path'])")
-    cat "$path"
-}
+# Extract a field from the final_output JSON.
+final() { barca_json "$1" | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d['final_output']))"; }
 
 # ─── Test: trivial asset ────────────────────────────────────────────────────
 echo "=== Trivial asset ==="
@@ -39,7 +35,7 @@ def hello() -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/trivial.py" 2>/dev/null)
-artifact "$OUTPUT" | grep -q '"msg"' && pass "correct output" || fail "wrong output: $OUTPUT"
+final "$OUTPUT" | grep -q '"msg"' && pass "correct output" || fail "wrong output: $OUTPUT"
 
 # ─── Test: linear chain passes values ────────────────────────────────────────
 echo "=== Linear chain ==="
@@ -61,7 +57,7 @@ def c(data: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/chain.py" 2>/dev/null)
-CHAIN_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+CHAIN_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
 [ "$CHAIN_VAL" = "22" ] && pass "chain passes values correctly" || fail "chain result: $CHAIN_VAL"
 
 # ─── Test: user print() visible, protocol hidden ────────────────────────────
@@ -84,7 +80,7 @@ PYEOF
 OUTPUT=$($BARCA run "$TMPDIR/prints.py" 2>/dev/null)
 echo "$OUTPUT" | grep -q "VISIBLE_USER_OUTPUT" && pass "user print visible in stdout" || fail "user print missing"
 echo "$OUTPUT" | grep -q "GOT_42" && pass "downstream print visible" || fail "downstream print missing"
-PRINT_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['result'])")
+PRINT_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['result'])")
 [ "$PRINT_VAL" = "84" ] && pass "correct result with prints" || fail "wrong result: $PRINT_VAL"
 echo "$OUTPUT" | grep -q '"node_id"' && fail "PROTOCOL LEAKED to stdout" || pass "protocol hidden from user"
 
@@ -112,7 +108,7 @@ def merge(a: dict, b: dict, c: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/fanout.py" 2>/dev/null)
-FAN_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['sum'])")
+FAN_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['sum'])")
 [ "$FAN_VAL" = "6" ] && pass "fan-out merge correct" || fail "fan-out result: $FAN_VAL"
 
 # ─── Test: aliased inputs ────────────────────────────────────────────────────
@@ -131,7 +127,7 @@ def normalized(data: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/alias.py" 2>/dev/null)
-ALIAS_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['normalized_price'])")
+ALIAS_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['normalized_price'])")
 [ "$ALIAS_VAL" = "1.0" ] && pass "aliased input works" || fail "alias result: $ALIAS_VAL"
 
 # ─── Test: multi-file ────────────────────────────────────────────────────────
@@ -172,7 +168,7 @@ def noisy() -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/noisy.py" 2>/dev/null)
-NOISY_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['real'])")
+NOISY_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['real'])")
 [ "$NOISY_VAL" = "True" ] && pass "real output survives noisy stderr" || fail "noisy stderr broke output: $NOISY_VAL"
 echo "$OUTPUT" | grep -q '"injected"' && fail "FAKE OUTPUT LEAKED into results" || pass "fake stderr JSON ignored"
 
@@ -192,8 +188,15 @@ def process(data: dict) -> dict:
 PYEOF
 
 OUTPUT=$($BARCA run "$TMPDIR/sensor_pipe.py" 2>/dev/null)
-SENSOR_VAL=$(artifact "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
+SENSOR_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
 [ "$SENSOR_VAL" = "144" ] && pass "sensor payload unpacked correctly" || fail "sensor payload wrong: $SENSOR_VAL"
+
+# ─── Test: help works ────────────────────────────────────────────────────────
+echo "=== Help ==="
+
+$BARCA --help 2>&1 | grep -q "Invisible asset orchestrator" && pass "barca --help works" || fail "no help"
+$BARCA run --help 2>&1 | grep -q "Parse, plan, and execute" && pass "barca run --help works" || fail "no run help"
+$BARCA get --help 2>&1 | grep -q "cache-aware" && pass "barca get --help works" || fail "no get help"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────
 echo ""

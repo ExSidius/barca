@@ -1,8 +1,6 @@
 //! Phase execution engine — worker spawning, protocol parsing, partition expansion.
 
-use barca_core::planner::{
-    ExecutionPlan, Phase, StreamStep, WorkerStream, expand_partition_combos,
-};
+use crate::planner::{ExecutionPlan, Phase, StreamStep, WorkerStream, expand_partition_combos};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -131,9 +129,9 @@ pub fn expand_pending_partitions(
 
             let combos = expand_partition_combos(&dim_values);
             for combo in combos {
-                let pk = barca_core::PartitionKey::from(combo);
+                let pk = crate::PartitionKey::from(combo);
                 all_expanded_steps.push(StreamStep {
-                    step_id: barca_core::StepId::new(step.step_id.base.clone(), pk),
+                    step_id: crate::StepId::new(step.step_id.base.clone(), pk),
                     kind: step.kind,
                     function_name: step.function_name.clone(),
                     source_file: step.source_file.clone(),
@@ -454,7 +452,7 @@ pub fn serialize_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use barca_core::planner::PhaseReason;
+    use crate::planner::PhaseReason;
 
     #[test]
     fn parse_worker_output_v2_separates_protocol_from_errors() {
@@ -521,7 +519,7 @@ Traceback (most recent call last):\n\
         assert!(errors.is_empty());
     }
 
-    use barca_core::{NodeKind, PartitionKey, StepId};
+    use crate::{NodeKind, PartitionKey, StepId};
 
     fn test_output_ref(path: &str, format: &str) -> OutputRef {
         OutputRef {
