@@ -152,78 +152,14 @@ fn get_command(args: &[String]) {
     // Resolve subgraph upstream of target.
     let subgraph_ids = dag.subgraph(&target_id);
 
-    // Initialize DB + check cache.
+    // Initialize DB.
     let db_path = ensure_db_dir();
     init_db_sync(&db_path);
-
-    // For each node in the subgraph (topo order), compute run_hash and check cache.
-    let mut cached_outputs: HashMap<String, serde_json::Value> = HashMap::new();
-    let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
-    let mut stale_ids: Vec<String> = Vec::new();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
-
-    for node_id in &subgraph_ids {
-        let node = dag.get_node(node_id).unwrap();
-
-        // Compute run_hash: definition_hash + upstream run_hashes.
-        let upstream_hashes: Vec<&str> = dag
-            .upstream(node_id)
-            .iter()
-            .filter_map(|uid| cached_run_hashes.get(*uid).map(|s| s.as_str()))
-            .collect();
-        let run_h = barca_core::hash::run_hash(&node.definition_hash, None, &upstream_hashes, None);
-
-        // Check DB for cached output with this run_hash.
-        let cached = rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query(
-                    "SELECT output_json FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
-                    [node_id.to_string(), run_h.clone()],
-                )
-                .await
-                .unwrap();
-            if let Some(row) = rows.next().await.unwrap() {
-                let output_json: String = row.get::<String>(0).unwrap();
-                Some(output_json)
-            } else {
-                None
-            }
-        });
-
-        if let Some(output_json) = cached {
-            // Cache hit — use stored output.
-            let value: serde_json::Value = serde_json::from_str(&output_json).unwrap_or_default();
-            cached_outputs.insert(node_id.to_string(), value);
-            cached_run_hashes.insert(node_id.to_string(), run_h);
-        } else {
-            // Stale — needs execution. All downstream is also stale.
-            stale_ids.push(node_id.to_string());
-            // Mark all remaining nodes as stale (they depend on this)
-            break;
-        }
-    }
-
-    // If target is cached and not stale, return immediately.
-    if stale_ids.is_empty()
-        && let Some(output) = cached_outputs.get(&target_id)
-    {
-        println!(
-            "{}",
-            serde_json::json!({
-                "elapsed_seconds": t0.elapsed().as_secs_f64(),
-                "steps_executed": 0,
-                "cached": true,
-                "final_output": output,
-            })
-        );
-        return;
-    }
 
     // Plan from the full DAG, then filter to only the target's subgraph.
     let pool_size = std::thread::available_parallelism()
@@ -278,36 +214,99 @@ fn get_command(args: &[String]) {
         ..exec_plan
     };
 
-    // Dispatch, seeding with cached outputs. Skip steps that are already cached.
-    let mut all_outputs = cached_outputs.clone();
+    // Check cache for all steps in the plan (including expanded partitions).
+    // Collect cached outputs + determine which steps are stale.
+    let mut cached_outputs: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
+
+    // Collect all step IDs from the plan (after partition expansion) to check cache.
+    // We do this per-phase since expansion depends on prior phase outputs.
+    let mut all_outputs: HashMap<String, serde_json::Value> = HashMap::new();
     let mut steps_executed = 0;
 
     for phase in &exec_plan.phases {
         let expanded_phase = expand_pending_partitions(phase, &all_outputs, pool_size);
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
 
-        // Filter out cached steps from this phase.
-        let filtered_streams: Vec<barca_core::planner::WorkerStream> = phase_ref
-            .streams
-            .iter()
-            .map(|s| {
-                let uncached_steps: Vec<barca_core::planner::StreamStep> = s
-                    .steps
-                    .iter()
-                    .filter(|st| !all_outputs.contains_key(&st.node_id))
-                    .cloned()
-                    .collect();
-                barca_core::planner::WorkerStream {
-                    stream_id: s.stream_id.clone(),
-                    steps: uncached_steps,
-                }
-            })
-            .filter(|s| !s.steps.is_empty())
-            .collect();
+        // Check cache for each step in this phase.
+        let mut uncached_streams: Vec<barca_core::planner::WorkerStream> = Vec::new();
 
-        if filtered_streams.is_empty() {
-            continue; // All steps cached — skip phase entirely.
+        for stream in &phase_ref.streams {
+            let mut uncached_steps: Vec<barca_core::planner::StreamStep> = Vec::new();
+
+            for step in &stream.steps {
+                // Get the base node (without partition suffix) for definition_hash.
+                let base_id = step.node_id.split('[').next().unwrap_or(&step.node_id);
+                let def_hash = dag
+                    .get_node(base_id)
+                    .map(|n| n.definition_hash.as_str())
+                    .unwrap_or("");
+
+                // Compute run_hash for this specific step.
+                let partition_key = if step.partition.is_empty() {
+                    None
+                } else {
+                    Some(
+                        step.partition
+                            .iter()
+                            .map(|(k, v)| format!("{k}={v}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                };
+                let upstream_hashes: Vec<&str> = step
+                    .inputs
+                    .values()
+                    .filter_map(|uid| cached_run_hashes.get(uid).map(|s| s.as_str()))
+                    .collect();
+                let run_h = barca_core::hash::run_hash(
+                    def_hash,
+                    partition_key.as_deref(),
+                    &upstream_hashes,
+                    None,
+                );
+
+                // Check DB.
+                let cached = rt.block_on(async {
+                    let db = Builder::new_local(&db_path).build().await.unwrap();
+                    let conn = db.connect().unwrap();
+                    let mut rows = conn
+                        .query(
+                            "SELECT output_json FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
+                            [step.node_id.clone(), run_h.clone()],
+                        )
+                        .await
+                        .unwrap();
+                    rows.next().await.unwrap().map(|row| row.get::<String>(0).unwrap())
+                });
+
+                if let Some(output_json) = cached {
+                    let value: serde_json::Value =
+                        serde_json::from_str(&output_json).unwrap_or_default();
+                    all_outputs.insert(step.node_id.clone(), value.clone());
+                    cached_outputs.insert(step.node_id.clone(), value);
+                    cached_run_hashes.insert(step.node_id.clone(), run_h);
+                } else {
+                    // Stale — this step and all subsequent in this stream must execute.
+                    uncached_steps.push(step.clone());
+                    // Also push remaining steps in this stream (they depend on this one).
+                    // Actually no — they'll be checked individually. Just push this one.
+                }
+            }
+
+            if !uncached_steps.is_empty() {
+                uncached_streams.push(barca_core::planner::WorkerStream {
+                    stream_id: stream.stream_id.clone(),
+                    steps: uncached_steps,
+                });
+            }
         }
+
+        if uncached_streams.is_empty() {
+            continue; // All steps in this phase are cached.
+        }
+
+        let filtered_streams = uncached_streams;
 
         let filtered_phase = barca_core::planner::Phase {
             reason: phase_ref.reason.clone(),
@@ -323,44 +322,89 @@ fn get_command(args: &[String]) {
         let provided = build_provided_inputs(&filtered_phase, &all_outputs);
         let phase_outputs = execute_phase(&filtered_phase, &provided, &python);
         for (node_id, value) in phase_outputs {
+            // Compute and store run_hash for this newly executed step.
+            let base_id = node_id.split('[').next().unwrap_or(&node_id);
+            let def_hash = dag
+                .get_node(base_id)
+                .map(|n| n.definition_hash.as_str())
+                .unwrap_or("");
+            let partition_key = if node_id.contains('[') {
+                node_id
+                    .split('[')
+                    .nth(1)
+                    .map(|s| s.trim_end_matches(']').to_string())
+            } else {
+                None
+            };
+            let upstream_hashes: Vec<&str> = dag
+                .get_node(base_id)
+                .map(|n| {
+                    n.resolved_inputs
+                        .values()
+                        .filter_map(|uid| cached_run_hashes.get(uid).map(|s| s.as_str()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let run_h = barca_core::hash::run_hash(
+                def_hash,
+                partition_key.as_deref(),
+                &upstream_hashes,
+                None,
+            );
+            cached_run_hashes.insert(node_id.clone(), run_h);
             all_outputs.insert(node_id, value);
         }
     }
 
-    // Compute run_hashes for ALL nodes (cached + newly executed) in topo order,
-    // then persist newly executed ones.
-    let mut final_run_hashes: HashMap<String, String> = HashMap::new();
-    for node_id in &subgraph_ids {
-        let Some(node) = dag.get_node(node_id) else {
-            continue;
-        };
-        let upstream_hashes: Vec<&str> = dag
-            .upstream(node_id)
-            .iter()
-            .filter_map(|uid| final_run_hashes.get(*uid).map(|s| s.as_str()))
-            .collect();
-        let run_h = barca_core::hash::run_hash(&node.definition_hash, None, &upstream_hashes, None);
-        final_run_hashes.insert(node_id.to_string(), run_h);
-    }
-
-    // Persist only newly executed nodes (not ones that were already cached).
+    // Persist newly executed outputs using the run_hashes from cached_run_hashes
+    // (populated during cache check for both cache hits AND newly computed hashes).
+    // For newly executed steps, we need to compute their run_hash the same way lookup does.
+    // Since lookup populates cached_run_hashes only for hits, we compute for misses here.
     rt.block_on(async {
         let db = Builder::new_local(&db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
-        for node_id in &subgraph_ids {
-            if cached_outputs.contains_key(*node_id) {
+        for (node_id, output) in &all_outputs {
+            if cached_outputs.contains_key(node_id) {
                 continue;
             }
-            let Some(output) = all_outputs.get(*node_id) else {
-                continue;
+            // Recompute run_hash identically to lookup.
+            let base_id = node_id.split('[').next().unwrap_or(node_id);
+            let def_hash = dag
+                .get_node(base_id)
+                .map(|n| n.definition_hash.as_str())
+                .unwrap_or("");
+            let partition_key = if node_id.contains('[') {
+                node_id
+                    .split('[')
+                    .nth(1)
+                    .map(|s| s.trim_end_matches(']').to_string())
+            } else {
+                None
             };
-            let Some(run_h) = final_run_hashes.get(*node_id) else {
-                continue;
-            };
+            // Upstream hashes: look up run_hashes of this step's inputs.
+            // For the persist path, get them from cached_run_hashes (populated during
+            // cache check for hits) or from the just-computed hashes for this run.
+            let upstream_hashes: Vec<&str> = dag
+                .get_node(base_id)
+                .map(|n| {
+                    n.resolved_inputs
+                        .values()
+                        .filter_map(|uid| cached_run_hashes.get(uid).map(|s| s.as_str()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let run_h = barca_core::hash::run_hash(
+                def_hash,
+                partition_key.as_deref(),
+                &upstream_hashes,
+                None,
+            );
+            // Store run_hash so downstream persist can reference it.
+            cached_run_hashes.insert(node_id.clone(), run_h.clone());
             let output_json = serde_json::to_string(output).unwrap_or_default();
             conn.execute(
                 "INSERT INTO materializations (node_id, run_hash, output_json) VALUES (?1, ?2, ?3)",
-                [node_id.to_string(), run_h.clone(), output_json],
+                [node_id.clone(), run_h, output_json],
             )
             .await
             .ok();
