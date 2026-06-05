@@ -32,6 +32,9 @@ enum Cli {
         /// Skip cache — execute everything fresh
         #[arg(long)]
         no_cache: bool,
+        /// Agent-friendly output: plain structured progress lines instead of visual progress bar
+        #[arg(long)]
+        agent: bool,
     },
     /// Parse source files and emit the execution plan as JSON
     Plan {
@@ -96,6 +99,7 @@ fn main() {
             args,
             output,
             no_cache,
+            agent,
         } => {
             let (target, files) = split_target_files(args);
             if files.is_empty() && target.is_none() {
@@ -103,12 +107,10 @@ fn main() {
                 std::process::exit(1);
             }
             if files.is_empty() && target.is_some() {
-                // target was set but no files — the "target" is actually
-                // a non-.py string with no files, which is an error.
                 eprintln!("error: no .py files provided\n\nUsage: barca get [TARGET] <FILES>...");
                 std::process::exit(1);
             }
-            get_cmd(target, files, &python, output, no_cache)
+            get_cmd(target, files, &python, output, no_cache, agent)
         }
         Cli::Plan { files } => plan_cmd(files, &python),
         Cli::History { limit } => history_cmd(limit),
@@ -125,15 +127,17 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn get_cmd(
     target: Option<String>,
     files: Vec<PathBuf>,
     python: &PathBuf,
     mode: OutputMode,
     no_cache: bool,
+    agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::get(target.as_deref(), &file_args, python, no_cache)?;
+    let result = barca_core::commands::get(target.as_deref(), &file_args, python, no_cache, agent)?;
     let final_output = result
         .final_output
         .as_ref()
