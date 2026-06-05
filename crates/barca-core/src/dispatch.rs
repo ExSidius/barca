@@ -307,7 +307,8 @@ pub fn execute_phase(
 
         let status = child.wait().expect("failed to wait on worker");
         if !status.success() {
-            eprintln!("[barca] Worker failed:\n{}", error_lines.join("\n"));
+            let cleaned = filter_traceback(&error_lines);
+            eprintln!("{cleaned}");
             std::fs::remove_file(&batch_path).ok();
             std::process::exit(1);
         }
@@ -447,6 +448,108 @@ pub fn serialize_batch(
         "steps": steps,
     })
     .to_string()
+}
+
+/// Filter a Python traceback to show only user-relevant frames.
+/// Handles chained exceptions (`raise X from Y`, "During handling...").
+/// Uses path component matching (not substring) to identify barca internals.
+fn filter_traceback(lines: &[String]) -> String {
+    let mut result: Vec<&str> = Vec::new();
+    let mut i = 0;
+
+    while i < lines.len() {
+        if lines[i].starts_with("Traceback (most recent call last):") {
+            result.push("Traceback (most recent call last):");
+            i += 1;
+            // Filter frames within this traceback block.
+            while i < lines.len() {
+                let trimmed = lines[i].trim();
+                if trimmed.starts_with("File \"") {
+                    if is_internal_frame(trimmed) {
+                        // Skip internal frame + its code/underline lines.
+                        i += 1;
+                        while i < lines.len() {
+                            let t = lines[i].trim();
+                            if t.starts_with("File \"") || is_exception_line(t, &lines[i]) {
+                                break;
+                            }
+                            i += 1;
+                        }
+                    } else {
+                        // Keep user frame + its code/underline lines.
+                        result.push(&lines[i]);
+                        i += 1;
+                        while i < lines.len() {
+                            let t = lines[i].trim();
+                            if t.starts_with("File \"") || is_exception_line(t, &lines[i]) {
+                                break;
+                            }
+                            result.push(&lines[i]);
+                            i += 1;
+                        }
+                    }
+                } else {
+                    // Exception line or chained traceback header — keep it.
+                    result.push(&lines[i]);
+                    i += 1;
+                    // If this is a chain header, the next iteration handles the new Traceback.
+                    break;
+                }
+            }
+        } else {
+            // Non-traceback line (chain separator, etc.) — keep it.
+            result.push(&lines[i]);
+            i += 1;
+        }
+    }
+
+    result.join("\n")
+}
+
+/// Check if a `File "..."` frame line is a barca internal frame.
+/// Uses path components, not substring matching, to avoid false positives
+/// on user files that happen to contain "barca/_worker.py" in their path.
+fn is_internal_frame(trimmed: &str) -> bool {
+    // Extract the path from `File "path", line N, in func`
+    let path = trimmed
+        .strip_prefix("File \"")
+        .and_then(|s| s.split('"').next())
+        .unwrap_or("");
+
+    // Check for frozen internals.
+    if path.starts_with("<frozen ") {
+        return true;
+    }
+
+    // Check path components: last two components should be "barca/_worker.py" etc.
+    let parts: Vec<&str> = path.rsplit('/').take(2).collect();
+    if parts.len() == 2 {
+        let file = parts[0];
+        let parent = parts[1];
+        if parent == "barca" && (file == "_worker.py" || file == "_runner.py") {
+            return true;
+        }
+    }
+    // Also check Windows paths.
+    let parts: Vec<&str> = path.rsplit('\\').take(2).collect();
+    if parts.len() == 2 {
+        let file = parts[0];
+        let parent = parts[1];
+        if parent == "barca" && (file == "_worker.py" || file == "_runner.py") {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Check if a line is an exception line (not a frame or code line).
+fn is_exception_line(trimmed: &str, raw: &str) -> bool {
+    !trimmed.is_empty()
+        && !trimmed.starts_with("File \"")
+        && !trimmed.starts_with('~')
+        && !raw.starts_with("    ")
+        && !raw.starts_with('\t')
 }
 
 #[cfg(test)]

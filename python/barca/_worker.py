@@ -36,9 +36,13 @@ def load_module(source_file):
         sys.path.insert(0, module_dir)
     mod_name = f"_barca_{path.stem}"
     spec = importlib.util.spec_from_file_location(mod_name, str(path))
+    if spec is None:
+        raise RuntimeError(f"Could not load module spec for {path}")
     mod = importlib.util.module_from_spec(spec)
     # Register in sys.modules so pickle can find classes defined in user code.
     sys.modules[mod_name] = mod
+    if spec.loader is None:
+        raise RuntimeError(f"No loader for {path}")
     spec.loader.exec_module(mod)
     return mod
 
@@ -100,11 +104,7 @@ def run_batch(batch):
         elapsed = time.perf_counter() - t0
 
         # Sensors return (updated: bool, data) tuples — unpack for downstream.
-        if (
-            step.get("kind") == "sensor"
-            and isinstance(result, tuple)
-            and len(result) == 2
-        ):
+        if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
             _updated, result = result
 
         cache[step["node_id"]] = result

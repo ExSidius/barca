@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "barca"
-version = "0.1.1"
+version = "0.1.2"
 description = "Invisible asset orchestrator"
 requires-python = ">=3.12"
 license = "MIT"
@@ -36,3 +36,6 @@ include = ["LICENSE"]
 
 [tool.ruff]
 line-length = 100
+
+[tool.ty.environment]
+extra-paths = ["python"]
