@@ -269,7 +269,39 @@ pub fn get(
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
-        let phase_result = dispatch::execute_phase(&filtered_phase, &provided, python);
+
+        // Progress callback — update bar as each step completes from any worker.
+        let mut on_step = |node_id: &str, output: &dispatch::OutputRef| {
+            if let Some(e) = output.elapsed_seconds {
+                elapsed_so_far += e;
+            }
+            completed_steps += 1;
+            if let Some(ref bar) = pb {
+                bar.set_position(completed_steps as u64);
+                let remaining = if total_estimated > 0.0 {
+                    (total_estimated - elapsed_so_far).max(0.0)
+                } else if completed_steps > 0 {
+                    let avg = elapsed_so_far / completed_steps as f64;
+                    avg * (total_steps - completed_steps) as f64
+                } else {
+                    0.0
+                };
+                // Show which step just finished + ETA.
+                let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
+                bar.set_message(format!("{short_name} done | ~{remaining:.0}s remaining"));
+            } else if agent_mode {
+                eprintln!(
+                    "[barca] step:{} completed {:.1}s ({}/{})",
+                    node_id,
+                    output.elapsed_seconds.unwrap_or(0.0),
+                    completed_steps,
+                    total_steps
+                );
+            }
+        };
+
+        let phase_result =
+            dispatch::execute_phase(&filtered_phase, &provided, python, Some(&mut on_step));
         if phase_error.is_none() {
             phase_error = phase_result.error;
         }
@@ -312,32 +344,7 @@ pub fn get(
                 &cached_run_hashes,
             );
             cached_run_hashes.insert(node_id.clone(), run_h);
-            if let Some(e) = oref.elapsed_seconds {
-                elapsed_so_far += e;
-            }
-            completed_steps += 1;
             all_outputs.insert(node_id, oref);
-        }
-
-        // Also count cached steps in progress.
-        completed_steps += cached_node_ids
-            .len()
-            .saturating_sub(completed_steps.saturating_sub(steps_executed));
-
-        // Update progress bar.
-        if total_steps > 0 {
-            let remaining = if total_estimated > 0.0 {
-                (total_estimated - elapsed_so_far).max(0.0)
-            } else if completed_steps > 0 {
-                let avg = elapsed_so_far / steps_executed.max(1) as f64;
-                avg * (total_steps - completed_steps) as f64
-            } else {
-                0.0
-            };
-            eprint!(
-                "\r[barca] {}/{} steps | ~{:.0}s remaining   ",
-                completed_steps, total_steps, remaining
-            );
         }
 
         // If this phase had a worker failure, stop after collecting partial results.

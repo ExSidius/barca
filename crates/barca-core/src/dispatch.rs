@@ -71,7 +71,7 @@ pub fn dispatch_plan(
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
 
         let provided = build_provided_inputs(phase_ref, &all_outputs);
-        let result = execute_phase(phase_ref, &provided, python);
+        let result = execute_phase(phase_ref, &provided, python, None);
 
         for (node_id, value) in result.outputs {
             if let Some(elapsed) = value.elapsed_seconds {
@@ -339,19 +339,35 @@ pub fn build_provided_inputs(
     provided
 }
 
-/// Execute a single phase: spawn N workers in parallel, collect results from stderr.
 /// Result of executing a phase — may contain partial outputs if a worker failed.
 pub struct PhaseResult {
     pub outputs: HashMap<String, OutputRef>,
     pub error: Option<String>,
 }
 
+/// Event from a worker, streamed via channel for real-time progress updates.
+enum WorkerEvent {
+    /// A step completed successfully.
+    StepCompleted { node_id: String, output: OutputRef },
+    /// Non-protocol stderr line (error/traceback).
+    ErrorLine(String),
+    /// Worker process exited.
+    WorkerDone { success: bool, batch_path: PathBuf },
+}
+
+/// Execute a single phase: spawn N workers in parallel, stream results via channels.
+///
+/// `on_step` is called on the main thread each time a step completes — enables
+/// real-time progress bar updates even when multiple workers run in parallel.
 pub fn execute_phase(
     phase: &Phase,
     provided_inputs: &HashMap<String, ProvidedInput>,
     python: &PathBuf,
+    mut on_step: Option<&mut dyn FnMut(&str, &OutputRef)>,
 ) -> PhaseResult {
-    let mut children: Vec<(std::process::Child, PathBuf)> = Vec::new();
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel::<WorkerEvent>();
 
     for stream in &phase.streams {
         let batch_json = serialize_batch(stream, provided_inputs);
@@ -359,52 +375,118 @@ pub fn execute_phase(
         batch_file
             .write_all(batch_json.as_bytes())
             .expect("failed to write batch");
-        let (_, path) = batch_file.keep().expect("failed to persist temp file");
+        let (_, batch_path) = batch_file.keep().expect("failed to persist temp file");
 
-        let child = Command::new(python)
+        let mut child = Command::new(python)
             .args(["-m", "barca._worker"])
-            .arg(&path)
+            .arg(&batch_path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn worker: {e}"));
 
-        children.push((child, path));
-    }
-
-    // Drain stderr from all workers in parallel via reader threads to avoid
-    // 64KB pipe buffer deadlocks when workers produce significant output.
-    let mut handles: Vec<(
-        std::thread::JoinHandle<(HashMap<String, OutputRef>, Vec<String>)>,
-        std::process::Child,
-        PathBuf,
-    )> = Vec::new();
-
-    for (mut child, batch_path) in children {
         let stderr = child.stderr.take().expect("no stderr");
-        let handle = std::thread::spawn(move || {
+
+        // Reader thread: parse stderr line-by-line, send events as they arrive.
+        let tx_reader = tx.clone();
+        std::thread::spawn(move || {
             let reader = BufReader::new(stderr);
-            parse_worker_output(reader)
+            let mut error_lines: Vec<String> = Vec::new();
+
+            for line in reader.lines() {
+                let line = line.expect("failed to read worker stderr");
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(json_str) = line.strip_prefix(PROTOCOL_PREFIX_V2) {
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
+                        if parsed.get("type").and_then(|v| v.as_str()) == Some("result") {
+                            if let (Some(node_id), Some(artifact)) = (
+                                parsed.get("node_id").and_then(|v| v.as_str()),
+                                parsed.get("artifact"),
+                            ) {
+                                let oref = OutputRef {
+                                    path: artifact
+                                        .get("path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    format: artifact
+                                        .get("format")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    size_bytes: artifact
+                                        .get("size_bytes")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0),
+                                    elapsed_seconds: parsed.get("elapsed").and_then(|v| v.as_f64()),
+                                };
+                                tx_reader
+                                    .send(WorkerEvent::StepCompleted {
+                                        node_id: node_id.to_string(),
+                                        output: oref,
+                                    })
+                                    .ok();
+                            }
+                        }
+                    }
+                } else if line.starts_with("BARCA:") {
+                    // Unsupported protocol version — ignore.
+                } else {
+                    error_lines.push(line.clone());
+                    tx_reader.send(WorkerEvent::ErrorLine(line)).ok();
+                }
+            }
+
+            // Wait for child to exit, then send done event.
+            let status = child.wait().expect("failed to wait on worker");
+            tx_reader
+                .send(WorkerEvent::WorkerDone {
+                    success: status.success(),
+                    batch_path,
+                })
+                .ok();
         });
-        handles.push((handle, child, batch_path));
     }
+    // Drop the original sender so rx terminates when all reader threads finish.
+    drop(tx);
 
     let mut phase_outputs: HashMap<String, OutputRef> = HashMap::new();
-    let mut first_error: Option<String> = None;
+    let mut error_lines: Vec<String> = Vec::new();
+    let mut had_failure = false;
 
-    for (handle, mut child, batch_path) in handles {
-        let (outputs, error_lines) = handle.join().expect("reader thread panicked");
-        // Always collect outputs — even from failed workers, partial results are valuable.
-        for (node_id, output) in outputs {
-            phase_outputs.insert(node_id, output);
+    // Main thread: receive events as they stream in from any worker.
+    for event in rx {
+        match event {
+            WorkerEvent::StepCompleted { node_id, output } => {
+                if let Some(cb) = &mut on_step {
+                    cb(&node_id, &output);
+                }
+                phase_outputs.insert(node_id, output);
+            }
+            WorkerEvent::WorkerDone {
+                success,
+                batch_path,
+            } => {
+                if !success {
+                    had_failure = true;
+                }
+                std::fs::remove_file(&batch_path).ok();
+            }
+            WorkerEvent::ErrorLine(line) => {
+                if !line.is_empty() {
+                    error_lines.push(line);
+                }
+            }
         }
-
-        let status = child.wait().expect("failed to wait on worker");
-        if !status.success() && first_error.is_none() {
-            first_error = Some(filter_traceback(&error_lines));
-        }
-        std::fs::remove_file(&batch_path).ok();
     }
+
+    let first_error = if had_failure && !error_lines.is_empty() {
+        Some(filter_traceback(&error_lines))
+    } else {
+        None
+    };
 
     PhaseResult {
         outputs: phase_outputs,
