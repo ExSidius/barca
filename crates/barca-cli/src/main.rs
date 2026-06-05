@@ -225,13 +225,16 @@ fn stats_cmd(
 ) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let stats = barca_core::commands::stats(&target, &file_args, python)?;
+    let fmt = |v: Option<f64>| v.map(|e| format!("{:.3}s", e)).unwrap_or("-".to_string());
     println!("Asset: {}", stats.node_id);
     println!("Total materializations: {}", stats.total_runs);
-    if let Some(avg) = stats.avg_elapsed_seconds {
-        println!("Avg elapsed: {:.3}s", avg);
-    } else {
-        println!("Avg elapsed: -");
-    }
+    println!(
+        "Timing:  avg {}  median {}  p95 {}  max {}",
+        fmt(stats.avg_elapsed_seconds),
+        fmt(stats.median_elapsed_seconds),
+        fmt(stats.p95_elapsed_seconds),
+        fmt(stats.max_elapsed_seconds),
+    );
     println!("Cache hit rate: {:.1}%", stats.cache_hit_rate * 100.0);
     if !stats.recent_runs.is_empty() {
         println!("\nRecent runs:");

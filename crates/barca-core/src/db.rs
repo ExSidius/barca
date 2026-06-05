@@ -29,6 +29,9 @@ pub struct AssetStats {
     pub node_id: String,
     pub total_runs: i64,
     pub avg_elapsed_seconds: Option<f64>,
+    pub median_elapsed_seconds: Option<f64>,
+    pub max_elapsed_seconds: Option<f64>,
+    pub p95_elapsed_seconds: Option<f64>,
     pub cache_hit_rate: f64,
     pub recent_runs: Vec<AssetRunEntry>,
 }
@@ -284,25 +287,48 @@ pub fn get_asset_stats_sync(db_path: &str, node_id: &str) -> AssetStats {
         let db = Builder::new_local(db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
 
-        // Aggregate: count, avg elapsed, cache hits.
-        let total_runs: i64;
-        let avg_elapsed: Option<f64>;
+        // Fetch all elapsed times for percentile computation.
+        let mut all_elapsed: Vec<f64> = Vec::new();
         {
             let mut rows = conn
                 .query(
-                    "SELECT COUNT(*), AVG(elapsed_seconds) FROM materializations WHERE node_id = ?1",
+                    "SELECT elapsed_seconds FROM materializations WHERE node_id = ?1 AND elapsed_seconds IS NOT NULL AND elapsed_seconds > 0 ORDER BY elapsed_seconds",
                     [node_id.to_string()],
                 )
                 .await
                 .unwrap();
-            if let Some(row) = rows.next().await.unwrap() {
-                total_runs = row.get::<i64>(0).unwrap_or(0);
-                avg_elapsed = row.get::<f64>(1).ok();
-            } else {
-                total_runs = 0;
-                avg_elapsed = None;
+            while let Some(row) = rows.next().await.unwrap() {
+                if let Ok(e) = row.get::<f64>(0) {
+                    all_elapsed.push(e);
+                }
             }
         }
+
+        let total_runs: i64;
+        {
+            let mut rows = conn
+                .query(
+                    "SELECT COUNT(*) FROM materializations WHERE node_id = ?1",
+                    [node_id.to_string()],
+                )
+                .await
+                .unwrap();
+            total_runs = rows
+                .next()
+                .await
+                .unwrap()
+                .map(|r| r.get::<i64>(0).unwrap_or(0))
+                .unwrap_or(0);
+        }
+
+        let avg_elapsed = if all_elapsed.is_empty() {
+            None
+        } else {
+            Some(all_elapsed.iter().sum::<f64>() / all_elapsed.len() as f64)
+        };
+        let median_elapsed = percentile(&all_elapsed, 50.0);
+        let max_elapsed = all_elapsed.last().copied();
+        let p95_elapsed = percentile(&all_elapsed, 95.0);
 
         // Cache hit rate: rows with non-null, non-empty run_hash that appear more than once.
         let cache_hit_rate = if total_runs > 1 {
@@ -342,10 +368,32 @@ pub fn get_asset_stats_sync(db_path: &str, node_id: &str) -> AssetStats {
             node_id: node_id.to_string(),
             total_runs,
             avg_elapsed_seconds: avg_elapsed,
+            median_elapsed_seconds: median_elapsed,
+            max_elapsed_seconds: max_elapsed,
+            p95_elapsed_seconds: p95_elapsed,
             cache_hit_rate,
             recent_runs,
         }
     })
+}
+
+/// Compute the p-th percentile from a sorted slice of values.
+fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    if sorted.len() == 1 {
+        return Some(sorted[0]);
+    }
+    let rank = (p / 100.0) * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        Some(sorted[lower])
+    } else {
+        let frac = rank - lower as f64;
+        Some(sorted[lower] * (1.0 - frac) + sorted[upper] * frac)
+    }
 }
 
 /// Look up the average elapsed_seconds for a list of node_ids.

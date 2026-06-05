@@ -225,20 +225,51 @@ def stats(target: str, file: str, *extra_files: str) -> dict:
         "node_id": "",
         "total_runs": 0,
         "avg_elapsed_seconds": None,
+        "median_elapsed_seconds": None,
+        "max_elapsed_seconds": None,
+        "p95_elapsed_seconds": None,
         "cache_hit_rate": 0.0,
         "recent_runs": [],
     }
 
+    def _parse_time(s: str) -> float | None:
+        s = s.strip().rstrip("s")
+        if s == "-":
+            return None
+        return float(s)
+
+    in_recent = False
     for line in lines:
         if line.startswith("Asset: "):
             stats_dict["node_id"] = line[len("Asset: ") :]
         elif line.startswith("Total materializations: "):
             stats_dict["total_runs"] = int(line.split(": ")[1])
-        elif line.startswith("Avg elapsed: "):
-            val = line.split(": ")[1]
-            stats_dict["avg_elapsed_seconds"] = float(val.rstrip("s")) if val != "-" else None
+        elif line.startswith("Timing:"):
+            # "Timing:  avg 0.105s  median 0.105s  p95 0.105s  max 0.105s"
+            parts = line.split()
+            for i, part in enumerate(parts):
+                if part == "avg" and i + 1 < len(parts):
+                    stats_dict["avg_elapsed_seconds"] = _parse_time(parts[i + 1])
+                elif part == "median" and i + 1 < len(parts):
+                    stats_dict["median_elapsed_seconds"] = _parse_time(parts[i + 1])
+                elif part == "p95" and i + 1 < len(parts):
+                    stats_dict["p95_elapsed_seconds"] = _parse_time(parts[i + 1])
+                elif part == "max" and i + 1 < len(parts):
+                    stats_dict["max_elapsed_seconds"] = _parse_time(parts[i + 1])
         elif line.startswith("Cache hit rate: "):
             val = line.split(": ")[1].rstrip("%")
             stats_dict["cache_hit_rate"] = float(val) / 100.0
+        elif line.strip().startswith("ELAPSED"):
+            in_recent = True
+        elif in_recent and line.strip():
+            parts = line.split()
+            if len(parts) >= 3:
+                stats_dict["recent_runs"].append(
+                    {
+                        "elapsed_seconds": _parse_time(parts[0]),
+                        "status": parts[1],
+                        "created_at": " ".join(parts[2:]),
+                    }
+                )
 
     return stats_dict
