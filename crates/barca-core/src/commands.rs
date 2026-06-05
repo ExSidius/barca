@@ -165,16 +165,17 @@ pub fn get(
         let bar = ProgressBar::new(total_steps as u64);
         bar.set_style(
             ProgressStyle::with_template(
-                "[barca] {bar:20.cyan/dim} {pos}/{len} steps | {wide_msg}",
+                "[barca] {prefix} {bar:20.cyan/dim} {pos}/{len} | {wide_msg}",
             )
             .unwrap()
             .progress_chars("█▓░"),
         );
         if total_estimated > 0.0 {
-            bar.set_message(format!("~{:.0}s remaining", total_estimated));
+            bar.set_prefix(format!("~{:.0}s left", total_estimated));
         } else {
-            bar.set_message("starting...");
+            bar.set_prefix("starting");
         }
+        bar.set_message("");
         Some(bar)
     } else {
         None
@@ -288,9 +289,13 @@ pub fn get(
                 } else {
                     0.0
                 };
-                // Show which step just finished + ETA.
                 let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
-                bar.set_message(format!("{short_name} done | ~{remaining:.0}s remaining"));
+                if remaining > 0.5 {
+                    bar.set_prefix(format!("~{remaining:.0}s left"));
+                } else {
+                    bar.set_prefix("finishing");
+                }
+                bar.set_message(format!("{short_name} done"));
             } else if agent_mode {
                 eprintln!(
                     "[barca] step:{} completed {:.1}s ({}/{})",
