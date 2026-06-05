@@ -237,24 +237,33 @@ How much framework code do you write per asset function?
 
 Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn't:
 
-| Feature | Dagster | Prefect | Airflow | Barca |
-|---------|---------|---------|---------|-------|
-| **Web UI / dashboard** | Yes (dagster dev) | Yes (Prefect Cloud / server) | Yes (webserver) | No |
-| **Run history / lineage** | Full event log, asset catalog | Flow run tracking, task states | DagRun/TaskInstance records | Basic: rows in SQLite, no UI |
-| **Retry on failure** | Built-in per-op retries | Built-in per-task retries | Built-in retries + SLAs | No — fails and persists partial results |
-| **Alerting / notifications** | Sensors + hooks | Automations, Slack/email | Email, Slack, PagerDuty | No |
-| **Scheduling** | Built-in cron + sensors | Built-in via deployments | Core feature (scheduler daemon) | Parsed but not enforced yet |
-| **Remote execution** | Kubernetes, Docker, ECS | Kubernetes, Docker, Process | Celery, Kubernetes, many executors | Local only |
-| **I/O management** | Pluggable I/O managers (S3, GCS, etc.) | Result storage backends | XCom + external storage hooks | Local filesystem only (.barca/artifacts/) |
-| **Multi-user / team** | Workspace permissions, code locations | Workspace RBAC, service accounts | DAG-level permissions, RBAC | Single-user only |
-| **Backfills** | Built-in partitioned backfills | Via deployments | `dags backfill` (v2) | Not implemented |
-| **Dynamic pipelines** | Dynamic partitions, graph DSL | Dynamic tasks via `.map()` | Dynamic task mapping | Static partitions only |
-| **Data quality / expectations** | Asset checks, freshness policies | Not built-in (use Great Expectations) | Not built-in | Not built-in |
-| **Plugin ecosystem** | Large (200+ integrations) | Growing (collections) | Massive (providers) | None |
+| Feature | Dagster | Prefect | Airflow | Barca | Roadmap |
+|---------|---------|---------|---------|-------|---------|
+| **Web UI / dashboard** | Yes (dagster dev) | Yes (Prefect Cloud / server) | Yes (webserver) | No | Possible after `barca serve` ([#53]) |
+| **Run history / lineage** | Full event log, asset catalog | Flow run tracking, task states | DagRun/TaskInstance records | Basic: rows in SQLite, no UI | Planned — just more DB rows ([#50]) |
+| **Retry on failure** | Built-in per-op retries | Built-in per-task retries | Built-in retries + SLAs | No — fails and persists partial results | Planned — `@asset(retries=3, retry_backoff=2.0)` ([#51]) |
+| **Alerting / notifications** | Sensors + hooks | Automations, Slack/email | Email, Slack, PagerDuty | No | Planned — Slack + Resend hooks via `barca.toml` ([#52]) |
+| **Scheduling** | Built-in cron + sensors | Built-in via deployments | Core feature (scheduler daemon) | Parsed but not enforced yet | Planned — cron enforcement in `barca serve` ([#54], depends on [#53]) |
+| **Server mode** | Built-in (dagster dev) | Built-in (prefect server) | Built-in (webserver + scheduler) | No | Planned — `barca serve` with HTTP API ([#53]) |
+| **Remote storage** | Pluggable I/O managers (S3, GCS, etc.) | Result storage backends | XCom + external storage hooks | Local filesystem only | Planned — pluggable DB + artifact backends ([#55], [#56]) |
+| **Docker / containers** | Supported via Kubernetes executor | Supported via Docker infra | Celery/Kubernetes executors | Not built-in | Trivial once backends are pluggable ([#56]) |
+| **Multi-user / team** | Workspace permissions, code locations | Workspace RBAC, service accounts | DAG-level permissions, RBAC | Single-user only | Not planned — deliberate decision for simplicity |
+| **Backfills** | Built-in partitioned backfills | Via deployments | `dags backfill` (v2) | Not implemented | — |
+| **Dynamic pipelines** | Dynamic partitions, graph DSL | Dynamic tasks via `.map()` | Dynamic task mapping | Static + derived partitions | — |
+| **Data quality / expectations** | Asset checks, freshness policies | Not built-in (use Great Expectations) | Not built-in | Not built-in | — |
+| **Plugin ecosystem** | Large (200+ integrations) | Growing (collections) | Massive (providers) | None | Hooks system ([#52]) is the starting point |
 
-Barca is fast and minimal **because** it doesn't do most of this. It's a single-machine, single-user, local-execution engine. If you need a web UI, team permissions, remote execution, or a plugin ecosystem, you need a different tool.
+[#50]: https://github.com/ExSidius/barca/issues/50
+[#51]: https://github.com/ExSidius/barca/issues/51
+[#52]: https://github.com/ExSidius/barca/issues/52
+[#53]: https://github.com/ExSidius/barca/issues/53
+[#54]: https://github.com/ExSidius/barca/issues/54
+[#55]: https://github.com/ExSidius/barca/issues/55
+[#56]: https://github.com/ExSidius/barca/issues/56
 
-The bet is that for many workloads — especially agent-driven pipelines, local data processing, and development iteration — the overhead of those features is not worth the cost. You can add observability, retry logic, and scheduling around barca rather than having them baked in.
+Barca is fast and minimal **because** it doesn't do most of this yet. But the roadmap is deliberate: each feature is designed to add capability without adding framework complexity. Run history is just more DB rows. Retries are a loop in the worker. Scheduling is a cron check in the server. None of these require new services, config languages, or architectural overhead.
+
+The bet is that for many workloads — especially agent-driven pipelines, local data processing, and development iteration — you want to start minimal and add what you need, rather than pay for everything upfront.
 
 ### Where the other frameworks genuinely shine
 
