@@ -1,4 +1,4 @@
-"""Run Airflow DAG using `dags test` with LocalExecutor."""
+"""Run Airflow DAG with LocalExecutor for genuine parallel execution."""
 
 import json
 import os
@@ -17,12 +17,17 @@ def run():
     os.makedirs(dags_dir)
     shutil.copy(os.path.join(SCRIPT_DIR, "dag.py"), dags_dir)
 
+    # Use LocalExecutor with PostgreSQL-compatible SQLite for parallelism.
+    # LocalExecutor forks a process per task, giving real parallelism.
     env = {
         **os.environ,
         "AIRFLOW_HOME": airflow_home,
         "AIRFLOW__CORE__DAGS_FOLDER": dags_dir,
         "AIRFLOW__CORE__LOAD_EXAMPLES": "False",
         "AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS": "False",
+        "AIRFLOW__CORE__EXECUTOR": "LocalExecutor",
+        "AIRFLOW__CORE__PARALLELISM": "32",
+        "AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG": "500",
         "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": f"sqlite:///{airflow_home}/airflow.db",
         "AIRFLOW__LOGGING__LOGGING_LEVEL": "ERROR",
     }
@@ -30,10 +35,21 @@ def run():
     # Initialize DB
     subprocess.run([AIRFLOW_BIN, "db", "migrate"], env=env, capture_output=True)
 
-    # Run DAG
+    # Use backfill with LocalExecutor — this actually uses the executor
+    # (unlike `dags test` which runs everything sequentially in-process).
     t0 = time.perf_counter()
     result = subprocess.run(
-        [AIRFLOW_BIN, "dags", "test", "fan_out_500_50ms", "2024-01-01"],
+        [
+            AIRFLOW_BIN,
+            "dags",
+            "backfill",
+            "fan_out_500_50ms",
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-01",
+            "--reset-dagruns",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -48,6 +64,7 @@ def run():
                 "elapsed_seconds": round(elapsed, 6),
                 "steps_executed": 500,
                 "success": result.returncode == 0,
+                "executor": "LocalExecutor",
             },
             indent=2,
         )

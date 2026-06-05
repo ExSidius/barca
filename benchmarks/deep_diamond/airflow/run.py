@@ -1,4 +1,4 @@
-"""Run Airflow DAG: deep_diamond."""
+"""Run Airflow DAG with LocalExecutor: deep_diamond."""
 
 import json
 import os
@@ -22,13 +22,25 @@ def run():
         "AIRFLOW__CORE__DAGS_FOLDER": dd,
         "AIRFLOW__CORE__LOAD_EXAMPLES": "False",
         "AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS": "False",
+        "AIRFLOW__CORE__EXECUTOR": "LocalExecutor",
+        "AIRFLOW__CORE__PARALLELISM": "32",
         "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": f"sqlite:///{ah}/airflow.db",
         "AIRFLOW__LOGGING__LOGGING_LEVEL": "ERROR",
     }
     subprocess.run([AIRFLOW_BIN, "db", "migrate"], env=env, capture_output=True)
     t0 = time.perf_counter()
     result = subprocess.run(
-        [AIRFLOW_BIN, "dags", "test", "deep_diamond", "2024-01-01"],
+        [
+            AIRFLOW_BIN,
+            "dags",
+            "backfill",
+            "deep_diamond",
+            "--start-date",
+            "2024-01-01",
+            "--end-date",
+            "2024-01-01",
+            "--reset-dagruns",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -41,6 +53,7 @@ def run():
                 "elapsed_seconds": round(elapsed, 6),
                 "steps_executed": 18,
                 "success": result.returncode == 0,
+                "executor": "LocalExecutor",
             },
             indent=2,
         )

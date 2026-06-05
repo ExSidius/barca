@@ -9,22 +9,36 @@ pub fn compute_run_hash(
     upstream_ids: impl Iterator<Item = impl AsRef<str>>,
     cached_run_hashes: &HashMap<String, String>,
 ) -> String {
-    let upstream_hashes: Vec<&str> = upstream_ids
-        .filter_map(|uid| {
-            let uid = uid.as_ref();
-            if let Some(h) = cached_run_hashes.get(uid) {
-                return Some(h.as_str());
+    let mut upstream_hashes: Vec<String> = Vec::new();
+    for uid in upstream_ids {
+        let uid = uid.as_ref();
+        if let Some(h) = cached_run_hashes.get(uid) {
+            upstream_hashes.push(h.clone());
+            continue;
+        }
+        // Try partition-aligned lookup (same partition as current step).
+        if let Some(pk) = partition_key {
+            let aligned = format!("{uid}[{pk}]");
+            if let Some(h) = cached_run_hashes.get(&aligned) {
+                upstream_hashes.push(h.clone());
+                continue;
             }
-            if let Some(pk) = partition_key {
-                let aligned = format!("{uid}[{pk}]");
-                if let Some(h) = cached_run_hashes.get(&aligned) {
-                    return Some(h.as_str());
-                }
+        }
+        // Fan-in: collect ALL partition hashes for this base ID (sorted for determinism).
+        let prefix = format!("{uid}[");
+        let mut partition_hashes: Vec<(&String, &String)> = cached_run_hashes
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .collect();
+        if !partition_hashes.is_empty() {
+            partition_hashes.sort_by_key(|(k, _)| k.clone());
+            for (_, h) in partition_hashes {
+                upstream_hashes.push(h.clone());
             }
-            None
-        })
-        .collect();
-    crate::hash::run_hash(def_hash, partition_key, &upstream_hashes, None)
+        }
+    }
+    let hash_refs: Vec<&str> = upstream_hashes.iter().map(|s| s.as_str()).collect();
+    crate::hash::run_hash(def_hash, partition_key, &hash_refs, None)
 }
 
 #[cfg(test)]

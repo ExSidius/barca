@@ -95,10 +95,17 @@ pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaErr
     let db_path = db::ensure_db_dir();
     db::init_db_sync(&db_path);
 
-    let all_outputs = dispatch::dispatch_plan(&exec_plan, python, &db_path, pool_size);
+    let dispatch_result = dispatch::dispatch_plan(&exec_plan, python, &db_path, pool_size);
+    let all_outputs = dispatch_result.outputs;
 
+    // Persist whatever succeeded — even on partial failure.
     let run_hashes = compute_run_hashes(&dag, &all_outputs);
     db::persist_outputs_sync(&db_path, &all_outputs, &run_hashes);
+
+    // If a worker failed, return the error after persisting partial results.
+    if let Some(error) = dispatch_result.error {
+        return Err(BarcaError::WorkerFailed(error));
+    }
 
     let total_executed = all_outputs.len();
     let last_planned_id = exec_plan
@@ -173,6 +180,7 @@ pub fn get(
 
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
+    let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     let mut steps_executed = 0;
 
@@ -259,7 +267,11 @@ pub fn get(
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
-        let phase_outputs = dispatch::execute_phase(&filtered_phase, &provided, python);
+        let phase_result = dispatch::execute_phase(&filtered_phase, &provided, python);
+        if phase_error.is_none() {
+            phase_error = phase_result.error;
+        }
+        let phase_outputs = phase_result.outputs;
 
         let step_order: Vec<String> = filtered_phase
             .streams
@@ -300,9 +312,14 @@ pub fn get(
             cached_run_hashes.insert(node_id.clone(), run_h);
             all_outputs.insert(node_id, oref);
         }
+
+        // If this phase had a worker failure, stop after collecting partial results.
+        if phase_error.is_some() {
+            break;
+        }
     }
 
-    // Persist newly executed outputs.
+    // Persist all executed outputs (including partial results on failure).
     rt.block_on(async {
         for (node_id, oref) in &all_outputs {
             if cached_node_ids.contains(node_id) {
@@ -325,6 +342,11 @@ pub fn get(
             .ok();
         }
     });
+
+    // Propagate worker error after persisting partial results.
+    if let Some(error) = phase_error {
+        return Err(BarcaError::WorkerFailed(error));
+    }
 
     let final_output = all_outputs.get(&target_id).cloned().or_else(|| {
         // For partitioned targets, sort by key for deterministic output.

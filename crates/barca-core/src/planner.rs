@@ -66,6 +66,8 @@ pub struct StreamStep {
     pub pending_partitions: HashMap<String, String>,
     /// Explicit artifact serializer from `@asset(serializer="parquet")`.
     pub serializer: Option<String>,
+    /// Timeout in seconds for this step's execution.
+    pub timeout_seconds: u32,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -341,9 +343,9 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             .extracted
             .artifact_serializer
             .map(|s| format!("{s:?}").to_lowercase());
+        let timeout_seconds = node.extracted.timeout_seconds;
 
         if !static_partitions.is_empty() {
-            // Static partitioned: expand into one step per partition value.
             let combos = expand_partition_combos(&static_partitions);
             for combo in combos {
                 let pk = PartitionKey::from(combo);
@@ -355,6 +357,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                     inputs: inputs.clone(),
                     pending_partitions: HashMap::new(),
                     serializer: serializer.clone(),
+                    timeout_seconds,
                 });
             }
         } else if !derived_partitions.is_empty() {
@@ -366,6 +369,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: derived_partitions,
                 serializer: serializer.clone(),
+                timeout_seconds,
             });
         } else {
             steps.push(StreamStep {
@@ -376,6 +380,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: HashMap::new(),
                 serializer,
+                timeout_seconds,
             });
         }
     }
