@@ -310,4 +310,15 @@ Barca is not a replacement for any of these in production data platform scenario
 
 The speed gap is real but context matters. In a 10-minute ETL pipeline, 400ms of framework overhead (Dagster) is noise. The gap matters most for: fast iteration loops, agent-driven pipelines that run many small DAGs, and workloads where framework overhead dominates actual compute.
 
-Airflow's numbers are worse than they would be in production (where Celery/Kubernetes executors parallelize across machines). The benchmark uses LocalExecutor + SQLite which serializes task completion. A fair production comparison would need Docker + PostgreSQL + Celery.
+### Partitioned Workloads (10 steps × 1000 partitions = 10,000 steps)
+
+Each framework uses its idiomatic partition/map pattern — no strawmen.
+
+| Benchmark | Barca | Dagster | Prefect | Airflow |
+|-----------|-------|---------|---------|---------|
+| 10k partitioned steps | **0.7s** | 95s (136x) | >9min (killed) | >22min (killed) |
+| Pattern used | `partitions()` | `StaticPartitionsDefinition` | `task.map()` | `expand()` + PostgreSQL |
+
+Barca's late partition expansion creates 10 StreamSteps (one per node), not 10,000. Workers expand partitions internally. The other frameworks create per-partition objects in their registries/DBs, which doesn't scale.
+
+At 200k steps (100k partitions × 2 steps), barca completes in 14s. The other frameworks are not viable at this scale.

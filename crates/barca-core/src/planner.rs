@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::dag::Dag;
 use crate::model::{PartitionKey, StepId};
@@ -54,20 +55,23 @@ pub struct WorkerStream {
 /// A step within a stream.
 #[derive(Debug, Clone)]
 pub struct StreamStep {
-    /// Step identity: base node ID + partition coordinate.
+    /// Step identity: base node ID (unpartitioned — workers expand partition_keys).
     pub step_id: StepId,
     /// The kind of node (asset, sensor, effect).
     pub kind: crate::model::NodeKind,
-    pub function_name: String,
-    pub source_file: String,
+    pub function_name: Arc<str>,
+    pub source_file: Arc<str>,
     pub inputs: HashMap<String, String>,
     /// Pending partition resolution: dimension → source_node_id.
     /// The dispatch loop reads the source output and expands into N steps.
     pub pending_partitions: HashMap<String, String>,
     /// Explicit artifact serializer from `@asset(serializer="parquet")`.
-    pub serializer: Option<String>,
+    pub serializer: Option<Arc<str>>,
     /// Timeout in seconds for this step's execution.
     pub timeout_seconds: u32,
+    /// Late-expanded partition keys: workers loop over these internally.
+    /// Empty for unpartitioned nodes. Enables 1M+ partitions without 1M structs.
+    pub partition_keys: Vec<PartitionKey>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -181,10 +185,17 @@ pub fn plan(dag: &Dag, topology: &Topology, config: &ResourceConfig) -> Executio
     let phases = build_phases(dag, topology, &phase_assignment, config);
     let phases = merge_single_stream_phases(phases);
 
-    let total_steps = phases
+    let total_steps: usize = phases
         .iter()
         .flat_map(|p| &p.streams)
-        .map(|s| s.steps.len())
+        .flat_map(|s| &s.steps)
+        .map(|st| {
+            if st.partition_keys.is_empty() {
+                1
+            } else {
+                st.partition_keys.len()
+            }
+        })
         .sum();
 
     ExecutionPlan {
@@ -274,42 +285,91 @@ fn build_phases(
             }
         };
 
-        // Convert chains to step lists. Partitioned chains produce partition-aligned
-        // work units: all steps for one partition value stay together in one stream.
+        // Convert chains to step lists. With late partition expansion, a partitioned
+        // node is ONE StreamStep with N partition_keys. We split the partition_keys
+        // across streams so each worker process handles a subset.
         let mut work_units: Vec<Vec<StreamStep>> = Vec::new();
         for &chain_idx in &chains_in_phase {
             let steps = chain_to_steps(dag, &topology.chains[chain_idx]);
-            let partitioned_steps: Vec<&StreamStep> = steps
-                .iter()
-                .filter(|s| !s.step_id.partition.is_empty())
-                .collect();
+            let has_partitioned = steps.iter().any(|s| !s.partition_keys.is_empty());
 
-            if partitioned_steps.is_empty() {
+            if !has_partitioned {
                 // No partitions — keep chain as one work unit.
                 work_units.push(steps);
             } else {
-                // Group steps by partition key → each group is one work unit.
-                let mut by_partition: HashMap<String, Vec<StreamStep>> = HashMap::new();
+                // Split partitioned steps across streams while preserving chain order.
+                // When a chain has multiple partitioned nodes (e.g., fetch→transform),
+                // we must keep them together so each stream executes the full chain
+                // for its partition slice.
                 let mut unpartitioned: Vec<StreamStep> = Vec::new();
+                let partitioned: Vec<&StreamStep> = steps
+                    .iter()
+                    .filter(|s| !s.partition_keys.is_empty())
+                    .collect();
 
-                for step in steps {
-                    if step.step_id.partition.is_empty() {
-                        unpartitioned.push(step);
-                    } else {
-                        let key = step.step_id.partition.suffix();
-                        by_partition.entry(key).or_default().push(step);
+                if partitioned.len() <= 1 {
+                    // Single partitioned node — split its partition_keys across streams.
+                    for step in steps {
+                        if step.partition_keys.is_empty() {
+                            unpartitioned.push(step);
+                        } else {
+                            let total_pks = step.partition_keys.len();
+                            let chunk_size = total_pks.div_ceil(config.pool_size);
+                            for chunk in step.partition_keys.chunks(chunk_size) {
+                                work_units.push(vec![StreamStep {
+                                    step_id: step.step_id.clone(),
+                                    kind: step.kind,
+                                    function_name: Arc::clone(&step.function_name),
+                                    source_file: Arc::clone(&step.source_file),
+                                    inputs: step.inputs.clone(),
+                                    pending_partitions: step.pending_partitions.clone(),
+                                    serializer: step.serializer.clone(),
+                                    timeout_seconds: step.timeout_seconds,
+                                    partition_keys: chunk.to_vec(),
+                                }]);
+                            }
+                        }
+                    }
+                } else {
+                    // Multiple partitioned nodes in the same chain — split by partition
+                    // chunk but keep the chain together per chunk. Use the first
+                    // partitioned node's partition count to determine chunk size.
+                    let total_pks = partitioned[0].partition_keys.len();
+                    let chunk_size = total_pks.div_ceil(config.pool_size);
+
+                    for chunk_start in (0..total_pks).step_by(chunk_size) {
+                        let chunk_end = (chunk_start + chunk_size).min(total_pks);
+                        let mut chain_chunk: Vec<StreamStep> = Vec::new();
+                        for step in &steps {
+                            if step.partition_keys.is_empty() {
+                                // Unpartitioned steps in a mixed chain run in every chunk.
+                                chain_chunk.push(step.clone());
+                            } else {
+                                let pks = if step.partition_keys.len() == total_pks {
+                                    step.partition_keys[chunk_start..chunk_end].to_vec()
+                                } else {
+                                    // Different partition counts — include all (fallback).
+                                    step.partition_keys.clone()
+                                };
+                                chain_chunk.push(StreamStep {
+                                    step_id: step.step_id.clone(),
+                                    kind: step.kind,
+                                    function_name: Arc::clone(&step.function_name),
+                                    source_file: Arc::clone(&step.source_file),
+                                    inputs: step.inputs.clone(),
+                                    pending_partitions: step.pending_partitions.clone(),
+                                    serializer: step.serializer.clone(),
+                                    timeout_seconds: step.timeout_seconds,
+                                    partition_keys: pks,
+                                });
+                            }
+                        }
+                        work_units.push(chain_chunk);
                     }
                 }
 
-                // Unpartitioned steps go in their own work unit.
                 if !unpartitioned.is_empty() {
                     work_units.push(unpartitioned);
-                }
-                // Each partition's steps form one work unit (stays in one process).
-                let mut keys: Vec<String> = by_partition.keys().cloned().collect();
-                keys.sort();
-                for key in keys {
-                    work_units.push(by_partition.remove(&key).unwrap());
                 }
             }
         }
@@ -339,48 +399,51 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
         let static_partitions = collect_static_partitions(&node.extracted.partitions);
         // Check for derived partitions — mark for resolution at dispatch time.
         let derived_partitions = collect_derived_partitions(&node.extracted.partitions);
-        let serializer = node
+        let serializer: Option<Arc<str>> = node
             .extracted
             .artifact_serializer
-            .map(|s| format!("{s:?}").to_lowercase());
+            .map(|s| Arc::from(format!("{s:?}").to_lowercase().as_str()));
         let timeout_seconds = node.extracted.timeout_seconds;
+        let function_name: Arc<str> = Arc::from(node.function_name());
+        let source_file: Arc<str> = Arc::from(node.source_file());
 
         if !static_partitions.is_empty() {
             let combos = expand_partition_combos(&static_partitions);
-            for combo in combos {
-                let pk = PartitionKey::from(combo);
-                steps.push(StreamStep {
-                    step_id: StepId::new(node_id.clone(), pk),
-                    kind: node.kind(),
-                    function_name: node.function_name().to_string(),
-                    source_file: node.source_file().to_string(),
-                    inputs: inputs.clone(),
-                    pending_partitions: HashMap::new(),
-                    serializer: serializer.clone(),
-                    timeout_seconds,
-                });
-            }
-        } else if !derived_partitions.is_empty() {
+            let pks: Vec<PartitionKey> = combos.into_iter().map(PartitionKey::from).collect();
             steps.push(StreamStep {
-                step_id: StepId::unpartitioned(node_id.clone()),
+                step_id: StepId::unpartitioned(node_id.as_str()),
                 kind: node.kind(),
-                function_name: node.function_name().to_string(),
-                source_file: node.source_file().to_string(),
-                inputs,
-                pending_partitions: derived_partitions,
-                serializer: serializer.clone(),
-                timeout_seconds,
-            });
-        } else {
-            steps.push(StreamStep {
-                step_id: StepId::unpartitioned(node_id.clone()),
-                kind: node.kind(),
-                function_name: node.function_name().to_string(),
-                source_file: node.source_file().to_string(),
+                function_name,
+                source_file,
                 inputs,
                 pending_partitions: HashMap::new(),
                 serializer,
                 timeout_seconds,
+                partition_keys: pks,
+            });
+        } else if !derived_partitions.is_empty() {
+            steps.push(StreamStep {
+                step_id: StepId::unpartitioned(node_id.as_str()),
+                kind: node.kind(),
+                function_name,
+                source_file,
+                inputs,
+                pending_partitions: derived_partitions,
+                serializer: serializer.clone(),
+                timeout_seconds,
+                partition_keys: Vec::new(),
+            });
+        } else {
+            steps.push(StreamStep {
+                step_id: StepId::unpartitioned(node_id.as_str()),
+                kind: node.kind(),
+                function_name,
+                source_file,
+                inputs,
+                pending_partitions: HashMap::new(),
+                serializer,
+                timeout_seconds,
+                partition_keys: Vec::new(),
             });
         }
     }
@@ -445,27 +508,42 @@ pub fn expand_partition_combos(
     combos
 }
 
-/// Distribute chains across N streams using greedy bin-packing (longest-first).
+/// Weight of a work unit: sum of max(1, partition_keys.len()) for each step.
+fn work_unit_weight(steps: &[StreamStep]) -> usize {
+    steps
+        .iter()
+        .map(|st| {
+            if st.partition_keys.is_empty() {
+                1
+            } else {
+                st.partition_keys.len()
+            }
+        })
+        .sum()
+}
+
+/// Distribute chains across N streams using greedy bin-packing (heaviest-first).
 fn bin_pack_to_streams(
     mut chain_steps: Vec<Vec<StreamStep>>,
     num_streams: usize,
     phase_idx: usize,
 ) -> Vec<WorkerStream> {
-    // Sort chains by length, longest first.
-    chain_steps.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    // Sort work units by weight, heaviest first.
+    chain_steps.sort_by_key(|s| std::cmp::Reverse(work_unit_weight(s)));
 
     let mut streams: Vec<Vec<StreamStep>> = vec![Vec::new(); num_streams];
     let mut stream_sizes: Vec<usize> = vec![0; num_streams];
 
     for steps in chain_steps {
-        // Assign to stream with fewest steps.
+        // Assign to stream with least weight.
+        let weight = work_unit_weight(&steps);
         let target = stream_sizes
             .iter()
             .enumerate()
             .min_by_key(|&(_, &size)| size)
             .map(|(idx, _)| idx)
             .unwrap_or(0);
-        stream_sizes[target] += steps.len();
+        stream_sizes[target] += weight;
         streams[target].extend(steps);
     }
 
@@ -1129,8 +1207,9 @@ mod tests {
     }
 
     #[test]
-    fn plan_static_partitions_expand_to_n_steps() {
-        // fetch_prices with 3 partitions → 3 steps
+    fn plan_static_partitions_late_expansion() {
+        // fetch_prices with 3 partitions → 1 StreamStep with 3 partition_keys
+        // (late expansion: workers loop internally)
         let dag = build_partitioned_dag(&[(
             "fetch_prices",
             &[],
@@ -1141,29 +1220,35 @@ mod tests {
         assert_eq!(p.total_steps, 3);
         assert_eq!(p.phases.len(), 1);
 
+        // Late expansion: planner produces fewer StreamSteps, each with partition_keys
         let all_steps: Vec<&StreamStep> =
             p.phases[0].streams.iter().flat_map(|s| &s.steps).collect();
+        // With pool_size=10 and 3 partitions, chunk_size=1 → 3 work units → 3 streams
         assert_eq!(all_steps.len(), 3);
 
-        // Each step has a different partition value
-        let mut tickers: Vec<&str> = all_steps
+        // Each step has partition_keys — step_id is unpartitioned
+        let mut all_tickers: Vec<String> = all_steps
             .iter()
-            .map(|s| s.step_id.partition.0.get("ticker").unwrap().as_str())
+            .flat_map(|s| {
+                s.partition_keys
+                    .iter()
+                    .map(|pk| pk.0.get("ticker").unwrap().clone())
+            })
             .collect();
-        tickers.sort();
-        assert_eq!(tickers, vec!["AAPL", "GOOG", "MSFT"]);
+        all_tickers.sort();
+        assert_eq!(all_tickers, vec!["AAPL", "GOOG", "MSFT"]);
 
-        // Node IDs include partition suffix
+        // step_id.base should be unpartitioned
         for step in &all_steps {
-            assert!(step.step_id.display().contains("[ticker="));
+            assert_eq!(step.step_id.base_id(), "test.py:fetch_prices");
+            assert!(step.step_id.partition.is_empty());
         }
     }
 
     #[test]
     fn plan_partitioned_steps_distributed_across_streams() {
-        // 100 partition values, pool_size=10 → distributed
+        // 100 partition values, pool_size=10 → split into 10 chunks of 10
 
-        // Actually generate unique values
         let ticker_strings: Vec<String> = (0..100).map(|i| format!("T{i:03}")).collect();
         let ticker_refs: Vec<&str> = ticker_strings.iter().map(|s| s.as_str()).collect();
 
@@ -1172,8 +1257,10 @@ mod tests {
 
         assert_eq!(p.total_steps, 100);
         assert_eq!(p.phases[0].streams.len(), 10);
+        // Each stream has 1 StreamStep with 10 partition_keys
         for stream in &p.phases[0].streams {
-            assert_eq!(stream.steps.len(), 10);
+            assert_eq!(stream.steps.len(), 1);
+            assert_eq!(stream.steps[0].partition_keys.len(), 10);
         }
     }
 
@@ -1191,17 +1278,18 @@ mod tests {
         ]);
         let p = plan_from_dag(&dag, &cfg(10));
 
-        // source = 1 step, fetch = 3 steps = 4 total
+        // source = 1 step, fetch = 3 partition_keys = 4 total
         assert_eq!(p.total_steps, 4);
     }
 
     #[test]
     fn plan_non_partitioned_remains_single_step() {
-        // Regular asset without partitions → 1 step, no partition field
+        // Regular asset without partitions → 1 step, no partition_keys
         let dag = build_partitioned_dag(&[("simple", &[], &[])]);
         let p = plan_from_dag(&dag, &cfg(10));
 
         assert_eq!(p.total_steps, 1);
+        assert!(p.phases[0].streams[0].steps[0].partition_keys.is_empty());
         assert!(p.phases[0].streams[0].steps[0].step_id.partition.is_empty());
     }
 }

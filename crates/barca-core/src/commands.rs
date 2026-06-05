@@ -132,8 +132,8 @@ pub fn get(
         full_plan
     };
 
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
+    let db_path = db::ensure_db_dir()?;
+    db::init_db_sync(&db_path)?;
 
     db::create_run_sync(
         &db_path,
@@ -142,15 +142,22 @@ pub fn get(
         &file_args.join(" "),
         target_name,
         Some(exec_plan.total_steps),
-    );
+    )?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
 
-    let db = rt.block_on(async { Builder::new_local(&db_path).build().await.unwrap() });
-    let conn = db.connect().unwrap();
+    let db = rt.block_on(async {
+        Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
+    })?;
+    let conn = db
+        .connect()
+        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
 
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
@@ -160,18 +167,44 @@ pub fn get(
 
     // Progress bar setup.
     let total_steps = exec_plan.total_steps;
-    let all_node_ids: Vec<String> = exec_plan
+    // Collect unpartitioned node_ids for exact ETA lookup.
+    let unpartitioned_node_ids: Vec<String> = exec_plan
         .phases
         .iter()
         .flat_map(|p| &p.streams)
         .flat_map(|s| &s.steps)
+        .filter(|st| st.partition_keys.is_empty())
         .map(|st| st.step_id.display())
         .collect();
-    let avg_times = db::get_avg_elapsed_sync(&db_path, &all_node_ids);
-    let total_estimated: f64 = all_node_ids
+    // Collect partitioned base node_ids for LIKE-based ETA lookup.
+    let partitioned_base_ids: Vec<String> = exec_plan
+        .phases
+        .iter()
+        .flat_map(|p| &p.streams)
+        .flat_map(|s| &s.steps)
+        .filter(|st| !st.partition_keys.is_empty())
+        .map(|st| st.step_id.base_id().to_string())
+        .collect();
+    let avg_times = db::get_avg_elapsed_sync(&db_path, &unpartitioned_node_ids)?;
+    let partitioned_avg_times =
+        db::get_avg_elapsed_for_partitioned_sync(&db_path, &partitioned_base_ids)?;
+    let total_estimated: f64 = unpartitioned_node_ids
         .iter()
         .filter_map(|nid| avg_times.get(nid))
-        .sum();
+        .sum::<f64>()
+        + exec_plan
+            .phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .filter(|st| !st.partition_keys.is_empty())
+            .filter_map(|st| {
+                let base = st.step_id.base_id().to_string();
+                partitioned_avg_times
+                    .get(&base)
+                    .map(|avg| avg * st.partition_keys.len() as f64)
+            })
+            .sum::<f64>();
     let mut elapsed_so_far: f64 = 0.0;
     let mut completed_steps: usize = 0;
 
@@ -219,6 +252,13 @@ pub fn get(
 
                 // Skip cache lookups when no_cache is set.
                 if no_cache {
+                    uncached_steps.push(step.clone());
+                    continue;
+                }
+
+                // TODO: Partitioned steps with partition_keys skip cache for now.
+                // To cache-check these, we'd need to verify each partition key individually.
+                if !step.partition_keys.is_empty() {
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -284,7 +324,14 @@ pub fn get(
         steps_executed += filtered_phase
             .streams
             .iter()
-            .map(|s| s.steps.len())
+            .flat_map(|s| &s.steps)
+            .map(|st| {
+                if st.partition_keys.is_empty() {
+                    1
+                } else {
+                    st.partition_keys.len()
+                }
+            })
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
@@ -435,7 +482,7 @@ pub fn get(
             steps_executed,
             steps_cached,
             elapsed,
-        );
+        )?;
         return Err(BarcaError::WorkerFailed(error));
     }
 
@@ -446,7 +493,7 @@ pub fn get(
         steps_executed,
         steps_cached,
         elapsed,
-    );
+    )?;
 
     // Determine final_output: use target if specified, otherwise last planned step.
     let final_output = if let Some(ref tid) = target_id {
@@ -521,9 +568,9 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaE
 // ─── history ──────────────────────────────────────────────────────────────────
 
 pub fn history(limit: usize) -> Result<Vec<db::RunRecord>, BarcaError> {
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-    Ok(db::get_recent_runs_sync(&db_path, limit))
+    let db_path = db::ensure_db_dir()?;
+    db::init_db_sync(&db_path)?;
+    db::get_recent_runs_sync(&db_path, limit)
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────
@@ -549,9 +596,9 @@ pub fn stats(
             BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
         })?;
 
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-    Ok(db::get_asset_stats_sync(&db_path, &target_id))
+    let db_path = db::ensure_db_dir()?;
+    db::init_db_sync(&db_path)?;
+    db::get_asset_stats_sync(&db_path, &target_id)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -593,7 +640,14 @@ fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> Execut
             .phases
             .iter()
             .flat_map(|p| &p.streams)
-            .map(|s| s.steps.len())
+            .flat_map(|s| &s.steps)
+            .map(|st| {
+                if st.partition_keys.is_empty() {
+                    1
+                } else {
+                    st.partition_keys.len()
+                }
+            })
             .sum(),
         ..exec_plan
     }
@@ -646,6 +700,13 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
         all_nodes.extend(nodes);
     }
 
+    // Parse module definitions once per source file, then compute cone hashes.
+    // This avoids re-parsing the same file for every node (O(n) parses instead of O(n²)).
+    let mut cached_defs: HashMap<String, HashMap<String, crate::cone::ModuleDef>> = HashMap::new();
+    for (key, src) in &file_sources {
+        cached_defs.insert(key.clone(), crate::cone::collect_module_definitions(src));
+    }
+
     for node in &mut all_nodes {
         let stem_from_path = node
             .source_file
@@ -653,16 +714,19 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
             .next()
             .unwrap_or("")
             .replace(".py", "");
-        let source = file_sources.get(&stem_from_path).or_else(|| {
+        let defs = cached_defs.get(&stem_from_path).or_else(|| {
             let stem = PathBuf::from(&node.source_file);
             let s = stem.file_stem()?.to_str()?;
-            file_sources.get(s)
+            cached_defs.get(s)
         });
-        if let Some(src) = source {
+        if let Some(defs) = defs {
             node.cone_hash =
-                crate::cone::cone_hash_with_imports(src, &node.function_name, &file_sources);
+                crate::cone::cone_hash_from_defs(defs, &node.function_name, &file_sources);
         }
     }
+
+    // Free source text memory before execution starts.
+    drop(file_sources);
 
     resolve_dynamic_partitions(&mut all_nodes, python);
 

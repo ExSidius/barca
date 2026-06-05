@@ -31,6 +31,16 @@ pub fn cone_hash_with_imports(
     other_sources: &HashMap<String, String>,
 ) -> String {
     let defs = collect_module_definitions(source);
+    cone_hash_from_defs(&defs, function_name, other_sources)
+}
+
+/// Cone hash from pre-parsed module definitions. Avoids re-parsing the source
+/// when computing hashes for multiple functions in the same file.
+pub fn cone_hash_from_defs(
+    defs: &HashMap<String, ModuleDef>,
+    function_name: &str,
+    other_sources: &HashMap<String, String>,
+) -> String {
     let Some(target) = defs.get(function_name) else {
         return String::new();
     };
@@ -112,7 +122,7 @@ pub fn cone_hash_with_imports(
 
 // ─── Internal types ──────────────────────────────────────────────────────────
 
-enum ModuleDef {
+pub enum ModuleDef {
     Function {
         source_text: String,
         references: HashSet<String>,
@@ -211,7 +221,7 @@ fn resolve_import(
 
 // ─── Module definition collection ────────────────────────────────────────────
 
-fn collect_module_definitions(source: &str) -> HashMap<String, ModuleDef> {
+pub fn collect_module_definitions(source: &str) -> HashMap<String, ModuleDef> {
     collect_module_definitions_with_context(source, None)
 }
 

@@ -31,6 +31,9 @@ pub enum BarcaError {
     #[error("Worker failed: {0}")]
     WorkerFailed(String),
 
+    #[error("Database error: {0}")]
+    Db(String),
+
     #[error("{0}")]
     Other(String),
 }

@@ -108,49 +108,104 @@ def run_batch(batch):
 
         fn = getattr(modules[source], step["function_name"])
 
-        # Resolve inputs: check local cache (includes provided_inputs).
-        kwargs = {}
-        for param_name, upstream_id in step.get("inputs", {}).items():
-            if upstream_id in cache:
-                kwargs[param_name] = cache[upstream_id]
-            else:
-                raise RuntimeError(
-                    f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
-                    f"Available: {list(cache.keys())}"
+        partition_keys = step.get("partition_keys", [])
+        if partition_keys:
+            # Late partition expansion: worker loops over partition_keys internally.
+            # Each partition key is a dict like {"ticker": "AAPL"}.
+            for pk in partition_keys:
+                # Resolve inputs with partition alignment.
+                kwargs = {}
+                for param_name, upstream_id in step.get("inputs", {}).items():
+                    suffix = ",".join(f"{k}={v}" for k, v in sorted(pk.items()))
+                    aligned_id = f"{upstream_id}[{suffix}]"
+                    if aligned_id in cache:
+                        kwargs[param_name] = cache[aligned_id]
+                    elif upstream_id in cache:
+                        kwargs[param_name] = cache[upstream_id]
+                    else:
+                        raise RuntimeError(
+                            f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
+                            f"Tried aligned '{aligned_id}' and base '{upstream_id}'. "
+                            f"Available: {list(cache.keys())}"
+                        )
+
+                # Inject partition values as kwargs (e.g., ticker="AAPL").
+                kwargs.update(pk)
+
+                timeout = step.get("timeout_seconds", 0)
+                t0 = time.perf_counter()
+                if timeout and timeout > 0:
+                    result = _run_with_timeout(fn, kwargs, timeout)
+                else:
+                    result = fn(**kwargs) if kwargs else fn()
+                elapsed = time.perf_counter() - t0
+
+                # Sensors return (updated: bool, data) tuples — unpack for downstream.
+                if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
+                    _updated, result = result
+
+                # Build partition-qualified node_id for cache and artifact.
+                suffix = ",".join(f"{k}={v}" for k, v in sorted(pk.items()))
+                full_node_id = f"{step['node_id']}[{suffix}]"
+                cache[full_node_id] = result
+
+                # Serialize to artifact file.
+                explicit_fmt = step.get("serializer")
+                fmt = detect_format(result, explicit=explicit_fmt)
+                path = artifact_path(art_dir, full_node_id, fmt)
+                size = serialize(result, path, fmt)
+
+                _emit(
+                    "result",
+                    node_id=full_node_id,
+                    artifact={"path": str(path), "format": fmt, "size_bytes": size},
+                    elapsed=elapsed,
                 )
-
-        # Inject partition values as kwargs (e.g., ticker="AAPL").
-        if "partition" in step:
-            kwargs.update(step["partition"])
-
-        # User's print() goes to stdout (visible in terminal).
-        # Protocol messages go to stderr (Rust reads this).
-        timeout = step.get("timeout_seconds", 0)
-        t0 = time.perf_counter()
-        if timeout and timeout > 0:
-            result = _run_with_timeout(fn, kwargs, timeout)
         else:
-            result = fn(**kwargs) if kwargs else fn()
-        elapsed = time.perf_counter() - t0
+            # Unpartitioned — existing code path.
+            # Resolve inputs: check local cache (includes provided_inputs).
+            kwargs = {}
+            for param_name, upstream_id in step.get("inputs", {}).items():
+                if upstream_id in cache:
+                    kwargs[param_name] = cache[upstream_id]
+                else:
+                    raise RuntimeError(
+                        f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
+                        f"Available: {list(cache.keys())}"
+                    )
 
-        # Sensors return (updated: bool, data) tuples — unpack for downstream.
-        if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
-            _updated, result = result
+            # Inject partition values as kwargs (e.g., ticker="AAPL").
+            if "partition" in step:
+                kwargs.update(step["partition"])
 
-        cache[step["node_id"]] = result
+            # User's print() goes to stdout (visible in terminal).
+            # Protocol messages go to stderr (Rust reads this).
+            timeout = step.get("timeout_seconds", 0)
+            t0 = time.perf_counter()
+            if timeout and timeout > 0:
+                result = _run_with_timeout(fn, kwargs, timeout)
+            else:
+                result = fn(**kwargs) if kwargs else fn()
+            elapsed = time.perf_counter() - t0
 
-        # Serialize to artifact file.
-        explicit_fmt = step.get("serializer")
-        fmt = detect_format(result, explicit=explicit_fmt)
-        path = artifact_path(art_dir, step["node_id"], fmt)
-        size = serialize(result, path, fmt)
+            # Sensors return (updated: bool, data) tuples — unpack for downstream.
+            if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
+                _updated, result = result
 
-        _emit(
-            "result",
-            node_id=step["node_id"],
-            artifact={"path": str(path), "format": fmt, "size_bytes": size},
-            elapsed=elapsed,
-        )
+            cache[step["node_id"]] = result
+
+            # Serialize to artifact file.
+            explicit_fmt = step.get("serializer")
+            fmt = detect_format(result, explicit=explicit_fmt)
+            path = artifact_path(art_dir, step["node_id"], fmt)
+            size = serialize(result, path, fmt)
+
+            _emit(
+                "result",
+                node_id=step["node_id"],
+                artifact={"path": str(path), "format": fmt, "size_bytes": size},
+                elapsed=elapsed,
+            )
 
 
 def main():
