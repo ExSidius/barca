@@ -1,11 +1,11 @@
 {
-  "measured_at": "2026-06-05T16:44:01Z",
+  "measured_at": "2026-06-05T18:04:19Z",
   "version": "0.1.5",
   "platform": "Darwin arm64",
   "benchmarks": {
-      "trivial": {"wall_time_s": 0.02423325, "peak_rss_bytes": 22216704, "cpu_user_s": 0.03, "cpu_sys_s": 0.03, "artifact_bytes": 4096, "db_bytes": 4096},
-      "chain_100": {"wall_time_s": 0.080242542, "peak_rss_bytes": 22626304, "cpu_user_s": 0.08, "cpu_sys_s": 0.08, "artifact_bytes": 409600, "db_bytes": 4096},
-      "deep_diamond": {"wall_time_s": 0.065695333, "peak_rss_bytes": 25706496, "cpu_user_s": 0.07, "cpu_sys_s": 0.07, "artifact_bytes": 831488, "db_bytes": 4096},
-      "fan_out_500_50ms": {"wall_time_s": 2.394349625, "peak_rss_bytes": 23461888, "cpu_user_s": 2.39, "cpu_sys_s": 2.39, "artifact_bytes": 2048000, "db_bytes": 552960}
+      "trivial": {"wall_time_s": 0.022515042, "peak_rss_bytes": 22052864, "cpu_user_s": 0.02, "cpu_sys_s": 0.02, "artifact_bytes": 4096, "db_bytes": 4096},
+      "chain_100": {"wall_time_s": 0.044316584, "peak_rss_bytes": 22577152, "cpu_user_s": 0.04, "cpu_sys_s": 0.04, "artifact_bytes": 409600, "db_bytes": 4096},
+      "deep_diamond": {"wall_time_s": 0.059731791, "peak_rss_bytes": 25591808, "cpu_user_s": 0.06, "cpu_sys_s": 0.06, "artifact_bytes": 831488, "db_bytes": 4096},
+      "fan_out_500_50ms": {"wall_time_s": 1.814454958, "peak_rss_bytes": 23379968, "cpu_user_s": 1.82, "cpu_sys_s": 1.82, "artifact_bytes": 2048000, "db_bytes": 548864}
   }
 }

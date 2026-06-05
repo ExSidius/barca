@@ -653,6 +653,13 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
         all_nodes.extend(nodes);
     }
 
+    // Parse module definitions once per source file, then compute cone hashes.
+    // This avoids re-parsing the same file for every node (O(n) parses instead of O(n²)).
+    let mut cached_defs: HashMap<String, HashMap<String, crate::cone::ModuleDef>> = HashMap::new();
+    for (key, src) in &file_sources {
+        cached_defs.insert(key.clone(), crate::cone::collect_module_definitions(src));
+    }
+
     for node in &mut all_nodes {
         let stem_from_path = node
             .source_file
@@ -660,14 +667,14 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
             .next()
             .unwrap_or("")
             .replace(".py", "");
-        let source = file_sources.get(&stem_from_path).or_else(|| {
+        let defs = cached_defs.get(&stem_from_path).or_else(|| {
             let stem = PathBuf::from(&node.source_file);
             let s = stem.file_stem()?.to_str()?;
-            file_sources.get(s)
+            cached_defs.get(s)
         });
-        if let Some(src) = source {
+        if let Some(defs) = defs {
             node.cone_hash =
-                crate::cone::cone_hash_with_imports(src, &node.function_name, &file_sources);
+                crate::cone::cone_hash_from_defs(defs, &node.function_name, &file_sources);
         }
     }
 

@@ -36,10 +36,9 @@ pub fn extract_nodes(source: &str, file_path: &str) -> Result<Vec<ExtractedNode>
 
     for stmt in &module.body {
         if let Stmt::FunctionDef(func) = stmt
-            && let Some(mut extracted) = try_extract_function(func, file_path, source)
+            && let Some(extracted) = try_extract_function(func, file_path, source)
         {
-            // Compute dependency cone hash for this function.
-            extracted.cone_hash = crate::cone::cone_hash(source, &extracted.function_name);
+            // Cone hash computed later in build_dag with cached module definitions.
             nodes.push(extracted);
         }
     }
