@@ -233,17 +233,55 @@ How much framework code do you write per asset function?
 
 ---
 
-## Summary Scorecard
+## What You Give Up With Barca
 
-Criteria: **minimal** (less code), **understandable** (behavior matches expectation), **transparent** (doesn't mask what it does).
+Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn't:
+
+| Feature | Dagster | Prefect | Airflow | Barca |
+|---------|---------|---------|---------|-------|
+| **Web UI / dashboard** | Yes (dagster dev) | Yes (Prefect Cloud / server) | Yes (webserver) | No |
+| **Run history / lineage** | Full event log, asset catalog | Flow run tracking, task states | DagRun/TaskInstance records | Basic: rows in SQLite, no UI |
+| **Retry on failure** | Built-in per-op retries | Built-in per-task retries | Built-in retries + SLAs | No — fails and persists partial results |
+| **Alerting / notifications** | Sensors + hooks | Automations, Slack/email | Email, Slack, PagerDuty | No |
+| **Scheduling** | Built-in cron + sensors | Built-in via deployments | Core feature (scheduler daemon) | Parsed but not enforced yet |
+| **Remote execution** | Kubernetes, Docker, ECS | Kubernetes, Docker, Process | Celery, Kubernetes, many executors | Local only |
+| **I/O management** | Pluggable I/O managers (S3, GCS, etc.) | Result storage backends | XCom + external storage hooks | Local filesystem only (.barca/artifacts/) |
+| **Multi-user / team** | Workspace permissions, code locations | Workspace RBAC, service accounts | DAG-level permissions, RBAC | Single-user only |
+| **Backfills** | Built-in partitioned backfills | Via deployments | `dags backfill` (v2) | Not implemented |
+| **Dynamic pipelines** | Dynamic partitions, graph DSL | Dynamic tasks via `.map()` | Dynamic task mapping | Static partitions only |
+| **Data quality / expectations** | Asset checks, freshness policies | Not built-in (use Great Expectations) | Not built-in | Not built-in |
+| **Plugin ecosystem** | Large (200+ integrations) | Growing (collections) | Massive (providers) | None |
+
+Barca is fast and minimal **because** it doesn't do most of this. It's a single-machine, single-user, local-execution engine. If you need a web UI, team permissions, remote execution, or a plugin ecosystem, you need a different tool.
+
+The bet is that for many workloads — especially agent-driven pipelines, local data processing, and development iteration — the overhead of those features is not worth the cost. You can add observability, retry logic, and scheduling around barca rather than having them baked in.
+
+### Where the other frameworks genuinely shine
+
+**Dagster** is the most thoughtful about data assets as first-class citizens. Its I/O manager abstraction means you can swap storage backends without changing business logic. Asset lineage and the software-defined asset model are genuinely good ideas that barca's `@asset` decorator is inspired by. If you need a production data platform with a team, Dagster is the right choice.
+
+**Prefect** is the most Pythonic. The `@task` / `@flow` model feels natural. `ConcurrentTaskRunner` and `.map()` for dynamic parallelism are elegant. If you want an orchestrator that feels like writing normal Python with superpowers, Prefect is excellent.
+
+**Airflow** has the largest ecosystem and the most battle-tested production deployment story. If you need 50 different provider integrations, a scheduler that runs 24/7, and an operations team that already knows Airflow, nothing else compares. The TaskFlow API in Airflow 2+ is a genuine improvement over the old operator model.
+
+### Barca's honest positioning
+
+Barca is not a replacement for any of these in production data platform scenarios. It's for a different use case: **you want to write Python functions, have them run fast, cache correctly, and get out of the way.** No server, no config, no framework to learn. The cost is that you're on your own for everything beyond execution and caching.
+
+---
+
+## Summary Scorecard
 
 | Criteria | Barca | Dagster | Prefect | Airflow |
 |----------|-------|---------|---------|---------|
-| **Minimal** | Best — just decorators | Good — similar decorators but needs `materialize()` | OK — needs `@flow` wrapper | Worst — needs `@dag(...)` with required config |
-| **Understandable** | Best — DAG visible from decorators alone | Good — `AssetIn` is explicit but verbose | OK — must read flow function to see DAG | OK — same as Prefect but more config noise |
-| **Transparent** | Best — it's a binary + plain files | Mixed — I/O managers and event logs are hidden | Mixed — state machine and API server hidden | Worst — scheduler, executor, XCom limits all hidden |
+| **Minimal code** | Best | Good | OK | Verbose |
+| **Dependency clarity** | Best (decorators only) | Good (AssetIn is explicit) | OK (read flow function) | OK (read dag function) |
+| **Behavior transparency** | Best (binary + files) | Mixed (I/O managers hidden) | Mixed (state machine hidden) | Low (scheduler/executor hidden) |
 | **Runs standalone** | Yes | No | No | No |
-| **Zero config** | Yes | Mostly (needs `materialize()`) | No (needs server or Cloud) | No (needs DB + scheduler) |
+| **Feature richness** | Low | High | High | Highest |
+| **Production readiness** | Early (v0.1.x) | Mature | Mature | Very mature |
+| **Team / multi-user** | No | Yes | Yes | Yes |
+| **Remote execution** | No | Yes | Yes | Yes |
 
 ---
 
@@ -256,4 +294,6 @@ Criteria: **minimal** (less code), **understandable** (behavior matches expectat
 | Deep diamond (18) | **66ms** | 453ms (7x) | 3.6s (54x) | 15.6s (237x) |
 | Fan-out 500×50ms | **2.4s** | 29.7s (12x) | 30.7s (13x) | 417s (171x) |
 
-The overhead gap is not marginal — it's structural. Barca's Rust binary + worker subprocess model avoids the framework initialization, state tracking, and I/O management that other frameworks pay for on every run.
+The speed gap is real but context matters. In a 10-minute ETL pipeline, 400ms of framework overhead (Dagster) is noise. The gap matters most for: fast iteration loops, agent-driven pipelines that run many small DAGs, and workloads where framework overhead dominates actual compute.
+
+Airflow's numbers are worse than they would be in production (where Celery/Kubernetes executors parallelize across machines). The benchmark uses LocalExecutor + SQLite which serializes task completion. A fair production comparison would need Docker + PostgreSQL + Celery.
