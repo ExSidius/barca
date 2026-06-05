@@ -47,6 +47,32 @@ def load_module(source_file):
     return mod
 
 
+def _run_with_timeout(fn, kwargs, timeout_seconds):
+    """Run a function with a timeout. Raises TimeoutError if exceeded."""
+    import threading
+
+    result = None
+    exception = None
+
+    def target():
+        nonlocal result, exception
+        try:
+            result = fn(**kwargs) if kwargs else fn()
+        except Exception as e:
+            exception = e
+
+    thread = threading.Thread(target=target)
+    thread.daemon = True
+    thread.start()
+    thread.join(timeout=timeout_seconds)
+
+    if thread.is_alive():
+        raise TimeoutError(f"Function '{fn.__name__}' exceeded timeout of {timeout_seconds}s")
+    if exception is not None:
+        raise exception
+    return result
+
+
 def _resolve_input(raw_value):
     """Resolve a provided input: artifact ref → deserialized value, else raw.
 
@@ -99,8 +125,12 @@ def run_batch(batch):
 
         # User's print() goes to stdout (visible in terminal).
         # Protocol messages go to stderr (Rust reads this).
+        timeout = step.get("timeout_seconds", 0)
         t0 = time.perf_counter()
-        result = fn(**kwargs) if kwargs else fn()
+        if timeout and timeout > 0:
+            result = _run_with_timeout(fn, kwargs, timeout)
+        else:
+            result = fn(**kwargs) if kwargs else fn()
         elapsed = time.perf_counter() - t0
 
         # Sensors return (updated: bool, data) tuples — unpack for downstream.

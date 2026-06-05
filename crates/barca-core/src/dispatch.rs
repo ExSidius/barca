@@ -15,13 +15,19 @@ pub struct OutputRef {
     pub size_bytes: u64,
 }
 
-/// Dispatch all phases, collecting outputs. Returns node_id → artifact reference.
+/// Result of dispatching all phases — includes partial outputs if a phase failed.
+pub struct DispatchResult {
+    pub outputs: HashMap<String, OutputRef>,
+    pub error: Option<String>,
+}
+
+/// Dispatch all phases, collecting outputs. Returns partial results even on failure.
 pub fn dispatch_plan(
     plan: &ExecutionPlan,
     python: &PathBuf,
     _db_path: &str,
     pool_size: usize,
-) -> HashMap<String, OutputRef> {
+) -> DispatchResult {
     let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
 
     for phase in &plan.phases {
@@ -29,14 +35,24 @@ pub fn dispatch_plan(
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
 
         let provided = build_provided_inputs(phase_ref, &all_outputs);
-        let phase_outputs = execute_phase(phase_ref, &provided, python);
+        let result = execute_phase(phase_ref, &provided, python);
 
-        for (node_id, value) in phase_outputs {
+        for (node_id, value) in result.outputs {
             all_outputs.insert(node_id, value);
+        }
+
+        if let Some(error) = result.error {
+            return DispatchResult {
+                outputs: all_outputs,
+                error: Some(error),
+            };
         }
     }
 
-    all_outputs
+    DispatchResult {
+        outputs: all_outputs,
+        error: None,
+    }
 }
 
 /// Expand steps with pending_partitions using materialized source outputs.
@@ -138,6 +154,7 @@ pub fn expand_pending_partitions(
                     inputs: step.inputs.clone(),
                     pending_partitions: HashMap::new(),
                     serializer: step.serializer.clone(),
+                    timeout_seconds: step.timeout_seconds,
                 });
             }
         }
@@ -254,11 +271,17 @@ pub fn build_provided_inputs(
 }
 
 /// Execute a single phase: spawn N workers in parallel, collect results from stderr.
+/// Result of executing a phase — may contain partial outputs if a worker failed.
+pub struct PhaseResult {
+    pub outputs: HashMap<String, OutputRef>,
+    pub error: Option<String>,
+}
+
 pub fn execute_phase(
     phase: &Phase,
     provided_inputs: &HashMap<String, ProvidedInput>,
     python: &PathBuf,
-) -> HashMap<String, OutputRef> {
+) -> PhaseResult {
     let mut children: Vec<(std::process::Child, PathBuf)> = Vec::new();
 
     for stream in &phase.streams {
@@ -298,24 +321,26 @@ pub fn execute_phase(
     }
 
     let mut phase_outputs: HashMap<String, OutputRef> = HashMap::new();
+    let mut first_error: Option<String> = None;
 
     for (handle, mut child, batch_path) in handles {
         let (outputs, error_lines) = handle.join().expect("reader thread panicked");
+        // Always collect outputs — even from failed workers, partial results are valuable.
         for (node_id, output) in outputs {
             phase_outputs.insert(node_id, output);
         }
 
         let status = child.wait().expect("failed to wait on worker");
-        if !status.success() {
-            let cleaned = filter_traceback(&error_lines);
-            eprintln!("{cleaned}");
-            std::fs::remove_file(&batch_path).ok();
-            std::process::exit(1);
+        if !status.success() && first_error.is_none() {
+            first_error = Some(filter_traceback(&error_lines));
         }
         std::fs::remove_file(&batch_path).ok();
     }
 
-    phase_outputs
+    PhaseResult {
+        outputs: phase_outputs,
+        error: first_error,
+    }
 }
 
 const PROTOCOL_PREFIX_V2: &str = "BARCA:2:";
@@ -414,6 +439,9 @@ pub fn serialize_batch(
             }
             if let Some(ref ser) = s.serializer {
                 step["serializer"] = serde_json::json!(ser);
+            }
+            if s.timeout_seconds > 0 {
+                step["timeout_seconds"] = serde_json::json!(s.timeout_seconds);
             }
             step
         })
@@ -646,6 +674,7 @@ Traceback (most recent call last):\n\
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    timeout_seconds: 300,
                 }],
             }],
         };
@@ -674,6 +703,7 @@ Traceback (most recent call last):\n\
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    timeout_seconds: 300,
                 }],
             }],
         };
@@ -704,6 +734,7 @@ Traceback (most recent call last):\n\
                     inputs: HashMap::new(),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    timeout_seconds: 300,
                 }],
             }],
         };
@@ -734,6 +765,7 @@ Traceback (most recent call last):\n\
                         "get_regions".to_string(),
                     )]),
                     serializer: None,
+                    timeout_seconds: 300,
                 }],
             }],
         };
@@ -771,6 +803,7 @@ Traceback (most recent call last):\n\
                 inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                 pending_partitions: HashMap::new(),
                 serializer: None,
+                timeout_seconds: 300,
             }],
         };
 
@@ -871,6 +904,7 @@ Traceback (most recent call last):\n\
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    timeout_seconds: 300,
                 }],
             }],
         };
@@ -906,6 +940,7 @@ Traceback (most recent call last):\n\
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    timeout_seconds: 300,
                 }],
             }],
         };
@@ -938,6 +973,7 @@ Traceback (most recent call last):\n\
                 inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                 pending_partitions: HashMap::new(),
                 serializer: None,
+                timeout_seconds: 300,
             }],
         };
         let mut provided: HashMap<String, ProvidedInput> = HashMap::new();
@@ -972,6 +1008,7 @@ Traceback (most recent call last):\n\
                 inputs: HashMap::new(),
                 pending_partitions: HashMap::new(),
                 serializer: None,
+                timeout_seconds: 300,
             }],
         };
 
@@ -1003,6 +1040,7 @@ Traceback (most recent call last):\n\
                         "get_regions".to_string(),
                     )]),
                     serializer: None,
+                    timeout_seconds: 300,
                 }],
             }],
         };

@@ -1,4 +1,4 @@
-"""Run Airflow DAG: trivial."""
+"""Run Airflow DAG with LocalExecutor for genuine parallel execution."""
 
 import json
 import os
@@ -22,13 +22,20 @@ def run():
         "AIRFLOW__CORE__DAGS_FOLDER": dd,
         "AIRFLOW__CORE__LOAD_EXAMPLES": "False",
         "AIRFLOW__CORE__LOAD_DEFAULT_CONNECTIONS": "False",
+        "AIRFLOW__CORE__EXECUTOR": "LocalExecutor",
         "AIRFLOW__DATABASE__SQL_ALCHEMY_CONN": f"sqlite:///{ah}/airflow.db",
         "AIRFLOW__LOGGING__LOGGING_LEVEL": "ERROR",
     }
     subprocess.run([AIRFLOW_BIN, "db", "migrate"], env=env, capture_output=True)
     t0 = time.perf_counter()
     result = subprocess.run(
-        [AIRFLOW_BIN, "dags", "test", "trivial", "2024-01-01"],
+        [
+            AIRFLOW_BIN,
+            "dags",
+            "test",
+            "trivial",
+            "2024-01-01",
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -41,6 +48,7 @@ def run():
                 "elapsed_seconds": round(elapsed, 6),
                 "steps_executed": 1,
                 "success": result.returncode == 0,
+                "executor": "LocalExecutor",
             },
             indent=2,
         )
