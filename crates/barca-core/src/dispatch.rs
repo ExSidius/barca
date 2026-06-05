@@ -377,8 +377,12 @@ pub fn execute_phase(
         }
     }
 
-    let first_error = if had_failure && !error_lines.is_empty() {
-        Some(filter_traceback(&error_lines))
+    let first_error = if had_failure {
+        if error_lines.is_empty() {
+            Some("Worker exited with non-zero status (no stderr output)".to_string())
+        } else {
+            Some(filter_traceback(&error_lines))
+        }
     } else {
         None
     };

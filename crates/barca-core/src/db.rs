@@ -139,7 +139,7 @@ pub fn persist_outputs_sync(
                 .map(|e| e.to_string())
                 .unwrap_or_default();
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''))",
                 [
                     node_id.clone(),
                     run_hash,

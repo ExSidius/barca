@@ -112,13 +112,7 @@ def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
 
     Returns the deserialized value of the target asset directly.
     """
-    args: list[str] = ["get"]
-    if target_or_file.endswith(".py"):
-        # All positional args are files, no target.
-        args.extend([target_or_file, *extra_files])
-    else:
-        # First arg is the target name, rest are files.
-        args.extend([target_or_file, *extra_files])
+    args: list[str] = ["get", target_or_file, *extra_files]
     if no_cache:
         args.append("--no-cache")
     result = _exec(args)
