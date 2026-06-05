@@ -457,7 +457,7 @@ pub fn get(
                 .iter()
                 .filter(|(k, _)| k.starts_with(&prefix))
                 .collect();
-            matches.sort_by_key(|(k, _)| k.clone());
+            matches.sort_by_key(|(k, _)| (*k).clone());
             matches.first().map(|(_, v)| (*v).clone())
         })
     } else {
@@ -474,7 +474,7 @@ pub fn get(
                 .iter()
                 .filter(|(k, _)| k.starts_with(&last_planned_id))
                 .collect();
-            matches.sort_by_key(|(k, _)| k.clone());
+            matches.sort_by_key(|(k, _)| (*k).clone());
             matches.first().map(|(_, v)| (*v).clone())
         })
     };

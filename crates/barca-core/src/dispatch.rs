@@ -1,6 +1,6 @@
 //! Phase execution engine — worker spawning, protocol parsing, partition expansion.
 
-use crate::planner::{ExecutionPlan, Phase, StreamStep, WorkerStream, expand_partition_combos};
+use crate::planner::{Phase, StreamStep, WorkerStream, expand_partition_combos};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -15,113 +15,6 @@ pub struct OutputRef {
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<f64>,
-}
-
-/// Result of dispatching all phases — includes partial outputs if a phase failed.
-pub struct DispatchResult {
-    pub outputs: HashMap<String, OutputRef>,
-    pub error: Option<String>,
-}
-
-/// Dispatch all phases, collecting outputs. Returns partial results even on failure.
-pub fn dispatch_plan(
-    plan: &ExecutionPlan,
-    python: &PathBuf,
-    db_path: &str,
-    pool_size: usize,
-) -> DispatchResult {
-    let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
-
-    // Gather all step IDs for progress bar.
-    let total_steps = plan.total_steps;
-    let mut completed_steps: usize = 0;
-
-    // Look up historical average times for ETA estimation.
-    let all_node_ids: Vec<String> = plan
-        .phases
-        .iter()
-        .flat_map(|p| &p.streams)
-        .flat_map(|s| &s.steps)
-        .map(|st| st.step_id.display())
-        .collect();
-    let avg_times = crate::db::get_avg_elapsed_sync(db_path, &all_node_ids);
-
-    // Compute initial ETA from averages.
-    let total_estimated: f64 = all_node_ids
-        .iter()
-        .filter_map(|nid| avg_times.get(nid))
-        .sum();
-
-    if total_steps > 0 {
-        let eta_str = if total_estimated > 0.0 {
-            format!("~{:.0}s remaining", total_estimated)
-        } else {
-            "estimating...".to_string()
-        };
-        eprint!(
-            "\r[barca] {}/{} steps | {}",
-            completed_steps, total_steps, eta_str
-        );
-    }
-
-    let mut elapsed_so_far: f64 = 0.0;
-
-    for phase in &plan.phases {
-        let expanded_phase = expand_pending_partitions(phase, &all_outputs, pool_size);
-        let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
-
-        let provided = build_provided_inputs(phase_ref, &all_outputs);
-        let result = execute_phase(phase_ref, &provided, python, None);
-
-        for (node_id, value) in result.outputs {
-            if let Some(elapsed) = value.elapsed_seconds {
-                elapsed_so_far += elapsed;
-            }
-            all_outputs.insert(node_id, value);
-            completed_steps += 1;
-
-            // Update progress bar.
-            if total_steps > 0 {
-                let remaining_estimated = if total_estimated > 0.0 {
-                    (total_estimated - elapsed_so_far).max(0.0)
-                } else if completed_steps > 0 {
-                    let avg_per_step = elapsed_so_far / completed_steps as f64;
-                    avg_per_step * (total_steps - completed_steps) as f64
-                } else {
-                    0.0
-                };
-                eprint!(
-                    "\r[barca] {}/{} steps | ~{:.0}s remaining   ",
-                    completed_steps, total_steps, remaining_estimated
-                );
-            }
-        }
-
-        if let Some(error) = result.error {
-            if total_steps > 0 {
-                eprintln!(
-                    "\r[barca] {}/{} steps | failed              ",
-                    completed_steps, total_steps
-                );
-            }
-            return DispatchResult {
-                outputs: all_outputs,
-                error: Some(error),
-            };
-        }
-    }
-
-    if total_steps > 0 {
-        eprintln!(
-            "\r[barca] {}/{} steps | done in {:.1}s              ",
-            completed_steps, total_steps, elapsed_so_far
-        );
-    }
-
-    DispatchResult {
-        outputs: all_outputs,
-        error: None,
-    }
 }
 
 /// Expand steps with pending_partitions using materialized source outputs.
