@@ -1,0 +1,11 @@
+{
+  "measured_at": "2026-06-05T16:20:55Z",
+  "version": "0.1.5",
+  "platform": "Darwin arm64",
+  "benchmarks": {
+      "trivial": {"wall_time_s": 0.021637833, "peak_rss_bytes": 22200320, "cpu_user_s": 0.02, "cpu_sys_s": 0.02, "artifact_bytes": 4096, "db_bytes": 4096},
+      "chain_100": {"wall_time_s": 0.075273125, "peak_rss_bytes": 22577152, "cpu_user_s": 0.08, "cpu_sys_s": 0.08, "artifact_bytes": 409600, "db_bytes": 4096},
+      "deep_diamond": {"wall_time_s": 0.060634584, "peak_rss_bytes": 25608192, "cpu_user_s": 0.06, "cpu_sys_s": 0.06, "artifact_bytes": 831488, "db_bytes": 4096},
+      "fan_out_500_50ms": {"wall_time_s": 2.395255958, "peak_rss_bytes": 23429120, "cpu_user_s": 2.41, "cpu_sys_s": 2.41, "artifact_bytes": 2048000, "db_bytes": 540672}
+  }
+}
