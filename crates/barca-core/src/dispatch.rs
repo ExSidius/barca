@@ -663,6 +663,7 @@ fn is_exception_line(trimmed: &str, raw: &str) -> bool {
 mod tests {
     use super::*;
     use crate::planner::PhaseReason;
+    use std::sync::Arc;
 
     #[test]
     fn parse_worker_output_v2_separates_protocol_from_errors() {
@@ -749,8 +750,8 @@ Traceback (most recent call last):\n\
                 steps: vec![StreamStep {
                     step_id: StepId::unpartitioned("f:b"),
                     kind: NodeKind::Asset,
-                    function_name: "b".to_string(),
-                    source_file: "f".to_string(),
+                    function_name: Arc::from("b"),
+                    source_file: Arc::from("f"),
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
@@ -778,8 +779,8 @@ Traceback (most recent call last):\n\
                 steps: vec![StreamStep {
                     step_id: StepId::new("f:b", pk),
                     kind: NodeKind::Asset,
-                    function_name: "b".to_string(),
-                    source_file: "f".to_string(),
+                    function_name: Arc::from("b"),
+                    source_file: Arc::from("f"),
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
@@ -809,8 +810,8 @@ Traceback (most recent call last):\n\
                 steps: vec![StreamStep {
                     step_id: StepId::unpartitioned("f:a"),
                     kind: NodeKind::Asset,
-                    function_name: "a".to_string(),
-                    source_file: "f".to_string(),
+                    function_name: Arc::from("a"),
+                    source_file: Arc::from("f"),
                     inputs: HashMap::new(),
                     pending_partitions: HashMap::new(),
                     serializer: None,
@@ -837,8 +838,8 @@ Traceback (most recent call last):\n\
                 steps: vec![StreamStep {
                     step_id: StepId::unpartitioned("f:transform"),
                     kind: NodeKind::Asset,
-                    function_name: "transform".to_string(),
-                    source_file: "f".to_string(),
+                    function_name: Arc::from("transform"),
+                    source_file: Arc::from("f"),
                     inputs: HashMap::new(),
                     pending_partitions: HashMap::from([(
                         "region".to_string(),
@@ -879,8 +880,8 @@ Traceback (most recent call last):\n\
             steps: vec![StreamStep {
                 step_id: StepId::new("f:b", pk),
                 kind: NodeKind::Asset,
-                function_name: "b".to_string(),
-                source_file: "f".to_string(),
+                function_name: Arc::from("b"),
+                source_file: Arc::from("f"),
                 inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                 pending_partitions: HashMap::new(),
                 serializer: None,
@@ -981,8 +982,8 @@ Traceback (most recent call last):\n\
                 steps: vec![StreamStep {
                     step_id: StepId::unpartitioned("f:b"),
                     kind: NodeKind::Asset,
-                    function_name: "b".to_string(),
-                    source_file: "f".to_string(),
+                    function_name: Arc::from("b"),
+                    source_file: Arc::from("f"),
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
@@ -1018,8 +1019,8 @@ Traceback (most recent call last):\n\
                 steps: vec![StreamStep {
                     step_id: StepId::new("f:b", pk),
                     kind: NodeKind::Asset,
-                    function_name: "b".to_string(),
-                    source_file: "f".to_string(),
+                    function_name: Arc::from("b"),
+                    source_file: Arc::from("f"),
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
@@ -1052,8 +1053,8 @@ Traceback (most recent call last):\n\
             steps: vec![StreamStep {
                 step_id: StepId::unpartitioned("f:b"),
                 kind: NodeKind::Asset,
-                function_name: "b".to_string(),
-                source_file: "f".to_string(),
+                function_name: Arc::from("b"),
+                source_file: Arc::from("f"),
                 inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                 pending_partitions: HashMap::new(),
                 serializer: None,
@@ -1088,8 +1089,8 @@ Traceback (most recent call last):\n\
             steps: vec![StreamStep {
                 step_id: StepId::unpartitioned("f:a"),
                 kind: NodeKind::Asset,
-                function_name: "a".to_string(),
-                source_file: "f".to_string(),
+                function_name: Arc::from("a"),
+                source_file: Arc::from("f"),
                 inputs: HashMap::new(),
                 pending_partitions: HashMap::new(),
                 serializer: None,
@@ -1117,8 +1118,8 @@ Traceback (most recent call last):\n\
                 steps: vec![StreamStep {
                     step_id: StepId::unpartitioned("f:transform"),
                     kind: NodeKind::Asset,
-                    function_name: "transform".to_string(),
-                    source_file: "f".to_string(),
+                    function_name: Arc::from("transform"),
+                    source_file: Arc::from("f"),
                     inputs: HashMap::new(),
                     pending_partitions: HashMap::from([(
                         "region".to_string(),

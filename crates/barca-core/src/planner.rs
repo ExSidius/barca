@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use crate::dag::Dag;
 use crate::model::{PartitionKey, StepId};
@@ -58,14 +59,14 @@ pub struct StreamStep {
     pub step_id: StepId,
     /// The kind of node (asset, sensor, effect).
     pub kind: crate::model::NodeKind,
-    pub function_name: String,
-    pub source_file: String,
+    pub function_name: Arc<str>,
+    pub source_file: Arc<str>,
     pub inputs: HashMap<String, String>,
     /// Pending partition resolution: dimension → source_node_id.
     /// The dispatch loop reads the source output and expands into N steps.
     pub pending_partitions: HashMap<String, String>,
     /// Explicit artifact serializer from `@asset(serializer="parquet")`.
-    pub serializer: Option<String>,
+    pub serializer: Option<Arc<str>>,
     /// Timeout in seconds for this step's execution.
     pub timeout_seconds: u32,
 }
@@ -339,11 +340,13 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
         let static_partitions = collect_static_partitions(&node.extracted.partitions);
         // Check for derived partitions — mark for resolution at dispatch time.
         let derived_partitions = collect_derived_partitions(&node.extracted.partitions);
-        let serializer = node
+        let serializer: Option<Arc<str>> = node
             .extracted
             .artifact_serializer
-            .map(|s| format!("{s:?}").to_lowercase());
+            .map(|s| Arc::from(format!("{s:?}").to_lowercase().as_str()));
         let timeout_seconds = node.extracted.timeout_seconds;
+        let function_name: Arc<str> = Arc::from(node.function_name());
+        let source_file: Arc<str> = Arc::from(node.source_file());
 
         if !static_partitions.is_empty() {
             let combos = expand_partition_combos(&static_partitions);
@@ -352,8 +355,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 steps.push(StreamStep {
                     step_id: StepId::new(node_id.clone(), pk),
                     kind: node.kind(),
-                    function_name: node.function_name().to_string(),
-                    source_file: node.source_file().to_string(),
+                    function_name: Arc::clone(&function_name),
+                    source_file: Arc::clone(&source_file),
                     inputs: inputs.clone(),
                     pending_partitions: HashMap::new(),
                     serializer: serializer.clone(),
@@ -364,8 +367,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             steps.push(StreamStep {
                 step_id: StepId::unpartitioned(node_id.clone()),
                 kind: node.kind(),
-                function_name: node.function_name().to_string(),
-                source_file: node.source_file().to_string(),
+                function_name,
+                source_file,
                 inputs,
                 pending_partitions: derived_partitions,
                 serializer: serializer.clone(),
@@ -375,8 +378,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             steps.push(StreamStep {
                 step_id: StepId::unpartitioned(node_id.clone()),
                 kind: node.kind(),
-                function_name: node.function_name().to_string(),
-                source_file: node.source_file().to_string(),
+                function_name,
+                source_file,
                 inputs,
                 pending_partitions: HashMap::new(),
                 serializer,

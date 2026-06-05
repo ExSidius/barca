@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 // ─── Node kinds ──────────────────────────────────────────────────────────────
 
@@ -177,20 +178,20 @@ impl fmt::Display for PartitionKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepId {
     /// The base node identity (continuity key), e.g. `"test.py:fetch"`.
-    pub base: String,
+    pub base: Arc<str>,
     /// The partition coordinate for this step. Empty for non-partitioned steps.
     pub partition: PartitionKey,
 }
 
 impl StepId {
-    pub fn new(base: impl Into<String>, partition: PartitionKey) -> Self {
+    pub fn new(base: impl Into<Arc<str>>, partition: PartitionKey) -> Self {
         Self {
             base: base.into(),
             partition,
         }
     }
 
-    pub fn unpartitioned(base: impl Into<String>) -> Self {
+    pub fn unpartitioned(base: impl Into<Arc<str>>) -> Self {
         Self {
             base: base.into(),
             partition: PartitionKey::empty(),
@@ -210,7 +211,7 @@ impl StepId {
     pub fn parse(id: &str) -> Self {
         let (base, partition) = PartitionKey::parse_from_id(id);
         Self {
-            base: base.to_string(),
+            base: Arc::from(base),
             partition,
         }
     }
