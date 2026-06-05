@@ -47,7 +47,7 @@ class TestUserErrors:
             """,
         )
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         msg = str(exc_info.value)
         assert "bad_syntax.py" in msg
 
@@ -65,7 +65,7 @@ class TestUserErrors:
             """,
         )
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         msg = str(exc_info.value)
         assert "ZeroDivisionError" in msg
         assert "divzero.py" in msg
@@ -89,7 +89,7 @@ class TestUserErrors:
             """,
         )
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         msg = str(exc_info.value)
         assert "KeyError" in msg
         assert "missing_key" in msg
@@ -110,7 +110,7 @@ class TestUserErrors:
             """,
         )
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         msg = str(exc_info.value)
         assert "nonexistent_module_xyz_12345" in msg
         assert "_worker.py" not in msg
@@ -118,7 +118,7 @@ class TestUserErrors:
     def test_file_not_found(self):
         """Missing file shows the file path."""
         with pytest.raises(BarcaError) as exc_info:
-            barca.run("/tmp/definitely_does_not_exist_12345.py")
+            barca.get("/tmp/definitely_does_not_exist_12345.py")
         msg = str(exc_info.value)
         assert "definitely_does_not_exist_12345.py" in msg
 
@@ -159,7 +159,7 @@ class TestUserErrors:
             """,
         )
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         msg = str(exc_info.value)
         assert "TypeError" in msg
         assert "takes_one" in msg
@@ -179,5 +179,5 @@ class TestUserErrors:
             """,
         )
         # Should not raise
-        result = barca.run(f)
-        assert result["steps_executed"] == 1
+        result = barca.get(f)
+        assert result is None

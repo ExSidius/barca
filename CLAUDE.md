@@ -27,7 +27,7 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
 
 ### How it works
 
-1. **Rust binary** (`barca run <file.py>`):
+1. **Rust binary** (`barca get <file.py>`):
    - Parses Python using ruff's AST (no import, pure static analysis)
    - Builds a petgraph DAG from `@asset`/`@sensor`/`@effect` decorators
    - Generates a tiered execution plan (JSON)
@@ -60,7 +60,7 @@ cargo build --release
 maturin develop --release     # installs into .venv
 
 # Run
-.venv/bin/barca run <file.py>
+.venv/bin/barca get <file.py>
 .venv/bin/barca plan <file.py>   # emit plan JSON only
 
 # Tests

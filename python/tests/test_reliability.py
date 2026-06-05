@@ -49,7 +49,7 @@ class TestPartialResults:
         )
         # First run should fail
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         assert "ValueError" in str(exc_info.value)
 
         # step_a's result should be cached — second run of just step_a should be instant
@@ -81,7 +81,7 @@ class TestPartialResults:
         """,
         )
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         msg = str(exc_info.value)
         assert "ZeroDivisionError" in msg
         assert "explode" in msg
@@ -107,7 +107,7 @@ class TestTimeout:
         """,
         )
         with pytest.raises(BarcaError) as exc_info:
-            barca.run(f)
+            barca.get(f)
         msg = str(exc_info.value)
         assert "TimeoutError" in msg or "timeout" in msg.lower()
 
@@ -124,8 +124,8 @@ class TestTimeout:
                 return {"done": True}
         """,
         )
-        result = barca.run(f)
-        assert result["final_output"] == {"done": True}
+        result = barca.get(f)
+        assert result == {"done": True}
 
 
 # ─── Fan-in cache correctness (#40) ──────────────────────────────────────────

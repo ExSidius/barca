@@ -31,14 +31,12 @@ uv add barca
 **Run:**
 ```bash
 barca --help
-barca run --help
 barca get --help
 ```
 
 **What to look for:**
-- Top-level help shows `run`, `get`, `plan`, `version` subcommands.
-- `run --help` shows `--output` flag with `json`, `value`, `pretty` modes.
-- `get --help` shows `target` positional, `--output` flag, and `files` positional.
+- Top-level help shows `get`, `plan`, `version` subcommands.
+- `get --help` shows optional `target` positional, `--output` flag, `--no-cache` flag, and `files` positional.
 
 ### 3. Trivial pipeline
 
@@ -56,9 +54,9 @@ def total(data):
     return {"total": data["price"] * data["quantity"]}
 EOF
 
-barca run pipeline.py
-barca run pipeline.py --output value
-barca run pipeline.py --output pretty
+barca get pipeline.py
+barca get pipeline.py --output value
+barca get pipeline.py --output pretty
 ```
 
 **Expected output:**
@@ -92,11 +90,11 @@ Result:
 cat > test_api.py << 'EOF'
 import barca
 
-result = barca.run("pipeline.py")
-print("run result:", result)
+value = barca.get("pipeline.py")
+print("get all:", value)
 
 value = barca.get("total", "pipeline.py")
-print("get value:", value)
+print("get target:", value)
 
 plan = barca.plan("pipeline.py")
 print("plan:", plan)
@@ -106,8 +104,8 @@ python test_api.py
 ```
 
 **What to look for:**
-- `barca.run()` returns a dict with `elapsed_seconds`, `steps_executed`, `phases`, `final_output`.
-- `barca.get()` returns the deserialized value directly (e.g. `{"total": 500}`).
+- `barca.get("pipeline.py")` returns the deserialized value of the last asset (e.g. `{"total": 500}`).
+- `barca.get("total", "pipeline.py")` returns a specific asset's value directly.
 - `barca.plan()` returns a dict with `total_steps` and `phases`.
 
 ### 5. Error messages
@@ -115,7 +113,7 @@ python test_api.py
 **Run:**
 ```bash
 # File not found
-barca run nonexistent.py
+barca get nonexistent.py
 
 # Syntax error
 cat > bad.py << 'EOF'
@@ -125,7 +123,7 @@ from barca import asset
 def broken():
     return {
 EOF
-barca run bad.py
+barca get bad.py
 
 # Runtime error
 cat > divzero.py << 'EOF'
@@ -135,7 +133,7 @@ from barca import asset
 def oops():
     return 1 / 0
 EOF
-barca run divzero.py
+barca get divzero.py
 
 # Asset not found
 barca get nonexistent pipeline.py
@@ -164,7 +162,7 @@ def transform(data):
     return {"processed": data["region"], "doubled": data["count"] * 2}
 EOF
 
-barca run partitioned.py --output pretty
+barca get partitioned.py --output pretty
 barca get fetch partitioned.py --output value
 ```
 
@@ -217,7 +215,7 @@ python -c "import barca; print(repr(barca.get('a_set', 'types.py')))"
 
 ## Known Rough Edges
 
-- `barca run` with a syntax error in the Python file may show a raw parse error from ruff rather than a friendly message.
+- `barca get` with a syntax error in the Python file may show a raw parse error from ruff rather than a friendly message.
 - Partition output order depends on sort order of partition keys; multi-dimensional partitions use alphabetical key order.
 - DataFrame round-tripping requires `barca[parquet]` extra (`uv add barca[parquet]`).
 - `barca get` on a partitioned asset returns only one partition value (the first), not all.

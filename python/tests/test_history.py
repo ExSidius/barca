@@ -1,7 +1,7 @@
 """Run history and stats tests.
 
 Tests that:
-- run() creates a run record visible in history()
+- get() creates a run record visible in history()
 - history() returns recent runs with correct fields
 - Multiple runs appear in history
 - stats() returns timing data after runs
@@ -37,7 +37,7 @@ def write_module(tmp_path, filename, code):
 
 
 class TestHistory:
-    def test_run_creates_run_record(self, tmp_path):
+    def test_get_creates_run_record(self, tmp_path):
         f = write_module(
             tmp_path,
             "trivial.py",
@@ -49,14 +49,14 @@ class TestHistory:
                 return {"msg": "hello"}
         """,
         )
-        result = barca.run(f)
+        result = barca.api._exec(["get", f])
         assert "run_id" in result
 
         runs = barca.history()
         assert len(runs) >= 1
         latest = runs[0]
         assert latest["run_id"] == result["run_id"]
-        assert latest["command"] == "run"
+        assert latest["command"] == "get"
         assert latest["status"] == "success"
 
     def test_history_returns_correct_fields(self, tmp_path):
@@ -71,7 +71,7 @@ class TestHistory:
                 return {"msg": "hello"}
         """,
         )
-        barca.run(f)
+        barca.get(f)
         runs = barca.history()
         assert len(runs) >= 1
         r = runs[0]
@@ -81,7 +81,7 @@ class TestHistory:
         assert "steps_executed" in r
         assert "elapsed_seconds" in r
 
-    def test_second_run_shows_in_history(self, tmp_path):
+    def test_second_get_shows_in_history(self, tmp_path):
         f = write_module(
             tmp_path,
             "trivial.py",
@@ -93,8 +93,8 @@ class TestHistory:
                 return {"msg": "hello"}
         """,
         )
-        r1 = barca.run(f)
-        r2 = barca.run(f)
+        r1 = barca.api._exec(["get", f])
+        r2 = barca.api._exec(["get", f])
 
         runs = barca.history()
         run_ids = [r["run_id"] for r in runs]
@@ -115,7 +115,7 @@ class TestHistory:
         """,
         )
         with pytest.raises(BarcaError):
-            barca.run(f)
+            barca.get(f)
 
         runs = barca.history()
         assert len(runs) >= 1
@@ -123,7 +123,7 @@ class TestHistory:
 
 
 class TestStats:
-    def test_stats_after_runs(self, tmp_path):
+    def test_stats_after_gets(self, tmp_path):
         f = write_module(
             tmp_path,
             "chain.py",
@@ -139,9 +139,9 @@ class TestStats:
                 return {"value": data["value"] + 10}
         """,
         )
-        # Run twice so there's stats data.
-        barca.run(f)
-        barca.run(f)
+        # Get twice so there's stats data.
+        barca.get(f)
+        barca.get(f, no_cache=True)
 
         result = barca.stats("a", f)
         assert result["node_id"].endswith(":a")

@@ -17,7 +17,7 @@ def summary(data: list[dict]) -> dict:
 ```
 
 ```bash
-barca run pipeline.py
+barca get pipeline.py
 ```
 
 ## Install

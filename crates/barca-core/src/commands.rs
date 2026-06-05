@@ -1,4 +1,4 @@
-//! Engine commands — run, get, plan. Return typed results; callers handle display.
+//! Engine commands — get, plan, history, stats. Return typed results; callers handle display.
 
 use crate::BarcaError;
 use crate::cache;
@@ -20,19 +20,11 @@ use turso::Builder;
 // ─── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunResult {
-    pub run_id: String,
-    pub elapsed_seconds: f64,
-    pub steps_executed: usize,
-    pub phases: usize,
-    pub final_output: Option<OutputRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetResult {
     pub run_id: String,
     pub elapsed_seconds: f64,
     pub steps_executed: usize,
+    pub phases: usize,
     pub final_output: Option<OutputRef>,
 }
 
@@ -80,111 +72,35 @@ fn default_pool_size() -> usize {
         .unwrap_or(4)
 }
 
-// ─── run ─────────────────────────────────────────────────────────────────────
-
-pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaError> {
-    let t0 = Instant::now();
-    let run_id = db::generate_run_id();
-
-    let dag = build_dag(file_args, python)?;
-
-    let pool_size = default_pool_size();
-    let config = ResourceConfig {
-        pool_size,
-        concurrency_groups: HashMap::new(),
-    };
-    let exec_plan = planner::plan_from_dag(&dag, &config);
-
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-
-    db::create_run_sync(
-        &db_path,
-        &run_id,
-        "run",
-        &file_args.join(" "),
-        None,
-        Some(exec_plan.total_steps),
-    );
-
-    let dispatch_result = dispatch::dispatch_plan(&exec_plan, python, &db_path, pool_size);
-    let all_outputs = dispatch_result.outputs;
-
-    // Persist whatever succeeded — even on partial failure.
-    let run_hashes = compute_run_hashes(&dag, &all_outputs);
-    db::persist_outputs_sync(&db_path, &all_outputs, &run_hashes);
-
-    let total_executed = all_outputs.len();
-    let elapsed = t0.elapsed().as_secs_f64();
-
-    // If a worker failed, record the run as failed and return the error.
-    if let Some(error) = dispatch_result.error {
-        db::finish_run_sync(&db_path, &run_id, "failed", total_executed, 0, elapsed);
-        return Err(BarcaError::WorkerFailed(error));
-    }
-
-    db::finish_run_sync(&db_path, &run_id, "success", total_executed, 0, elapsed);
-
-    let last_planned_id = exec_plan
-        .phases
-        .last()
-        .and_then(|p| p.streams.last())
-        .and_then(|s| s.steps.last())
-        .map(|s| s.step_id.display())
-        .unwrap_or_default();
-    let final_output = all_outputs.get(&last_planned_id).cloned().or_else(|| {
-        let mut matches: Vec<_> = all_outputs
-            .iter()
-            .filter(|(k, _)| k.starts_with(&last_planned_id))
-            .collect();
-        matches.sort_by_key(|(k, _)| k.clone());
-        matches.first().map(|(_, v)| (*v).clone())
-    });
-
-    Ok(RunResult {
-        run_id,
-        elapsed_seconds: elapsed,
-        steps_executed: total_executed,
-        phases: exec_plan.phases.len(),
-        final_output,
-    })
-}
-
 // ─── get ─────────────────────────────────────────────────────────────────────
 
 pub fn get(
-    target_name: &str,
+    target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
+    no_cache: bool,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
     let run_id = db::generate_run_id();
 
     let dag = build_dag(file_args, python)?;
 
-    let target_id = dag
-        .topo_order()
-        .into_iter()
-        .find(|id| {
-            id.ends_with(&format!(":{target_name}"))
-                || *id == target_name
-                || id.ends_with(target_name)
-        })
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let available: Vec<&str> = dag.topo_order();
-            BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
-        })?;
-
-    let subgraph_ids = dag.subgraph(&target_id);
-
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    // Resolve target: if Some, find it and extract subgraph; if None, use full DAG.
+    let target_id: Option<String> = match target_name {
+        Some(name) => {
+            let id = dag
+                .topo_order()
+                .into_iter()
+                .find(|id| id.ends_with(&format!(":{name}")) || *id == name || id.ends_with(name))
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    let available: Vec<&str> = dag.topo_order();
+                    BarcaError::AssetNotFound(name.to_string(), available.join(", "))
+                })?;
+            Some(id)
+        }
+        None => None,
+    };
 
     let pool_size = default_pool_size();
     let config = ResourceConfig {
@@ -192,16 +108,29 @@ pub fn get(
         concurrency_groups: HashMap::new(),
     };
     let full_plan = planner::plan_from_dag(&dag, &config);
-    let exec_plan = filter_plan_to_subgraph(full_plan, &subgraph_ids);
+    let exec_plan = if let Some(ref tid) = target_id {
+        let subgraph_ids = dag.subgraph(tid);
+        filter_plan_to_subgraph(full_plan, &subgraph_ids)
+    } else {
+        full_plan
+    };
+
+    let db_path = db::ensure_db_dir();
+    db::init_db_sync(&db_path);
 
     db::create_run_sync(
         &db_path,
         &run_id,
         "get",
         &file_args.join(" "),
-        Some(target_name),
+        target_name,
         Some(exec_plan.total_steps),
     );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     let db = rt.block_on(async { Builder::new_local(&db_path).build().await.unwrap() });
     let conn = db.connect().unwrap();
@@ -226,7 +155,14 @@ pub fn get(
                 let display_id = step.step_id.display();
                 let base_node = dag.get_node(base_id);
 
+                // Sensors always re-run.
                 if base_node.is_some_and(|n| n.kind() == crate::NodeKind::Sensor) {
+                    uncached_steps.push(step.clone());
+                    continue;
+                }
+
+                // Skip cache lookups when no_cache is set.
+                if no_cache {
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -402,21 +338,42 @@ pub fn get(
         elapsed,
     );
 
-    let final_output = all_outputs.get(&target_id).cloned().or_else(|| {
-        // For partitioned targets, sort by key for deterministic output.
-        let prefix = format!("{target_id}[");
-        let mut matches: Vec<_> = all_outputs
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .collect();
-        matches.sort_by_key(|(k, _)| k.clone());
-        matches.first().map(|(_, v)| (*v).clone())
-    });
+    // Determine final_output: use target if specified, otherwise last planned step.
+    let final_output = if let Some(ref tid) = target_id {
+        all_outputs.get(tid).cloned().or_else(|| {
+            // For partitioned targets, sort by key for deterministic output.
+            let prefix = format!("{tid}[");
+            let mut matches: Vec<_> = all_outputs
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .collect();
+            matches.sort_by_key(|(k, _)| k.clone());
+            matches.first().map(|(_, v)| (*v).clone())
+        })
+    } else {
+        // No target: return the last planned step's output.
+        let last_planned_id = exec_plan
+            .phases
+            .last()
+            .and_then(|p| p.streams.last())
+            .and_then(|s| s.steps.last())
+            .map(|s| s.step_id.display())
+            .unwrap_or_default();
+        all_outputs.get(&last_planned_id).cloned().or_else(|| {
+            let mut matches: Vec<_> = all_outputs
+                .iter()
+                .filter(|(k, _)| k.starts_with(&last_planned_id))
+                .collect();
+            matches.sort_by_key(|(k, _)| k.clone());
+            matches.first().map(|(_, v)| (*v).clone())
+        })
+    };
 
     Ok(GetResult {
         run_id,
         elapsed_seconds: elapsed,
         steps_executed,
+        phases: exec_plan.phases.len(),
         final_output,
     })
 }
@@ -488,49 +445,6 @@ pub fn stats(
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-fn compute_run_hashes(
-    dag: &Dag,
-    all_outputs: &HashMap<String, OutputRef>,
-) -> HashMap<String, String> {
-    let mut run_hashes: HashMap<String, String> = HashMap::new();
-    let topo: Vec<String> = dag
-        .topo_order()
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-    for base_id in &topo {
-        if let Some(node) = dag.get_node(base_id) {
-            let display_ids: Vec<String> = all_outputs
-                .keys()
-                .filter(|k| *k == base_id || k.starts_with(&format!("{base_id}[")))
-                .cloned()
-                .collect();
-            for display_id in display_ids {
-                let sid = crate::StepId::parse(&display_id);
-                let partition_key = if sid.partition.is_empty() {
-                    None
-                } else {
-                    Some(sid.partition.suffix())
-                };
-                let upstream_ids: Vec<String> = node
-                    .resolved_inputs
-                    .values()
-                    .chain(node.resolved_collected.values())
-                    .cloned()
-                    .collect();
-                let run_h = cache::compute_run_hash(
-                    &node.definition_hash,
-                    partition_key.as_deref(),
-                    upstream_ids.iter(),
-                    &run_hashes,
-                );
-                run_hashes.insert(display_id, run_h);
-            }
-        }
-    }
-    run_hashes
-}
 
 fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> ExecutionPlan {
     let subgraph_set: std::collections::HashSet<&str> = subgraph_ids.iter().copied().collect();

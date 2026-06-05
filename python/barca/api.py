@@ -104,29 +104,24 @@ def _read_output(output_ref: Any) -> Any:
     return output_ref
 
 
-def run(file: str, *extra_files: str) -> dict:
-    """Execute all assets in a pipeline.
+def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
+    """Get asset value(s).
 
-    Returns a dict with:
-        - elapsed_seconds: float
-        - steps_executed: int
-        - phases: int
-        - final_output: the deserialized value of the last asset
-    """
-    files = [file, *extra_files]
-    result = _exec(["run", *files])
-    if result.get("final_output") is not None:
-        result["final_output"] = _read_output(result["final_output"])
-    return result
-
-
-def get(target: str, file: str, *extra_files: str) -> Any:
-    """Get a fresh asset value (cache-aware).
+    If target_or_file ends in .py, gets all assets in the file.
+    Otherwise, treats it as a target asset name and remaining args as files.
 
     Returns the deserialized value of the target asset directly.
     """
-    files = [file, *extra_files]
-    result = _exec(["get", target, *files])
+    args: list[str] = ["get"]
+    if target_or_file.endswith(".py"):
+        # All positional args are files, no target.
+        args.extend([target_or_file, *extra_files])
+    else:
+        # First arg is the target name, rest are files.
+        args.extend([target_or_file, *extra_files])
+    if no_cache:
+        args.append("--no-cache")
+    result = _exec(args)
     output = result.get("final_output")
     if output is not None:
         return _read_output(output)

@@ -29,7 +29,7 @@ def summary(data: list[dict]) -> dict:
 ```
 
 ```
-$ barca run pipeline.py
+$ barca get pipeline.py
 {"elapsed_seconds":0.042,"steps_executed":2,"phases":2,"final_output":{"count":3,"total":6}}
 ```
 
@@ -45,7 +45,7 @@ uv add barca
 
 This gives you:
 - The `barca` CLI binary (compiled Rust)
-- Python API: `barca.run()`, `barca.get()`, `barca.plan()`
+- Python API: `barca.get()`, `barca.plan()`
 - Decorator stubs for `@asset`, `@sensor`, `@effect` (IDE autocomplete + type checking)
 
 For optional parquet (DataFrame) support:
@@ -78,7 +78,7 @@ def hello() -> dict:
 ```
 
 ```bash
-barca run assets.py
+barca get assets.py
 ```
 
 That's it. Barca parses your Python source with [ruff](https://github.com/astral-sh/ruff)'s AST parser (no import, pure static analysis), builds a dependency graph, generates a phased execution plan, spawns Python workers, and persists results to a local SQLite database -- all in under 40ms for a trivial asset.
@@ -87,7 +87,7 @@ That's it. Barca parses your Python source with [ruff](https://github.com/astral
 
 ```
                     ┌─────────────────────────────────────┐
-                    │          barca run pipeline.py       │
+                    │          barca get pipeline.py       │
                     └──────────────┬──────────────────────┘
                                    │
                     ┌──────────────▼──────────────────────┐
@@ -200,22 +200,21 @@ def prices(ticker: str) -> dict:
 ## CLI
 
 ```
-barca run <file.py> [file.py ...]          Parse, plan, and execute
-barca get <target> <file.py> [file.py ...] Get a single asset (cache-aware)
+barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
 barca --help                               Show help
 ```
 
-Shorthand: `barca pipeline.py` works as `barca run pipeline.py`.
+Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 
 ## Python API
 
 ```python
 import barca
 
-# Execute all assets, get the final output
-result = barca.run("pipeline.py")
-print(result["final_output"])  # {"count": 3, "total": 6}
+# Get all assets in a file (returns the last asset's value)
+value = barca.get("pipeline.py")
+print(value)  # {"count": 3, "total": 6}
 
 # Get a specific asset's value (cache-aware)
 value = barca.get("summary", "pipeline.py")
@@ -241,9 +240,9 @@ $ barca plan pipeline.py
 }
 ```
 
-### `barca run` -- execute the full plan
+### `barca get` -- execute and get results
 
-Parses source, builds DAG, spawns workers, collects outputs, persists to `.barca/metadata.db`.
+Parses source, builds DAG, spawns workers, collects outputs, persists to `.barca/metadata.db`. With a target, only the target's subgraph runs. Without a target, all assets run.
 
 Output is a JSON summary:
 
@@ -255,6 +254,8 @@ Output is a JSON summary:
   "final_output": {"count": 3, "total": 6}
 }
 ```
+
+Use `--no-cache` to skip cache lookups and execute everything fresh.
 
 Diagnostics go to stderr:
 
@@ -315,7 +316,7 @@ crates/
   barca-cli/                Thin CLI shell (clap → barca-core)
 python/barca/
   __init__.py               Decorator stubs + API exports
-  api.py                    Python API (run/get/plan via subprocess)
+  api.py                    Python API (get/plan via subprocess)
   _worker.py                Execution worker (invoked by Rust binary)
   _artifacts.py             Artifact serialization (json/pickle/parquet)
   py.typed                  PEP 561 marker
@@ -356,7 +357,7 @@ maturin develop --release
 cargo test
 
 # Run
-barca run examples/basic_app/example_project/assets.py
+barca get examples/basic_app/example_project/assets.py
 barca plan examples/basic_app/example_project/assets.py
 ```
 

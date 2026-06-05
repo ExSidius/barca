@@ -30,7 +30,7 @@ def greeting() -> dict:
 Run it:
 
 ```bash
-barca run pipeline.py
+barca get pipeline.py
 ```
 
 You'll see output like:
@@ -82,7 +82,7 @@ def summary(data: list[dict]) -> dict:
 ```
 
 ```bash
-barca run pipeline.py
+barca get pipeline.py
 ```
 
 Barca sees that `summary` depends on `raw_data`, so it:
@@ -268,7 +268,7 @@ my_project/
 ```
 
 ```bash
-barca run my_project/sources.py my_project/transforms.py my_project/effects.py
+barca get my_project/sources.py my_project/transforms.py my_project/effects.py
 ```
 
 Barca merges all discovered nodes into a single DAG and plans execution across the full graph.
@@ -358,7 +358,7 @@ def notify(report: dict) -> None:
 
 ```bash
 barca plan pipeline.py   # inspect the execution plan
-barca run pipeline.py    # run it
+barca get pipeline.py    # run it
 ```
 
 ## Tips
@@ -376,5 +376,5 @@ barca run pipeline.py    # run it
 
 - **Stderr is for diagnostics.** Barca prints timing and topology info to stderr. Stdout is reserved for structured JSON output. Pipe stdout to `jq` for clean formatting:
   ```bash
-  barca run pipeline.py 2>/dev/null | jq .
+  barca get pipeline.py 2>/dev/null | jq .
   ```
