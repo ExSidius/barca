@@ -250,7 +250,7 @@ Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn
 | **Multi-user / team** | Workspace permissions, code locations | Workspace RBAC, service accounts | DAG-level permissions, RBAC | Single-user only | Not planned — deliberate decision for simplicity |
 | **Backfills** | Built-in partitioned backfills | Via deployments | `dags backfill` (v2) | Supported — `barca get` re-runs subgraphs; needs partition filter on CLI | CLI flag: `--partition region=us` |
 | **Dynamic pipelines** | Dynamic partitions, graph DSL | Dynamic tasks via `.map()` | Dynamic task mapping | Supported — static, dynamic (eval at plan time), derived (`partitions_from`) | — |
-| **Data quality / expectations** | Asset checks, freshness policies | Not built-in (use Great Expectations) | Not built-in | Not built-in | — |
+| **Data quality / expectations** | Asset checks, freshness policies | Not built-in (use Great Expectations) | Not built-in | Not built-in — use pydantic/pandera/asserts in your functions; failures block downstream naturally | Syntactic sugar at best; not urgent |
 | **Plugin ecosystem** | Large (200+ integrations) | Growing (collections) | Massive (providers) | None | Hooks system ([#52]) is the starting point |
 
 [#50]: https://github.com/ExSidius/barca/issues/50
