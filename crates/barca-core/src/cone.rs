@@ -81,66 +81,15 @@ pub fn cone_hash_with_imports(
                 }
             }
             ModuleDef::Import { module } => {
-                // Resolve cross-file import: look up the module's source,
-                // find the specific imported function/constant, trace its cone.
-                if let Some(module_source) = other_sources.get(module) {
-                    let imported_defs = collect_module_definitions(module_source);
-                    if let Some(imported_def) = imported_defs.get(&name) {
-                        match imported_def {
-                            ModuleDef::Function {
-                                source_text,
-                                references,
-                            } => {
-                                cone_parts.push((format!("{module}:{name}"), source_text.clone()));
-                                // Trace transitive deps within the imported module.
-                                let mut import_queue: Vec<String> = references
-                                    .iter()
-                                    .filter(|r| imported_defs.contains_key(r.as_str()))
-                                    .cloned()
-                                    .collect();
-                                while let Some(dep) = import_queue.pop() {
-                                    let dep_key = format!("{module}:{dep}");
-                                    if visited.contains(&dep_key) {
-                                        continue;
-                                    }
-                                    visited.insert(dep_key.clone());
-                                    if let Some(
-                                        ModuleDef::Function {
-                                            source_text,
-                                            references,
-                                        }
-                                        | ModuleDef::Assignment {
-                                            source_text,
-                                            references,
-                                        },
-                                    ) = imported_defs.get(&dep)
-                                    {
-                                        cone_parts.push((dep_key, source_text.clone()));
-                                        for r in references {
-                                            if !visited.contains(&format!("{module}:{r}"))
-                                                && imported_defs.contains_key(r.as_str())
-                                            {
-                                                import_queue.push(r.clone());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            ModuleDef::Assignment { source_text, .. } => {
-                                cone_parts.push((format!("{module}:{name}"), source_text.clone()));
-                            }
-                            _ => {
-                                cone_parts.push((name.clone(), name.clone()));
-                            }
-                        }
-                    } else {
-                        // Imported name not found in module — hash the import statement itself.
-                        cone_parts.push((name.clone(), format!("import:{module}:{name}")));
-                    }
-                } else {
-                    // Module source not available — hash the import reference.
-                    cone_parts.push((name.clone(), format!("import:{module}:{name}")));
-                }
+                // Resolve cross-file import, following re-export chains.
+                resolve_import(
+                    module,
+                    &name,
+                    other_sources,
+                    &mut visited,
+                    &mut cone_parts,
+                    0, // depth limit to prevent infinite loops
+                );
             }
         }
     }
@@ -176,9 +125,100 @@ enum ModuleDef {
     Import { module: String },
 }
 
+/// Resolve a cross-file import, following re-export chains up to a depth limit.
+fn resolve_import(
+    module: &str,
+    name: &str,
+    other_sources: &HashMap<String, String>,
+    visited: &mut HashSet<String>,
+    cone_parts: &mut Vec<(String, String)>,
+    depth: usize,
+) {
+    if depth > 5 {
+        cone_parts.push((name.to_string(), format!("import:{module}:{name}")));
+        return;
+    }
+
+    let Some(module_source) = other_sources.get(module) else {
+        cone_parts.push((name.to_string(), format!("import:{module}:{name}")));
+        return;
+    };
+
+    let imported_defs = collect_module_definitions_with_context(module_source, Some(module));
+    let Some(imported_def) = imported_defs.get(name) else {
+        cone_parts.push((name.to_string(), format!("import:{module}:{name}")));
+        return;
+    };
+
+    match imported_def {
+        ModuleDef::Function {
+            source_text,
+            references,
+        }
+        | ModuleDef::Assignment {
+            source_text,
+            references,
+        } => {
+            cone_parts.push((format!("{module}:{name}"), source_text.clone()));
+            // Trace transitive deps within the module.
+            let mut bfs_queue: Vec<String> = references
+                .iter()
+                .filter(|r| imported_defs.contains_key(r.as_str()))
+                .cloned()
+                .collect();
+            while let Some(dep) = bfs_queue.pop() {
+                let dep_key = format!("{module}:{dep}");
+                if !visited.insert(dep_key.clone()) {
+                    continue;
+                }
+                if let Some(
+                    ModuleDef::Function {
+                        source_text,
+                        references,
+                    }
+                    | ModuleDef::Assignment {
+                        source_text,
+                        references,
+                    },
+                ) = imported_defs.get(&dep)
+                {
+                    cone_parts.push((dep_key, source_text.clone()));
+                    for r in references {
+                        if !visited.contains(&format!("{module}:{r}"))
+                            && imported_defs.contains_key(r.as_str())
+                        {
+                            bfs_queue.push(r.clone());
+                        }
+                    }
+                }
+            }
+        }
+        ModuleDef::Import {
+            module: next_module,
+        } => {
+            // Re-export chain: follow to the next module recursively.
+            resolve_import(
+                next_module,
+                name,
+                other_sources,
+                visited,
+                cone_parts,
+                depth + 1,
+            );
+        }
+    }
+}
+
 // ─── Module definition collection ────────────────────────────────────────────
 
 fn collect_module_definitions(source: &str) -> HashMap<String, ModuleDef> {
+    collect_module_definitions_with_context(source, None)
+}
+
+fn collect_module_definitions_with_context(
+    source: &str,
+    parent_module: Option<&str>,
+) -> HashMap<String, ModuleDef> {
     let Ok(parsed) = parse_module(source) else {
         return HashMap::new();
     };
@@ -241,11 +281,26 @@ fn collect_module_definitions(source: &str) -> HashMap<String, ModuleDef> {
                 }
             }
             Stmt::ImportFrom(import) => {
-                let module_name = import
+                let raw_module = import
                     .module
                     .as_ref()
                     .map(|m| m.to_string())
                     .unwrap_or_default();
+                // Resolve relative imports: `from .core import x` with level=1
+                // becomes `parent_module.core` when we know the parent.
+                let module_name = if import.level > 0 {
+                    if let Some(parent) = parent_module {
+                        if raw_module.is_empty() {
+                            parent.to_string()
+                        } else {
+                            format!("{parent}.{raw_module}")
+                        }
+                    } else {
+                        raw_module
+                    }
+                } else {
+                    raw_module
+                };
                 for alias in &import.names {
                     let imported_name = alias
                         .asname

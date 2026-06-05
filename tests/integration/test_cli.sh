@@ -34,7 +34,7 @@ def hello() -> dict:
     return {"msg": "hello"}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/trivial.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/trivial.py" 2>/dev/null)
 final "$OUTPUT" | grep -q '"msg"' && pass "correct output" || fail "wrong output: $OUTPUT"
 
 # ─── Test: linear chain passes values ────────────────────────────────────────
@@ -56,7 +56,7 @@ def c(data: dict) -> dict:
     return {"value": data["value"] * 2}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/chain.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/chain.py" 2>/dev/null)
 CHAIN_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
 [ "$CHAIN_VAL" = "22" ] && pass "chain passes values correctly" || fail "chain result: $CHAIN_VAL"
 
@@ -77,7 +77,7 @@ def consumer(data: dict) -> dict:
     return {"result": data["value"] * 2}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/prints.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/prints.py" 2>/dev/null)
 echo "$OUTPUT" | grep -q "VISIBLE_USER_OUTPUT" && pass "user print visible in stdout" || fail "user print missing"
 echo "$OUTPUT" | grep -q "GOT_42" && pass "downstream print visible" || fail "downstream print missing"
 PRINT_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['result'])")
@@ -107,7 +107,7 @@ def merge(a: dict, b: dict, c: dict) -> dict:
     return {"sum": a["x"] + b["x"] + c["x"]}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/fanout.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/fanout.py" 2>/dev/null)
 FAN_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['sum'])")
 [ "$FAN_VAL" = "6" ] && pass "fan-out merge correct" || fail "fan-out result: $FAN_VAL"
 
@@ -126,7 +126,7 @@ def normalized(data: dict) -> dict:
     return {"normalized_price": data["price"] / 100}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/alias.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/alias.py" 2>/dev/null)
 ALIAS_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['normalized_price'])")
 [ "$ALIAS_VAL" = "1.0" ] && pass "aliased input works" || fail "alias result: $ALIAS_VAL"
 
@@ -149,7 +149,7 @@ def from_file2() -> dict:
     return {"source": "file2"}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/file1.py" "$TMPDIR/file2.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/file1.py" "$TMPDIR/file2.py" 2>/dev/null)
 echo "$OUTPUT" | grep -q "steps_executed.*2\|steps_executed\":2" && pass "multi-file runs both assets" || fail "multi-file result: $OUTPUT"
 
 # ─── Test: noisy stderr doesn't corrupt protocol ────────────────────────────
@@ -167,7 +167,7 @@ def noisy() -> dict:
     return {"real": True}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/noisy.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/noisy.py" 2>/dev/null)
 NOISY_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['real'])")
 [ "$NOISY_VAL" = "True" ] && pass "real output survives noisy stderr" || fail "noisy stderr broke output: $NOISY_VAL"
 echo "$OUTPUT" | grep -q '"injected"' && fail "FAKE OUTPUT LEAKED into results" || pass "fake stderr JSON ignored"
@@ -187,7 +187,7 @@ def process(data: dict) -> dict:
     return {"value": data["temp"] * 2}
 PYEOF
 
-OUTPUT=$($BARCA run "$TMPDIR/sensor_pipe.py" 2>/dev/null)
+OUTPUT=$($BARCA get "$TMPDIR/sensor_pipe.py" 2>/dev/null)
 SENSOR_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")
 [ "$SENSOR_VAL" = "144" ] && pass "sensor payload unpacked correctly" || fail "sensor payload wrong: $SENSOR_VAL"
 
@@ -195,7 +195,6 @@ SENSOR_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.
 echo "=== Help ==="
 
 $BARCA --help 2>&1 | grep -q "Invisible asset orchestrator" && pass "barca --help works" || fail "no help"
-$BARCA run --help 2>&1 | grep -q "Parse, plan, and execute" && pass "barca run --help works" || fail "no run help"
 $BARCA get --help 2>&1 | grep -q "cache-aware" && pass "barca get --help works" || fail "no get help"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

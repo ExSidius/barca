@@ -1,7 +1,7 @@
 """Extensive Python API parity tests — mirrors CLI integration tests.
 
 Every scenario tested via bash integration tests is also tested here
-via the Python API to ensure barca.run/get/plan return correct values.
+via the Python API to ensure barca.get/plan return correct values.
 """
 
 import textwrap
@@ -36,7 +36,9 @@ def write_module(tmp_path, filename, code):
 # ─── Basic execution (mirrors test_cli.sh) ───────────────────────────────────
 
 
-class TestRun:
+class TestGetAll:
+    """Test `barca.get(file)` — get all assets (no target)."""
+
     def test_trivial_asset(self, tmp_path):
         f = write_module(
             tmp_path,
@@ -49,9 +51,8 @@ class TestRun:
                 return {"msg": "hello"}
         """,
         )
-        result = barca.run(f)
-        assert result["final_output"] == {"msg": "hello"}
-        assert result["steps_executed"] == 1
+        result = barca.get(f)
+        assert result == {"msg": "hello"}
 
     def test_linear_chain(self, tmp_path):
         f = write_module(
@@ -73,9 +74,8 @@ class TestRun:
                 return {"value": data["value"] * 2}
         """,
         )
-        result = barca.run(f)
-        assert result["final_output"] == {"value": 22}
-        assert result["steps_executed"] == 3
+        result = barca.get(f)
+        assert result == {"value": 22}
 
     def test_fan_out_merge(self, tmp_path):
         f = write_module(
@@ -101,8 +101,8 @@ class TestRun:
                 return {"sum": a["x"] + b["x"] + c["x"]}
         """,
         )
-        result = barca.run(f)
-        assert result["final_output"] == {"sum": 6}
+        result = barca.get(f)
+        assert result == {"sum": 6}
 
     def test_aliased_inputs(self, tmp_path):
         f = write_module(
@@ -120,8 +120,8 @@ class TestRun:
                 return {"normalized_price": data["price"] / 100}
         """,
         )
-        result = barca.run(f)
-        assert result["final_output"]["normalized_price"] == 1.0
+        result = barca.get(f)
+        assert result["normalized_price"] == 1.0
 
     def test_multi_file(self, tmp_path):
         f1 = write_module(
@@ -146,8 +146,9 @@ class TestRun:
                 return {"source": "file2"}
         """,
         )
-        result = barca.run(f1, f2)
-        assert result["steps_executed"] == 2
+        # get all assets across both files
+        result = barca.get(f1, f2)
+        assert result is not None
 
     def test_sensor_unpacking(self, tmp_path):
         f = write_module(
@@ -165,8 +166,8 @@ class TestRun:
                 return {"value": data["temp"] * 2}
         """,
         )
-        result = barca.run(f)
-        assert result["final_output"] == {"value": 144}
+        result = barca.get(f)
+        assert result == {"value": 144}
 
 
 # ─── Get command ──────────────────────────────────────────────────────────────
@@ -392,6 +393,96 @@ class TestFormats:
         assert barca.get("data", f) == {"key": "value"}
 
 
+# ─── Subdirectory file paths ──────────────────────────────────────────────────
+
+
+class TestSubdirectoryPaths:
+    """Files in a/b/c.py style paths should work correctly."""
+
+    def _write_nested(self, tmp_path, relpath, code):
+        p = tmp_path / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(textwrap.dedent(code))
+        return str(p)
+
+    def test_get_all_from_subdirectory(self, tmp_path):
+        f = self._write_nested(
+            tmp_path,
+            "proj/pipelines/etl.py",
+            """
+            from barca import asset
+
+            @asset()
+            def extract():
+                return {"rows": 10}
+
+            @asset(inputs={"data": extract})
+            def transform(data):
+                return {"rows": data["rows"] * 2}
+        """,
+        )
+        result = barca.get(f)
+        assert result == {"rows": 20}
+
+    def test_get_target_from_subdirectory(self, tmp_path):
+        f = self._write_nested(
+            tmp_path,
+            "proj/pipelines/etl.py",
+            """
+            from barca import asset
+
+            @asset()
+            def extract():
+                return {"rows": 10}
+
+            @asset(inputs={"data": extract})
+            def transform(data):
+                return {"rows": data["rows"] * 2}
+        """,
+        )
+        result = barca.get("extract", f)
+        assert result == {"rows": 10}
+
+    def test_deeply_nested_file(self, tmp_path):
+        f = self._write_nested(
+            tmp_path,
+            "a/b/c/d/pipeline.py",
+            """
+            from barca import asset
+
+            @asset()
+            def deep():
+                return {"depth": 4}
+        """,
+        )
+        result = barca.get(f)
+        assert result == {"depth": 4}
+
+    def test_get_with_cross_subdir_import(self, tmp_path):
+        self._write_nested(
+            tmp_path,
+            "proj/utils/math.py",
+            """
+            def double(x):
+                return x * 2
+        """,
+        )
+        f = self._write_nested(
+            tmp_path,
+            "proj/pipeline.py",
+            """
+            from barca import asset
+            from utils.math import double
+
+            @asset()
+            def result():
+                return {"value": double(21)}
+        """,
+        )
+        result = barca.get(f)
+        assert result == {"value": 42}
+
+
 # ─── Error cases ──────────────────────────────────────────────────────────────
 
 
@@ -413,11 +504,11 @@ class TestErrors:
 
     def test_nonexistent_file(self):
         with pytest.raises(BarcaError):
-            barca.run("/tmp/definitely_does_not_exist_12345.py")
+            barca.get("/tmp/definitely_does_not_exist_12345.py")
 
-    def test_run_no_args(self):
+    def test_get_no_args(self):
         with pytest.raises(TypeError):
-            barca.run()
+            barca.get()
 
 
 # ─── Plan ─────────────────────────────────────────────────────────────────────

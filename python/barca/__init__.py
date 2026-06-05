@@ -7,7 +7,7 @@ parses these statically from source without importing.
 
 from __future__ import annotations
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 __all__ = [
     "asset",
@@ -22,9 +22,10 @@ __all__ = [
     "partitions_from",
     "collect",
     "asset_ref",
-    "run",
     "get",
     "plan",
+    "history",
+    "stats",
     "BarcaError",
 ]
 
@@ -122,4 +123,4 @@ def asset_ref(ref_string: str) -> str:
 
 # ─── Python API ──────────────────────────────────────────────────────────────
 
-from barca.api import BarcaError, get, plan, run  # noqa: E402
+from barca.api import BarcaError, get, history, plan, stats  # noqa: E402

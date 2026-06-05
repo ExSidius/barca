@@ -31,7 +31,7 @@ pub fn compute_run_hash(
             .filter(|(k, _)| k.starts_with(&prefix))
             .collect();
         if !partition_hashes.is_empty() {
-            partition_hashes.sort_by_key(|(k, _)| k.clone());
+            partition_hashes.sort_by_key(|(k, _)| (*k).clone());
             for (_, h) in partition_hashes {
                 upstream_hashes.push(h.clone());
             }

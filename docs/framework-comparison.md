@@ -223,7 +223,7 @@ How much framework code do you write per asset function?
 
 "What actually happens when I run this?"
 
-**Barca**: `barca run file.py` → Rust binary parses source (no import), builds DAG, spawns Python workers, collects results. You can see exactly what happened: `barca plan file.py` shows the execution plan as JSON. Artifacts are plain files in `.barca/artifacts/`. No hidden state machines.
+**Barca**: `barca get file.py` → Rust binary parses source (no import), builds DAG, spawns Python workers, collects results. You can see exactly what happened: `barca plan file.py` shows the execution plan as JSON. Artifacts are plain files in `.barca/artifacts/`. No hidden state machines.
 
 **Dagster**: `materialize([assets])` → loads assets into a "repository", builds a job, creates a "run", executes steps through an I/O manager that pickles results, logs events to a structured store. `dagster dev` launches a full web UI. Much of this is invisible from the code.
 

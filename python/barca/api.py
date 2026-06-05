@@ -104,29 +104,18 @@ def _read_output(output_ref: Any) -> Any:
     return output_ref
 
 
-def run(file: str, *extra_files: str) -> dict:
-    """Execute all assets in a pipeline.
+def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
+    """Get asset value(s).
 
-    Returns a dict with:
-        - elapsed_seconds: float
-        - steps_executed: int
-        - phases: int
-        - final_output: the deserialized value of the last asset
-    """
-    files = [file, *extra_files]
-    result = _exec(["run", *files])
-    if result.get("final_output") is not None:
-        result["final_output"] = _read_output(result["final_output"])
-    return result
-
-
-def get(target: str, file: str, *extra_files: str) -> Any:
-    """Get a fresh asset value (cache-aware).
+    If target_or_file ends in .py, gets all assets in the file.
+    Otherwise, treats it as a target asset name and remaining args as files.
 
     Returns the deserialized value of the target asset directly.
     """
-    files = [file, *extra_files]
-    result = _exec(["get", target, *files])
+    args: list[str] = ["get", target_or_file, *extra_files]
+    if no_cache:
+        args.append("--no-cache")
+    result = _exec(args)
     output = result.get("final_output")
     if output is not None:
         return _read_output(output)
@@ -142,3 +131,139 @@ def plan(file: str, *extra_files: str) -> dict:
     """
     files = [file, *extra_files]
     return _exec(["plan", *files])
+
+
+def history(limit: int = 10) -> list[dict]:
+    """Return recent run history.
+
+    Returns a list of dicts, each with:
+        - run_id: str
+        - command: str
+        - files: str
+        - target: str | None
+        - status: str
+        - steps_total: int | None
+        - steps_executed: int
+        - steps_cached: int
+        - started_at: str
+        - finished_at: str | None
+        - elapsed_seconds: float | None
+    """
+    binary = _find_binary()
+    result = subprocess.run(
+        [binary, "history", "--limit", str(limit)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr.startswith("Error: "):
+            stderr = stderr[len("Error: ") :]
+        raise BarcaError(stderr)
+
+    # Parse the table output into dicts.
+    stdout = result.stdout.strip()
+    if not stdout or stdout == "No run history found.":
+        return []
+
+    lines = stdout.splitlines()
+    if len(lines) < 3:  # header + separator + at least one row
+        return []
+
+    records = []
+    for line in lines[2:]:  # skip header and separator
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+        records.append(
+            {
+                "run_id": parts[0],
+                "command": parts[1],
+                "status": parts[2],
+                "steps_executed": int(parts[3]),
+                "steps_cached": int(parts[4]),
+                "elapsed_seconds": float(parts[5].rstrip("s")) if parts[5] != "-" else None,
+                "started_at": " ".join(parts[6:]),
+            }
+        )
+    return records
+
+
+def stats(target: str, file: str, *extra_files: str) -> dict:
+    """Return execution statistics for an asset.
+
+    Returns a dict with:
+        - node_id: str
+        - total_runs: int
+        - avg_elapsed_seconds: float | None
+        - cache_hit_rate: float
+        - recent_runs: list of dicts
+    """
+    files = [file, *extra_files]
+    binary = _find_binary()
+    result = subprocess.run(
+        [binary, "stats", target, *files],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr.startswith("Error: "):
+            stderr = stderr[len("Error: ") :]
+        raise BarcaError(stderr)
+
+    stdout = result.stdout.strip()
+    lines = stdout.splitlines()
+
+    stats_dict: dict[str, Any] = {
+        "node_id": "",
+        "total_runs": 0,
+        "avg_elapsed_seconds": None,
+        "median_elapsed_seconds": None,
+        "max_elapsed_seconds": None,
+        "p95_elapsed_seconds": None,
+        "cache_hit_rate": 0.0,
+        "recent_runs": [],
+    }
+
+    def _parse_time(s: str) -> float | None:
+        s = s.strip().rstrip("s")
+        if s == "-":
+            return None
+        return float(s)
+
+    in_recent = False
+    for line in lines:
+        if line.startswith("Asset: "):
+            stats_dict["node_id"] = line[len("Asset: ") :]
+        elif line.startswith("Total materializations: "):
+            stats_dict["total_runs"] = int(line.split(": ")[1])
+        elif line.startswith("Timing:"):
+            # "Timing:  avg 0.105s  median 0.105s  p95 0.105s  max 0.105s"
+            parts = line.split()
+            for i, part in enumerate(parts):
+                if part == "avg" and i + 1 < len(parts):
+                    stats_dict["avg_elapsed_seconds"] = _parse_time(parts[i + 1])
+                elif part == "median" and i + 1 < len(parts):
+                    stats_dict["median_elapsed_seconds"] = _parse_time(parts[i + 1])
+                elif part == "p95" and i + 1 < len(parts):
+                    stats_dict["p95_elapsed_seconds"] = _parse_time(parts[i + 1])
+                elif part == "max" and i + 1 < len(parts):
+                    stats_dict["max_elapsed_seconds"] = _parse_time(parts[i + 1])
+        elif line.startswith("Cache hit rate: "):
+            val = line.split(": ")[1].rstrip("%")
+            stats_dict["cache_hit_rate"] = float(val) / 100.0
+        elif line.strip().startswith("ELAPSED"):
+            in_recent = True
+        elif in_recent and line.strip():
+            parts = line.split()
+            if len(parts) >= 3:
+                stats_dict["recent_runs"].append(
+                    {
+                        "elapsed_seconds": _parse_time(parts[0]),
+                        "status": parts[1],
+                        "created_at": " ".join(parts[2:]),
+                    }
+                )
+
+    return stats_dict

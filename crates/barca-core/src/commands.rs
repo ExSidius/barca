@@ -1,4 +1,4 @@
-//! Engine commands — run, get, plan. Return typed results; callers handle display.
+//! Engine commands — get, plan, history, stats. Return typed results; callers handle display.
 
 use crate::BarcaError;
 use crate::cache;
@@ -17,20 +17,30 @@ use std::process::Command;
 use std::time::Instant;
 use turso::Builder;
 
+/// Format seconds as a fixed-width time string for progress display.
+/// Always 8 chars wide: "   5s   ", " 2m 30s ", " 1h 05m ", "2d 03h  "
+fn fmt_eta(secs: f64) -> String {
+    let s = secs.round() as u64;
+    if s < 60 {
+        format!("{s:>4}s   ")
+    } else if s < 3600 {
+        format!("{:>2}m {:02}s ", s / 60, s % 60)
+    } else if s < 86400 {
+        format!("{:>2}h {:02}m ", s / 3600, (s % 3600) / 60)
+    } else {
+        let d = s / 86400;
+        format!("{d:>2}d {:02}h  ", (s % 86400) / 3600)
+    }
+}
+
 // ─── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunResult {
+pub struct GetResult {
+    pub run_id: String,
     pub elapsed_seconds: f64,
     pub steps_executed: usize,
     pub phases: usize,
-    pub final_output: Option<OutputRef>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetResult {
-    pub elapsed_seconds: f64,
-    pub steps_executed: usize,
     pub final_output: Option<OutputRef>,
 }
 
@@ -56,16 +66,16 @@ pub struct PlanStream {
 
 pub fn find_python() -> PathBuf {
     // Look for sibling python in the same bin/ directory as the barca binary.
-    if let Ok(self_exe) = env::current_exe() {
-        if let Some(bin_dir) = self_exe.parent() {
-            let candidate = bin_dir.join("python");
-            if candidate.exists() {
-                return candidate;
-            }
-            let candidate3 = bin_dir.join("python3");
-            if candidate3.exists() {
-                return candidate3;
-            }
+    if let Ok(self_exe) = env::current_exe()
+        && let Some(bin_dir) = self_exe.parent()
+    {
+        let candidate = bin_dir.join("python");
+        if candidate.exists() {
+            return candidate;
+        }
+        let candidate3 = bin_dir.join("python3");
+        if candidate3.exists() {
+            return candidate3;
         }
     }
     // Fall back to PATH.
@@ -78,94 +88,36 @@ fn default_pool_size() -> usize {
         .unwrap_or(4)
 }
 
-// ─── run ─────────────────────────────────────────────────────────────────────
-
-pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaError> {
-    let t0 = Instant::now();
-
-    let dag = build_dag(file_args, python)?;
-
-    let pool_size = default_pool_size();
-    let config = ResourceConfig {
-        pool_size,
-        concurrency_groups: HashMap::new(),
-    };
-    let exec_plan = planner::plan_from_dag(&dag, &config);
-
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-
-    let dispatch_result = dispatch::dispatch_plan(&exec_plan, python, &db_path, pool_size);
-    let all_outputs = dispatch_result.outputs;
-
-    // Persist whatever succeeded — even on partial failure.
-    let run_hashes = compute_run_hashes(&dag, &all_outputs);
-    db::persist_outputs_sync(&db_path, &all_outputs, &run_hashes);
-
-    // If a worker failed, return the error after persisting partial results.
-    if let Some(error) = dispatch_result.error {
-        return Err(BarcaError::WorkerFailed(error));
-    }
-
-    let total_executed = all_outputs.len();
-    let last_planned_id = exec_plan
-        .phases
-        .last()
-        .and_then(|p| p.streams.last())
-        .and_then(|s| s.steps.last())
-        .map(|s| s.step_id.display())
-        .unwrap_or_default();
-    let final_output = all_outputs.get(&last_planned_id).cloned().or_else(|| {
-        let mut matches: Vec<_> = all_outputs
-            .iter()
-            .filter(|(k, _)| k.starts_with(&last_planned_id))
-            .collect();
-        matches.sort_by_key(|(k, _)| k.clone());
-        matches.first().map(|(_, v)| (*v).clone())
-    });
-
-    Ok(RunResult {
-        elapsed_seconds: t0.elapsed().as_secs_f64(),
-        steps_executed: total_executed,
-        phases: exec_plan.phases.len(),
-        final_output,
-    })
-}
-
 // ─── get ─────────────────────────────────────────────────────────────────────
 
 pub fn get(
-    target_name: &str,
+    target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
+    no_cache: bool,
+    agent_mode: bool,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
+    let run_id = db::generate_run_id();
 
     let dag = build_dag(file_args, python)?;
 
-    let target_id = dag
-        .topo_order()
-        .into_iter()
-        .find(|id| {
-            id.ends_with(&format!(":{target_name}"))
-                || *id == target_name
-                || id.ends_with(target_name)
-        })
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let available: Vec<&str> = dag.topo_order();
-            BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
-        })?;
-
-    let subgraph_ids = dag.subgraph(&target_id);
-
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
+    // Resolve target: if Some, find it and extract subgraph; if None, use full DAG.
+    let target_id: Option<String> = match target_name {
+        Some(name) => {
+            let id = dag
+                .topo_order()
+                .into_iter()
+                .find(|id| id.ends_with(&format!(":{name}")) || *id == name || id.ends_with(name))
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    let available: Vec<&str> = dag.topo_order();
+                    BarcaError::AssetNotFound(name.to_string(), available.join(", "))
+                })?;
+            Some(id)
+        }
+        None => None,
+    };
 
     let pool_size = default_pool_size();
     let config = ResourceConfig {
@@ -173,7 +125,29 @@ pub fn get(
         concurrency_groups: HashMap::new(),
     };
     let full_plan = planner::plan_from_dag(&dag, &config);
-    let exec_plan = filter_plan_to_subgraph(full_plan, &subgraph_ids);
+    let exec_plan = if let Some(ref tid) = target_id {
+        let subgraph_ids = dag.subgraph(tid);
+        filter_plan_to_subgraph(full_plan, &subgraph_ids)
+    } else {
+        full_plan
+    };
+
+    let db_path = db::ensure_db_dir();
+    db::init_db_sync(&db_path);
+
+    db::create_run_sync(
+        &db_path,
+        &run_id,
+        "get",
+        &file_args.join(" "),
+        target_name,
+        Some(exec_plan.total_steps),
+    );
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
 
     let db = rt.block_on(async { Builder::new_local(&db_path).build().await.unwrap() });
     let conn = db.connect().unwrap();
@@ -183,6 +157,45 @@ pub fn get(
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     let mut steps_executed = 0;
+
+    // Progress bar setup.
+    let total_steps = exec_plan.total_steps;
+    let all_node_ids: Vec<String> = exec_plan
+        .phases
+        .iter()
+        .flat_map(|p| &p.streams)
+        .flat_map(|s| &s.steps)
+        .map(|st| st.step_id.display())
+        .collect();
+    let avg_times = db::get_avg_elapsed_sync(&db_path, &all_node_ids);
+    let total_estimated: f64 = all_node_ids
+        .iter()
+        .filter_map(|nid| avg_times.get(nid))
+        .sum();
+    let mut elapsed_so_far: f64 = 0.0;
+    let mut completed_steps: usize = 0;
+
+    // Create indicatif progress bar for human mode, plain text for agent mode.
+    let pb = if !agent_mode && total_steps > 0 {
+        use indicatif::{ProgressBar, ProgressStyle};
+        let bar = ProgressBar::new(total_steps as u64);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "[barca] {prefix} {bar:20.cyan/dim} {pos}/{len} | {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("█▓░"),
+        );
+        if total_estimated > 0.0 {
+            bar.set_prefix(format!("{}left", fmt_eta(total_estimated)));
+        } else {
+            bar.set_prefix("        ");
+        }
+        bar.set_message("");
+        Some(bar)
+    } else {
+        None
+    };
 
     for phase in &exec_plan.phases {
         let expanded_phase = dispatch::expand_pending_partitions(phase, &all_outputs, pool_size);
@@ -198,7 +211,14 @@ pub fn get(
                 let display_id = step.step_id.display();
                 let base_node = dag.get_node(base_id);
 
+                // Sensors always re-run.
                 if base_node.is_some_and(|n| n.kind() == crate::NodeKind::Sensor) {
+                    uncached_steps.push(step.clone());
+                    continue;
+                }
+
+                // Skip cache lookups when no_cache is set.
+                if no_cache {
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -230,6 +250,7 @@ pub fn get(
                             path: row.get::<String>(0).ok()?,
                             format: row.get::<String>(1).ok()?,
                             size_bytes: row.get::<i64>(2).ok()? as u64,
+                            elapsed_seconds: None,
                         })
                     })
                 });
@@ -267,7 +288,43 @@ pub fn get(
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
-        let phase_result = dispatch::execute_phase(&filtered_phase, &provided, python);
+
+        // Progress callback — update bar as each step completes from any worker.
+        let mut on_step = |node_id: &str, output: &dispatch::OutputRef| {
+            if let Some(e) = output.elapsed_seconds {
+                elapsed_so_far += e;
+            }
+            completed_steps += 1;
+            if let Some(ref bar) = pb {
+                bar.set_position(completed_steps as u64);
+                let remaining = if total_estimated > 0.0 {
+                    (total_estimated - elapsed_so_far).max(0.0)
+                } else if completed_steps > 0 {
+                    let avg = elapsed_so_far / completed_steps as f64;
+                    avg * (total_steps - completed_steps) as f64
+                } else {
+                    0.0
+                };
+                let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
+                if remaining > 0.5 {
+                    bar.set_prefix(format!("{}left", fmt_eta(remaining)));
+                } else {
+                    bar.set_prefix("   done ");
+                }
+                bar.set_message(format!("{short_name} done"));
+            } else if agent_mode {
+                eprintln!(
+                    "[barca] step:{} completed {:.1}s ({}/{})",
+                    node_id,
+                    output.elapsed_seconds.unwrap_or(0.0),
+                    completed_steps,
+                    total_steps
+                );
+            }
+        };
+
+        let phase_result =
+            dispatch::execute_phase(&filtered_phase, &provided, python, Some(&mut on_step));
         if phase_error.is_none() {
             phase_error = phase_result.error;
         }
@@ -319,6 +376,24 @@ pub fn get(
         }
     }
 
+    // Finish progress bar.
+    if let Some(ref bar) = pb {
+        if steps_executed > 0 {
+            bar.finish_and_clear();
+            eprintln!(
+                "[barca] {}/{} steps done in {:.1}s",
+                completed_steps, total_steps, elapsed_so_far
+            );
+        } else {
+            bar.finish_and_clear();
+        }
+    } else if agent_mode && steps_executed > 0 {
+        eprintln!(
+            "[barca] {}/{} steps | done in {:.1}s",
+            completed_steps, total_steps, elapsed_so_far
+        );
+    }
+
     // Persist all executed outputs (including partial results on failure).
     rt.block_on(async {
         for (node_id, oref) in &all_outputs {
@@ -328,14 +403,19 @@ pub fn get(
             let Some(run_h) = cached_run_hashes.get(node_id) else {
                 continue;
             };
+            let elapsed_str = oref
+                .elapsed_seconds
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''))",
                 [
                     node_id.clone(),
                     run_h.clone(),
                     oref.path.clone(),
                     oref.format.clone(),
                     oref.size_bytes.to_string(),
+                    elapsed_str,
                 ],
             )
             .await
@@ -343,25 +423,67 @@ pub fn get(
         }
     });
 
+    let steps_cached = cached_node_ids.len();
+    let elapsed = t0.elapsed().as_secs_f64();
+
     // Propagate worker error after persisting partial results.
     if let Some(error) = phase_error {
+        db::finish_run_sync(
+            &db_path,
+            &run_id,
+            "failed",
+            steps_executed,
+            steps_cached,
+            elapsed,
+        );
         return Err(BarcaError::WorkerFailed(error));
     }
 
-    let final_output = all_outputs.get(&target_id).cloned().or_else(|| {
-        // For partitioned targets, sort by key for deterministic output.
-        let prefix = format!("{target_id}[");
-        let mut matches: Vec<_> = all_outputs
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .collect();
-        matches.sort_by_key(|(k, _)| k.clone());
-        matches.first().map(|(_, v)| (*v).clone())
-    });
+    db::finish_run_sync(
+        &db_path,
+        &run_id,
+        "success",
+        steps_executed,
+        steps_cached,
+        elapsed,
+    );
+
+    // Determine final_output: use target if specified, otherwise last planned step.
+    let final_output = if let Some(ref tid) = target_id {
+        all_outputs.get(tid).cloned().or_else(|| {
+            // For partitioned targets, sort by key for deterministic output.
+            let prefix = format!("{tid}[");
+            let mut matches: Vec<_> = all_outputs
+                .iter()
+                .filter(|(k, _)| k.starts_with(&prefix))
+                .collect();
+            matches.sort_by_key(|(k, _)| (*k).clone());
+            matches.first().map(|(_, v)| (*v).clone())
+        })
+    } else {
+        // No target: return the last planned step's output.
+        let last_planned_id = exec_plan
+            .phases
+            .last()
+            .and_then(|p| p.streams.last())
+            .and_then(|s| s.steps.last())
+            .map(|s| s.step_id.display())
+            .unwrap_or_default();
+        all_outputs.get(&last_planned_id).cloned().or_else(|| {
+            let mut matches: Vec<_> = all_outputs
+                .iter()
+                .filter(|(k, _)| k.starts_with(&last_planned_id))
+                .collect();
+            matches.sort_by_key(|(k, _)| (*k).clone());
+            matches.first().map(|(_, v)| (*v).clone())
+        })
+    };
 
     Ok(GetResult {
-        elapsed_seconds: t0.elapsed().as_secs_f64(),
+        run_id,
+        elapsed_seconds: elapsed,
         steps_executed,
+        phases: exec_plan.phases.len(),
         final_output,
     })
 }
@@ -396,50 +518,43 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaE
     })
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── history ──────────────────────────────────────────────────────────────────
 
-fn compute_run_hashes(
-    dag: &Dag,
-    all_outputs: &HashMap<String, OutputRef>,
-) -> HashMap<String, String> {
-    let mut run_hashes: HashMap<String, String> = HashMap::new();
-    let topo: Vec<String> = dag
+pub fn history(limit: usize) -> Result<Vec<db::RunRecord>, BarcaError> {
+    let db_path = db::ensure_db_dir();
+    db::init_db_sync(&db_path);
+    Ok(db::get_recent_runs_sync(&db_path, limit))
+}
+
+// ─── stats ────────────────────────────────────────────────────────────────────
+
+pub fn stats(
+    target_name: &str,
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<db::AssetStats, BarcaError> {
+    let dag = build_dag(file_args, python)?;
+
+    let target_id = dag
         .topo_order()
         .into_iter()
+        .find(|id| {
+            id.ends_with(&format!(":{target_name}"))
+                || *id == target_name
+                || id.ends_with(target_name)
+        })
         .map(|s| s.to_string())
-        .collect();
-    for base_id in &topo {
-        if let Some(node) = dag.get_node(base_id) {
-            let display_ids: Vec<String> = all_outputs
-                .keys()
-                .filter(|k| *k == base_id || k.starts_with(&format!("{base_id}[")))
-                .cloned()
-                .collect();
-            for display_id in display_ids {
-                let sid = crate::StepId::parse(&display_id);
-                let partition_key = if sid.partition.is_empty() {
-                    None
-                } else {
-                    Some(sid.partition.suffix())
-                };
-                let upstream_ids: Vec<String> = node
-                    .resolved_inputs
-                    .values()
-                    .chain(node.resolved_collected.values())
-                    .cloned()
-                    .collect();
-                let run_h = cache::compute_run_hash(
-                    &node.definition_hash,
-                    partition_key.as_deref(),
-                    upstream_ids.iter(),
-                    &run_hashes,
-                );
-                run_hashes.insert(display_id, run_h);
-            }
-        }
-    }
-    run_hashes
+        .ok_or_else(|| {
+            let available: Vec<&str> = dag.topo_order();
+            BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
+        })?;
+
+    let db_path = db::ensure_db_dir();
+    db::init_db_sync(&db_path);
+    Ok(db::get_asset_stats_sync(&db_path, &target_id))
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> ExecutionPlan {
     let subgraph_set: std::collections::HashSet<&str> = subgraph_ids.iter().copied().collect();
@@ -504,6 +619,11 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
             .to_string();
         file_sources.insert(stem, source.clone());
         if let Some(parent) = path.parent() {
+            // Scan subdirectories FIRST — packages (__init__.py) take precedence
+            // over same-named sibling .py files, matching Python's import semantics.
+            scan_subdirectories(parent, parent, &mut file_sources);
+            // Then scan sibling .py files (flat) — or_insert_with is a no-op if
+            // a package with the same name was already registered above.
             if let Ok(entries) = std::fs::read_dir(parent) {
                 for entry in entries.flatten() {
                     let ep = entry.path();
@@ -549,6 +669,70 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
     Ok(Dag::build(&all_nodes)?)
 }
 
+/// Recursively scan subdirectories for Python modules.
+/// Stores dotted module paths as keys: `utils/math.py` → `"utils.math"`.
+/// Handles `__init__.py`: `mylib/__init__.py` → `"mylib"`.
+fn scan_subdirectories(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    file_sources: &mut HashMap<String, String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let ep = entry.path();
+        if ep.is_dir() {
+            let dir_name = ep
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            // Skip hidden dirs, __pycache__, .venv, etc.
+            if dir_name.starts_with('.')
+                || dir_name == "__pycache__"
+                || dir_name == ".venv"
+                || dir_name == "node_modules"
+            {
+                continue;
+            }
+            // Check if this is a Python package (has __init__.py).
+            let init_path = ep.join("__init__.py");
+            if init_path.exists()
+                && let Ok(content) = fs::read_to_string(&init_path)
+            {
+                let module_path = ep
+                    .strip_prefix(root)
+                    .unwrap_or(&ep)
+                    .to_string_lossy()
+                    .replace(['/', '\\'], ".");
+                file_sources.entry(module_path).or_insert_with(|| content);
+            }
+            // Scan .py files in the subdirectory.
+            if let Ok(sub_entries) = std::fs::read_dir(&ep) {
+                for sub_entry in sub_entries.flatten() {
+                    let sp = sub_entry.path();
+                    if sp.extension().map(|e| e == "py").unwrap_or(false)
+                        && sp.file_name().map(|n| n != "__init__.py").unwrap_or(true)
+                        && let Ok(content) = fs::read_to_string(&sp)
+                    {
+                        // Build dotted module path relative to root.
+                        let rel = sp.strip_prefix(root).unwrap_or(&sp);
+                        let module_path = rel
+                            .to_string_lossy()
+                            .replace(['/', '\\'], ".")
+                            .trim_end_matches(".py")
+                            .to_string();
+                        file_sources.entry(module_path).or_insert_with(|| content);
+                    }
+                }
+            }
+            // Recurse into deeper subdirectories.
+            scan_subdirectories(&ep, root, file_sources);
+        }
+    }
+}
+
 fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python: &PathBuf) {
     for node in nodes.iter_mut() {
         let mut resolved: Vec<(String, Vec<crate::model::PartitionValue>)> = Vec::new();
@@ -558,14 +742,13 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
                 let module_path = std::path::Path::new(&node.source_file)
                     .canonicalize()
                     .unwrap_or_else(|_| PathBuf::from(&node.source_file));
-                let script = format!(
-                    "import json, importlib.util, sys\n\
+                let script = "import json, importlib.util, sys\n\
                      _spec = importlib.util.spec_from_file_location('_m', sys.argv[1])\n\
                      _mod = importlib.util.module_from_spec(_spec)\n\
                      _spec.loader.exec_module(_mod)\n\
                      _ns = vars(_mod); _ns['__builtins__'] = __builtins__\n\
                      print(json.dumps(eval(sys.argv[2], _ns)))\n"
-                );
+                    .to_string();
                 let mut script_file =
                     tempfile::NamedTempFile::new().expect("failed to create temp file");
                 use std::io::Write;
