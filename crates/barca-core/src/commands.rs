@@ -671,6 +671,9 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
         }
     }
 
+    // Free source text memory before execution starts.
+    drop(file_sources);
+
     resolve_dynamic_partitions(&mut all_nodes, python);
 
     Ok(Dag::build(&all_nodes)?)
