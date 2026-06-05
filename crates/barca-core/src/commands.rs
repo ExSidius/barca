@@ -132,8 +132,8 @@ pub fn get(
         full_plan
     };
 
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
+    let db_path = db::ensure_db_dir()?;
+    db::init_db_sync(&db_path)?;
 
     db::create_run_sync(
         &db_path,
@@ -142,15 +142,22 @@ pub fn get(
         &file_args.join(" "),
         target_name,
         Some(exec_plan.total_steps),
-    );
+    )?;
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .unwrap();
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
 
-    let db = rt.block_on(async { Builder::new_local(&db_path).build().await.unwrap() });
-    let conn = db.connect().unwrap();
+    let db = rt.block_on(async {
+        Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
+    })?;
+    let conn = db
+        .connect()
+        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
 
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
@@ -167,7 +174,7 @@ pub fn get(
         .flat_map(|s| &s.steps)
         .map(|st| st.step_id.display())
         .collect();
-    let avg_times = db::get_avg_elapsed_sync(&db_path, &all_node_ids);
+    let avg_times = db::get_avg_elapsed_sync(&db_path, &all_node_ids)?;
     let total_estimated: f64 = all_node_ids
         .iter()
         .filter_map(|nid| avg_times.get(nid))
@@ -435,7 +442,7 @@ pub fn get(
             steps_executed,
             steps_cached,
             elapsed,
-        );
+        )?;
         return Err(BarcaError::WorkerFailed(error));
     }
 
@@ -446,7 +453,7 @@ pub fn get(
         steps_executed,
         steps_cached,
         elapsed,
-    );
+    )?;
 
     // Determine final_output: use target if specified, otherwise last planned step.
     let final_output = if let Some(ref tid) = target_id {
@@ -521,9 +528,9 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaE
 // ─── history ──────────────────────────────────────────────────────────────────
 
 pub fn history(limit: usize) -> Result<Vec<db::RunRecord>, BarcaError> {
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-    Ok(db::get_recent_runs_sync(&db_path, limit))
+    let db_path = db::ensure_db_dir()?;
+    db::init_db_sync(&db_path)?;
+    db::get_recent_runs_sync(&db_path, limit)
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────
@@ -549,9 +556,9 @@ pub fn stats(
             BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
         })?;
 
-    let db_path = db::ensure_db_dir();
-    db::init_db_sync(&db_path);
-    Ok(db::get_asset_stats_sync(&db_path, &target_id))
+    let db_path = db::ensure_db_dir()?;
+    db::init_db_sync(&db_path)?;
+    db::get_asset_stats_sync(&db_path, &target_id)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

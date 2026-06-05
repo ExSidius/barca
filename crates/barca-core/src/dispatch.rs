@@ -267,19 +267,46 @@ pub fn execute_phase(
 
     for stream in &phase.streams {
         let batch_json = serialize_batch(stream, provided_inputs);
-        let mut batch_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
-        batch_file
-            .write_all(batch_json.as_bytes())
-            .expect("failed to write batch");
-        let (_, batch_path) = batch_file.keep().expect("failed to persist temp file");
+        let mut batch_file = match tempfile::NamedTempFile::new() {
+            Ok(f) => f,
+            Err(e) => {
+                return PhaseResult {
+                    outputs: HashMap::new(),
+                    error: Some(format!("failed to create temp file: {e}")),
+                };
+            }
+        };
+        if let Err(e) = batch_file.write_all(batch_json.as_bytes()) {
+            return PhaseResult {
+                outputs: HashMap::new(),
+                error: Some(format!("failed to write batch: {e}")),
+            };
+        }
+        let (_, batch_path) = match batch_file.keep() {
+            Ok(kept) => kept,
+            Err(e) => {
+                return PhaseResult {
+                    outputs: HashMap::new(),
+                    error: Some(format!("failed to persist temp file: {e}")),
+                };
+            }
+        };
 
-        let mut child = Command::new(python)
+        let mut child = match Command::new(python)
             .args(["-m", "barca._worker"])
             .arg(&batch_path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::piped())
             .spawn()
-            .unwrap_or_else(|e| panic!("failed to spawn worker: {e}"));
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return PhaseResult {
+                    outputs: HashMap::new(),
+                    error: Some(format!("failed to spawn worker: {e}")),
+                };
+            }
+        };
 
         let stderr = child.stderr.take().expect("no stderr");
 
