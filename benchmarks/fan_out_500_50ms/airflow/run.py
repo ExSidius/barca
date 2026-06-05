@@ -35,20 +35,15 @@ def run():
     # Initialize DB
     subprocess.run([AIRFLOW_BIN, "db", "migrate"], env=env, capture_output=True)
 
-    # Use backfill with LocalExecutor — this actually uses the executor
-    # (unlike `dags test` which runs everything sequentially in-process).
+    # Airflow 3: `dags test` respects the configured executor (LocalExecutor).
     t0 = time.perf_counter()
     result = subprocess.run(
         [
             AIRFLOW_BIN,
             "dags",
-            "backfill",
+            "test",
             "fan_out_500_50ms",
-            "--start-date",
             "2024-01-01",
-            "--end-date",
-            "2024-01-01",
-            "--reset-dagruns",
         ],
         env=env,
         capture_output=True,
