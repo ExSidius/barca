@@ -17,6 +17,22 @@ use std::process::Command;
 use std::time::Instant;
 use turso::Builder;
 
+/// Format seconds as a fixed-width time string for progress display.
+/// Always 8 chars wide: "   5s   ", " 2m 30s ", " 1h 05m ", "2d 03h  "
+fn fmt_eta(secs: f64) -> String {
+    let s = secs.round() as u64;
+    if s < 60 {
+        format!("{s:>4}s   ")
+    } else if s < 3600 {
+        format!("{:>2}m {:02}s ", s / 60, s % 60)
+    } else if s < 86400 {
+        format!("{:>2}h {:02}m ", s / 3600, (s % 3600) / 60)
+    } else {
+        let d = s / 86400;
+        format!("{d:>2}d {:02}h  ", (s % 86400) / 3600)
+    }
+}
+
 // ─── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,9 +187,9 @@ pub fn get(
             .progress_chars("█▓░"),
         );
         if total_estimated > 0.0 {
-            bar.set_prefix(format!("~{:.0}s left", total_estimated));
+            bar.set_prefix(format!("{}left", fmt_eta(total_estimated)));
         } else {
-            bar.set_prefix("starting");
+            bar.set_prefix("        ");
         }
         bar.set_message("");
         Some(bar)
@@ -291,9 +307,9 @@ pub fn get(
                 };
                 let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
                 if remaining > 0.5 {
-                    bar.set_prefix(format!("~{remaining:.0}s left"));
+                    bar.set_prefix(format!("{}left", fmt_eta(remaining)));
                 } else {
-                    bar.set_prefix("finishing");
+                    bar.set_prefix("   done ");
                 }
                 bar.set_message(format!("{short_name} done"));
             } else if agent_mode {
