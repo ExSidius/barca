@@ -66,16 +66,16 @@ pub struct PlanStream {
 
 pub fn find_python() -> PathBuf {
     // Look for sibling python in the same bin/ directory as the barca binary.
-    if let Ok(self_exe) = env::current_exe() {
-        if let Some(bin_dir) = self_exe.parent() {
-            let candidate = bin_dir.join("python");
-            if candidate.exists() {
-                return candidate;
-            }
-            let candidate3 = bin_dir.join("python3");
-            if candidate3.exists() {
-                return candidate3;
-            }
+    if let Ok(self_exe) = env::current_exe()
+        && let Some(bin_dir) = self_exe.parent()
+    {
+        let candidate = bin_dir.join("python");
+        if candidate.exists() {
+            return candidate;
+        }
+        let candidate3 = bin_dir.join("python3");
+        if candidate3.exists() {
+            return candidate3;
         }
     }
     // Fall back to PATH.
@@ -698,15 +698,15 @@ fn scan_subdirectories(
             }
             // Check if this is a Python package (has __init__.py).
             let init_path = ep.join("__init__.py");
-            if init_path.exists() {
-                if let Ok(content) = fs::read_to_string(&init_path) {
-                    let module_path = ep
-                        .strip_prefix(root)
-                        .unwrap_or(&ep)
-                        .to_string_lossy()
-                        .replace(['/', '\\'], ".");
-                    file_sources.entry(module_path).or_insert_with(|| content);
-                }
+            if init_path.exists()
+                && let Ok(content) = fs::read_to_string(&init_path)
+            {
+                let module_path = ep
+                    .strip_prefix(root)
+                    .unwrap_or(&ep)
+                    .to_string_lossy()
+                    .replace(['/', '\\'], ".");
+                file_sources.entry(module_path).or_insert_with(|| content);
             }
             // Scan .py files in the subdirectory.
             if let Ok(sub_entries) = std::fs::read_dir(&ep) {
@@ -714,17 +714,16 @@ fn scan_subdirectories(
                     let sp = sub_entry.path();
                     if sp.extension().map(|e| e == "py").unwrap_or(false)
                         && sp.file_name().map(|n| n != "__init__.py").unwrap_or(true)
+                        && let Ok(content) = fs::read_to_string(&sp)
                     {
-                        if let Ok(content) = fs::read_to_string(&sp) {
-                            // Build dotted module path relative to root.
-                            let rel = sp.strip_prefix(root).unwrap_or(&sp);
-                            let module_path = rel
-                                .to_string_lossy()
-                                .replace(['/', '\\'], ".")
-                                .trim_end_matches(".py")
-                                .to_string();
-                            file_sources.entry(module_path).or_insert_with(|| content);
-                        }
+                        // Build dotted module path relative to root.
+                        let rel = sp.strip_prefix(root).unwrap_or(&sp);
+                        let module_path = rel
+                            .to_string_lossy()
+                            .replace(['/', '\\'], ".")
+                            .trim_end_matches(".py")
+                            .to_string();
+                        file_sources.entry(module_path).or_insert_with(|| content);
                     }
                 }
             }
@@ -743,14 +742,13 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
                 let module_path = std::path::Path::new(&node.source_file)
                     .canonicalize()
                     .unwrap_or_else(|_| PathBuf::from(&node.source_file));
-                let script = format!(
-                    "import json, importlib.util, sys\n\
+                let script = "import json, importlib.util, sys\n\
                      _spec = importlib.util.spec_from_file_location('_m', sys.argv[1])\n\
                      _mod = importlib.util.module_from_spec(_spec)\n\
                      _spec.loader.exec_module(_mod)\n\
                      _ns = vars(_mod); _ns['__builtins__'] = __builtins__\n\
                      print(json.dumps(eval(sys.argv[2], _ns)))\n"
-                );
+                    .to_string();
                 let mut script_file =
                     tempfile::NamedTempFile::new().expect("failed to create temp file");
                 use std::io::Write;

@@ -74,7 +74,7 @@ fn split_target_files(args: Vec<String>) -> (Option<String>, Vec<PathBuf>) {
     } else {
         // First arg is the target, rest are files.
         let target = args[0].clone();
-        let files = args[1..].iter().map(|s| PathBuf::from(s)).collect();
+        let files = args[1..].iter().map(PathBuf::from).collect();
         (Some(target), files)
     }
 }
@@ -138,10 +138,7 @@ fn get_cmd(
 ) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let result = barca_core::commands::get(target.as_deref(), &file_args, python, no_cache, agent)?;
-    let final_output = result
-        .final_output
-        .as_ref()
-        .map(|oref| read_final_output(oref));
+    let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
         OutputMode::Json => {

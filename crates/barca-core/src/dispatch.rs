@@ -250,13 +250,16 @@ enum WorkerEvent {
 
 /// Execute a single phase: spawn N workers in parallel, stream results via channels.
 ///
+/// Callback type for per-step progress updates.
+pub type StepCallback<'a> = &'a mut dyn FnMut(&str, &OutputRef);
+
 /// `on_step` is called on the main thread each time a step completes — enables
 /// real-time progress bar updates even when multiple workers run in parallel.
 pub fn execute_phase(
     phase: &Phase,
     provided_inputs: &HashMap<String, ProvidedInput>,
     python: &PathBuf,
-    mut on_step: Option<&mut dyn FnMut(&str, &OutputRef)>,
+    mut on_step: Option<StepCallback<'_>>,
 ) -> PhaseResult {
     use std::sync::mpsc;
 
@@ -292,37 +295,36 @@ pub fn execute_phase(
                     continue;
                 }
                 if let Some(json_str) = line.strip_prefix(PROTOCOL_PREFIX_V2) {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if parsed.get("type").and_then(|v| v.as_str()) == Some("result") {
-                            if let (Some(node_id), Some(artifact)) = (
-                                parsed.get("node_id").and_then(|v| v.as_str()),
-                                parsed.get("artifact"),
-                            ) {
-                                let oref = OutputRef {
-                                    path: artifact
-                                        .get("path")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    format: artifact
-                                        .get("format")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("")
-                                        .to_string(),
-                                    size_bytes: artifact
-                                        .get("size_bytes")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0),
-                                    elapsed_seconds: parsed.get("elapsed").and_then(|v| v.as_f64()),
-                                };
-                                tx_reader
-                                    .send(WorkerEvent::StepCompleted {
-                                        node_id: node_id.to_string(),
-                                        output: oref,
-                                    })
-                                    .ok();
-                            }
-                        }
+                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str)
+                        && parsed.get("type").and_then(|v| v.as_str()) == Some("result")
+                        && let (Some(node_id), Some(artifact)) = (
+                            parsed.get("node_id").and_then(|v| v.as_str()),
+                            parsed.get("artifact"),
+                        )
+                    {
+                        let oref = OutputRef {
+                            path: artifact
+                                .get("path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            format: artifact
+                                .get("format")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            size_bytes: artifact
+                                .get("size_bytes")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0),
+                            elapsed_seconds: parsed.get("elapsed").and_then(|v| v.as_f64()),
+                        };
+                        tx_reader
+                            .send(WorkerEvent::StepCompleted {
+                                node_id: node_id.to_string(),
+                                output: oref,
+                            })
+                            .ok();
                     }
                 } else if line.starts_with("BARCA:") {
                     // Unsupported protocol version — ignore.

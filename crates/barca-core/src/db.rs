@@ -418,11 +418,10 @@ pub fn get_avg_elapsed_sync(db_path: &str, node_ids: &[String]) -> HashMap<Strin
                 )
                 .await
                 .unwrap();
-            if let Some(row) = rows.next().await.unwrap() {
-                if let Ok(avg) = row.get::<f64>(0) {
+            if let Some(row) = rows.next().await.unwrap()
+                && let Ok(avg) = row.get::<f64>(0) {
                     result.insert(nid.clone(), avg);
                 }
-            }
         }
         result
     })
