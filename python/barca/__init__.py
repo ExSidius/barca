@@ -25,6 +25,8 @@ __all__ = [
     "run",
     "get",
     "plan",
+    "history",
+    "stats",
     "BarcaError",
 ]
 
@@ -122,4 +124,4 @@ def asset_ref(ref_string: str) -> str:
 
 # ─── Python API ──────────────────────────────────────────────────────────────
 
-from barca.api import BarcaError, get, plan, run  # noqa: E402
+from barca.api import BarcaError, get, history, plan, run, stats  # noqa: E402

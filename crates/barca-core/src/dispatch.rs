@@ -13,6 +13,8 @@ pub struct OutputRef {
     pub path: String,
     pub format: String,
     pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_seconds: Option<f64>,
 }
 
 /// Result of dispatching all phases — includes partial outputs if a phase failed.
@@ -25,10 +27,44 @@ pub struct DispatchResult {
 pub fn dispatch_plan(
     plan: &ExecutionPlan,
     python: &PathBuf,
-    _db_path: &str,
+    db_path: &str,
     pool_size: usize,
 ) -> DispatchResult {
     let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
+
+    // Gather all step IDs for progress bar.
+    let total_steps = plan.total_steps;
+    let mut completed_steps: usize = 0;
+
+    // Look up historical average times for ETA estimation.
+    let all_node_ids: Vec<String> = plan
+        .phases
+        .iter()
+        .flat_map(|p| &p.streams)
+        .flat_map(|s| &s.steps)
+        .map(|st| st.step_id.display())
+        .collect();
+    let avg_times = crate::db::get_avg_elapsed_sync(db_path, &all_node_ids);
+
+    // Compute initial ETA from averages.
+    let total_estimated: f64 = all_node_ids
+        .iter()
+        .filter_map(|nid| avg_times.get(nid))
+        .sum();
+
+    if total_steps > 0 {
+        let eta_str = if total_estimated > 0.0 {
+            format!("~{:.0}s remaining", total_estimated)
+        } else {
+            "estimating...".to_string()
+        };
+        eprint!(
+            "\r[barca] {}/{} steps | {}",
+            completed_steps, total_steps, eta_str
+        );
+    }
+
+    let mut elapsed_so_far: f64 = 0.0;
 
     for phase in &plan.phases {
         let expanded_phase = expand_pending_partitions(phase, &all_outputs, pool_size);
@@ -38,15 +74,48 @@ pub fn dispatch_plan(
         let result = execute_phase(phase_ref, &provided, python);
 
         for (node_id, value) in result.outputs {
+            if let Some(elapsed) = value.elapsed_seconds {
+                elapsed_so_far += elapsed;
+            }
             all_outputs.insert(node_id, value);
+            completed_steps += 1;
+
+            // Update progress bar.
+            if total_steps > 0 {
+                let remaining_estimated = if total_estimated > 0.0 {
+                    (total_estimated - elapsed_so_far).max(0.0)
+                } else if completed_steps > 0 {
+                    let avg_per_step = elapsed_so_far / completed_steps as f64;
+                    avg_per_step * (total_steps - completed_steps) as f64
+                } else {
+                    0.0
+                };
+                eprint!(
+                    "\r[barca] {}/{} steps | ~{:.0}s remaining   ",
+                    completed_steps, total_steps, remaining_estimated
+                );
+            }
         }
 
         if let Some(error) = result.error {
+            if total_steps > 0 {
+                eprintln!(
+                    "\r[barca] {}/{} steps | failed              ",
+                    completed_steps, total_steps
+                );
+            }
             return DispatchResult {
                 outputs: all_outputs,
                 error: Some(error),
             };
         }
+    }
+
+    if total_steps > 0 {
+        eprintln!(
+            "\r[barca] {}/{} steps | done in {:.1}s              ",
+            completed_steps, total_steps, elapsed_so_far
+        );
     }
 
     DispatchResult {
@@ -367,6 +436,7 @@ pub fn parse_worker_output(reader: impl BufRead) -> (HashMap<String, OutputRef>,
                         parsed.get("node_id").and_then(|v| v.as_str()),
                         parsed.get("artifact"),
                     ) {
+                        let elapsed = parsed.get("elapsed").and_then(|v| v.as_f64());
                         let oref = OutputRef {
                             path: artifact
                                 .get("path")
@@ -382,6 +452,7 @@ pub fn parse_worker_output(reader: impl BufRead) -> (HashMap<String, OutputRef>,
                                 .get("size_bytes")
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(0),
+                            elapsed_seconds: elapsed,
                         };
                         outputs.insert(node_id.to_string(), oref);
                     }
@@ -657,6 +728,7 @@ Traceback (most recent call last):\n\
             path: path.to_string(),
             format: format.to_string(),
             size_bytes: 100,
+            elapsed_seconds: None,
         }
     }
 
@@ -776,6 +848,7 @@ Traceback (most recent call last):\n\
                 path: artifact_path.to_string_lossy().to_string(),
                 format: "json".to_string(),
                 size_bytes: 12,
+                elapsed_seconds: None,
             },
         );
 
@@ -829,6 +902,7 @@ Traceback (most recent call last):\n\
                 path: ".barca/artifacts/test.py--foo.json".to_string(),
                 format: "json".to_string(),
                 size_bytes: 42,
+                elapsed_seconds: Some(0.01),
             }
         );
         assert!(errors.is_empty());
@@ -915,6 +989,7 @@ Traceback (most recent call last):\n\
                 path: ".barca/artifacts/f--a.json".to_string(),
                 format: "json".to_string(),
                 size_bytes: 100,
+                elapsed_seconds: None,
             },
         );
 
@@ -951,6 +1026,7 @@ Traceback (most recent call last):\n\
                 path: ".barca/artifacts/f--a_t_X.parquet".to_string(),
                 format: "parquet".to_string(),
                 size_bytes: 5000,
+                elapsed_seconds: None,
             },
         );
 
@@ -983,6 +1059,7 @@ Traceback (most recent call last):\n\
                 path: ".barca/artifacts/f--a.json".to_string(),
                 format: "json".to_string(),
                 size_bytes: 100,
+                elapsed_seconds: None,
             }),
         );
 
@@ -1052,6 +1129,7 @@ Traceback (most recent call last):\n\
                 path: artifact_path.to_string_lossy().to_string(),
                 format: "json".to_string(),
                 size_bytes: 14,
+                elapsed_seconds: None,
             },
         );
 

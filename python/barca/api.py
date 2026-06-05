@@ -142,3 +142,108 @@ def plan(file: str, *extra_files: str) -> dict:
     """
     files = [file, *extra_files]
     return _exec(["plan", *files])
+
+
+def history(limit: int = 10) -> list[dict]:
+    """Return recent run history.
+
+    Returns a list of dicts, each with:
+        - run_id: str
+        - command: str
+        - files: str
+        - target: str | None
+        - status: str
+        - steps_total: int | None
+        - steps_executed: int
+        - steps_cached: int
+        - started_at: str
+        - finished_at: str | None
+        - elapsed_seconds: float | None
+    """
+    binary = _find_binary()
+    result = subprocess.run(
+        [binary, "history", "--limit", str(limit)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr.startswith("Error: "):
+            stderr = stderr[len("Error: ") :]
+        raise BarcaError(stderr)
+
+    # Parse the table output into dicts.
+    stdout = result.stdout.strip()
+    if not stdout or stdout == "No run history found.":
+        return []
+
+    lines = stdout.splitlines()
+    if len(lines) < 3:  # header + separator + at least one row
+        return []
+
+    records = []
+    for line in lines[2:]:  # skip header and separator
+        parts = line.split()
+        if len(parts) < 7:
+            continue
+        records.append(
+            {
+                "run_id": parts[0],
+                "command": parts[1],
+                "status": parts[2],
+                "steps_executed": int(parts[3]),
+                "steps_cached": int(parts[4]),
+                "elapsed_seconds": float(parts[5].rstrip("s")) if parts[5] != "-" else None,
+                "started_at": " ".join(parts[6:]),
+            }
+        )
+    return records
+
+
+def stats(target: str, file: str, *extra_files: str) -> dict:
+    """Return execution statistics for an asset.
+
+    Returns a dict with:
+        - node_id: str
+        - total_runs: int
+        - avg_elapsed_seconds: float | None
+        - cache_hit_rate: float
+        - recent_runs: list of dicts
+    """
+    files = [file, *extra_files]
+    binary = _find_binary()
+    result = subprocess.run(
+        [binary, "stats", target, *files],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip()
+        if stderr.startswith("Error: "):
+            stderr = stderr[len("Error: ") :]
+        raise BarcaError(stderr)
+
+    stdout = result.stdout.strip()
+    lines = stdout.splitlines()
+
+    stats_dict: dict[str, Any] = {
+        "node_id": "",
+        "total_runs": 0,
+        "avg_elapsed_seconds": None,
+        "cache_hit_rate": 0.0,
+        "recent_runs": [],
+    }
+
+    for line in lines:
+        if line.startswith("Asset: "):
+            stats_dict["node_id"] = line[len("Asset: ") :]
+        elif line.startswith("Total materializations: "):
+            stats_dict["total_runs"] = int(line.split(": ")[1])
+        elif line.startswith("Avg elapsed: "):
+            val = line.split(": ")[1]
+            stats_dict["avg_elapsed_seconds"] = float(val.rstrip("s")) if val != "-" else None
+        elif line.startswith("Cache hit rate: "):
+            val = line.split(": ")[1].rstrip("%")
+            stats_dict["cache_hit_rate"] = float(val) / 100.0
+
+    return stats_dict

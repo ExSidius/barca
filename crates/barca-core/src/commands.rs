@@ -21,6 +21,7 @@ use turso::Builder;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
+    pub run_id: String,
     pub elapsed_seconds: f64,
     pub steps_executed: usize,
     pub phases: usize,
@@ -29,6 +30,7 @@ pub struct RunResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetResult {
+    pub run_id: String,
     pub elapsed_seconds: f64,
     pub steps_executed: usize,
     pub final_output: Option<OutputRef>,
@@ -82,6 +84,7 @@ fn default_pool_size() -> usize {
 
 pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaError> {
     let t0 = Instant::now();
+    let run_id = db::generate_run_id();
 
     let dag = build_dag(file_args, python)?;
 
@@ -95,6 +98,15 @@ pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaErr
     let db_path = db::ensure_db_dir();
     db::init_db_sync(&db_path);
 
+    db::create_run_sync(
+        &db_path,
+        &run_id,
+        "run",
+        &file_args.join(" "),
+        None,
+        Some(exec_plan.total_steps),
+    );
+
     let dispatch_result = dispatch::dispatch_plan(&exec_plan, python, &db_path, pool_size);
     let all_outputs = dispatch_result.outputs;
 
@@ -102,12 +114,17 @@ pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaErr
     let run_hashes = compute_run_hashes(&dag, &all_outputs);
     db::persist_outputs_sync(&db_path, &all_outputs, &run_hashes);
 
-    // If a worker failed, return the error after persisting partial results.
+    let total_executed = all_outputs.len();
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    // If a worker failed, record the run as failed and return the error.
     if let Some(error) = dispatch_result.error {
+        db::finish_run_sync(&db_path, &run_id, "failed", total_executed, 0, elapsed);
         return Err(BarcaError::WorkerFailed(error));
     }
 
-    let total_executed = all_outputs.len();
+    db::finish_run_sync(&db_path, &run_id, "success", total_executed, 0, elapsed);
+
     let last_planned_id = exec_plan
         .phases
         .last()
@@ -125,7 +142,8 @@ pub fn run(file_args: &[String], python: &PathBuf) -> Result<RunResult, BarcaErr
     });
 
     Ok(RunResult {
-        elapsed_seconds: t0.elapsed().as_secs_f64(),
+        run_id,
+        elapsed_seconds: elapsed,
         steps_executed: total_executed,
         phases: exec_plan.phases.len(),
         final_output,
@@ -140,6 +158,7 @@ pub fn get(
     python: &PathBuf,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
+    let run_id = db::generate_run_id();
 
     let dag = build_dag(file_args, python)?;
 
@@ -174,6 +193,15 @@ pub fn get(
     };
     let full_plan = planner::plan_from_dag(&dag, &config);
     let exec_plan = filter_plan_to_subgraph(full_plan, &subgraph_ids);
+
+    db::create_run_sync(
+        &db_path,
+        &run_id,
+        "get",
+        &file_args.join(" "),
+        Some(target_name),
+        Some(exec_plan.total_steps),
+    );
 
     let db = rt.block_on(async { Builder::new_local(&db_path).build().await.unwrap() });
     let conn = db.connect().unwrap();
@@ -230,6 +258,7 @@ pub fn get(
                             path: row.get::<String>(0).ok()?,
                             format: row.get::<String>(1).ok()?,
                             size_bytes: row.get::<i64>(2).ok()? as u64,
+                            elapsed_seconds: None,
                         })
                     })
                 });
@@ -328,14 +357,19 @@ pub fn get(
             let Some(run_h) = cached_run_hashes.get(node_id) else {
                 continue;
             };
+            let elapsed_str = oref
+                .elapsed_seconds
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 [
                     node_id.clone(),
                     run_h.clone(),
                     oref.path.clone(),
                     oref.format.clone(),
                     oref.size_bytes.to_string(),
+                    elapsed_str,
                 ],
             )
             .await
@@ -343,10 +377,30 @@ pub fn get(
         }
     });
 
+    let steps_cached = cached_node_ids.len();
+    let elapsed = t0.elapsed().as_secs_f64();
+
     // Propagate worker error after persisting partial results.
     if let Some(error) = phase_error {
+        db::finish_run_sync(
+            &db_path,
+            &run_id,
+            "failed",
+            steps_executed,
+            steps_cached,
+            elapsed,
+        );
         return Err(BarcaError::WorkerFailed(error));
     }
+
+    db::finish_run_sync(
+        &db_path,
+        &run_id,
+        "success",
+        steps_executed,
+        steps_cached,
+        elapsed,
+    );
 
     let final_output = all_outputs.get(&target_id).cloned().or_else(|| {
         // For partitioned targets, sort by key for deterministic output.
@@ -360,7 +414,8 @@ pub fn get(
     });
 
     Ok(GetResult {
-        elapsed_seconds: t0.elapsed().as_secs_f64(),
+        run_id,
+        elapsed_seconds: elapsed,
         steps_executed,
         final_output,
     })
@@ -394,6 +449,42 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaE
             })
             .collect(),
     })
+}
+
+// ─── history ──────────────────────────────────────────────────────────────────
+
+pub fn history(limit: usize) -> Result<Vec<db::RunRecord>, BarcaError> {
+    let db_path = db::ensure_db_dir();
+    db::init_db_sync(&db_path);
+    Ok(db::get_recent_runs_sync(&db_path, limit))
+}
+
+// ─── stats ────────────────────────────────────────────────────────────────────
+
+pub fn stats(
+    target_name: &str,
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<db::AssetStats, BarcaError> {
+    let dag = build_dag(file_args, python)?;
+
+    let target_id = dag
+        .topo_order()
+        .into_iter()
+        .find(|id| {
+            id.ends_with(&format!(":{target_name}"))
+                || *id == target_name
+                || id.ends_with(target_name)
+        })
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            let available: Vec<&str> = dag.topo_order();
+            BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
+        })?;
+
+    let db_path = db::ensure_db_dir();
+    db::init_db_sync(&db_path);
+    Ok(db::get_asset_stats_sync(&db_path, &target_id))
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
