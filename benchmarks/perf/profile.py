@@ -52,7 +52,9 @@ def run_get(asset_file):
             "steps": data["steps_executed"],
         }
     except (IndexError, json.JSONDecodeError, KeyError):
-        return {"wall_ms": wall_ms, "barca_ms": 0, "steps": 0, "error": r.stderr[:200]}
+        err = r.stderr[:200] if r.stderr else "(no stderr)"
+        print(f"  WARNING: benchmark failed — {err}", file=sys.stderr)
+        return {"wall_ms": wall_ms, "barca_ms": 0, "steps": 0, "error": err}
 
 
 def main():

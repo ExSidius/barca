@@ -20,8 +20,9 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
     # macOS: /usr/bin/time -l gives peak RSS in bytes
     TIME_CMD="/usr/bin/time -l"
     parse_rss() { grep "maximum resident set size" | awk '{print $1}'; }
-    parse_user() { grep "user" | head -1 | awk '{print $1}'; }
-    parse_sys() { grep "sys" | head -1 | awk '{print $1}'; }
+    # macOS /usr/bin/time -l: "0.02 real  0.01 user  0.00 sys"
+    parse_user() { grep "real" | head -1 | awk '{print $3}'; }
+    parse_sys() { grep "real" | head -1 | awk '{print $5}'; }
 else
     # Linux: /usr/bin/time -v gives peak RSS in KB
     TIME_CMD="/usr/bin/time -v"

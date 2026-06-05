@@ -411,7 +411,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             let combos = expand_partition_combos(&static_partitions);
             let pks: Vec<PartitionKey> = combos.into_iter().map(PartitionKey::from).collect();
             steps.push(StreamStep {
-                step_id: StepId::unpartitioned(node_id.clone()),
+                step_id: StepId::unpartitioned(node_id.as_str()),
                 kind: node.kind(),
                 function_name,
                 source_file,
@@ -423,7 +423,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             });
         } else if !derived_partitions.is_empty() {
             steps.push(StreamStep {
-                step_id: StepId::unpartitioned(node_id.clone()),
+                step_id: StepId::unpartitioned(node_id.as_str()),
                 kind: node.kind(),
                 function_name,
                 source_file,
@@ -435,7 +435,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             });
         } else {
             steps.push(StreamStep {
-                step_id: StepId::unpartitioned(node_id.clone()),
+                step_id: StepId::unpartitioned(node_id.as_str()),
                 kind: node.kind(),
                 function_name,
                 source_file,
