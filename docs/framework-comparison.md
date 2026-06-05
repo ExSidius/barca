@@ -248,8 +248,10 @@ Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn
 | **Remote storage** | Pluggable I/O managers (S3, GCS, etc.) | Result storage backends | XCom + external storage hooks | Local filesystem only | Planned — pluggable DB + artifact backends ([#55], [#56]) |
 | **Docker / containers** | Supported via Kubernetes executor | Supported via Docker infra | Celery/Kubernetes executors | Not built-in | Trivial once backends are pluggable ([#56]) |
 | **Multi-user / team** | Workspace permissions, code locations | Workspace RBAC, service accounts | DAG-level permissions, RBAC | Single-user only | Not planned — deliberate decision for simplicity |
-| **Backfills** | Built-in partitioned backfills | Via deployments | `dags backfill` (v2) | Supported — `barca get` re-runs subgraphs; needs partition filter on CLI | CLI flag: `--partition region=us` |
+| **Backfills** | Built-in partitioned backfills | Via deployments | `dags backfill` (v2) | Supported — `barca get` re-runs subgraphs; needs partition filter on CLI | CLI flag: `--partition region=us` ([#57]) |
 | **Dynamic pipelines** | Dynamic partitions, graph DSL | Dynamic tasks via `.map()` | Dynamic task mapping | Supported — static, dynamic (eval at plan time), derived (`partitions_from`) | — |
+| **Task-based workflows** | Jobs + ops (separate from assets) | `@task` + `@flow` (native) | `@task` (native) | `@effect` for leaves; mid-DAG tasks need design work | Architectural decision pending ([#58]) |
+| **APM / observability** | Via OpenTelemetry | Via OpenTelemetry | Via StatsD / Prometheus | Not built-in | Planned — Datadog (P1) + Sentry (P2) ([#59]) |
 | **Data quality / expectations** | Asset checks, freshness policies | Not built-in (use Great Expectations) | Not built-in | Not built-in — use pydantic/pandera/asserts in your functions; failures block downstream naturally | Syntactic sugar at best; not urgent |
 | **Plugin ecosystem** | Large (200+ integrations) | Growing (collections) | Massive (providers) | None | Hooks system ([#52]) is the starting point |
 
@@ -260,6 +262,9 @@ Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn
 [#54]: https://github.com/ExSidius/barca/issues/54
 [#55]: https://github.com/ExSidius/barca/issues/55
 [#56]: https://github.com/ExSidius/barca/issues/56
+[#57]: https://github.com/ExSidius/barca/issues/57
+[#58]: https://github.com/ExSidius/barca/issues/58
+[#59]: https://github.com/ExSidius/barca/issues/59
 
 Barca is fast and minimal **because** it doesn't do most of this yet. But the roadmap is deliberate: each feature is designed to add capability without adding framework complexity. Run history is just more DB rows. Retries are a loop in the worker. Scheduling is a cron check in the server. None of these require new services, config languages, or architectural overhead.
 
