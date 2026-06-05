@@ -164,9 +164,11 @@ pub fn get(
         use indicatif::{ProgressBar, ProgressStyle};
         let bar = ProgressBar::new(total_steps as u64);
         bar.set_style(
-            ProgressStyle::with_template("[barca] {bar:20.cyan/dim} {pos}/{len} steps | {msg}")
-                .unwrap()
-                .progress_chars("█▓░"),
+            ProgressStyle::with_template(
+                "[barca] {bar:20.cyan/dim} {pos}/{len} steps | {wide_msg}",
+            )
+            .unwrap()
+            .progress_chars("█▓░"),
         );
         if total_estimated > 0.0 {
             bar.set_message(format!("~{:.0}s remaining", total_estimated));
@@ -354,10 +356,20 @@ pub fn get(
     }
 
     // Finish progress bar.
-    if total_steps > 0 && steps_executed > 0 {
+    if let Some(ref bar) = pb {
+        if steps_executed > 0 {
+            bar.finish_and_clear();
+            eprintln!(
+                "[barca] {}/{} steps done in {:.1}s",
+                completed_steps, total_steps, elapsed_so_far
+            );
+        } else {
+            bar.finish_and_clear();
+        }
+    } else if agent_mode && steps_executed > 0 {
         eprintln!(
-            "\r[barca] {}/{} steps | done in {:.1}s              ",
-            total_steps, total_steps, elapsed_so_far
+            "[barca] {}/{} steps | done in {:.1}s",
+            completed_steps, total_steps, elapsed_so_far
         );
     }
 
