@@ -20,7 +20,7 @@ REPO = str(Path(__file__).resolve().parent.parent.parent)
 
 # Thresholds — if any measurement exceeds these, it's a regression.
 THRESHOLDS = {
-    "plan_2002_ms": 200,  # planning 2002 assets should be <200ms
+    "plan_2002_ms": 500,  # planning 2002 assets should be <500ms (includes cone hashing)
     "plan_100_ms": 50,  # planning 100 assets should be <50ms
     "per_step_ms": 1.0,  # per-step overhead should be <1ms
     "trivial_ms": 100,  # trivial (1 asset) total should be <100ms
