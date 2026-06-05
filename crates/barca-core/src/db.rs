@@ -491,6 +491,51 @@ pub fn get_avg_elapsed_sync(
     })
 }
 
+/// Look up the average elapsed_seconds for partitioned nodes using LIKE pattern matching.
+/// For base_node_ids like "file.py:fetch", matches all "file.py:fetch[%]" in the DB.
+/// Used for ETA estimation when steps carry partition_keys (late expansion).
+pub fn get_avg_elapsed_for_partitioned_sync(
+    db_path: &str,
+    base_node_ids: &[String],
+) -> Result<HashMap<String, f64>, BarcaError> {
+    if base_node_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        let mut result = HashMap::new();
+        for nid in base_node_ids {
+            let pattern = format!("{nid}[%]");
+            let mut rows = conn
+                .query(
+                    "SELECT AVG(elapsed_seconds) FROM materializations WHERE node_id LIKE ?1 AND elapsed_seconds IS NOT NULL",
+                    [pattern],
+                )
+                .await
+                .map_err(|e| BarcaError::Db(format!("failed to query avg elapsed: {e}")))?;
+            if let Some(row) = rows
+                .next()
+                .await
+                .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+                && let Ok(avg) = row.get::<f64>(0)
+            {
+                result.insert(nid.clone(), avg);
+            }
+        }
+        Ok(result)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

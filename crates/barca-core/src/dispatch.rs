@@ -106,38 +106,48 @@ pub fn expand_pending_partitions(
             }
 
             let combos = expand_partition_combos(&dim_values);
-            for combo in combos {
-                let pk = crate::PartitionKey::from(combo);
-                all_expanded_steps.push(StreamStep {
-                    step_id: crate::StepId::new(step.step_id.base.clone(), pk),
-                    kind: step.kind,
-                    function_name: step.function_name.clone(),
-                    source_file: step.source_file.clone(),
-                    inputs: step.inputs.clone(),
-                    pending_partitions: HashMap::new(),
-                    serializer: step.serializer.clone(),
-                    timeout_seconds: step.timeout_seconds,
-                });
-            }
+            let pks: Vec<crate::PartitionKey> =
+                combos.into_iter().map(crate::PartitionKey::from).collect();
+            all_expanded_steps.push(StreamStep {
+                step_id: crate::StepId::unpartitioned(step.step_id.base.clone()),
+                kind: step.kind,
+                function_name: step.function_name.clone(),
+                source_file: step.source_file.clone(),
+                inputs: step.inputs.clone(),
+                pending_partitions: HashMap::new(),
+                serializer: step.serializer.clone(),
+                timeout_seconds: step.timeout_seconds,
+                partition_keys: pks,
+            });
         }
     }
 
-    // Group expanded steps by partition key for aligned execution.
-    let mut by_partition: HashMap<String, Vec<StreamStep>> = HashMap::new();
-    for step in all_expanded_steps {
-        let key = step.step_id.partition.suffix();
-        by_partition.entry(key).or_default().push(step);
-    }
-
-    // Build work units: each partition group + passthrough steps.
+    // Build work units: expanded steps (with partition_keys) + passthrough steps.
     let mut work_units: Vec<Vec<StreamStep>> = Vec::new();
     if !passthrough_steps.is_empty() {
         work_units.push(passthrough_steps);
     }
-    let mut keys: Vec<String> = by_partition.keys().cloned().collect();
-    keys.sort();
-    for key in keys {
-        work_units.push(by_partition.remove(&key).unwrap());
+    // Split each expanded step's partition_keys across streams.
+    for step in all_expanded_steps {
+        let total_pks = step.partition_keys.len();
+        if total_pks == 0 {
+            work_units.push(vec![step]);
+        } else {
+            let chunk_size = total_pks.div_ceil(pool_size);
+            for chunk in step.partition_keys.chunks(chunk_size) {
+                work_units.push(vec![StreamStep {
+                    step_id: step.step_id.clone(),
+                    kind: step.kind,
+                    function_name: step.function_name.clone(),
+                    source_file: step.source_file.clone(),
+                    inputs: step.inputs.clone(),
+                    pending_partitions: step.pending_partitions.clone(),
+                    serializer: step.serializer.clone(),
+                    timeout_seconds: step.timeout_seconds,
+                    partition_keys: chunk.to_vec(),
+                }]);
+            }
+        }
     }
 
     // Distribute work units across streams via bin-packing.
@@ -146,13 +156,23 @@ pub fn expand_pending_partitions(
     let mut sizes: Vec<usize> = vec![0; num_streams];
 
     for unit in work_units {
+        let weight: usize = unit
+            .iter()
+            .map(|st| {
+                if st.partition_keys.is_empty() {
+                    1
+                } else {
+                    st.partition_keys.len()
+                }
+            })
+            .sum();
         let target = sizes
             .iter()
             .enumerate()
             .min_by_key(|(_, s)| *s)
             .map(|(i, _)| i)
             .unwrap_or(0);
-        sizes[target] += unit.len();
+        sizes[target] += weight;
         streams[target].extend(unit);
     }
 
@@ -196,18 +216,38 @@ pub fn build_provided_inputs(
             };
 
             for upstream_id in step.inputs.values() {
+                // Direct base match.
                 if let Some(output) = all_outputs.get(upstream_id) {
                     provided
                         .entry(upstream_id.clone())
                         .or_insert_with(|| ProvidedInput::Single(output.clone()));
                     continue;
                 }
+                // Partition-aligned match (old-style: step_id has partition suffix).
                 if !suffix.is_empty() {
                     let aligned_id = format!("{upstream_id}{suffix}");
                     if let Some(output) = all_outputs.get(&aligned_id) {
                         provided
                             .entry(aligned_id)
                             .or_insert_with(|| ProvidedInput::Single(output.clone()));
+                        continue;
+                    }
+                }
+                // Late expansion: step has partition_keys — provide all aligned upstream
+                // outputs so the worker can resolve per-partition inputs.
+                if !step.partition_keys.is_empty() {
+                    let mut found_any = false;
+                    for pk in &step.partition_keys {
+                        let pk_suffix = format!("[{}]", pk.suffix());
+                        let aligned_id = format!("{upstream_id}{pk_suffix}");
+                        if let Some(output) = all_outputs.get(&aligned_id) {
+                            provided
+                                .entry(aligned_id)
+                                .or_insert_with(|| ProvidedInput::Single(output.clone()));
+                            found_any = true;
+                        }
+                    }
+                    if found_any {
                         continue;
                     }
                 }
@@ -493,18 +533,9 @@ pub fn serialize_batch(
         .steps
         .iter()
         .map(|s| {
-            let inputs = if s.step_id.partition.is_empty() {
-                s.inputs.clone()
-            } else {
-                let suffix = s.step_id.partition.suffix();
-                s.inputs
-                    .iter()
-                    .map(|(param, upstream_id)| {
-                        let aligned_id = format!("{upstream_id}[{suffix}]");
-                        (param.clone(), aligned_id)
-                    })
-                    .collect()
-            };
+            // With late expansion, inputs are always base (unpartitioned) IDs.
+            // The worker resolves partition-aligned inputs when iterating partition_keys.
+            let inputs = s.inputs.clone();
 
             let mut step = serde_json::json!({
                 "node_id": s.step_id.display(),
@@ -513,8 +544,14 @@ pub fn serialize_batch(
                 "source_file": s.source_file,
                 "inputs": inputs,
             });
-            if !s.step_id.partition.is_empty() {
-                step["partition"] = serde_json::json!(s.step_id.partition.0);
+            if !s.partition_keys.is_empty() {
+                // Serialize partition_keys as array of objects: [{"ticker":"AAPL"}, ...]
+                let pks: Vec<serde_json::Value> = s
+                    .partition_keys
+                    .iter()
+                    .map(|pk| serde_json::json!(pk.0))
+                    .collect();
+                step["partition_keys"] = serde_json::json!(pks);
             }
             if let Some(ref ser) = s.serializer {
                 step["serializer"] = serde_json::json!(ser);
@@ -756,6 +793,7 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    partition_keys: vec![],
                 }],
             }],
         };
@@ -785,6 +823,7 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    partition_keys: vec![],
                 }],
             }],
         };
@@ -816,6 +855,7 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    partition_keys: vec![],
                 }],
             }],
         };
@@ -847,6 +887,7 @@ Traceback (most recent call last):\n\
                     )]),
                     serializer: None,
                     timeout_seconds: 300,
+                    partition_keys: vec![],
                 }],
             }],
         };
@@ -862,23 +903,31 @@ Traceback (most recent call last):\n\
         );
 
         let expanded = expand_pending_partitions(&phase, &outputs, 4).unwrap();
-        let all_steps: Vec<String> = expanded
+        // Late expansion: expanded steps have partition_keys, not individual step_ids.
+        let all_pks: Vec<String> = expanded
             .streams
             .iter()
-            .flat_map(|s| s.steps.iter().map(|st| st.step_id.display()))
+            .flat_map(|s| &s.steps)
+            .flat_map(|st| {
+                st.partition_keys
+                    .iter()
+                    .map(|pk| pk.display_id(&st.step_id.base))
+            })
             .collect();
-        assert!(all_steps.contains(&"f:transform[region=eu]".to_string()));
-        assert!(all_steps.contains(&"f:transform[region=us]".to_string()));
-        assert_eq!(all_steps.len(), 2);
+        assert!(all_pks.contains(&"f:transform[region=eu]".to_string()));
+        assert!(all_pks.contains(&"f:transform[region=us]".to_string()));
+        assert_eq!(all_pks.len(), 2);
     }
 
     #[test]
-    fn serialize_batch_includes_partition_aligned_inputs() {
+    fn serialize_batch_includes_partition_keys() {
+        // Late expansion: step has unpartitioned step_id + partition_keys.
+        // Inputs are base IDs — the worker resolves partition-aligned inputs.
         let pk = PartitionKey::from(HashMap::from([("t".to_string(), "X".to_string())]));
         let stream = WorkerStream {
             stream_id: "w0".to_string(),
             steps: vec![StreamStep {
-                step_id: StepId::new("f:b", pk),
+                step_id: StepId::unpartitioned("f:b"),
                 kind: NodeKind::Asset,
                 function_name: Arc::from("b"),
                 source_file: Arc::from("f"),
@@ -886,13 +935,18 @@ Traceback (most recent call last):\n\
                 pending_partitions: HashMap::new(),
                 serializer: None,
                 timeout_seconds: 300,
+                partition_keys: vec![pk],
             }],
         };
 
         let json_str = serialize_batch(&stream, &HashMap::<String, ProvidedInput>::new());
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        let step_inputs = &parsed["steps"][0]["inputs"];
-        assert_eq!(step_inputs["data"], "f:a[t=X]");
+        // Inputs are base IDs (worker handles alignment)
+        assert_eq!(parsed["steps"][0]["inputs"]["data"], "f:a");
+        // partition_keys should be serialized as array of objects
+        let pks = &parsed["steps"][0]["partition_keys"];
+        assert_eq!(pks.as_array().unwrap().len(), 1);
+        assert_eq!(pks[0]["t"], "X");
     }
 
     // ─── v2 protocol + OutputRef tests ───────────────────────────────────────
@@ -988,6 +1042,7 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    partition_keys: vec![],
                 }],
             }],
         };
@@ -1025,6 +1080,7 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    partition_keys: vec![],
                 }],
             }],
         };
@@ -1059,6 +1115,7 @@ Traceback (most recent call last):\n\
                 pending_partitions: HashMap::new(),
                 serializer: None,
                 timeout_seconds: 300,
+                partition_keys: vec![],
             }],
         };
         let mut provided: HashMap<String, ProvidedInput> = HashMap::new();
@@ -1095,6 +1152,7 @@ Traceback (most recent call last):\n\
                 pending_partitions: HashMap::new(),
                 serializer: None,
                 timeout_seconds: 300,
+                partition_keys: vec![],
             }],
         };
 
@@ -1127,6 +1185,7 @@ Traceback (most recent call last):\n\
                     )]),
                     serializer: None,
                     timeout_seconds: 300,
+                    partition_keys: vec![],
                 }],
             }],
         };
@@ -1143,14 +1202,20 @@ Traceback (most recent call last):\n\
         );
 
         let expanded = expand_pending_partitions(&phase, &outputs, 4).unwrap();
-        let all_steps: Vec<String> = expanded
+        // Late expansion: expanded steps have partition_keys, not individual step_ids.
+        let all_pks: Vec<String> = expanded
             .streams
             .iter()
-            .flat_map(|s| s.steps.iter().map(|st| st.step_id.display()))
+            .flat_map(|s| &s.steps)
+            .flat_map(|st| {
+                st.partition_keys
+                    .iter()
+                    .map(|pk| pk.display_id(&st.step_id.base))
+            })
             .collect();
-        assert!(all_steps.contains(&"f:transform[region=us]".to_string()));
-        assert!(all_steps.contains(&"f:transform[region=eu]".to_string()));
-        assert!(all_steps.contains(&"f:transform[region=ap]".to_string()));
-        assert_eq!(all_steps.len(), 3);
+        assert!(all_pks.contains(&"f:transform[region=us]".to_string()));
+        assert!(all_pks.contains(&"f:transform[region=eu]".to_string()));
+        assert!(all_pks.contains(&"f:transform[region=ap]".to_string()));
+        assert_eq!(all_pks.len(), 3);
     }
 }

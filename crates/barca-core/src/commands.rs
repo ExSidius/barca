@@ -167,18 +167,44 @@ pub fn get(
 
     // Progress bar setup.
     let total_steps = exec_plan.total_steps;
-    let all_node_ids: Vec<String> = exec_plan
+    // Collect unpartitioned node_ids for exact ETA lookup.
+    let unpartitioned_node_ids: Vec<String> = exec_plan
         .phases
         .iter()
         .flat_map(|p| &p.streams)
         .flat_map(|s| &s.steps)
+        .filter(|st| st.partition_keys.is_empty())
         .map(|st| st.step_id.display())
         .collect();
-    let avg_times = db::get_avg_elapsed_sync(&db_path, &all_node_ids)?;
-    let total_estimated: f64 = all_node_ids
+    // Collect partitioned base node_ids for LIKE-based ETA lookup.
+    let partitioned_base_ids: Vec<String> = exec_plan
+        .phases
+        .iter()
+        .flat_map(|p| &p.streams)
+        .flat_map(|s| &s.steps)
+        .filter(|st| !st.partition_keys.is_empty())
+        .map(|st| st.step_id.base_id().to_string())
+        .collect();
+    let avg_times = db::get_avg_elapsed_sync(&db_path, &unpartitioned_node_ids)?;
+    let partitioned_avg_times =
+        db::get_avg_elapsed_for_partitioned_sync(&db_path, &partitioned_base_ids)?;
+    let total_estimated: f64 = unpartitioned_node_ids
         .iter()
         .filter_map(|nid| avg_times.get(nid))
-        .sum();
+        .sum::<f64>()
+        + exec_plan
+            .phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .filter(|st| !st.partition_keys.is_empty())
+            .filter_map(|st| {
+                let base = st.step_id.base_id().to_string();
+                partitioned_avg_times
+                    .get(&base)
+                    .map(|avg| avg * st.partition_keys.len() as f64)
+            })
+            .sum::<f64>();
     let mut elapsed_so_far: f64 = 0.0;
     let mut completed_steps: usize = 0;
 
@@ -226,6 +252,13 @@ pub fn get(
 
                 // Skip cache lookups when no_cache is set.
                 if no_cache {
+                    uncached_steps.push(step.clone());
+                    continue;
+                }
+
+                // TODO: Partitioned steps with partition_keys skip cache for now.
+                // To cache-check these, we'd need to verify each partition key individually.
+                if !step.partition_keys.is_empty() {
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -291,7 +324,14 @@ pub fn get(
         steps_executed += filtered_phase
             .streams
             .iter()
-            .map(|s| s.steps.len())
+            .flat_map(|s| &s.steps)
+            .map(|st| {
+                if st.partition_keys.is_empty() {
+                    1
+                } else {
+                    st.partition_keys.len()
+                }
+            })
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
@@ -600,7 +640,14 @@ fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> Execut
             .phases
             .iter()
             .flat_map(|p| &p.streams)
-            .map(|s| s.steps.len())
+            .flat_map(|s| &s.steps)
+            .map(|st| {
+                if st.partition_keys.is_empty() {
+                    1
+                } else {
+                    st.partition_keys.len()
+                }
+            })
             .sum(),
         ..exec_plan
     }
