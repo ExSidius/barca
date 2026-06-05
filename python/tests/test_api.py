@@ -393,6 +393,96 @@ class TestFormats:
         assert barca.get("data", f) == {"key": "value"}
 
 
+# ─── Subdirectory file paths ──────────────────────────────────────────────────
+
+
+class TestSubdirectoryPaths:
+    """Files in a/b/c.py style paths should work correctly."""
+
+    def _write_nested(self, tmp_path, relpath, code):
+        p = tmp_path / relpath
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(textwrap.dedent(code))
+        return str(p)
+
+    def test_get_all_from_subdirectory(self, tmp_path):
+        f = self._write_nested(
+            tmp_path,
+            "proj/pipelines/etl.py",
+            """
+            from barca import asset
+
+            @asset()
+            def extract():
+                return {"rows": 10}
+
+            @asset(inputs={"data": extract})
+            def transform(data):
+                return {"rows": data["rows"] * 2}
+        """,
+        )
+        result = barca.get(f)
+        assert result == {"rows": 20}
+
+    def test_get_target_from_subdirectory(self, tmp_path):
+        f = self._write_nested(
+            tmp_path,
+            "proj/pipelines/etl.py",
+            """
+            from barca import asset
+
+            @asset()
+            def extract():
+                return {"rows": 10}
+
+            @asset(inputs={"data": extract})
+            def transform(data):
+                return {"rows": data["rows"] * 2}
+        """,
+        )
+        result = barca.get("extract", f)
+        assert result == {"rows": 10}
+
+    def test_deeply_nested_file(self, tmp_path):
+        f = self._write_nested(
+            tmp_path,
+            "a/b/c/d/pipeline.py",
+            """
+            from barca import asset
+
+            @asset()
+            def deep():
+                return {"depth": 4}
+        """,
+        )
+        result = barca.get(f)
+        assert result == {"depth": 4}
+
+    def test_get_with_cross_subdir_import(self, tmp_path):
+        self._write_nested(
+            tmp_path,
+            "proj/utils/math.py",
+            """
+            def double(x):
+                return x * 2
+        """,
+        )
+        f = self._write_nested(
+            tmp_path,
+            "proj/pipeline.py",
+            """
+            from barca import asset
+            from utils.math import double
+
+            @asset()
+            def result():
+                return {"value": double(21)}
+        """,
+        )
+        result = barca.get(f)
+        assert result == {"value": 42}
+
+
 # ─── Error cases ──────────────────────────────────────────────────────────────
 
 
