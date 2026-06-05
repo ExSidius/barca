@@ -129,8 +129,74 @@ pub fn cone_hash_with_imports(
                             ModuleDef::Assignment { source_text, .. } => {
                                 cone_parts.push((format!("{module}:{name}"), source_text.clone()));
                             }
-                            _ => {
-                                cone_parts.push((name.clone(), name.clone()));
+                            ModuleDef::Import {
+                                module: reexport_module,
+                            } => {
+                                // Re-export: __init__.py imports from another module.
+                                // Follow the chain: look up the re-exported module.
+                                if let Some(reexport_source) = other_sources.get(reexport_module) {
+                                    let reexport_defs = collect_module_definitions(reexport_source);
+                                    if let Some(
+                                        ModuleDef::Function {
+                                            source_text,
+                                            references,
+                                        }
+                                        | ModuleDef::Assignment {
+                                            source_text,
+                                            references,
+                                        },
+                                    ) = reexport_defs.get(&name)
+                                    {
+                                        cone_parts.push((
+                                            format!("{reexport_module}:{name}"),
+                                            source_text.clone(),
+                                        ));
+                                        // Trace transitive deps in the re-exported module.
+                                        let mut rq: Vec<String> = references
+                                            .iter()
+                                            .filter(|r| reexport_defs.contains_key(r.as_str()))
+                                            .cloned()
+                                            .collect();
+                                        while let Some(dep) = rq.pop() {
+                                            let dep_key = format!("{reexport_module}:{dep}");
+                                            if visited.contains(&dep_key) {
+                                                continue;
+                                            }
+                                            visited.insert(dep_key.clone());
+                                            if let Some(
+                                                ModuleDef::Function {
+                                                    source_text,
+                                                    references,
+                                                }
+                                                | ModuleDef::Assignment {
+                                                    source_text,
+                                                    references,
+                                                },
+                                            ) = reexport_defs.get(&dep)
+                                            {
+                                                cone_parts.push((dep_key, source_text.clone()));
+                                                for r in references {
+                                                    if !visited
+                                                        .contains(&format!("{reexport_module}:{r}"))
+                                                        && reexport_defs.contains_key(r.as_str())
+                                                    {
+                                                        rq.push(r.clone());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        cone_parts.push((
+                                            name.clone(),
+                                            format!("import:{reexport_module}:{name}"),
+                                        ));
+                                    }
+                                } else {
+                                    cone_parts.push((
+                                        name.clone(),
+                                        format!("import:{reexport_module}:{name}"),
+                                    ));
+                                }
                             }
                         }
                     } else {

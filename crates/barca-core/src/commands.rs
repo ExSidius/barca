@@ -504,6 +504,7 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
             .to_string();
         file_sources.insert(stem, source.clone());
         if let Some(parent) = path.parent() {
+            // Scan sibling .py files (flat).
             if let Ok(entries) = std::fs::read_dir(parent) {
                 for entry in entries.flatten() {
                     let ep = entry.path();
@@ -522,6 +523,10 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
                     }
                 }
             }
+            // Scan subdirectories recursively for dotted module imports.
+            // e.g., utils/math.py → "utils.math", pkg/sub/helpers.py → "pkg.sub.helpers"
+            // Also handles __init__.py: mylib/__init__.py → "mylib"
+            scan_subdirectories(parent, parent, &mut file_sources);
         }
         all_nodes.extend(nodes);
     }
@@ -547,6 +552,71 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
     resolve_dynamic_partitions(&mut all_nodes, python);
 
     Ok(Dag::build(&all_nodes)?)
+}
+
+/// Recursively scan subdirectories for Python modules.
+/// Stores dotted module paths as keys: `utils/math.py` → `"utils.math"`.
+/// Handles `__init__.py`: `mylib/__init__.py` → `"mylib"`.
+fn scan_subdirectories(
+    dir: &std::path::Path,
+    root: &std::path::Path,
+    file_sources: &mut HashMap<String, String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let ep = entry.path();
+        if ep.is_dir() {
+            let dir_name = ep
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            // Skip hidden dirs, __pycache__, .venv, etc.
+            if dir_name.starts_with('.')
+                || dir_name == "__pycache__"
+                || dir_name == ".venv"
+                || dir_name == "node_modules"
+            {
+                continue;
+            }
+            // Check if this is a Python package (has __init__.py).
+            let init_path = ep.join("__init__.py");
+            if init_path.exists() {
+                if let Ok(content) = fs::read_to_string(&init_path) {
+                    let module_path = ep
+                        .strip_prefix(root)
+                        .unwrap_or(&ep)
+                        .to_string_lossy()
+                        .replace(['/', '\\'], ".");
+                    file_sources.entry(module_path).or_insert_with(|| content);
+                }
+            }
+            // Scan .py files in the subdirectory.
+            if let Ok(sub_entries) = std::fs::read_dir(&ep) {
+                for sub_entry in sub_entries.flatten() {
+                    let sp = sub_entry.path();
+                    if sp.extension().map(|e| e == "py").unwrap_or(false)
+                        && sp.file_name().map(|n| n != "__init__.py").unwrap_or(true)
+                    {
+                        if let Ok(content) = fs::read_to_string(&sp) {
+                            // Build dotted module path relative to root.
+                            let rel = sp.strip_prefix(root).unwrap_or(&sp);
+                            let module_path = rel
+                                .to_string_lossy()
+                                .replace(['/', '\\'], ".")
+                                .trim_end_matches(".py")
+                                .to_string();
+                            file_sources.entry(module_path).or_insert_with(|| content);
+                        }
+                    }
+                }
+            }
+            // Recurse into deeper subdirectories.
+            scan_subdirectories(&ep, root, file_sources);
+        }
+    }
 }
 
 fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python: &PathBuf) {
