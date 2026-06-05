@@ -540,8 +540,7 @@ fn is_internal_frame(trimmed: &str) -> bool {
         }
     }
 
-    // runpy internals
-    path.starts_with("<frozen runpy>")
+    false
 }
 
 /// Check if a line is an exception line (not a frame or code line).
