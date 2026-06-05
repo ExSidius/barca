@@ -117,6 +117,59 @@ class TestSubdirectoryImports:
         assert r3["steps_executed"] == 1
 
 
+class TestRelativeImports:
+    """from .submodule import func (relative imports in __init__.py)."""
+
+    def test_relative_import_in_init(self, tmp_path):
+        """__init__.py using `from .core import transform` should track core.py changes."""
+        write_file(
+            tmp_path,
+            "mylib/__init__.py",
+            """
+            from .core import transform
+        """,
+        )
+        write_file(
+            tmp_path,
+            "mylib/core.py",
+            """
+            def transform(x):
+                return x * 2
+        """,
+        )
+        asset_file = write_file(
+            tmp_path,
+            "pipeline.py",
+            """
+            from barca import asset
+            from mylib import transform
+
+            @asset()
+            def result():
+                return {"value": transform(21)}
+        """,
+        )
+
+        r1 = barca.api._exec(["get", "result", asset_file])
+        assert r1["steps_executed"] == 1
+
+        r2 = barca.api._exec(["get", "result", asset_file])
+        assert r2["steps_executed"] == 0
+
+        # Change the implementation behind the relative import
+        write_file(
+            tmp_path,
+            "mylib/core.py",
+            """
+            def transform(x):
+                return x * 99
+        """,
+        )
+
+        r3 = barca.api._exec(["get", "result", asset_file])
+        assert r3["steps_executed"] == 1
+
+
 class TestInitReExports:
     """from mypackage import thing where thing is in __init__.py."""
 

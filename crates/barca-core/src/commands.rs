@@ -504,7 +504,11 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
             .to_string();
         file_sources.insert(stem, source.clone());
         if let Some(parent) = path.parent() {
-            // Scan sibling .py files (flat).
+            // Scan subdirectories FIRST — packages (__init__.py) take precedence
+            // over same-named sibling .py files, matching Python's import semantics.
+            scan_subdirectories(parent, parent, &mut file_sources);
+            // Then scan sibling .py files (flat) — or_insert_with is a no-op if
+            // a package with the same name was already registered above.
             if let Ok(entries) = std::fs::read_dir(parent) {
                 for entry in entries.flatten() {
                     let ep = entry.path();
@@ -523,10 +527,6 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
                     }
                 }
             }
-            // Scan subdirectories recursively for dotted module imports.
-            // e.g., utils/math.py → "utils.math", pkg/sub/helpers.py → "pkg.sub.helpers"
-            // Also handles __init__.py: mylib/__init__.py → "mylib"
-            scan_subdirectories(parent, parent, &mut file_sources);
         }
         all_nodes.extend(nodes);
     }
