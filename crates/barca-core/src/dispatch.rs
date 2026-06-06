@@ -1,6 +1,7 @@
 //! Phase execution engine — worker spawning, protocol parsing, partition expansion.
 
 use crate::planner::{Phase, StreamStep, WorkerStream, expand_partition_combos};
+use crate::scheduler::Unit;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
@@ -15,6 +16,24 @@ pub struct OutputRef {
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<f64>,
+}
+
+/// A structured failure reported by a worker for a single step.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StepError {
+    pub error_type: String,
+    pub message: String,
+    /// User-relevant traceback (barca-internal frames filtered out).
+    pub traceback: String,
+    /// Number of attempts made before this failure became permanent.
+    pub attempts: u32,
+}
+
+/// A permanently-failed step (retry budget exhausted), for the metadata DB.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepFailure {
+    pub node_id: String,
+    pub error: StepError,
 }
 
 /// Expand steps with pending_partitions using materialized source outputs.
@@ -117,6 +136,8 @@ pub fn expand_pending_partitions(
                 pending_partitions: HashMap::new(),
                 serializer: step.serializer.clone(),
                 timeout_seconds: step.timeout_seconds,
+                retries: step.retries,
+                retry_backoff_seconds: step.retry_backoff_seconds,
                 partition_keys: pks,
             });
         }
@@ -144,6 +165,8 @@ pub fn expand_pending_partitions(
                     pending_partitions: step.pending_partitions.clone(),
                     serializer: step.serializer.clone(),
                     timeout_seconds: step.timeout_seconds,
+                    retries: step.retries,
+                    retry_backoff_seconds: step.retry_backoff_seconds,
                     partition_keys: chunk.to_vec(),
                 }]);
             }
@@ -279,188 +302,362 @@ pub fn build_provided_inputs(
 /// Result of executing a phase — may contain partial outputs if a worker failed.
 pub struct PhaseResult {
     pub outputs: HashMap<String, OutputRef>,
+    /// First permanent failure rendered as a string, for `BarcaError::WorkerFailed`
+    /// back-compat. `None` if the phase fully succeeded.
     pub error: Option<String>,
+    /// All permanently-failed steps (retry budget exhausted), for the metadata DB.
+    pub failures: Vec<StepFailure>,
+    /// Attempts dispatched per base node id — used to persist `attempts` for
+    /// succeeded nodes (defaults to 1 when absent).
+    pub attempts: HashMap<String, u32>,
 }
 
-/// Event from a worker, streamed via channel for real-time progress updates.
+/// Event from a worker thread to the coordinator. `StepCompleted` is streamed
+/// live for progress; `UnitFinished` is fed to the pure scheduler core.
 enum WorkerEvent {
-    /// A step completed successfully.
+    /// A step completed successfully (live progress).
     StepCompleted { node_id: String, output: OutputRef },
-    /// Non-protocol stderr line (error/traceback).
-    ErrorLine(String),
-    /// Worker process exited.
-    WorkerDone { success: bool, batch_path: PathBuf },
+    /// A worker process for `unit` exited; carries the steps that failed/were blocked.
+    UnitFinished {
+        unit: Unit,
+        failures: Vec<(String, StepError)>,
+        blocked: Vec<String>,
+    },
 }
 
-/// Execute a single phase: spawn N workers in parallel, stream results via channels.
+/// Execute a single phase. The pure `scheduler::Scheduler` owns all dispatch /
+/// retry / backoff decisions; this function is the **imperative shell** that
+/// interprets the scheduler's `Action`s (spawn a worker, arm a timer, record a
+/// failure) and feeds `SchedEvent`s back in. Worker threads are pure producers
+/// that stream `WorkerEvent`s over a single channel.
 ///
 /// Callback type for per-step progress updates.
 pub type StepCallback<'a> = &'a mut dyn FnMut(&str, &OutputRef);
 
-/// `on_step` is called on the main thread each time a step completes — enables
-/// real-time progress bar updates even when multiple workers run in parallel.
+/// `on_step` is called on the coordinator thread each time a step completes —
+/// real-time progress even while multiple workers run in parallel.
 pub fn execute_phase(
     phase: &Phase,
     provided_inputs: &HashMap<String, ProvidedInput>,
     python: &PathBuf,
     mut on_step: Option<StepCallback<'_>>,
 ) -> PhaseResult {
-    use std::sync::mpsc;
+    use crate::scheduler::{Action, SchedEvent, Scheduler, Unit};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Instant;
+
+    // Initial units = the phase's streams as-is (batched, no per-chain spawn).
+    let initial_units: Vec<Unit> = phase
+        .streams
+        .iter()
+        .map(|s| Unit {
+            stream_id: s.stream_id.clone(),
+            steps: s.steps.clone(),
+            provided_ids: Vec::new(),
+        })
+        .collect();
+    // Capacity = number of streams (≈ pool_size); matches today's "one process
+    // per stream concurrently", with freed slots reused for retries.
+    let capacity = initial_units.len().max(1);
 
     let (tx, rx) = mpsc::channel::<WorkerEvent>();
-
-    for stream in &phase.streams {
-        let batch_json = serialize_batch(stream, provided_inputs);
-        let mut batch_file = match tempfile::NamedTempFile::new() {
-            Ok(f) => f,
-            Err(e) => {
-                return PhaseResult {
-                    outputs: HashMap::new(),
-                    error: Some(format!("failed to create temp file: {e}")),
-                };
-            }
-        };
-        if let Err(e) = batch_file.write_all(batch_json.as_bytes()) {
-            return PhaseResult {
-                outputs: HashMap::new(),
-                error: Some(format!("failed to write batch: {e}")),
-            };
-        }
-        let (_, batch_path) = match batch_file.keep() {
-            Ok(kept) => kept,
-            Err(e) => {
-                return PhaseResult {
-                    outputs: HashMap::new(),
-                    error: Some(format!("failed to persist temp file: {e}")),
-                };
-            }
-        };
-
-        let mut child = match Command::new(python)
-            .args(["-m", "barca._worker"])
-            .arg(&batch_path)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
-            Ok(c) => c,
-            Err(e) => {
-                return PhaseResult {
-                    outputs: HashMap::new(),
-                    error: Some(format!("failed to spawn worker: {e}")),
-                };
-            }
-        };
-
-        let stderr = child.stderr.take().expect("no stderr");
-
-        // Reader thread: parse stderr line-by-line, send events as they arrive.
-        let tx_reader = tx.clone();
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            let mut error_lines: Vec<String> = Vec::new();
-
-            for line in reader.lines() {
-                let line = line.expect("failed to read worker stderr");
-                if line.is_empty() {
-                    continue;
-                }
-                if let Some(json_str) = line.strip_prefix(PROTOCOL_PREFIX_V2) {
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str)
-                        && parsed.get("type").and_then(|v| v.as_str()) == Some("result")
-                        && let (Some(node_id), Some(artifact)) = (
-                            parsed.get("node_id").and_then(|v| v.as_str()),
-                            parsed.get("artifact"),
-                        )
-                    {
-                        let oref = OutputRef {
-                            path: artifact
-                                .get("path")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            format: artifact
-                                .get("format")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                            size_bytes: artifact
-                                .get("size_bytes")
-                                .and_then(|v| v.as_u64())
-                                .unwrap_or(0),
-                            elapsed_seconds: parsed.get("elapsed").and_then(|v| v.as_f64()),
-                        };
-                        tx_reader
-                            .send(WorkerEvent::StepCompleted {
-                                node_id: node_id.to_string(),
-                                output: oref,
-                            })
-                            .ok();
-                    }
-                } else if line.starts_with("BARCA:") {
-                    // Unsupported protocol version — ignore.
-                } else {
-                    error_lines.push(line.clone());
-                    tx_reader.send(WorkerEvent::ErrorLine(line)).ok();
-                }
-            }
-
-            // Wait for child to exit, then send done event.
-            let status = child.wait().expect("failed to wait on worker");
-            tx_reader
-                .send(WorkerEvent::WorkerDone {
-                    success: status.success(),
-                    batch_path,
-                })
-                .ok();
-        });
-    }
-    // Drop the original sender so rx terminates when all reader threads finish.
-    drop(tx);
+    let mut sched = Scheduler::new(initial_units, capacity);
 
     let mut phase_outputs: HashMap<String, OutputRef> = HashMap::new();
-    let mut error_lines: Vec<String> = Vec::new();
-    let mut had_failure = false;
+    let mut failures: Vec<StepFailure> = Vec::new();
+    // Actual executions per base node id (one per `result`/`error` event), for the
+    // DB `attempts` column. Counts executions, not unit dispatches — a step blocked
+    // while an upstream retries never executed, so it isn't counted.
+    let mut exec_attempts: HashMap<String, u32> = HashMap::new();
+    // Set by every `interpret!` (reset to None, then to the nearest backoff deadline).
+    let mut next_timer: Option<Instant>;
+    let mut spawn_error: Option<String> = None;
+    let mut done = false;
 
-    // Main thread: receive events as they stream in from any worker.
-    for event in rx {
-        match event {
+    // Interpret a batch of scheduler actions. Returns true if `Finished` seen.
+    macro_rules! interpret {
+        ($actions:expr) => {{
+            next_timer = None;
+            for action in $actions {
+                match action {
+                    Action::Spawn(unit) => {
+                        if let Err(e) =
+                            spawn_unit(&unit, provided_inputs, &phase_outputs, python, &tx)
+                        {
+                            spawn_error.get_or_insert(e);
+                        }
+                    }
+                    Action::SetTimer(at) => next_timer = Some(at),
+                    Action::EmitFailed(node_id, error) => {
+                        failures.push(StepFailure { node_id, error });
+                    }
+                    Action::Finished => done = true,
+                }
+            }
+        }};
+    }
+
+    interpret!(sched.start(Instant::now()));
+
+    while !done {
+        let event: Option<SchedEvent> = match next_timer {
+            Some(at) => {
+                let now = Instant::now();
+                if at <= now {
+                    Some(SchedEvent::Tick)
+                } else {
+                    match rx.recv_timeout(at - now) {
+                        Ok(we) => we.into_sched_event(&mut on_step, &mut phase_outputs, &mut exec_attempts),
+                        Err(RecvTimeoutError::Timeout) => Some(SchedEvent::Tick),
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            }
+            None => match rx.recv() {
+                Ok(we) => we.into_sched_event(&mut on_step, &mut phase_outputs, &mut exec_attempts),
+                Err(_) => break,
+            },
+        };
+
+        let Some(event) = event else { continue };
+        interpret!(sched.on_event(event, Instant::now()));
+    }
+
+    // Drop our sender; any still-running worker threads detach harmlessly.
+    drop(tx);
+
+    let error = spawn_error.or_else(|| {
+        failures.first().map(|f| {
+            if f.error.traceback.is_empty() {
+                format!("{}: {}", f.error.error_type, f.error.message)
+            } else {
+                f.error.traceback.clone()
+            }
+        })
+    });
+    PhaseResult {
+        outputs: phase_outputs,
+        error,
+        failures,
+        attempts: exec_attempts,
+    }
+}
+
+impl WorkerEvent {
+    /// Fold a worker event into the coordinator: `StepCompleted` is handled
+    /// inline (progress + record output) and yields `None`; `UnitFinished`
+    /// becomes a `SchedEvent` for the pure core.
+    fn into_sched_event(
+        self,
+        on_step: &mut Option<StepCallback<'_>>,
+        phase_outputs: &mut HashMap<String, OutputRef>,
+        exec_attempts: &mut HashMap<String, u32>,
+    ) -> Option<crate::scheduler::SchedEvent> {
+        match self {
             WorkerEvent::StepCompleted { node_id, output } => {
-                if let Some(cb) = &mut on_step {
+                // One actual execution of this node's function.
+                let base = crate::StepId::parse(&node_id).base_id().to_string();
+                *exec_attempts.entry(base).or_insert(0) += 1;
+                if let Some(cb) = on_step {
                     cb(&node_id, &output);
                 }
                 phase_outputs.insert(node_id, output);
+                None
             }
-            WorkerEvent::WorkerDone {
-                success,
-                batch_path,
+            WorkerEvent::UnitFinished {
+                unit,
+                failures,
+                blocked,
             } => {
-                if !success {
-                    had_failure = true;
+                // Each reported failure is also one actual execution (the function
+                // ran and raised). Blocked steps never ran, so they don't count.
+                for (node_id, _) in &failures {
+                    let base = crate::StepId::parse(node_id).base_id().to_string();
+                    *exec_attempts.entry(base).or_insert(0) += 1;
                 }
-                std::fs::remove_file(&batch_path).ok();
-            }
-            WorkerEvent::ErrorLine(line) => {
-                if !line.is_empty() {
-                    error_lines.push(line);
-                }
+                Some(crate::scheduler::SchedEvent::UnitFinished {
+                    unit,
+                    failures,
+                    blocked,
+                })
             }
         }
     }
+}
 
-    let first_error = if had_failure {
-        if error_lines.is_empty() {
-            Some("Worker exited with non-zero status (no stderr output)".to_string())
-        } else {
-            Some(filter_traceback(&error_lines))
+/// Serialize a unit's batch (merging any retry predecessor outputs into the
+/// provided map), spawn one Python worker, and start a reader thread that
+/// streams `StepCompleted` events and sends one `UnitFinished` on exit.
+fn spawn_unit(
+    unit: &crate::scheduler::Unit,
+    base_provided: &HashMap<String, ProvidedInput>,
+    phase_outputs: &HashMap<String, OutputRef>,
+    python: &PathBuf,
+    tx: &std::sync::mpsc::Sender<WorkerEvent>,
+) -> Result<(), String> {
+    // Merge base provided inputs with this unit's predecessor outputs (retries).
+    let mut provided = base_provided.clone();
+    for id in &unit.provided_ids {
+        if let Some(oref) = phase_outputs.get(id) {
+            provided.insert(id.clone(), ProvidedInput::Single(oref.clone()));
         }
-    } else {
-        None
+    }
+
+    let ws = WorkerStream {
+        stream_id: unit.stream_id.clone(),
+        steps: unit.steps.clone(),
+    };
+    let batch_json = serialize_batch(&ws, &provided);
+
+    let mut batch_file =
+        tempfile::NamedTempFile::new().map_err(|e| format!("failed to create temp file: {e}"))?;
+    batch_file
+        .write_all(batch_json.as_bytes())
+        .map_err(|e| format!("failed to write batch: {e}"))?;
+    let (_, batch_path) = batch_file
+        .keep()
+        .map_err(|e| format!("failed to persist temp file: {e}"))?;
+
+    let mut child = match Command::new(python)
+        .args(["-m", "barca._worker"])
+        .arg(&batch_path)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            std::fs::remove_file(&batch_path).ok();
+            return Err(format!("failed to spawn worker: {e}"));
+        }
     };
 
-    PhaseResult {
-        outputs: phase_outputs,
-        error: first_error,
+    let stderr = child.stderr.take().expect("no stderr");
+    let tx_reader = tx.clone();
+    let unit = unit.clone();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        let mut error_lines: Vec<String> = Vec::new();
+        let mut failures: Vec<(String, StepError)> = Vec::new();
+        let mut blocked: Vec<String> = Vec::new();
+        let mut completed: Vec<String> = Vec::new();
+
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            if line.is_empty() {
+                continue;
+            }
+            if let Some(json_str) = line.strip_prefix(PROTOCOL_PREFIX_V2) {
+                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
+                    continue;
+                };
+                match parsed.get("type").and_then(|v| v.as_str()) {
+                    Some("result") => {
+                        if let (Some(node_id), Some(artifact)) = (
+                            parsed.get("node_id").and_then(|v| v.as_str()),
+                            parsed.get("artifact"),
+                        ) {
+                            let oref = OutputRef {
+                                path: artifact
+                                    .get("path")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                format: artifact
+                                    .get("format")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                size_bytes: artifact
+                                    .get("size_bytes")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0),
+                                elapsed_seconds: parsed.get("elapsed").and_then(|v| v.as_f64()),
+                            };
+                            completed.push(node_id.to_string());
+                            tx_reader
+                                .send(WorkerEvent::StepCompleted {
+                                    node_id: node_id.to_string(),
+                                    output: oref,
+                                })
+                                .ok();
+                        }
+                    }
+                    Some("error") => {
+                        if let Some(node_id) = parsed.get("node_id").and_then(|v| v.as_str()) {
+                            failures.push((node_id.to_string(), parse_step_error(&parsed)));
+                        }
+                    }
+                    Some("blocked") => {
+                        if let Some(node_id) = parsed.get("node_id").and_then(|v| v.as_str()) {
+                            blocked.push(node_id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+            } else if !line.starts_with("BARCA:") {
+                error_lines.push(line);
+            }
+        }
+
+        let status = child.wait();
+        std::fs::remove_file(&batch_path).ok();
+
+        // Hard-crash fallback: non-zero exit with no structured error reported.
+        let crashed = status.map(|s| !s.success()).unwrap_or(true);
+        if crashed && failures.is_empty() {
+            let node = unit
+                .steps
+                .iter()
+                .map(|s| s.step_id.display())
+                .find(|d| !completed.contains(d))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let traceback = filter_traceback(&error_lines);
+            failures.push((
+                node,
+                StepError {
+                    error_type: "WorkerCrash".to_string(),
+                    message: "worker exited with a non-zero status".to_string(),
+                    traceback,
+                    attempts: 0,
+                },
+            ));
+        }
+
+        tx_reader
+            .send(WorkerEvent::UnitFinished {
+                unit,
+                failures,
+                blocked,
+            })
+            .ok();
+    });
+
+    Ok(())
+}
+
+/// Build a `StepError` from an `error` protocol message, filtering the
+/// traceback to user-relevant frames.
+fn parse_step_error(parsed: &serde_json::Value) -> StepError {
+    let raw_tb = parsed
+        .get("traceback")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tb_lines: Vec<String> = raw_tb.lines().map(|l| l.to_string()).collect();
+    StepError {
+        error_type: parsed
+            .get("error_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Error")
+            .to_string(),
+        message: parsed
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        traceback: filter_traceback(&tb_lines),
+        attempts: 0,
     }
 }
 
@@ -797,6 +994,8 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
                 }],
             }],
@@ -827,6 +1026,8 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
                 }],
             }],
@@ -859,6 +1060,8 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
                 }],
             }],
@@ -891,6 +1094,8 @@ Traceback (most recent call last):\n\
                     )]),
                     serializer: None,
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
                 }],
             }],
@@ -939,6 +1144,8 @@ Traceback (most recent call last):\n\
                 pending_partitions: HashMap::new(),
                 serializer: None,
                 timeout_seconds: 300,
+                retries: 1,
+                retry_backoff_seconds: 0.0,
                 partition_keys: vec![pk],
             }],
         };
@@ -1046,6 +1253,8 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
                 }],
             }],
@@ -1084,6 +1293,8 @@ Traceback (most recent call last):\n\
                     pending_partitions: HashMap::new(),
                     serializer: None,
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
                 }],
             }],
@@ -1119,6 +1330,8 @@ Traceback (most recent call last):\n\
                 pending_partitions: HashMap::new(),
                 serializer: None,
                 timeout_seconds: 300,
+                retries: 1,
+                retry_backoff_seconds: 0.0,
                 partition_keys: vec![],
             }],
         };
@@ -1156,6 +1369,8 @@ Traceback (most recent call last):\n\
                 pending_partitions: HashMap::new(),
                 serializer: None,
                 timeout_seconds: 300,
+                retries: 1,
+                retry_backoff_seconds: 0.0,
                 partition_keys: vec![],
             }],
         };
@@ -1189,6 +1404,8 @@ Traceback (most recent call last):\n\
                     )]),
                     serializer: None,
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
                 }],
             }],
@@ -1221,5 +1438,27 @@ Traceback (most recent call last):\n\
         assert!(all_pks.contains(&"f:transform[region=eu]".to_string()));
         assert!(all_pks.contains(&"f:transform[region=ap]".to_string()));
         assert_eq!(all_pks.len(), 3);
+    }
+
+    #[test]
+    fn parse_step_error_filters_internal_frames() {
+        let parsed: serde_json::Value = serde_json::json!({
+            "type": "error",
+            "node_id": "f:boom",
+            "error_type": "ValueError",
+            "message": "kaboom",
+            "traceback": "Traceback (most recent call last):\n  \
+                File \"/x/barca/_worker.py\", line 1, in run\n    fn()\n  \
+                File \"user.py\", line 3, in boom\n    raise ValueError('kaboom')\n\
+                ValueError: kaboom",
+        });
+        let err = parse_step_error(&parsed);
+        assert_eq!(err.error_type, "ValueError");
+        assert_eq!(err.message, "kaboom");
+        assert_eq!(err.attempts, 0); // filled in by the scheduler when permanent
+        // User frame retained, internal _worker.py frame stripped.
+        assert!(err.traceback.contains("user.py"));
+        assert!(!err.traceback.contains("_worker.py"));
+        assert!(err.traceback.contains("ValueError: kaboom"));
     }
 }

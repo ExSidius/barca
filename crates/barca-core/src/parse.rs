@@ -85,6 +85,9 @@ fn try_extract_function(
     let explicit_name = extract_string_kwarg(&keywords, "name");
     let description = extract_string_kwarg(&keywords, "description");
     let timeout_seconds = extract_int_kwarg(&keywords, "timeout_seconds").unwrap_or(300);
+    // `retries` is the total number of attempts (1 = no retry). Clamp 0 → 1.
+    let retries = extract_int_kwarg(&keywords, "retries").unwrap_or(1).max(1);
+    let retry_backoff_seconds = extract_float_kwarg(&keywords, "retry_backoff").unwrap_or(0.0);
     let tags = extract_tags(&keywords);
     let artifact_serializer = keywords
         .iter()
@@ -105,6 +108,8 @@ fn try_extract_function(
         partitions,
         sinks,
         timeout_seconds,
+        retries,
+        retry_backoff_seconds,
         description,
         tags,
         is_unsafe,
@@ -463,6 +468,23 @@ fn extract_int_kwarg(keywords: &[&Keyword], name: &str) -> Option<u32> {
             && let ast::Number::Int(i) = &n.value
         {
             return i.as_u32();
+        }
+    }
+    None
+}
+
+/// Extract a float kwarg, accepting both float (`2.0`) and int (`2`) literals.
+fn extract_float_kwarg(keywords: &[&Keyword], name: &str) -> Option<f64> {
+    for kw in keywords {
+        let Some(ref ident) = kw.arg else { continue };
+        if ident.as_str() == name
+            && let Expr::NumberLiteral(n) = &kw.value
+        {
+            return match &n.value {
+                ast::Number::Float(f) => Some(*f),
+                ast::Number::Int(i) => i.as_u32().map(|v| v as f64),
+                _ => None,
+            };
         }
     }
     None

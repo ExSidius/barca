@@ -222,6 +222,9 @@ fn execute(
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
+    // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
+    let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
+    let mut all_attempts: HashMap<String, u32> = HashMap::new();
     let mut steps_executed = 0;
 
     // Progress bar setup.
@@ -360,7 +363,7 @@ fn execute(
                 let cached = rt.block_on(async {
                     let mut rows = conn
                         .query(
-                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
+                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
                             [display_id.clone(), run_h.clone()],
                         )
                         .await
@@ -455,6 +458,10 @@ fn execute(
         if phase_error.is_none() {
             phase_error = phase_result.error;
         }
+        for (base, n) in phase_result.attempts {
+            all_attempts.insert(base, n);
+        }
+        all_failures.extend(phase_result.failures);
         let phase_outputs = phase_result.outputs;
 
         let step_order: Vec<String> = filtered_phase
@@ -534,8 +541,10 @@ fn execute(
                 .elapsed_seconds
                 .map(|e| e.to_string())
                 .unwrap_or_default();
+            let base = crate::StepId::parse(node_id).base_id().to_string();
+            let attempts = all_attempts.get(&base).copied().unwrap_or(1);
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''))",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7)",
                 [
                     node_id.clone(),
                     run_h.clone(),
@@ -543,6 +552,51 @@ fn execute(
                     oref.format.clone(),
                     oref.size_bytes.to_string(),
                     elapsed_str,
+                    attempts.to_string(),
+                ],
+            )
+            .await
+            .ok();
+        }
+
+        // Persist permanently-failed steps as `status='failed'` rows (artifact
+        // columns NULL). Failed rows are never served as cache hits.
+        for failure in &all_failures {
+            let node_id = &failure.node_id;
+            let sid = crate::StepId::parse(node_id);
+            let def_hash = dag
+                .get_node(sid.base_id())
+                .map(|n| n.definition_hash.as_str())
+                .unwrap_or("");
+            let partition_key = if sid.partition.is_empty() {
+                None
+            } else {
+                Some(sid.partition.suffix())
+            };
+            let upstream_ids: Vec<String> = dag
+                .get_node(sid.base_id())
+                .map(|n| {
+                    n.resolved_inputs
+                        .values()
+                        .chain(n.resolved_collected.values())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let run_h = cache::compute_run_hash(
+                def_hash,
+                partition_key.as_deref(),
+                upstream_ids.iter(),
+                &cached_run_hashes,
+            );
+            conn.execute(
+                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
+                [
+                    node_id.clone(),
+                    run_h,
+                    failure.error.message.clone(),
+                    failure.error.traceback.clone(),
+                    failure.error.attempts.to_string(),
                 ],
             )
             .await

@@ -69,6 +69,10 @@ pub struct StreamStep {
     pub serializer: Option<Arc<str>>,
     /// Timeout in seconds for this step's execution.
     pub timeout_seconds: u32,
+    /// Total number of attempts on failure (1 = no retry). Rust-side only.
+    pub retries: u32,
+    /// Base backoff in seconds between attempts; delay = `retry_backoff_seconds * attempt`.
+    pub retry_backoff_seconds: f64,
     /// Late-expanded partition keys: workers loop over these internally.
     /// Empty for unpartitioned nodes. Enables 1M+ partitions without 1M structs.
     pub partition_keys: Vec<PartitionKey>,
@@ -325,6 +329,8 @@ fn build_phases(
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
                                     timeout_seconds: step.timeout_seconds,
+                                    retries: step.retries,
+                                    retry_backoff_seconds: step.retry_backoff_seconds,
                                     partition_keys: chunk.to_vec(),
                                 }]);
                             }
@@ -360,6 +366,8 @@ fn build_phases(
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
                                     timeout_seconds: step.timeout_seconds,
+                                    retries: step.retries,
+                                    retry_backoff_seconds: step.retry_backoff_seconds,
                                     partition_keys: pks,
                                 });
                             }
@@ -404,6 +412,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             .artifact_serializer
             .map(|s| Arc::from(format!("{s:?}").to_lowercase().as_str()));
         let timeout_seconds = node.extracted.timeout_seconds;
+        let retries = node.extracted.retries;
+        let retry_backoff_seconds = node.extracted.retry_backoff_seconds;
         let function_name: Arc<str> = Arc::from(node.function_name());
         let source_file: Arc<str> = Arc::from(node.source_file());
 
@@ -419,6 +429,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 pending_partitions: HashMap::new(),
                 serializer,
                 timeout_seconds,
+                retries,
+                retry_backoff_seconds,
                 partition_keys: pks,
             });
         } else if !derived_partitions.is_empty() {
@@ -431,6 +443,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 pending_partitions: derived_partitions,
                 serializer: serializer.clone(),
                 timeout_seconds,
+                retries,
+                retry_backoff_seconds,
                 partition_keys: Vec::new(),
             });
         } else {
@@ -443,6 +457,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 pending_partitions: HashMap::new(),
                 serializer,
                 timeout_seconds,
+                retries,
+                retry_backoff_seconds,
                 partition_keys: Vec::new(),
             });
         }
@@ -661,6 +677,8 @@ mod tests {
                     partitions: HashMap::new(),
                     sinks: SmallVec::new(),
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     description: None,
                     tags: HashMap::new(),
                     is_unsafe: false,
@@ -1091,6 +1109,8 @@ mod tests {
                 partitions: HashMap::new(),
                 sinks: SmallVec::new(),
                 timeout_seconds: 300,
+                retries: 1,
+                retry_backoff_seconds: 0.0,
                 description: None,
                 tags: HashMap::new(),
                 is_unsafe: false,
@@ -1228,6 +1248,8 @@ mod tests {
                     partitions: partition_map,
                     sinks: SmallVec::new(),
                     timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
                     description: None,
                     tags: HashMap::new(),
                     is_unsafe: false,

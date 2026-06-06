@@ -328,16 +328,25 @@ fn stats_cmd(
     println!("Cache hit rate: {:.1}%", stats.cache_hit_rate * 100.0);
     if !stats.recent_runs.is_empty() {
         println!("\nRecent runs:");
-        println!("  {:<10} {:<9} {:<20}", "ELAPSED", "STATUS", "CREATED");
+        println!(
+            "  {:<10} {:<9} {:<8} {:<20}",
+            "ELAPSED", "STATUS", "ATTEMPTS", "CREATED"
+        );
         for entry in &stats.recent_runs {
             let elapsed_str = entry
                 .elapsed_seconds
                 .map(|e| format!("{:.3}s", e))
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {:<10} {:<9} {:<20}",
-                elapsed_str, entry.status, entry.created_at,
+                "  {:<10} {:<9} {:<8} {:<20}",
+                elapsed_str, entry.status, entry.attempts, entry.created_at,
             );
+            if entry.status == "failed"
+                && let Some(msg) = &entry.error_message
+                && !msg.is_empty()
+            {
+                println!("      └─ {msg}");
+            }
         }
     }
     Ok(())

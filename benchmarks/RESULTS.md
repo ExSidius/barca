@@ -53,6 +53,22 @@ All frameworks invoked as scripts — no pre-started servers.
 
 *Airflow `dags test` has ~800ms per-task overhead. Airflow 3's LocalExecutor was tested with both SQLite and PostgreSQL — SQLite fails on concurrent writes, PostgreSQL fails because Airflow 3's task runner requires an API server connection (`httpx.ConnectError: Connection refused`). The `dags test` in-process mode is the only reliable local execution path for Airflow 3.x. Dashes indicate benchmarks not yet run for Airflow.*
 
+## Resilience / anti-pileup (resilience_pileup)
+
+Failure-path behavior, not happy-path overhead: 8 independent healthy 2-asset
+chains + one *poison* chain whose head fails twice (with `retry_backoff=0.5s`)
+before recovering. The question is whether one flaky asset stalls runnable work.
+
+| Framework | Mode | Expected wall-clock |
+|---|---|---|
+| **Barca** | Rust-owned retries; healthy chains run in-process; backoff sits in a delay-queue (holds no worker slot) | ≈ `max(healthy work, total backoff ≈ 1.5s)` |
+| Dagster | `materialize()` script mode (sequential) | ≈ `sum(work) + 1.5s backoff` |
+| Prefect | direct task calls (sequential) | ≈ `sum(work) + 1.5s backoff` |
+
+Run `benchmarks/resilience_pileup/bench.sh 5` (requires `hyperfine` + per-framework
+`.venv`s) to populate measured numbers. The barca side is validated end-to-end;
+competitor numbers depend on a machine with `dagster`/`prefect` installed.
+
 ## Parallel mode comparison (fan_out_500_50ms)
 
 500 independent tasks, each sleeping 50ms. Sequential minimum: 25.0s. This is the benchmark where parallelism matters most.

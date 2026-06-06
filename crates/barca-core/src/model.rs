@@ -305,6 +305,10 @@ pub struct ExtractedNode {
     pub sinks: SmallVec<[SinkDecl; 2]>,
     /// Timeout in seconds.
     pub timeout_seconds: u32,
+    /// Total number of attempts on failure (1 = no retry).
+    pub retries: u32,
+    /// Base backoff in seconds between attempts; delay = `retry_backoff_seconds * attempt`.
+    pub retry_backoff_seconds: f64,
     /// Human-readable description.
     pub description: Option<String>,
     /// Metadata tags.
