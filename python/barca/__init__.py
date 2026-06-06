@@ -52,8 +52,14 @@ class Schedule:
 # ─── Decorators ───────────────────────────────────────────────────────────────
 
 
-def asset(fn=None, *, serializer=None, **kwargs):
-    """Declare a cached asset node."""
+def asset(fn=None, *, serializer=None, retries=1, retry_backoff=0.0, **kwargs):
+    """Declare a cached asset node.
+
+    `retries` is the total number of attempts on failure (1 = no retry).
+    `retry_backoff` is the base delay in seconds between attempts (delay grows
+    linearly: `retry_backoff * attempt`). Both are read statically by the Rust
+    binary, which owns the retry loop; this stub stays a no-op.
+    """
     if fn is not None:
         return fn
 
@@ -63,8 +69,11 @@ def asset(fn=None, *, serializer=None, **kwargs):
     return decorator
 
 
-def sensor(fn=None, **kwargs):
-    """Declare a sensor node (observes external state)."""
+def sensor(fn=None, *, retries=1, retry_backoff=0.0, **kwargs):
+    """Declare a sensor node (observes external state).
+
+    See `asset` for `retries` / `retry_backoff` semantics.
+    """
     if fn is not None:
         return fn
 
@@ -74,7 +83,7 @@ def sensor(fn=None, **kwargs):
     return decorator
 
 
-def task(fn=None, *, after=None, inputs=None, **kwargs):
+def task(fn=None, *, after=None, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
     """Declare a task node (always re-runs; never cached).
 
     Tasks model workflow-management steps — deploys, notifications, migrations,
@@ -84,6 +93,8 @@ def task(fn=None, *, after=None, inputs=None, **kwargs):
 
     Ordering-only dependencies (no data passed) are declared with
     ``after=[other_task, ...]``.
+
+    See `asset` for `retries` / `retry_backoff` semantics.
     """
     if fn is not None:
         return fn

@@ -527,6 +527,54 @@ def normal_asset() -> dict:
     assert_eq!(nodes[0].timeout_seconds, 300);
 }
 
+#[test]
+fn retries_and_retry_backoff_parsed() {
+    let src = r#"
+from barca import asset
+
+@asset(retries=3, retry_backoff=2.5)
+def flaky() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes[0].retries, 3);
+    assert_eq!(nodes[0].retry_backoff_seconds, 2.5);
+}
+
+#[test]
+fn retry_backoff_accepts_int_literal() {
+    let src = r#"
+from barca import asset
+
+@asset(retries=2, retry_backoff=2)
+def flaky() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert_eq!(nodes[0].retry_backoff_seconds, 2.0);
+}
+
+#[test]
+fn retries_defaults_and_zero_clamps_to_one() {
+    let src = r#"
+from barca import asset
+
+@asset()
+def normal() -> dict:
+    return {}
+
+@asset(retries=0)
+def clamped() -> dict:
+    return {}
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    // Default: 1 attempt, no backoff.
+    assert_eq!(nodes[0].retries, 1);
+    assert_eq!(nodes[0].retry_backoff_seconds, 0.0);
+    // retries=0 is meaningless (zero attempts) → clamped to 1.
+    assert_eq!(nodes[1].retries, 1);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 8. @unsafe decorator
 // ═══════════════════════════════════════════════════════════════════════════════

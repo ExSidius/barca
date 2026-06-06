@@ -8,6 +8,7 @@ pub mod hash;
 pub mod model;
 pub mod parse;
 pub mod planner;
+pub mod scheduler;
 
 pub use dag::Dag;
 pub use model::*;

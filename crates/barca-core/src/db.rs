@@ -43,6 +43,10 @@ pub struct AssetRunEntry {
     pub elapsed_seconds: Option<f64>,
     pub status: String,
     pub created_at: String,
+    /// Error message for `status='failed'` rows (None for successes).
+    pub error_message: Option<String>,
+    /// Number of attempts made.
+    pub attempts: i64,
 }
 
 pub fn ensure_db_dir() -> Result<String, BarcaError> {
@@ -78,6 +82,9 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
                 artifact_size_bytes INTEGER,
                 elapsed_seconds REAL,
                 status TEXT NOT NULL DEFAULT 'success',
+                error_message TEXT,
+                error_traceback TEXT,
+                attempts INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT (datetime('now'))
             )",
             (),
@@ -98,6 +105,9 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
             "ALTER TABLE materializations ADD COLUMN artifact_format TEXT",
             "ALTER TABLE materializations ADD COLUMN artifact_size_bytes INTEGER",
             "ALTER TABLE materializations ADD COLUMN elapsed_seconds REAL",
+            "ALTER TABLE materializations ADD COLUMN error_message TEXT",
+            "ALTER TABLE materializations ADD COLUMN error_traceback TEXT",
+            "ALTER TABLE materializations ADD COLUMN attempts INTEGER DEFAULT 1",
         ] {
             conn.execute(col, ()).await.ok();
         }
@@ -398,7 +408,7 @@ pub fn get_asset_stats_sync(db_path: &str, node_id: &str) -> Result<AssetStats, 
         // Recent runs (last 10).
         let mut rows = conn
             .query(
-                "SELECT elapsed_seconds, status, created_at FROM materializations WHERE node_id = ?1 ORDER BY id DESC LIMIT 10",
+                "SELECT elapsed_seconds, status, created_at, error_message, attempts FROM materializations WHERE node_id = ?1 ORDER BY id DESC LIMIT 10",
                 [node_id.to_string()],
             )
             .await
@@ -413,6 +423,8 @@ pub fn get_asset_stats_sync(db_path: &str, node_id: &str) -> Result<AssetStats, 
                 elapsed_seconds: row.get::<f64>(0).ok(),
                 status: row.get::<String>(1).unwrap_or_else(|_| "success".to_string()),
                 created_at: row.get::<String>(2).unwrap_or_default(),
+                error_message: row.get::<String>(3).ok(),
+                attempts: row.get::<i64>(4).unwrap_or(1),
             });
         }
 
@@ -728,8 +740,68 @@ mod tests {
         assert!(columns.contains(&"artifact_path".to_string()));
         assert!(columns.contains(&"artifact_format".to_string()));
         assert!(columns.contains(&"artifact_size_bytes".to_string()));
+        // Error/retry tracking columns.
+        assert!(columns.contains(&"error_message".to_string()));
+        assert!(columns.contains(&"error_traceback".to_string()));
+        assert!(columns.contains(&"attempts".to_string()));
         // Old column still exists for backward compat
         assert!(columns.contains(&"output_json".to_string()));
+    }
+
+    #[test]
+    fn failed_row_round_trips_and_is_excluded_from_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (status, msg, attempts, success_hits) = rt.block_on(async {
+            let db = Builder::new_local(&db_path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            // Insert a failed materialization.
+            conn.execute(
+                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
+                ["f:boom".to_string(), "rh1".to_string(), "kaboom".to_string(), "Traceback…".to_string(), "3".to_string()],
+            )
+            .await
+            .unwrap();
+
+            // Read it back.
+            let mut rows = conn
+                .query(
+                    "SELECT status, error_message, attempts FROM materializations WHERE node_id = ?1",
+                    ["f:boom".to_string()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            let status = row.get::<String>(0).unwrap();
+            let msg = row.get::<String>(1).unwrap();
+            let attempts = row.get::<i64>(2).unwrap();
+
+            // The cache lookup filters on status='success' — a failed row is never served.
+            let mut hit_rows = conn
+                .query(
+                    "SELECT artifact_path FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
+                    ["f:boom".to_string(), "rh1".to_string()],
+                )
+                .await
+                .unwrap();
+            let success_hits = hit_rows.next().await.unwrap().is_some();
+
+            (status, msg, attempts, success_hits)
+        });
+
+        assert_eq!(status, "failed");
+        assert_eq!(msg, "kaboom");
+        assert_eq!(attempts, 3);
+        assert!(
+            !success_hits,
+            "failed rows must not satisfy the cache lookup"
+        );
     }
 
     #[test]
