@@ -280,6 +280,19 @@ pub enum SerializerKind {
     Yaml,
 }
 
+// ─── Parallel calls ──────────────────────────────────────────────────────────
+
+/// A parallel work item extracted from a `parallel()` call in a task body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParallelCall {
+    /// Function references in this parallel() call. Each is a @task function.
+    /// Empty if the call is fully dynamic (can't be resolved statically).
+    pub static_refs: Vec<NodeRef>,
+    /// Whether this parallel() call has dynamic (non-static) arguments
+    /// that need runtime expansion (like generators or splat of variables).
+    pub is_dynamic: bool,
+}
+
 // ─── Extracted node ──────────────────────────────────────────────────────────
 
 /// A fully extracted node from Python source — the output of parsing.
@@ -324,6 +337,9 @@ pub struct ExtractedNode {
     pub cone_hash: String,
     /// Explicit artifact serializer override from `@asset(serializer="parquet")`.
     pub artifact_serializer: Option<SerializerKind>,
+    /// Parallel calls found in this task's function body.
+    /// Only populated for `@task` nodes. Empty for assets/sensors.
+    pub parallel_calls: Vec<ParallelCall>,
 }
 
 impl ExtractedNode {

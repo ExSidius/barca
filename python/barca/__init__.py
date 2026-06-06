@@ -22,6 +22,8 @@ __all__ = [
     "partitions_from",
     "collect",
     "asset_ref",
+    "parallel",
+    "parallel_map",
     "get",
     "run",
     "plan",
@@ -137,6 +139,32 @@ def collect(asset_fn):
 def asset_ref(ref_string: str) -> str:
     """Canonical asset reference."""
     return ref_string
+
+
+# ─── Parallel primitives ─────────────────────────────────────────────────────
+
+
+def parallel(*callables):
+    """Run callables in parallel across worker processes.
+
+    Each argument should be a `functools.partial` wrapping a @task-decorated
+    function. Returns a list of results (or error objects) in argument order.
+
+    This is a planning-time primitive -- Rust extracts the structure from the
+    AST and dispatches branches across workers.
+    """
+    # Stub: execute sequentially for standalone Python usage.
+    return [c() for c in callables]
+
+
+def parallel_map(fn, items, **kwargs):
+    """Map a @task function over items in parallel.
+
+    Sugar for `parallel(*(partial(fn, item, **kwargs) for item in items))`.
+    """
+    from functools import partial
+
+    return parallel(*(partial(fn, item, **kwargs) for item in items))
 
 
 # ─── Python API ──────────────────────────────────────────────────────────────

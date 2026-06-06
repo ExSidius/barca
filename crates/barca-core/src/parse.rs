@@ -10,8 +10,8 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 
 use crate::model::{
-    CronExpr, DeclaredInput, ExtractedNode, Freshness, NodeKind, NodeRef, PartitionSpec,
-    PartitionValue, SerializerKind, SinkDecl,
+    CronExpr, DeclaredInput, ExtractedNode, Freshness, NodeKind, NodeRef, ParallelCall,
+    PartitionSpec, PartitionValue, SerializerKind, SinkDecl,
 };
 
 /// Error from parsing a Python source file.
@@ -93,6 +93,12 @@ fn try_extract_function(
         .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("serializer"))
         .and_then(|kw| extract_serializer_kind(&kw.value));
 
+    let parallel_calls = if kind == NodeKind::Task {
+        extract_parallel_calls(&func.body)
+    } else {
+        Vec::new()
+    };
+
     let start = func.range().start().to_usize();
     let end = func.range().end().to_usize();
     let source_text = source[start..end].to_string();
@@ -116,6 +122,7 @@ fn try_extract_function(
         source_text,
         cone_hash: String::new(), // computed after extraction in extract_nodes()
         artifact_serializer,
+        parallel_calls,
     })
 }
 
@@ -460,6 +467,177 @@ fn extract_string_literal(expr: &Expr) -> Option<String> {
     }
 }
 
+/// Scan a task function body for `parallel(...)` and `parallel_map(...)` calls.
+/// Returns a list of ParallelCall structs describing each call.
+fn extract_parallel_calls(body: &[Stmt]) -> Vec<ParallelCall> {
+    let mut results = Vec::new();
+    collect_parallel_calls_from_stmts(body, &mut results);
+    results
+}
+
+/// Recursively walk statements looking for parallel()/parallel_map() calls.
+fn collect_parallel_calls_from_stmts(stmts: &[Stmt], results: &mut Vec<ParallelCall>) {
+    for stmt in stmts {
+        match stmt {
+            Stmt::Expr(expr_stmt) => {
+                collect_parallel_calls_from_expr(&expr_stmt.value, results);
+            }
+            Stmt::Assign(assign) => {
+                collect_parallel_calls_from_expr(&assign.value, results);
+            }
+            Stmt::AnnAssign(assign) => {
+                if let Some(ref value) = assign.value {
+                    collect_parallel_calls_from_expr(value, results);
+                }
+            }
+            Stmt::Return(ret) => {
+                if let Some(ref value) = ret.value {
+                    collect_parallel_calls_from_expr(value, results);
+                }
+            }
+            Stmt::If(if_stmt) => {
+                collect_parallel_calls_from_stmts(&if_stmt.body, results);
+                for clause in &if_stmt.elif_else_clauses {
+                    collect_parallel_calls_from_stmts(&clause.body, results);
+                }
+            }
+            Stmt::For(for_stmt) => {
+                collect_parallel_calls_from_stmts(&for_stmt.body, results);
+                collect_parallel_calls_from_stmts(&for_stmt.orelse, results);
+            }
+            Stmt::While(while_stmt) => {
+                collect_parallel_calls_from_stmts(&while_stmt.body, results);
+                collect_parallel_calls_from_stmts(&while_stmt.orelse, results);
+            }
+            Stmt::With(with_stmt) => {
+                collect_parallel_calls_from_stmts(&with_stmt.body, results);
+            }
+            Stmt::Try(try_stmt) => {
+                collect_parallel_calls_from_stmts(&try_stmt.body, results);
+                for handler in &try_stmt.handlers {
+                    let ast::ExceptHandler::ExceptHandler(h) = handler;
+                    collect_parallel_calls_from_stmts(&h.body, results);
+                }
+                collect_parallel_calls_from_stmts(&try_stmt.orelse, results);
+                collect_parallel_calls_from_stmts(&try_stmt.finalbody, results);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Check if an expression is a call to `parallel()` or `parallel_map()` and extract it.
+fn collect_parallel_calls_from_expr(expr: &Expr, results: &mut Vec<ParallelCall>) {
+    if let Expr::Call(call) = expr {
+        if let Expr::Name(n) = call.func.as_ref() {
+            match n.id.as_str() {
+                "parallel" => {
+                    results.push(extract_parallel_call(call));
+                    return;
+                }
+                "parallel_map" => {
+                    results.push(extract_parallel_map_call(call));
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Extract a ParallelCall from a `parallel(...)` call expression.
+fn extract_parallel_call(call: &ast::ExprCall) -> ParallelCall {
+    let mut static_refs = Vec::new();
+    let mut is_dynamic = false;
+
+    for arg in &call.arguments.args {
+        match arg {
+            // partial(func_name, ...) — extract func_name
+            Expr::Call(inner_call) => {
+                if let Expr::Name(n) = inner_call.func.as_ref() {
+                    if n.id.as_str() == "partial" {
+                        if let Some(first_arg) = inner_call.arguments.args.first() {
+                            if let Expr::Name(func_name) = first_arg {
+                                static_refs.push(NodeRef::FunctionName(func_name.id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            // *expr — starred argument, always dynamic
+            Expr::Starred(starred) => {
+                is_dynamic = true;
+                // Try to extract static_refs from the starred expression.
+                // e.g., *(partial(deploy, r) for r in regions) — extract "deploy"
+                extract_refs_from_starred(&starred.value, &mut static_refs);
+            }
+            _ => {}
+        }
+    }
+
+    ParallelCall {
+        static_refs,
+        is_dynamic,
+    }
+}
+
+/// Extract a ParallelCall from a `parallel_map(func, items, ...)` call expression.
+fn extract_parallel_map_call(call: &ast::ExprCall) -> ParallelCall {
+    let mut static_refs = Vec::new();
+
+    // First arg is the function reference
+    if let Some(first_arg) = call.arguments.args.first() {
+        if let Expr::Name(func_name) = first_arg {
+            static_refs.push(NodeRef::FunctionName(func_name.id.to_string()));
+        }
+    }
+
+    // parallel_map is always dynamic (items resolved at runtime)
+    ParallelCall {
+        static_refs,
+        is_dynamic: true,
+    }
+}
+
+/// Try to extract function references from a starred expression.
+/// Handles patterns like:
+///   *(partial(deploy, r) for r in regions)  → extracts "deploy"
+///   *work_items                              → no refs extractable
+fn extract_refs_from_starred(expr: &Expr, refs: &mut Vec<NodeRef>) {
+    match expr {
+        // Generator expression: (partial(func, ...) for ... in ...)
+        Expr::Generator(genexpr) => {
+            if let Expr::Call(inner_call) = genexpr.elt.as_ref() {
+                if let Expr::Name(n) = inner_call.func.as_ref() {
+                    if n.id.as_str() == "partial" {
+                        if let Some(first_arg) = inner_call.arguments.args.first() {
+                            if let Expr::Name(func_name) = first_arg {
+                                refs.push(NodeRef::FunctionName(func_name.id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // List comprehension: [partial(func, ...) for ... in ...]
+        Expr::ListComp(comp) => {
+            if let Expr::Call(inner_call) = comp.elt.as_ref() {
+                if let Expr::Name(n) = inner_call.func.as_ref() {
+                    if n.id.as_str() == "partial" {
+                        if let Some(first_arg) = inner_call.arguments.args.first() {
+                            if let Expr::Name(func_name) = first_arg {
+                                refs.push(NodeRef::FunctionName(func_name.id.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Plain variable: *work_items — can't extract refs
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -553,5 +731,96 @@ def my_asset() -> dict:
         assert_eq!(nodes[0].sinks[0].path, "tmp/out.json");
         assert_eq!(nodes[0].sinks[0].serializer, Some(SerializerKind::Json));
         assert_eq!(nodes[0].sinks[1].path, "s3://bucket/out.txt");
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // Parallel call extraction
+    // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn parallel_static_partials_extracted() {
+        let src = r#"
+@task()
+def deploy_all():
+    parallel(partial(deploy_us, model), partial(deploy_eu, model))
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes[0].parallel_calls.len(), 1);
+        assert!(!nodes[0].parallel_calls[0].is_dynamic);
+        assert_eq!(nodes[0].parallel_calls[0].static_refs.len(), 2);
+    }
+
+    #[test]
+    fn parallel_dynamic_generator_extracted() {
+        let src = r#"
+@task()
+def deploy_all():
+    parallel(*(partial(deploy, r) for r in regions))
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes[0].parallel_calls.len(), 1);
+        assert!(nodes[0].parallel_calls[0].is_dynamic);
+        assert_eq!(nodes[0].parallel_calls[0].static_refs.len(), 1); // knows the function
+    }
+
+    #[test]
+    fn parallel_map_extracted() {
+        let src = r#"
+@task()
+def deploy_all():
+    parallel_map(deploy, regions)
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes[0].parallel_calls.len(), 1);
+        assert!(nodes[0].parallel_calls[0].is_dynamic);
+        assert_eq!(nodes[0].parallel_calls[0].static_refs.len(), 1);
+    }
+
+    #[test]
+    fn parallel_fully_dynamic_extracted() {
+        let src = r#"
+@task()
+def release():
+    parallel(*work_items)
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes[0].parallel_calls.len(), 1);
+        assert!(nodes[0].parallel_calls[0].is_dynamic);
+        assert!(nodes[0].parallel_calls[0].static_refs.is_empty());
+    }
+
+    #[test]
+    fn parallel_not_extracted_from_assets() {
+        let src = r#"
+@asset()
+def compute():
+    parallel(partial(a), partial(b))
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert!(nodes[0].parallel_calls.is_empty());
+    }
+
+    #[test]
+    fn parallel_multiple_calls_in_body() {
+        let src = r#"
+@task()
+def pipeline():
+    parallel(partial(a), partial(b))
+    parallel(partial(c), partial(d))
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes[0].parallel_calls.len(), 2);
+    }
+
+    #[test]
+    fn parallel_inside_if_else() {
+        let src = r#"
+@task()
+def conditional():
+    if True:
+        parallel(partial(a), partial(b))
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes[0].parallel_calls.len(), 1);
     }
 }

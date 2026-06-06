@@ -653,6 +653,7 @@ mod tests {
                     source_text: String::new(),
                     cone_hash: String::new(),
                     artifact_serializer: None,
+                    parallel_calls: Vec::new(),
                 }
             })
             .collect();
@@ -1084,6 +1085,7 @@ mod tests {
                 source_text: String::new(),
                 cone_hash: String::new(),
                 artifact_serializer: None,
+                parallel_calls: Vec::new(),
             })
             .collect();
         let dag = Dag::build(&extracted).unwrap();
@@ -1222,6 +1224,7 @@ mod tests {
                     source_text: String::new(),
                     cone_hash: String::new(),
                     artifact_serializer: None,
+                    parallel_calls: Vec::new(),
                 }
             })
             .collect();
