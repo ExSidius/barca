@@ -1,11 +1,23 @@
-"""Iris ML pipeline — load, split, train, evaluate.
+"""Iris ML pipeline — load, split, train, evaluate, deploy, notify.
 
-Demonstrates a simple multi-stage pipeline with an attached ``@sink`` on
-the evaluation step so that every successful training run writes a JSON
-report to ``tmp/iris_eval.json`` for downstream tooling to consume.
+Demonstrates a realistic *mixed* pipeline: the data stages (load → split →
+train → evaluate) are cacheable ``@asset`` nodes, while the workflow-management
+tail (deploy the model, notify the team) are ``@task`` nodes — they always
+re-run, are never cached, and consume upstream outputs.
+
+- ``@sink`` on evaluation writes a JSON report to ``tmp/iris_eval.json``.
+- ``deploy_model`` is a ``@task`` consuming the ``evaluation`` *asset*.
+- ``notify_team`` is a ``@task`` consuming the ``deploy_model`` *task* — a
+  nested task. Targeting it (``barca run notify_team ...``) scopes the run to
+  exactly this subtree, pulling the assets + deploy behind it.
+
+Try it::
+
+    barca run notify_team iris_project/assets.py
+    barca run notify_team --burst trained_model iris_project/assets.py
 """
 
-from barca import asset, sink
+from barca import asset, sink, task
 
 
 @asset()
@@ -88,3 +100,31 @@ def evaluation(model: dict, split: dict) -> dict:
         ),
         "classification_report": report,
     }
+
+
+# ---------------------------------------------------------------------------
+# Workflow tail: tasks (always re-run, never cached)
+# ---------------------------------------------------------------------------
+
+
+@task(inputs={"eval": evaluation})
+def deploy_model(eval: dict) -> dict:
+    """Deploy the evaluated model (asset → task).
+
+    A task that consumes the ``evaluation`` *asset*. It "uploads" the model and
+    returns a deployment id. Because it's a task it always re-runs — you never
+    want a cached deploy.
+    """
+    deployment_id = f"iris-{int(eval['test_accuracy'] * 10000)}"
+    print(f"[barca task] deploying model (accuracy={eval['test_accuracy']}) -> {deployment_id}")
+    return {"deployment_id": deployment_id, "accuracy": eval["test_accuracy"]}
+
+
+@task(inputs={"deploy": deploy_model})
+def notify_team(deploy: dict) -> None:
+    """Notify the team (task → task = nested task).
+
+    Consumes the ``deploy_model`` *task*. ``barca run notify_team`` scopes the
+    run to this whole subtree (assets + deploy + notify).
+    """
+    print(f"[barca task] deployed {deploy['deployment_id']} — notifying team")

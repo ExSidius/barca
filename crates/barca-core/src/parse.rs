@@ -69,7 +69,7 @@ fn try_extract_function(
             continue;
         }
 
-        // Check for @asset/@sensor/@effect
+        // Check for @asset/@sensor/@task
         if let Some((k, kws)) = match_node_decorator(&decorator.expression) {
             kind = Some(k);
             keywords = kws;
@@ -80,6 +80,7 @@ fn try_extract_function(
 
     let freshness = extract_freshness(&keywords).unwrap_or(Freshness::default_for(kind));
     let inputs = extract_inputs(&keywords);
+    let after = extract_after(&keywords);
     let partitions = extract_partitions(&keywords, source);
     let explicit_name = extract_string_kwarg(&keywords, "name");
     let description = extract_string_kwarg(&keywords, "description");
@@ -100,6 +101,7 @@ fn try_extract_function(
         explicit_name,
         freshness,
         inputs,
+        after,
         partitions,
         sinks,
         timeout_seconds,
@@ -161,7 +163,7 @@ fn match_node_decorator(expr: &Expr) -> Option<(NodeKind, Vec<&Keyword>)> {
             let kind = match name.id.as_str() {
                 "asset" => NodeKind::Asset,
                 "sensor" => NodeKind::Sensor,
-                "effect" => NodeKind::Effect,
+                "task" => NodeKind::Task,
                 _ => return None,
             };
             Some((kind, vec![]))
@@ -174,7 +176,7 @@ fn match_node_decorator(expr: &Expr) -> Option<(NodeKind, Vec<&Keyword>)> {
             let kind = match name {
                 "asset" => NodeKind::Asset,
                 "sensor" => NodeKind::Sensor,
-                "effect" => NodeKind::Effect,
+                "task" => NodeKind::Task,
                 _ => return None,
             };
             let kwargs: Vec<&Keyword> = call.arguments.keywords.iter().collect();
@@ -285,6 +287,42 @@ fn extract_inputs_from_dict(dict: &ast::ExprDict) -> SmallVec<[DeclaredInput; 4]
     }
 
     inputs
+}
+
+/// Extract `after=[node_a, node_b]` — execution-order-only dependencies.
+/// Accepts bare function references and `asset_ref("...")` calls.
+fn extract_after(keywords: &[&Keyword]) -> SmallVec<[NodeRef; 4]> {
+    for kw in keywords {
+        let Some(ref ident) = kw.arg else { continue };
+        if ident.as_str() != "after" {
+            continue;
+        }
+        if let Expr::List(list) = &kw.value {
+            return extract_node_ref_list(list);
+        }
+    }
+    SmallVec::new()
+}
+
+fn extract_node_ref_list(list: &ast::ExprList) -> SmallVec<[NodeRef; 4]> {
+    let mut refs = SmallVec::new();
+    for elt in &list.elts {
+        match elt {
+            Expr::Name(n) => refs.push(NodeRef::FunctionName(n.id.to_string())),
+            Expr::Call(call) => {
+                // Support asset_ref("path") inside after=[...].
+                if let Expr::Name(n) = call.func.as_ref()
+                    && n.id.as_str() == "asset_ref"
+                    && let Some(arg) = call.arguments.args.first()
+                    && let Some(s) = extract_string_literal(arg)
+                {
+                    refs.push(NodeRef::Canonical(s));
+                }
+            }
+            _ => {}
+        }
+    }
+    refs
 }
 
 fn extract_partitions(keywords: &[&Keyword], source: &str) -> HashMap<String, PartitionSpec> {
@@ -493,16 +531,16 @@ def b(a: str) -> str:
     }
 
     #[test]
-    fn test_sensor_and_effect() {
+    fn test_sensor_and_task() {
         let src = r#"
-from barca import sensor, effect, Schedule, Always
+from barca import sensor, task, Schedule, Always
 
 @sensor(freshness=Schedule("*/5 * * * *"))
 def my_sensor():
     return (True, {})
 
-@effect(inputs={"data": my_sensor}, freshness=Always())
-def my_effect(data):
+@task(inputs={"data": my_sensor}, freshness=Always())
+def my_task(data):
     print(data)
 "#;
         let nodes = extract_nodes(src, "test.py").unwrap();
@@ -511,7 +549,33 @@ def my_effect(data):
             nodes[0].freshness,
             Freshness::Schedule(CronExpr("*/5 * * * *".into()))
         );
-        assert_eq!(nodes[1].kind, NodeKind::Effect);
+        assert_eq!(nodes[1].kind, NodeKind::Task);
+    }
+
+    #[test]
+    fn test_after_kwarg() {
+        let src = r#"
+from barca import task
+
+@task()
+def migrate():
+    pass
+
+@task()
+def seed():
+    pass
+
+@task(after=[migrate, seed])
+def notify():
+    pass
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        let notify = nodes.iter().find(|n| n.function_name == "notify").unwrap();
+        assert_eq!(notify.kind, NodeKind::Task);
+        assert!(notify.inputs.is_empty());
+        assert_eq!(notify.after.len(), 2);
+        let names: Vec<&str> = notify.after.iter().map(|r| r.resolution_name()).collect();
+        assert_eq!(names, vec!["migrate", "seed"]);
     }
 
     #[test]

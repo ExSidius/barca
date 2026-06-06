@@ -29,7 +29,7 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
 
 1. **Rust binary** (`barca get <file.py>`):
    - Parses Python using ruff's AST (no import, pure static analysis)
-   - Builds a petgraph DAG from `@asset`/`@sensor`/`@effect` decorators
+   - Builds a petgraph DAG from `@asset`/`@sensor`/`@task` decorators
    - Generates a tiered execution plan (JSON)
    - Persists plan + results to local Turso/libSQL database (`.barca/metadata.db`)
    - Spawns Python worker processes per batch (`python -m barca._worker`)

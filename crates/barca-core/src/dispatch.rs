@@ -201,6 +201,10 @@ pub enum ProvidedInput {
 }
 
 /// Determine what values need to be provided to workers in this phase.
+///
+/// Only data edges (`Direct`/`Collect`, surfaced via `step.inputs`) produce
+/// provided inputs. `After` edges carry no data — they never appear in
+/// `step.inputs`, so an after-ordered step receives no artifact from them.
 pub fn build_provided_inputs(
     phase: &Phase,
     all_outputs: &HashMap<String, OutputRef>,

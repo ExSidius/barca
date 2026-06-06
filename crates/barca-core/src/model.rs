@@ -24,8 +24,10 @@ pub enum NodeKind {
     Asset,
     /// `@sensor` — observes external state, returns `(updated: bool, output)`.
     Sensor,
-    /// `@effect` — side-effect leaf node, cannot be an input to other nodes.
-    Effect,
+    /// `@task` — never cached, always re-runs; may appear anywhere in the DAG.
+    /// May depend on assets/sensors/tasks, but must not be upstream of an
+    /// asset or sensor (that would poison caching).
+    Task,
 }
 
 // ─── Freshness ───────────────────────────────────────────────────────────────
@@ -46,7 +48,7 @@ impl Freshness {
     /// Default freshness for a given node kind.
     pub fn default_for(kind: NodeKind) -> Self {
         match kind {
-            NodeKind::Asset | NodeKind::Effect => Freshness::Always,
+            NodeKind::Asset | NodeKind::Task => Freshness::Always,
             NodeKind::Sensor => Freshness::Manual,
         }
     }
@@ -294,6 +296,9 @@ pub struct ExtractedNode {
     pub freshness: Freshness,
     /// Declared inputs (parameter → upstream mapping). Typically 0–4 items.
     pub inputs: SmallVec<[DeclaredInput; 4]>,
+    /// Execution-order-only dependencies from `@task(after=[...])`. No data is
+    /// passed along these — they only force the referenced nodes to run first.
+    pub after: SmallVec<[NodeRef; 4]>,
     /// Partition dimensions.
     pub partitions: HashMap<String, PartitionSpec>,
     /// Sink declarations (from stacked `@sink` decorators). Typically 0–2 items.
@@ -375,4 +380,7 @@ pub enum EdgeKind {
     Collect,
     /// Partition source: upstream defines the partition universe for downstream.
     PartitionSource,
+    /// Execution-ordering-only edge from `@task(after=[...])`. Forces the
+    /// upstream to run first but passes no data — never becomes a worker input.
+    After,
 }

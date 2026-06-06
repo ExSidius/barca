@@ -170,6 +170,90 @@ class TestGetAll:
         assert result == {"value": 144}
 
 
+# ─── Tasks ──────────────────────────────────────────────────────────────────────
+
+
+class TestTask:
+    """Test `@task` — always re-runs, never cached; assets may feed tasks."""
+
+    def test_task_consumes_asset(self, tmp_path):
+        f = write_module(
+            tmp_path,
+            "deploy.py",
+            """
+            from barca import asset, task
+
+            @asset()
+            def model():
+                return {"weights": [1, 2, 3]}
+
+            @task(inputs={"m": model})
+            def deploy(m):
+                return {"deployed": len(m["weights"])}
+            """,
+        )
+        assert barca.run("deploy", f) == {"deployed": 3}
+
+    def test_task_after_ordering(self, tmp_path):
+        f = write_module(
+            tmp_path,
+            "chain.py",
+            """
+            from barca import task
+
+            @task()
+            def migrate():
+                return {"step": "migrate"}
+
+            @task(after=[migrate])
+            def warm_cache():
+                return {"step": "warm_cache"}
+
+            @task(after=[warm_cache])
+            def notify():
+                return {"step": "notify"}
+            """,
+        )
+        # The whole after-chain runs; targeting notify scopes to the subtree.
+        assert barca.run("notify", f) == {"step": "notify"}
+
+    def test_task_always_reruns(self, tmp_path):
+        f = write_module(
+            tmp_path,
+            "rerun.py",
+            """
+            from barca import task
+
+            @task()
+            def t():
+                return {"ok": True}
+            """,
+        )
+        # Two consecutive runs both execute the task (never cached).
+        barca.run("t", f)
+        result = barca.run("t", f)
+        assert result == {"ok": True}
+
+    def test_task_cannot_feed_asset(self, tmp_path):
+        f = write_module(
+            tmp_path,
+            "bad.py",
+            """
+            from barca import asset, task
+
+            @task()
+            def t():
+                return {"x": 1}
+
+            @asset(inputs={"data": t})
+            def a(data):
+                return data
+            """,
+        )
+        with pytest.raises(BarcaError, match="task"):
+            barca.get("a", f)
+
+
 # ─── Get command ──────────────────────────────────────────────────────────────
 
 

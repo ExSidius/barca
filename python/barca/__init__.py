@@ -12,7 +12,7 @@ __version__ = "0.1.5"
 __all__ = [
     "asset",
     "sensor",
-    "effect",
+    "task",
     "sink",
     "unsafe",
     "Always",
@@ -23,6 +23,7 @@ __all__ = [
     "collect",
     "asset_ref",
     "get",
+    "run",
     "plan",
     "history",
     "stats",
@@ -73,8 +74,17 @@ def sensor(fn=None, **kwargs):
     return decorator
 
 
-def effect(fn=None, **kwargs):
-    """Declare an effect node (side-effect leaf)."""
+def task(fn=None, *, after=None, inputs=None, **kwargs):
+    """Declare a task node (always re-runs; never cached).
+
+    Tasks model workflow-management steps — deploys, notifications, migrations,
+    cache warming — that *do* something rather than produce cacheable data. They
+    may appear anywhere in the graph and may depend on assets, sensors, or other
+    tasks, but must not be an input to an asset or sensor.
+
+    Ordering-only dependencies (no data passed) are declared with
+    ``after=[other_task, ...]``.
+    """
     if fn is not None:
         return fn
 
@@ -123,4 +133,4 @@ def asset_ref(ref_string: str) -> str:
 
 # ─── Python API ──────────────────────────────────────────────────────────────
 
-from barca.api import BarcaError, get, history, plan, stats  # noqa: E402
+from barca.api import BarcaError, get, history, plan, run, stats  # noqa: E402

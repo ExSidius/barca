@@ -1,6 +1,6 @@
 # Decorators
 
-Core decorators for defining assets, sensors, effects, sinks, and related primitives.
+Core decorators for defining assets, sensors, tasks, sinks, and related primitives.
 
 ## @asset
 
@@ -107,12 +107,13 @@ Sensors are source nodes only — they have no upstream inputs.
 
 ::: barca.SensorWrapper
 
-## @effect
+## @task
 
 ```python
-@effect(
+@task(
     name: str | None = None,
     inputs: dict[str, NodeRefLike] | None = None,
+    after: list[NodeRefLike] | None = None,
     freshness: Freshness = Always,
     timeout_seconds: int = 300,
     description: str | None = None,
@@ -120,29 +121,48 @@ Sensors are source nodes only — they have no upstream inputs.
 )
 ```
 
-Declares a standalone side-effect function — sending email, writing to a database, calling an external API. Effects take upstream inputs and produce no meaningful output. Use `@effect` for arbitrary side-effects; use `@sink` for writing asset outputs to file paths.
+Declares a **task** — a workflow-management step such as a deploy, notification,
+migration, or cache warm. Tasks always re-run and are never cached, so they're
+the right home for "do something" operations that don't produce cacheable data.
 
-Effects are leaf nodes — no other asset may list an effect as an input.
+Tasks are more general than a side-effect leaf:
+
+- They may appear **anywhere** in the graph (not just at the leaves).
+- They may depend on assets, sensors, or other tasks (via `inputs=`).
+- They may declare **ordering-only** dependencies via `after=[...]` — the
+  referenced nodes run first, but no data is passed.
+- They must **not** be an input to an asset or sensor (a task always re-runs, so
+  feeding its output into a cacheable node would keep that node perpetually
+  stale). Use `@sink` for writing asset outputs to file paths.
+
+Run a task and its cone with [`barca run`](../cli.md). By default `barca run`
+force-reruns every upstream asset; `--burst a,b` re-runs only the named assets.
 
 ```python
-from barca import asset, effect, Always
+from barca import asset, task
 
 @asset()
 def report() -> dict:
     return {"rows": 42}
 
-@effect(inputs={"data": report}, freshness=Always)
+# asset → task: a task consuming an upstream asset.
+@task(inputs={"data": report})
 def send_email(data: dict) -> None:
     print(f"Sending report: {data}")
+
+# Ordering-only task chain (no data passed): migrate → notify.
+@task()
+def migrate() -> None:
+    run_migration()
+
+@task(after=[migrate])
+def notify() -> None:
+    send_slack("migration done")
 ```
 
-::: barca.effect
+::: barca.task
     options:
       show_source: false
-
-## EffectWrapper
-
-::: barca.EffectWrapper
 
 ## @unsafe
 

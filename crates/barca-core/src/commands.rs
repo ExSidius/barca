@@ -88,14 +88,73 @@ fn default_pool_size() -> usize {
         .unwrap_or(4)
 }
 
-// ─── get ─────────────────────────────────────────────────────────────────────
+// ─── get / run ─────────────────────────────────────────────────────────────────
 
+/// How the engine treats cached asset materializations for this invocation.
+#[derive(Debug, Clone)]
+pub enum CachePolicy {
+    /// Normal cache-aware behavior — reuse fresh asset artifacts (`barca get`).
+    CacheAware,
+    /// Force-rerun every asset in the target's cone (`barca run`, default).
+    BurstAll,
+    /// Force-rerun only the named assets; all others stay cache-aware
+    /// (`barca run <task> --burst a,b`). Names are matched the same fuzzy way
+    /// as a CLI target (bare function name, `:name` suffix, or substring).
+    BurstSelective(Vec<String>),
+}
+
+/// `barca get` — cache-aware execution of an asset (or all assets).
 pub fn get(
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
     no_cache: bool,
     agent_mode: bool,
+) -> Result<GetResult, BarcaError> {
+    execute(
+        target_name,
+        file_args,
+        python,
+        no_cache,
+        agent_mode,
+        CachePolicy::CacheAware,
+        "get",
+    )
+}
+
+/// `barca run` — execute a task (and its cone), bursting upstream asset caches.
+/// `burst == None` bursts all upstream assets; `Some(names)` bursts only those.
+pub fn run(
+    target_name: &str,
+    file_args: &[String],
+    python: &PathBuf,
+    burst: Option<Vec<String>>,
+    agent_mode: bool,
+) -> Result<GetResult, BarcaError> {
+    let policy = match burst {
+        None => CachePolicy::BurstAll,
+        Some(names) => CachePolicy::BurstSelective(names),
+    };
+    execute(
+        Some(target_name),
+        file_args,
+        python,
+        false,
+        agent_mode,
+        policy,
+        "run",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    target_name: Option<&str>,
+    file_args: &[String],
+    python: &PathBuf,
+    no_cache: bool,
+    agent_mode: bool,
+    policy: CachePolicy,
+    command_label: &str,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
     let run_id = db::generate_run_id();
@@ -138,7 +197,7 @@ pub fn get(
     db::create_run_sync(
         &db_path,
         &run_id,
-        "get",
+        command_label,
         &file_args.join(" "),
         target_name,
         Some(exec_plan.total_steps),
@@ -244,14 +303,37 @@ pub fn get(
                 let display_id = step.step_id.display();
                 let base_node = dag.get_node(base_id);
 
-                // Sensors always re-run.
-                if base_node.is_some_and(|n| n.kind() == crate::NodeKind::Sensor) {
+                // Sensors and tasks always re-run — never cached.
+                if base_node.is_some_and(|n| {
+                    matches!(n.kind(), crate::NodeKind::Sensor | crate::NodeKind::Task)
+                }) {
                     uncached_steps.push(step.clone());
                     continue;
                 }
 
                 // Skip cache lookups when no_cache is set.
                 if no_cache {
+                    uncached_steps.push(step.clone());
+                    continue;
+                }
+
+                // Burst policy (`barca run`): force-rerun assets in/named by the
+                // burst set, bypassing the cache. Tasks/sensors already re-ran above.
+                let bursted = match &policy {
+                    CachePolicy::CacheAware => false,
+                    CachePolicy::BurstAll => {
+                        base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+                    }
+                    CachePolicy::BurstSelective(names) => {
+                        base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+                            && names.iter().any(|name| {
+                                base_id == name
+                                    || base_id.ends_with(&format!(":{name}"))
+                                    || base_id.ends_with(name.as_str())
+                            })
+                    }
+                };
+                if bursted {
                     uncached_steps.push(step.clone());
                     continue;
                 }
