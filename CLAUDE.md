@@ -105,3 +105,14 @@ git-cliff groups commits into changelog sections by type:
 | `remove`   | Removed         |
 
 Non-conventional commits appear under "Changes". Co-Authored-By trailers are stripped automatically.
+
+## Versioning
+
+Pre-1.0 — everything is unstable prototype work. Stay on `0.x.y` until the API and CLI
+surface are genuinely stable and battle-tested.
+
+- **Minor bump** (`0.x.0`): new capability area, new public surface (e.g. adding the HTTP API), or breaking changes
+- **Patch bump** (`0.x.y`): iteration within a capability — bug fixes, polish, performance, refactors
+
+Version must be consistent across `Cargo.toml` (workspace root + all crates) and `pyproject.toml`.
+Bump all of them together in a single commit at the start of a release branch.
