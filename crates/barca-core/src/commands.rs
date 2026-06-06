@@ -561,9 +561,12 @@ fn execute(
 
         // Persist permanently-failed steps as `status='failed'` rows (artifact
         // columns NULL). Failed rows are never served as cache hits.
+        // Use all_attempts (exec_attempts) for parity with success rows —
+        // scheduler dispatch counts can overstate for blocked descendants.
         for failure in &all_failures {
             let node_id = &failure.node_id;
             let sid = crate::StepId::parse(node_id);
+            let base = sid.base_id().to_string();
             let def_hash = dag
                 .get_node(sid.base_id())
                 .map(|n| n.definition_hash.as_str())
@@ -589,6 +592,7 @@ fn execute(
                 upstream_ids.iter(),
                 &cached_run_hashes,
             );
+            let attempts = all_attempts.get(&base).copied().unwrap_or(failure.error.attempts);
             conn.execute(
                 "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
                 [
@@ -596,7 +600,7 @@ fn execute(
                     run_h,
                     failure.error.message.clone(),
                     failure.error.traceback.clone(),
-                    failure.error.attempts.to_string(),
+                    attempts.to_string(),
                 ],
             )
             .await

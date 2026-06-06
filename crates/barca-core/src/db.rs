@@ -798,7 +798,10 @@ mod tests {
         assert_eq!(status, "failed");
         assert_eq!(msg, "kaboom");
         assert_eq!(attempts, 3);
-        assert!(!success_hits, "failed rows must not satisfy the cache lookup");
+        assert!(
+            !success_hits,
+            "failed rows must not satisfy the cache lookup"
+        );
     }
 
     #[test]

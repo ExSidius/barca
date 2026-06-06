@@ -354,6 +354,7 @@ pub fn execute_phase(
             stream_id: s.stream_id.clone(),
             steps: s.steps.clone(),
             provided_ids: Vec::new(),
+            retry_root: None,
         })
         .collect();
     // Capacity = number of streams (≈ pool_size); matches today's "one process
@@ -407,7 +408,11 @@ pub fn execute_phase(
                     Some(SchedEvent::Tick)
                 } else {
                     match rx.recv_timeout(at - now) {
-                        Ok(we) => we.into_sched_event(&mut on_step, &mut phase_outputs, &mut exec_attempts),
+                        Ok(we) => we.into_sched_event(
+                            &mut on_step,
+                            &mut phase_outputs,
+                            &mut exec_attempts,
+                        ),
                         Err(RecvTimeoutError::Timeout) => Some(SchedEvent::Tick),
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
@@ -605,24 +610,40 @@ fn spawn_unit(
         std::fs::remove_file(&batch_path).ok();
 
         // Hard-crash fallback: non-zero exit with no structured error reported.
+        // Report one WorkerCrash per uncompleted step so the scheduler can
+        // apply each step's retry policy and commands.rs can persist them all.
         let crashed = status.map(|s| !s.success()).unwrap_or(true);
         if crashed && failures.is_empty() {
-            let node = unit
+            let traceback = filter_traceback(&error_lines);
+            let uncompleted: Vec<String> = unit
                 .steps
                 .iter()
                 .map(|s| s.step_id.display())
-                .find(|d| !completed.contains(d))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let traceback = filter_traceback(&error_lines);
-            failures.push((
-                node,
-                StepError {
-                    error_type: "WorkerCrash".to_string(),
-                    message: "worker exited with a non-zero status".to_string(),
-                    traceback,
-                    attempts: 0,
-                },
-            ));
+                .filter(|d| !completed.contains(d))
+                .collect();
+            if uncompleted.is_empty() {
+                failures.push((
+                    "<unknown>".to_string(),
+                    StepError {
+                        error_type: "WorkerCrash".to_string(),
+                        message: "worker exited with a non-zero status".to_string(),
+                        traceback: traceback.clone(),
+                        attempts: 0,
+                    },
+                ));
+            } else {
+                for node in uncompleted {
+                    failures.push((
+                        node,
+                        StepError {
+                            error_type: "WorkerCrash".to_string(),
+                            message: "worker exited with a non-zero status".to_string(),
+                            traceback: traceback.clone(),
+                            attempts: 0,
+                        },
+                    ));
+                }
+            }
         }
 
         tx_reader

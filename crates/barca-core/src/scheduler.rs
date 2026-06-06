@@ -32,6 +32,10 @@ pub struct Unit {
     /// units, since within-stream predecessors run in the same process and
     /// cross-phase inputs are already in the base provided map.
     pub provided_ids: Vec<String>,
+    /// The base node id of the step being retried. `None` for initial units.
+    /// Used by the scheduler to only charge the retry budget of the root step,
+    /// not blocked descendants carried along in the same unit.
+    pub retry_root: Option<String>,
 }
 
 impl Unit {
@@ -176,7 +180,9 @@ impl Scheduler {
         for (node_id, err) in failures {
             let sid = StepId::parse(&node_id);
             let base = sid.base.to_string();
-            let entry = by_base.entry(base).or_insert_with(|| (err.clone(), Vec::new()));
+            let entry = by_base
+                .entry(base)
+                .or_insert_with(|| (err.clone(), Vec::new()));
             if !sid.partition.is_empty() {
                 entry.1.push(sid.partition);
             }
@@ -237,8 +243,15 @@ impl Scheduler {
             let Some(unit) = self.ready.pop_front() else {
                 break;
             };
-            for base in unit.base_ids() {
-                *self.attempts.entry(base).or_insert(0) += 1;
+            // For initial units, charge all bases. For retry units, only
+            // charge the retry root — blocked descendants are carried along
+            // but haven't consumed an attempt yet.
+            if let Some(root) = &unit.retry_root {
+                *self.attempts.entry(root.clone()).or_insert(0) += 1;
+            } else {
+                for base in unit.base_ids() {
+                    *self.attempts.entry(base).or_insert(0) += 1;
+                }
             }
             self.in_flight += 1;
             actions.push(Action::Spawn(unit));
@@ -297,8 +310,16 @@ fn build_retry_unit(
         }
     }
 
-    // Clone the included steps, restricting the failed step to its failed
-    // partition keys (so we only re-run partitions that didn't complete).
+    // Collect blocked partition keys so descendants can be restricted too.
+    let blocked_pks: Vec<PartitionKey> = blocked
+        .iter()
+        .map(|n| StepId::parse(n).partition)
+        .filter(|pk| !pk.is_empty())
+        .collect();
+
+    // Clone the included steps, restricting partition keys to only those
+    // that need re-running (failed partitions for the root, blocked
+    // partitions for descendants).
     let mut steps: Vec<StreamStep> = Vec::new();
     for step in &unit.steps {
         let base = step.step_id.base.to_string();
@@ -308,6 +329,10 @@ fn build_retry_unit(
         let mut clone = step.clone();
         if base == failed_base && !failed_pks.is_empty() {
             clone.partition_keys = failed_pks.to_vec();
+        } else if base != failed_base && !blocked_pks.is_empty() {
+            // Restrict descendants to only the blocked partition keys,
+            // not their full original set.
+            clone.partition_keys = blocked_pks.clone();
         }
         steps.push(clone);
     }
@@ -330,6 +355,7 @@ fn build_retry_unit(
         stream_id: unit.stream_id.clone(),
         steps,
         provided_ids,
+        retry_root: Some(failed_base.to_string()),
     })
 }
 
@@ -362,6 +388,7 @@ mod tests {
             stream_id: base.to_string(),
             steps: vec![step],
             provided_ids: Vec::new(),
+            retry_root: None,
         }
     }
 
@@ -414,7 +441,9 @@ mod tests {
     #[test]
     fn no_per_chain_overhead_exactly_k_spawns() {
         let t0 = Instant::now();
-        let units: Vec<Unit> = (0..3).map(|i| mk_unit(&format!("s{i}"), 1, 0.0, &[])).collect();
+        let units: Vec<Unit> = (0..3)
+            .map(|i| mk_unit(&format!("s{i}"), 1, 0.0, &[]))
+            .collect();
         let mut s = Scheduler::new(units, 3);
 
         let d = drain(s.start(t0));
@@ -436,7 +465,9 @@ mod tests {
     #[test]
     fn capacity_bounds_concurrent_spawns() {
         let t0 = Instant::now();
-        let units: Vec<Unit> = (0..4).map(|i| mk_unit(&format!("s{i}"), 1, 0.0, &[])).collect();
+        let units: Vec<Unit> = (0..4)
+            .map(|i| mk_unit(&format!("s{i}"), 1, 0.0, &[]))
+            .collect();
         let mut s = Scheduler::new(units, 2);
 
         let d = drain(s.start(t0));
@@ -517,8 +548,18 @@ mod tests {
         // Initial: poison + h0 in flight.
         let d = drain(s.start(t0));
         assert_eq!(d.spawns.len(), 2);
-        let poison = d.spawns.iter().find(|u| u.stream_id == "poison").unwrap().clone();
-        let h0 = d.spawns.iter().find(|u| u.stream_id == "h0").unwrap().clone();
+        let poison = d
+            .spawns
+            .iter()
+            .find(|u| u.stream_id == "poison")
+            .unwrap()
+            .clone();
+        let h0 = d
+            .spawns
+            .iter()
+            .find(|u| u.stream_id == "h0")
+            .unwrap()
+            .clone();
 
         // h0 finishes → h1 spawns (healthy work keeps flowing).
         let a = drain(s.on_event(finish_ok(h0), t0));
@@ -529,7 +570,11 @@ mod tests {
         // its freed slot immediately runs h2.
         let b = drain(s.on_event(finish_fail(poison, "poison"), t0));
         assert!(b.failed.is_empty());
-        assert_eq!(b.spawns.len(), 1, "freed slot picks up the next healthy unit");
+        assert_eq!(
+            b.spawns.len(),
+            1,
+            "freed slot picks up the next healthy unit"
+        );
         assert_eq!(b.spawns[0].stream_id, "h2");
         let h2 = b.spawns[0].clone();
         assert!(!b.timers.is_empty(), "a backoff timer is armed for poison");
@@ -539,7 +584,10 @@ mod tests {
         let c = drain(s.on_event(finish_ok(h2), t0));
         // Nothing running, nothing ready — only the delayed poison remains.
         assert!(!c.finished, "not done: poison still backing off");
-        assert!(!c.timers.is_empty(), "still waiting on the backoff deadline, holding no worker");
+        assert!(
+            !c.timers.is_empty(),
+            "still waiting on the backoff deadline, holding no worker"
+        );
     }
 
     #[test]
@@ -549,8 +597,18 @@ mod tests {
         let s_units = vec![mk_unit("a", 2, 5.0, &[]), mk_unit("b", 2, 1.0, &[])];
         let mut s = Scheduler::new(s_units, 2);
         let d = drain(s.start(t0));
-        let ua = d.spawns.iter().find(|u| u.stream_id == "a").unwrap().clone();
-        let ub = d.spawns.iter().find(|u| u.stream_id == "b").unwrap().clone();
+        let ua = d
+            .spawns
+            .iter()
+            .find(|u| u.stream_id == "a")
+            .unwrap()
+            .clone();
+        let ub = d
+            .spawns
+            .iter()
+            .find(|u| u.stream_id == "b")
+            .unwrap()
+            .clone();
 
         drain(s.on_event(finish_fail(ua, "a"), t0)); // delayed at t0+5
         let d2 = drain(s.on_event(finish_fail(ub, "b"), t0)); // delayed at t0+1
