@@ -107,17 +107,19 @@ def evaluation(model: dict, split: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-@task(inputs={"eval": evaluation})
-def deploy_model(eval: dict) -> dict:
+@task(inputs={"evaluation": evaluation})
+def deploy_model(evaluation: dict) -> dict:
     """Deploy the evaluated model (asset → task).
 
     A task that consumes the ``evaluation`` *asset*. It "uploads" the model and
     returns a deployment id. Because it's a task it always re-runs — you never
     want a cached deploy.
     """
-    deployment_id = f"iris-{int(eval['test_accuracy'] * 10000)}"
-    print(f"[barca task] deploying model (accuracy={eval['test_accuracy']}) -> {deployment_id}")
-    return {"deployment_id": deployment_id, "accuracy": eval["test_accuracy"]}
+    deployment_id = f"iris-{int(evaluation['test_accuracy'] * 10000)}"
+    print(
+        f"[barca task] deploying model (accuracy={evaluation['test_accuracy']}) -> {deployment_id}"
+    )
+    return {"deployment_id": deployment_id, "accuracy": evaluation["test_accuracy"]}
 
 
 @task(inputs={"deploy": deploy_model})

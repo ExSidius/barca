@@ -136,7 +136,7 @@ def _deserialize_parquet(path: Path) -> Any:
         pass
 
     try:
-        import polars as pl
+        import polars as pl  # ty: ignore[unresolved-import]
 
         return pl.read_parquet(str(path))
     except ImportError:

@@ -327,9 +327,7 @@ fn execute(
                     CachePolicy::BurstSelective(names) => {
                         base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
                             && names.iter().any(|name| {
-                                base_id == name
-                                    || base_id.ends_with(&format!(":{name}"))
-                                    || base_id.ends_with(name.as_str())
+                                base_id == name || base_id.ends_with(&format!(":{name}"))
                             })
                     }
                 };
