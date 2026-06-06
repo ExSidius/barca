@@ -180,23 +180,27 @@ def run_batch(batch):
                         modules[source] = load_module(source)
                     fn = getattr(modules[source], step["function_name"])
 
-                    kwargs = {}
-                    for param_name, upstream_id in step.get("inputs", {}).items():
-                        if param_name.startswith("_"):
-                            kwargs[param_name] = None
-                            continue
-                        aligned_id = f"{upstream_id}[{suffix}]"
-                        if aligned_id in cache:
-                            kwargs[param_name] = cache[aligned_id]
-                        elif upstream_id in cache:
-                            kwargs[param_name] = cache[upstream_id]
-                        else:
-                            raise RuntimeError(
-                                f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
-                                f"Tried aligned '{aligned_id}' and base '{upstream_id}'. "
-                                f"Available: {list(cache.keys())}"
-                            )
-                    kwargs.update(pk)  # inject partition values (e.g., ticker="AAPL").
+                    # Direct kwargs from parallel() dispatch — skip artifact lookup.
+                    if "direct_kwargs" in step:
+                        kwargs = {k: v for k, v in step["direct_kwargs"].items()}
+                    else:
+                        kwargs = {}
+                        for param_name, upstream_id in step.get("inputs", {}).items():
+                            if param_name.startswith("_"):
+                                kwargs[param_name] = None
+                                continue
+                            aligned_id = f"{upstream_id}[{suffix}]"
+                            if aligned_id in cache:
+                                kwargs[param_name] = cache[aligned_id]
+                            elif upstream_id in cache:
+                                kwargs[param_name] = cache[upstream_id]
+                            else:
+                                raise RuntimeError(
+                                    f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
+                                    f"Tried aligned '{aligned_id}' and base '{upstream_id}'. "
+                                    f"Available: {list(cache.keys())}"
+                                )
+                        kwargs.update(pk)  # inject partition values (e.g., ticker="AAPL").
 
                     result, elapsed = _execute(fn, kwargs, step)
                 except Exception as exc:
@@ -226,20 +230,24 @@ def run_batch(batch):
                     modules[source] = load_module(source)
                 fn = getattr(modules[source], step["function_name"])
 
-                kwargs = {}
-                for param_name, upstream_id in step.get("inputs", {}).items():
-                    if param_name.startswith("_"):
-                        kwargs[param_name] = None
-                        continue
-                    if upstream_id in cache:
-                        kwargs[param_name] = cache[upstream_id]
-                    else:
-                        raise RuntimeError(
-                            f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
-                            f"Available: {list(cache.keys())}"
-                        )
-                if "partition" in step:
-                    kwargs.update(step["partition"])
+                # Direct kwargs from parallel() dispatch — skip artifact lookup.
+                if "direct_kwargs" in step:
+                    kwargs = {k: v for k, v in step["direct_kwargs"].items()}
+                else:
+                    kwargs = {}
+                    for param_name, upstream_id in step.get("inputs", {}).items():
+                        if param_name.startswith("_"):
+                            kwargs[param_name] = None
+                            continue
+                        if upstream_id in cache:
+                            kwargs[param_name] = cache[upstream_id]
+                        else:
+                            raise RuntimeError(
+                                f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
+                                f"Available: {list(cache.keys())}"
+                            )
+                    if "partition" in step:
+                        kwargs.update(step["partition"])
 
                 result, elapsed = _execute(fn, kwargs, step)
             except Exception as exc:

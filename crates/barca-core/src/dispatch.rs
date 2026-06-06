@@ -573,6 +573,7 @@ fn spawn_unit(
     let child_stdin = child.stdin.take().expect("no stdin");
     let tx_reader = tx.clone();
     let unit = unit.clone();
+    let python_path = python.clone();
 
     std::thread::spawn(move || {
         let reader = BufReader::new(stderr);
@@ -604,24 +605,211 @@ fn spawn_unit(
                         serde_json::from_value(pr.clone()).unwrap_or_default();
 
                     if let Some(mut pipe) = stdin_pipe.take() {
-                        // TODO(v0.2.0 stage 3): Spawn sub-workers for each
+                        // Stage 3: spawn sub-workers for each parallel work
                         // item, collect results, and write the combined
-                        // response back to `pipe`. For now, return an error
-                        // response so the parent worker can handle it
-                        // gracefully.
-                        let response: Vec<serde_json::Value> = items
-                            .iter()
-                            .map(|_item| {
-                                serde_json::json!({
-                                    "status": "error",
-                                    "error": "parallel dispatch not yet implemented"
-                                })
+                        // response back to the parent worker's stdin pipe.
+
+                        let artifact_dir = std::env::current_dir()
+                            .map(|p| {
+                                p.join(".barca")
+                                    .join("artifacts")
+                                    .to_string_lossy()
+                                    .to_string()
                             })
-                            .collect();
+                            .unwrap_or_else(|_| ".barca/artifacts".to_string());
+
+                        // Phase 1: spawn all sub-workers at once for true
+                        // parallelism in execution.
+                        struct SubWorker {
+                            child: std::process::Child,
+                            batch_path: std::path::PathBuf,
+                        }
+                        let mut children: Vec<Result<SubWorker, serde_json::Value>> = Vec::new();
+
+                        for (i, item) in items.iter().enumerate() {
+                            // Parse fn_ref into source_file and function_name.
+                            let (source_file, function_name) = match item.fn_ref.rsplit_once(':') {
+                                Some((file, func)) => (file.to_string(), func.to_string()),
+                                None => {
+                                    children.push(Err(serde_json::json!({
+                                        "status": "error",
+                                        "error": format!("invalid fn_ref: {}", item.fn_ref)
+                                    })));
+                                    continue;
+                                }
+                            };
+
+                            // Build kwargs from the item's args and kwargs.
+                            let mut direct_kwargs: serde_json::Map<String, serde_json::Value> =
+                                serde_json::Map::new();
+                            for (j, arg) in item.args.iter().enumerate() {
+                                direct_kwargs.insert(format!("_arg{j}"), arg.clone());
+                            }
+                            for (k, v) in &item.kwargs {
+                                direct_kwargs.insert(k.clone(), v.clone());
+                            }
+
+                            // Create a minimal batch JSON.
+                            let batch = serde_json::json!({
+                                "stream_id": format!("parallel-{i}"),
+                                "artifact_dir": &artifact_dir,
+                                "steps": [{
+                                    "node_id": &item.fn_ref,
+                                    "function_name": function_name,
+                                    "source_file": source_file,
+                                    "kind": "task",
+                                    "inputs": {},
+                                    "timeout_seconds": 300,
+                                    "partition_keys": [],
+                                    "direct_kwargs": direct_kwargs,
+                                }],
+                                "provided_inputs": {}
+                            });
+
+                            let batch_json = serde_json::to_string(&batch).unwrap_or_default();
+                            let batch_file = match tempfile::NamedTempFile::new() {
+                                Ok(mut f) => {
+                                    let _ = f.write_all(batch_json.as_bytes());
+                                    match f.keep() {
+                                        Ok((_, path)) => path,
+                                        Err(_) => {
+                                            children.push(Err(serde_json::json!({
+                                                "status": "error",
+                                                "error": "failed to create batch file"
+                                            })));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    children.push(Err(serde_json::json!({
+                                        "status": "error",
+                                        "error": "failed to create temp file"
+                                    })));
+                                    continue;
+                                }
+                            };
+
+                            match Command::new(&python_path)
+                                .args(["-m", "barca._worker"])
+                                .arg(&batch_file)
+                                .stdout(Stdio::inherit())
+                                .stderr(Stdio::piped())
+                                .stdin(Stdio::null())
+                                .env("BARCA_WORKER", "1")
+                                .spawn()
+                            {
+                                Ok(child) => {
+                                    children.push(Ok(SubWorker {
+                                        child,
+                                        batch_path: batch_file,
+                                    }));
+                                }
+                                Err(e) => {
+                                    std::fs::remove_file(&batch_file).ok();
+                                    children.push(Err(serde_json::json!({
+                                        "status": "error",
+                                        "error": format!("failed to spawn worker: {e}")
+                                    })));
+                                }
+                            }
+                        }
+
+                        // Phase 2: collect results from each sub-worker
+                        // sequentially. The Python processes are already
+                        // running in parallel; we just read each one's stderr
+                        // in turn.
+                        let mut results: Vec<serde_json::Value> =
+                            Vec::with_capacity(children.len());
+
+                        for entry in children {
+                            match entry {
+                                Err(err_json) => {
+                                    results.push(err_json);
+                                }
+                                Ok(mut sw) => {
+                                    let stderr = sw.child.stderr.take().expect("no stderr");
+                                    let sub_reader = BufReader::new(stderr);
+                                    let mut sub_result: Option<serde_json::Value> = None;
+                                    let mut sub_error: Option<String> = None;
+
+                                    for sub_line in sub_reader.lines() {
+                                        let Ok(sub_line) = sub_line else { break };
+                                        if let Some(json_str) =
+                                            sub_line.strip_prefix(PROTOCOL_PREFIX_V2)
+                                        {
+                                            if let Ok(parsed) =
+                                                serde_json::from_str::<serde_json::Value>(json_str)
+                                            {
+                                                match parsed.get("type").and_then(|v| v.as_str()) {
+                                                    Some("result") => {
+                                                        if let Some(artifact) =
+                                                            parsed.get("artifact")
+                                                        {
+                                                            let path = artifact
+                                                                .get("path")
+                                                                .and_then(|v| v.as_str())
+                                                                .unwrap_or("");
+                                                            let format = artifact
+                                                                .get("format")
+                                                                .and_then(|v| v.as_str())
+                                                                .unwrap_or("json");
+                                                            if format == "json" && !path.is_empty()
+                                                            {
+                                                                if let Ok(content) =
+                                                                    std::fs::read_to_string(path)
+                                                                {
+                                                                    sub_result =
+                                                                        serde_json::from_str(
+                                                                            &content,
+                                                                        )
+                                                                        .ok();
+                                                                }
+                                                            }
+                                                            if sub_result.is_none() {
+                                                                sub_result = Some(artifact.clone());
+                                                            }
+                                                        }
+                                                    }
+                                                    Some("error") => {
+                                                        let msg = parsed
+                                                            .get("message")
+                                                            .and_then(|v| v.as_str())
+                                                            .unwrap_or("unknown error");
+                                                        sub_error = Some(msg.to_string());
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let _ = sw.child.wait();
+                                    std::fs::remove_file(&sw.batch_path).ok();
+
+                                    if let Some(err) = sub_error {
+                                        results.push(serde_json::json!({
+                                            "status": "error",
+                                            "error": err
+                                        }));
+                                    } else if let Some(val) = sub_result {
+                                        results.push(serde_json::json!({
+                                            "status": "ok",
+                                            "result": val
+                                        }));
+                                    } else {
+                                        results.push(serde_json::json!({
+                                            "status": "ok",
+                                            "result": null
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+
+                        // Write combined response to parent's stdin pipe.
                         let response_json =
-                            serde_json::to_string(&response).unwrap_or_else(|_| "[]".to_string());
-                        // Write the response line; if the pipe is broken the
-                        // worker will see EOF and raise RuntimeError.
+                            serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
                         let _ = pipe.write_all(response_json.as_bytes());
                         let _ = pipe.write_all(b"\n");
                         let _ = pipe.flush();
