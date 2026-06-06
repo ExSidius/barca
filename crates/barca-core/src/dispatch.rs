@@ -29,6 +29,17 @@ pub struct StepError {
     pub attempts: u32,
 }
 
+/// A work item from a `parallel()` request — one branch to dispatch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParallelWorkItem {
+    /// Function reference: "source_file.py:function_name"
+    pub fn_ref: String,
+    /// Positional args (JSON values).
+    pub args: Vec<serde_json::Value>,
+    /// Keyword args (JSON values).
+    pub kwargs: HashMap<String, serde_json::Value>,
+}
+
 /// A permanently-failed step (retry budget exhausted), for the metadata DB.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepFailure {
@@ -323,6 +334,17 @@ enum WorkerEvent {
         failures: Vec<(String, StepError)>,
         blocked: Vec<String>,
     },
+    /// A worker is requesting parallel dispatch of sub-tasks.
+    /// The worker is suspended (blocking on stdin) until we write a response.
+    #[allow(dead_code)]
+    ParallelRequest {
+        /// The worker's stdin pipe to write the response to when done.
+        response_pipe: std::process::ChildStdin,
+        /// The parent unit (kept alive while waiting).
+        parent_unit: Unit,
+        /// The work items to dispatch.
+        items: Vec<ParallelWorkItem>,
+    },
 }
 
 /// Execute a single phase. The pure `scheduler::Scheduler` owns all dispatch /
@@ -486,6 +508,13 @@ impl WorkerEvent {
                     blocked,
                 })
             }
+            WorkerEvent::ParallelRequest { .. } => {
+                // TODO(v0.2.0): Handle parallel dispatch. For now, parallel
+                // requests are handled in-band by the reader thread (see
+                // spawn_unit). This variant exists for the future async path
+                // where the coordinator manages parallel sub-workers.
+                None
+            }
         }
     }
 }
@@ -528,6 +557,8 @@ fn spawn_unit(
         .arg(&batch_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
+        .stdin(Stdio::piped())
+        .env("BARCA_WORKER", "1")
         .spawn()
     {
         Ok(c) => c,
@@ -538,6 +569,8 @@ fn spawn_unit(
     };
 
     let stderr = child.stderr.take().expect("no stderr");
+    // Take stdin so the reader thread can use it for the parallel protocol.
+    let child_stdin = child.stdin.take().expect("no stdin");
     let tx_reader = tx.clone();
     let unit = unit.clone();
 
@@ -547,6 +580,10 @@ fn spawn_unit(
         let mut failures: Vec<(String, StepError)> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut completed: Vec<String> = Vec::new();
+        // Held until a parallel_request arrives; consumed at most once per
+        // worker lifetime (a worker issues at most one parallel() call before
+        // resuming normal execution).
+        let mut stdin_pipe: Option<std::process::ChildStdin> = Some(child_stdin);
 
         for line in reader.lines() {
             let Ok(line) = line else { break };
@@ -557,6 +594,43 @@ fn spawn_unit(
                 let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
                     continue;
                 };
+
+                // ── parallel_request protocol ───────────────────────────
+                // The worker sends `{"parallel_request": [...]}` (no "type"
+                // field) when a task calls `parallel()`. The worker then
+                // blocks reading its stdin for the response.
+                if let Some(pr) = parsed.get("parallel_request") {
+                    let items: Vec<ParallelWorkItem> =
+                        serde_json::from_value(pr.clone()).unwrap_or_default();
+
+                    if let Some(mut pipe) = stdin_pipe.take() {
+                        // TODO(v0.2.0 stage 3): Spawn sub-workers for each
+                        // item, collect results, and write the combined
+                        // response back to `pipe`. For now, return an error
+                        // response so the parent worker can handle it
+                        // gracefully.
+                        let response: Vec<serde_json::Value> = items
+                            .iter()
+                            .map(|_item| {
+                                serde_json::json!({
+                                    "status": "error",
+                                    "error": "parallel dispatch not yet implemented"
+                                })
+                            })
+                            .collect();
+                        let response_json =
+                            serde_json::to_string(&response).unwrap_or_else(|_| "[]".to_string());
+                        // Write the response line; if the pipe is broken the
+                        // worker will see EOF and raise RuntimeError.
+                        let _ = pipe.write_all(response_json.as_bytes());
+                        let _ = pipe.write_all(b"\n");
+                        let _ = pipe.flush();
+                    }
+                    // Continue reading stderr — the worker resumes after
+                    // reading the response and will eventually exit normally.
+                    continue;
+                }
+
                 match parsed.get("type").and_then(|v| v.as_str()) {
                     Some("result") => {
                         if let (Some(node_id), Some(artifact)) = (
@@ -605,6 +679,10 @@ fn spawn_unit(
                 error_lines.push(line);
             }
         }
+
+        // Drop the stdin pipe if still held — this signals EOF to the worker
+        // if it was somehow waiting.
+        drop(stdin_pipe);
 
         let status = child.wait();
         std::fs::remove_file(&batch_path).ok();

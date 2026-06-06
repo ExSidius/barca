@@ -7,6 +7,10 @@ parses these statically from source without importing.
 
 from __future__ import annotations
 
+import json
+import os
+import sys
+
 __version__ = "0.1.5"
 
 __all__ = [
@@ -24,6 +28,7 @@ __all__ = [
     "asset_ref",
     "parallel",
     "parallel_map",
+    "ParallelError",
     "get",
     "run",
     "plan",
@@ -31,6 +36,9 @@ __all__ = [
     "stats",
     "BarcaError",
 ]
+
+# True when running inside a barca worker process (set by Rust via env var).
+_BARCA_WORKER = os.environ.get("BARCA_WORKER") == "1"
 
 
 # ─── Freshness markers ───────────────────────────────────────────────────────
@@ -144,17 +152,72 @@ def asset_ref(ref_string: str) -> str:
 # ─── Parallel primitives ─────────────────────────────────────────────────────
 
 
+class ParallelError:
+    """Represents a failed branch in a parallel() call."""
+
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    def __repr__(self) -> str:
+        return f"ParallelError({self.error!r})"
+
+    def __str__(self) -> str:
+        return self.error
+
+
 def parallel(*callables):
     """Run callables in parallel across worker processes.
 
     Each argument should be a `functools.partial` wrapping a @task-decorated
-    function. Returns a list of results (or error objects) in argument order.
+    function. Returns a list of results (or ParallelError objects) in argument
+    order.
 
-    This is a planning-time primitive -- Rust extracts the structure from the
-    AST and dispatches branches across workers.
+    When running inside a barca worker (BARCA_WORKER=1), uses the stderr/stdin
+    protocol to request Rust to dispatch branches as separate workers. When
+    running standalone, executes sequentially.
     """
-    # Stub: execute sequentially for standalone Python usage.
-    return [c() for c in callables]
+    if not _BARCA_WORKER:
+        # Standalone: execute sequentially.
+        return [c() for c in callables]
+
+    # Build work items from the callables (must be functools.partial objects).
+    items = []
+    for c in callables:
+        if hasattr(c, "func") and hasattr(c, "args") and hasattr(c, "keywords"):
+            # It's a functools.partial.
+            fn = c.func
+            fn_name = fn.__name__
+            # Get the source file from the function's code object.
+            source_file = getattr(fn, "__code__", None)
+            source_file = getattr(source_file, "co_filename", "") if source_file else ""
+            fn_ref = f"{source_file}:{fn_name}" if source_file else fn_name
+            items.append(
+                {
+                    "fn_ref": fn_ref,
+                    "args": list(c.args),
+                    "kwargs": dict(c.keywords),
+                }
+            )
+        else:
+            raise TypeError(f"parallel() expects functools.partial objects, got {type(c).__name__}")
+
+    # Send request to Rust via stderr protocol.
+    request = json.dumps({"parallel_request": items})
+    print(f"BARCA:2:{request}", file=sys.stderr, flush=True)
+
+    # Block and read response from stdin.
+    response_line = sys.stdin.readline()
+    if not response_line:
+        raise RuntimeError("parallel(): no response from orchestrator")
+
+    response = json.loads(response_line)
+    results = []
+    for item in response:
+        if item.get("status") == "ok":
+            results.append(item.get("result"))
+        else:
+            results.append(ParallelError(item.get("error", "unknown error")))
+    return results
 
 
 def parallel_map(fn, items, **kwargs):
