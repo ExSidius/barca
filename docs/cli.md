@@ -8,7 +8,7 @@ is on your PATH.
 ```
 barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
-barca history [-n N]                          Show recent run history
+barca history [-l N]                          Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N] [--watch] Run the HTTP API server
 barca version                                 Print version
@@ -48,7 +48,7 @@ Show recent runs from `.barca/metadata.db` — run id, command, status, step cou
 
 ```bash
 barca history          # last 10 runs
-barca history -n 25    # last 25
+barca history -l 25    # last 25
 ```
 
 ## stats

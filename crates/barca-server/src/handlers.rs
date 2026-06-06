@@ -9,6 +9,10 @@ use axum::extract::{Path, State};
 use barca_core::commands;
 use barca_core::db;
 use serde_json::{Value, json};
+use std::time::Duration;
+
+/// Default timeout for a single run (10 minutes).
+const RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// `GET /health` — liveness + version. No core work.
 pub async fn health() -> Json<Value> {
@@ -50,20 +54,41 @@ pub async fn asset_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    // Use cached assets if available, otherwise fetch and cache them.
+    let summaries = if let Some(cached) = state.cache.read().unwrap().assets.clone() {
+        cached
+    } else {
+        let files = state.config.files.clone();
+        let python = state.config.python.clone();
+        let result =
+            tokio::task::spawn_blocking(move || commands::list_assets(&files, &python)).await??;
+        state.cache.write().unwrap().assets = Some(result.clone());
+        result
+    };
+
+    // Exact match first, then colon-prefixed match. No unbounded ends_with.
+    let matches: Vec<_> = summaries
+        .iter()
+        .filter(|s| s.id == name || s.id.ends_with(&format!(":{name}")))
+        .collect();
+
+    let summary = match matches.len() {
+        0 => return Err(ApiError::NotFound(format!("asset '{name}' not found"))),
+        1 => matches[0].clone(),
+        n => {
+            let ids: Vec<_> = matches.iter().map(|s| s.id.as_str()).collect();
+            return Err(ApiError::Conflict(format!(
+                "'{name}' is ambiguous — matches {n} assets: {}",
+                ids.join(", ")
+            )));
+        }
+    };
+
     let files = state.config.files.clone();
     let python = state.config.python.clone();
     let lookup = name.clone();
-    // stats() returns AssetNotFound (-> 404) for unknown names.
-    let (summaries, stats) = tokio::task::spawn_blocking(move || {
-        let summaries = commands::list_assets(&files, &python)?;
-        let stats = commands::stats(&lookup, &files, &python)?;
-        Ok::<_, barca_core::BarcaError>((summaries, stats))
-    })
-    .await??;
-
-    let summary = summaries.into_iter().find(|s| {
-        s.id == name || s.id.ends_with(&format!(":{name}")) || s.id.ends_with(&name)
-    });
+    let stats =
+        tokio::task::spawn_blocking(move || commands::stats(&lookup, &files, &python)).await??;
 
     Ok(Json(json!({
         "asset": summary,
@@ -114,6 +139,10 @@ fn start_run(state: AppState, target: Option<String>) -> String {
     let st = state.clone();
     let h = handle.clone();
     tokio::spawn(async move {
+        // Serialize runs so only one pipeline executes at a time, preventing
+        // concurrent writes to the shared metadata.db.
+        let _guard = st.run_mutex.lock().await;
+
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.status = RunStatus::Running;
         }
@@ -121,29 +150,54 @@ fn start_run(state: AppState, target: Option<String>) -> String {
         let files = st.config.files.clone();
         let python = st.config.python.clone();
         let tgt = target.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            commands::get(tgt.as_deref(), &files, &python, false, true)
-        })
+        let res = tokio::time::timeout(
+            RUN_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                commands::get(tgt.as_deref(), &files, &python, false, true)
+            }),
+        )
         .await;
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.finished_at = Some(now_ts());
             match res {
-                Ok(Ok(result)) => {
+                Ok(Ok(Ok(result))) => {
                     r.status = RunStatus::Complete;
                     r.result = Some(result);
                 }
-                Ok(Err(e)) => {
+                Ok(Ok(Err(e))) => {
                     r.status = RunStatus::Failed;
                     r.error = Some(e.to_string());
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     r.status = RunStatus::Failed;
                     r.error = Some(format!("background task failed: {e}"));
+                }
+                Err(_) => {
+                    r.status = RunStatus::Failed;
+                    r.error = Some(format!("run timed out after {}s", RUN_TIMEOUT.as_secs()));
                 }
             }
         }
     });
 
     handle
+}
+
+/// Evict completed/failed runs older than `max_age` from the in-memory runs map.
+/// Intended to be spawned as a background task from `serve_async`.
+pub async fn evict_finished_runs(state: AppState, interval: Duration, max_age: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let cutoff = now_ts() - max_age.as_secs_f64();
+        state.runs.retain(|_, run| {
+            match run.status {
+                RunStatus::Complete | RunStatus::Failed => {
+                    // Keep if it finished recently (or hasn't finished yet somehow).
+                    run.finished_at.map_or(true, |t| t > cutoff)
+                }
+                _ => true,
+            }
+        });
+    }
 }

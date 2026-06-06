@@ -54,6 +54,13 @@ async fn serve_async(config: ServeConfig) -> Result<(), ServeError> {
 
     let state = AppState::new(config);
 
+    // Evict completed/failed runs older than 1 hour, checking every 5 minutes.
+    tokio::spawn(handlers::evict_finished_runs(
+        state.clone(),
+        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(3600),
+    ));
+
     // Dev-mode hot reload. The watcher must be held for the server's lifetime.
     let _watcher = if watch {
         match watch::spawn(state.clone()) {

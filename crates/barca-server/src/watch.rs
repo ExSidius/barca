@@ -8,17 +8,42 @@
 use crate::state::AppState;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Minimum interval between cache invalidations (milliseconds).
+const DEBOUNCE_MS: u64 = 250;
 
 /// Spawn a watcher over the parent directories of the configured source files.
 /// The returned `RecommendedWatcher` must be kept alive for watching to continue.
 pub fn spawn(state: AppState) -> notify::Result<RecommendedWatcher> {
     let cache = state.cache.clone();
+    let last_invalidation = Arc::new(AtomicU64::new(0));
+
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-        // Any successful filesystem event invalidates the cache; it will be
-        // rebuilt lazily on the next /assets or /plan request.
-        if res.is_ok()
-            && let Ok(mut c) = cache.write()
-        {
+        let Ok(event) = res else { return };
+
+        // Only invalidate on changes to .py files.
+        let has_py = event
+            .paths
+            .iter()
+            .any(|p| p.extension().is_some_and(|ext| ext == "py"));
+        if !has_py {
+            return;
+        }
+
+        // Simple debounce: skip if we invalidated less than DEBOUNCE_MS ago.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let prev = last_invalidation.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(prev) < DEBOUNCE_MS {
+            return;
+        }
+        last_invalidation.store(now_ms, Ordering::Relaxed);
+
+        if let Ok(mut c) = cache.write() {
             c.assets = None;
             c.plan = None;
         }

@@ -15,6 +15,8 @@ pub enum ApiError {
     Barca(BarcaError),
     /// A resource (asset, run) was not found.
     NotFound(String),
+    /// Ambiguous lookup — multiple matches.
+    Conflict(String),
 }
 
 impl From<BarcaError> for ApiError {
@@ -33,6 +35,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            ApiError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             ApiError::Barca(err) => {
                 let status = match &err {
                     BarcaError::AssetNotFound(..) => StatusCode::NOT_FOUND,

@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use tokio::sync::Mutex;
 
 /// Configuration for a `barca serve` instance. Built by the CLI and handed to
 /// [`crate::serve`].
@@ -69,6 +70,9 @@ pub struct AppState {
     pub config: Arc<ServeConfig>,
     pub runs: Arc<DashMap<String, RunState>>,
     pub cache: Arc<RwLock<DagCache>>,
+    /// Serializes run execution so only one pipeline executes at a time,
+    /// preventing concurrent DB writes from racing on the shared metadata.db.
+    pub run_mutex: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -77,6 +81,7 @@ impl AppState {
             config: Arc::new(config),
             runs: Arc::new(DashMap::new()),
             cache: Arc::new(RwLock::new(DagCache::default())),
+            run_mutex: Arc::new(Mutex::new(())),
         }
     }
 }

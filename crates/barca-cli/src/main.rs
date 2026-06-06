@@ -80,7 +80,8 @@ enum Cli {
     /// Binds to 127.0.0.1 (local only, no auth). POST /run and /get trigger
     /// async runs; poll GET /status/<run_id> for results.
     Serve {
-        /// Python source files defining the DAG to serve (optional)
+        /// Python source files defining the DAG to serve
+        #[arg(required = true)]
         files: Vec<PathBuf>,
         /// Port to bind on
         #[arg(short, long, default_value = "8274")]
@@ -169,11 +170,7 @@ fn main() {
         Cli::Plan { files } => plan_cmd(files, &python),
         Cli::History { limit } => history_cmd(limit),
         Cli::Stats { target, files } => stats_cmd(target, files, &python),
-        Cli::Serve {
-            files,
-            port,
-            watch,
-        } => serve_cmd(files, port, watch, &python),
+        Cli::Serve { files, port, watch } => serve_cmd(files, port, watch, &python),
         Cli::Version => {
             println!("barca {}", env!("CARGO_PKG_VERSION"));
             Ok(())

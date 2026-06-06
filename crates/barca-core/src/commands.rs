@@ -756,7 +756,10 @@ pub fn stats(
 
 /// Build the DAG and return a summary of every node (id, kind, freshness, inputs).
 /// Pure static analysis — no execution, no DB. Used by the server's `/assets` route.
-pub fn list_assets(file_args: &[String], python: &PathBuf) -> Result<Vec<AssetSummary>, BarcaError> {
+pub fn list_assets(
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<Vec<AssetSummary>, BarcaError> {
     let dag = build_dag(file_args, python)?;
     let summaries = dag
         .topo_order()
