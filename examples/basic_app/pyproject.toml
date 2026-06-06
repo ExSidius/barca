@@ -1,12 +1,13 @@
 [project]
 name = "barca-basic-app"
 version = "0.1.0"
-description = "Example Barca app for the 0.1.1 vertical slice."
+description = "Example Barca app demonstrating assets, tasks, sensors, and partitions."
 requires-python = ">=3.14"
 dependencies = ["barca"]
 
-[tool.uv.sources]
-barca = { path = "../../packages/barca", editable = true }
+# For local development, uncomment the next two lines to use the local build:
+# [tool.uv.sources]
+# barca = { path = "../..", editable = true }
 
 [build-system]
 requires = ["hatchling"]

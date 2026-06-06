@@ -5,8 +5,9 @@ description = "Iris ML pipeline built with Barca."
 requires-python = ">=3.14"
 dependencies = ["barca", "scikit-learn"]
 
-[tool.uv.sources]
-barca = { path = "../../packages/barca" }
+# For local development, uncomment the next two lines to use the local build:
+# [tool.uv.sources]
+# barca = { path = "../..", editable = true }
 
 [build-system]
 requires = ["hatchling"]
