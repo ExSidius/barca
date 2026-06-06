@@ -57,17 +57,17 @@ def check_inbox():
 }
 
 #[test]
-fn effect_decorator() {
+fn task_decorator() {
     let src = r#"
-from barca import effect
+from barca import task
 
-@effect()
+@task()
 def send_email():
     pass
 "#;
     let nodes = extract_nodes(src, "test.py").unwrap();
     assert_eq!(nodes.len(), 1);
-    assert_eq!(nodes[0].kind, NodeKind::Effect);
+    assert_eq!(nodes[0].kind, NodeKind::Task);
     assert_eq!(nodes[0].freshness, Freshness::Always);
 }
 
@@ -565,13 +565,13 @@ def dynamic_config() -> dict:
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn dag_rejects_effect_as_input() {
+fn dag_rejects_task_as_asset_input() {
     use barca_core::dag::Dag;
 
     let src = r#"
-from barca import asset, effect
+from barca import asset, task
 
-@effect()
+@task()
 def send_email():
     pass
 
@@ -583,7 +583,49 @@ def bad_asset(email) -> dict:
     let result = Dag::build(&nodes);
     assert!(result.is_err());
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("effect"));
+    assert!(err.contains("task"));
+}
+
+#[test]
+fn dag_allows_asset_upstream_of_task() {
+    use barca_core::dag::Dag;
+
+    let src = r#"
+from barca import asset, task
+
+@asset()
+def data() -> dict:
+    return {}
+
+@task(inputs={"d": data})
+def deploy(d):
+    pass
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert!(Dag::build(&nodes).is_ok());
+}
+
+#[test]
+fn dag_allows_task_after_task() {
+    use barca_core::dag::Dag;
+
+    let src = r#"
+from barca import task
+
+@task()
+def migrate():
+    pass
+
+@task()
+def warm_cache():
+    pass
+
+@task(after=[migrate, warm_cache])
+def notify():
+    pass
+"#;
+    let nodes = extract_nodes(src, "test.py").unwrap();
+    assert!(Dag::build(&nodes).is_ok());
 }
 
 #[test]
@@ -743,7 +785,7 @@ def evaluate(model, data): return {}
 fn all_decorators_combined() {
     // A single file with every decorator type
     let src = r#"
-from barca import asset, sensor, effect, sink, unsafe, Always, Manual, Schedule, partitions, collect
+from barca import asset, sensor, task, sink, unsafe, Always, Manual, Schedule, partitions, collect
 
 @sensor(freshness=Schedule("*/5 * * * *"), description="Check for new files")
 def file_watcher():
@@ -769,7 +811,7 @@ def transform(raw: dict, trigger) -> dict:
 def regional_export(region: str) -> dict:
     return {"region": region}
 
-@effect(inputs={"data": transform}, freshness=Always)
+@task(inputs={"data": transform}, freshness=Always)
 def notify(data):
     pass
 "#;
@@ -799,8 +841,8 @@ def notify(data):
     assert!(nodes[3].is_unsafe);
     assert!(nodes[3].partitions.contains_key("region"));
 
-    // Effect
-    assert_eq!(nodes[4].kind, NodeKind::Effect);
+    // Task
+    assert_eq!(nodes[4].kind, NodeKind::Task);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

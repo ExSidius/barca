@@ -1,0 +1,2 @@
+[project]
+modules = ["nested_project.assets"]

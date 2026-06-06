@@ -36,6 +36,25 @@ enum Cli {
         #[arg(long)]
         agent: bool,
     },
+    /// Run a task (and its cone) — always re-runs, bursting upstream asset caches
+    ///
+    /// Like `get`, but for task-style workflows: tasks always execute, and by
+    /// default every upstream asset is force-rerun. Use `--burst` to re-run only
+    /// selected assets while the rest stay cached.
+    Run {
+        /// TARGET file.py [file.py ...] — target task is required
+        #[arg(required = true)]
+        args: Vec<String>,
+        /// Comma-separated asset names to force-rerun. Omit to burst ALL upstream assets.
+        #[arg(long, value_delimiter = ',')]
+        burst: Option<Vec<String>>,
+        /// Output format
+        #[arg(short, long, default_value = "json")]
+        output: OutputMode,
+        /// Agent-friendly output: plain structured progress lines instead of visual progress bar
+        #[arg(long)]
+        agent: bool,
+    },
     /// Parse source files and emit the execution plan as JSON
     Plan {
         /// Python source files containing @asset definitions
@@ -112,6 +131,27 @@ fn main() {
             }
             get_cmd(target, files, &python, output, no_cache, agent)
         }
+        Cli::Run {
+            args,
+            burst,
+            output,
+            agent,
+        } => {
+            let (target, files) = split_target_files(args);
+            let Some(target) = target else {
+                eprintln!(
+                    "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                );
+                std::process::exit(1);
+            };
+            if files.is_empty() {
+                eprintln!(
+                    "error: no .py files provided\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                );
+                std::process::exit(1);
+            }
+            run_cmd(target, files, &python, burst, output, agent)
+        }
         Cli::Plan { files } => plan_cmd(files, &python),
         Cli::History { limit } => history_cmd(limit),
         Cli::Stats { target, files } => stats_cmd(target, files, &python),
@@ -167,6 +207,55 @@ fn get_cmd(
                 "Run {} | {} in {:.3}s ({} step{}, {} phase{})",
                 result.run_id,
                 label,
+                result.elapsed_seconds,
+                result.steps_executed,
+                if result.steps_executed == 1 { "" } else { "s" },
+                result.phases,
+                if result.phases == 1 { "" } else { "s" }
+            );
+            if let Some(ref val) = final_output {
+                println!("\nValue:\n{}", serde_json::to_string_pretty(val).unwrap());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_cmd(
+    target: String,
+    files: Vec<PathBuf>,
+    python: &PathBuf,
+    burst: Option<Vec<String>>,
+    mode: OutputMode,
+    agent: bool,
+) -> Result<(), barca_core::BarcaError> {
+    let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    let result = barca_core::commands::run(&target, &file_args, python, burst, agent)?;
+    let final_output = result.final_output.as_ref().map(read_final_output);
+
+    match mode {
+        OutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "run_id": result.run_id,
+                    "elapsed_seconds": result.elapsed_seconds,
+                    "steps_executed": result.steps_executed,
+                    "phases": result.phases,
+                    "final_output": final_output,
+                })
+            );
+        }
+        OutputMode::Value => {
+            if let Some(ref val) = final_output {
+                println!("{}", serde_json::to_string_pretty(val).unwrap());
+            }
+        }
+        OutputMode::Pretty => {
+            println!(
+                "Run {} | ran '{}' in {:.3}s ({} step{}, {} phase{})",
+                result.run_id,
+                target,
                 result.elapsed_seconds,
                 result.steps_executed,
                 if result.steps_executed == 1 { "" } else { "s" },

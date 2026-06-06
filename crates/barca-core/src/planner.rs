@@ -57,7 +57,7 @@ pub struct WorkerStream {
 pub struct StreamStep {
     /// Step identity: base node ID (unpartitioned — workers expand partition_keys).
     pub step_id: StepId,
-    /// The kind of node (asset, sensor, effect).
+    /// The kind of node (asset, sensor, task).
     pub kind: crate::model::NodeKind,
     pub function_name: Arc<str>,
     pub source_file: Arc<str>,
@@ -624,6 +624,40 @@ mod tests {
                     explicit_name: None,
                     freshness: Freshness::Always,
                     inputs,
+                    after: SmallVec::new(),
+                    partitions: HashMap::new(),
+                    sinks: SmallVec::new(),
+                    timeout_seconds: 300,
+                    description: None,
+                    tags: HashMap::new(),
+                    is_unsafe: false,
+                    source_file: "test.py".to_string(),
+                    byte_offset: 0,
+                    source_text: String::new(),
+                    cone_hash: String::new(),
+                    artifact_serializer: None,
+                }
+            })
+            .collect();
+        Dag::build(&extracted).unwrap()
+    }
+
+    /// Build a DAG of `@task` nodes wired only by `after=` (no data edges).
+    fn build_after_task_dag(specs: &[(&str, &[&str])]) -> Dag {
+        let extracted: Vec<ExtractedNode> = specs
+            .iter()
+            .map(|(name, after_deps)| {
+                let after: SmallVec<[NodeRef; 4]> = after_deps
+                    .iter()
+                    .map(|&dep| NodeRef::FunctionName(dep.to_string()))
+                    .collect();
+                ExtractedNode {
+                    kind: NodeKind::Task,
+                    function_name: name.to_string(),
+                    explicit_name: None,
+                    freshness: Freshness::Always,
+                    inputs: SmallVec::new(),
+                    after,
                     partitions: HashMap::new(),
                     sinks: SmallVec::new(),
                     timeout_seconds: 300,
@@ -1053,6 +1087,7 @@ mod tests {
                 explicit_name: None,
                 freshness: Freshness::Always,
                 inputs: SmallVec::new(),
+                after: SmallVec::new(),
                 partitions: HashMap::new(),
                 sinks: SmallVec::new(),
                 timeout_seconds: 300,
@@ -1189,6 +1224,7 @@ mod tests {
                     explicit_name: None,
                     freshness: Freshness::Always,
                     inputs,
+                    after: SmallVec::new(),
                     partitions: partition_map,
                     sinks: SmallVec::new(),
                     timeout_seconds: 300,
@@ -1291,5 +1327,45 @@ mod tests {
         assert_eq!(p.total_steps, 1);
         assert!(p.phases[0].streams[0].steps[0].partition_keys.is_empty());
         assert!(p.phases[0].streams[0].steps[0].step_id.partition.is_empty());
+    }
+
+    #[test]
+    fn after_edges_order_tasks_without_data() {
+        // migrate → seed → notify, wired only by `after=` (no data passed).
+        let dag = build_after_task_dag(&[
+            ("migrate", &[]),
+            ("seed", &["migrate"]),
+            ("notify", &["seed"]),
+        ]);
+        let p = plan_from_dag(&dag, &cfg(10));
+
+        // Flatten all steps in execution order (phases are sequential; within a
+        // merged single-stream phase, step order is the execution order).
+        let order: Vec<String> = p
+            .phases
+            .iter()
+            .flat_map(|ph| &ph.streams)
+            .flat_map(|s| &s.steps)
+            .map(|st| st.step_id.display())
+            .collect();
+
+        let pos = |name: &str| order.iter().position(|id| id.ends_with(name)).unwrap();
+        assert!(pos("migrate") < pos("seed"), "migrate must precede seed");
+        assert!(pos("seed") < pos("notify"), "seed must precede notify");
+
+        // After edges carry no data: no step receives a provided input.
+        for st in p
+            .phases
+            .iter()
+            .flat_map(|ph| &ph.streams)
+            .flat_map(|s| &s.steps)
+        {
+            assert!(
+                st.inputs.is_empty(),
+                "after-ordered step {} should have no data inputs",
+                st.step_id.display()
+            );
+        }
+        assert_eq!(p.total_steps, 3);
     }
 }
