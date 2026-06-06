@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, rust-rewrite, v0.1.1-engine-refactor]
+    branches: [main, rust-rewrite, "v*"]
   pull_request:
-    branches: [main]
+    branches: [main, "v*"]
 
 jobs:
   test:

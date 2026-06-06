@@ -79,3 +79,29 @@ benchmarks/chain_100/bench.sh 5   # (coming soon)
 4. **Single install** — `uv add barca` gives users everything
 5. **Turso for persistence** — Rust owns the DB; Python has no DB access
 6. **Artifact-based data passing** — serialized files (json/pickle/parquet) between worker batches
+
+## Git workflow
+
+- **Always use worktrees** for local development work
+- **Release branches**: `v<major>.<minor>.<patch>` off main — no descriptive suffix
+- **Topic branches**: one per issue, branched off main, PRed into the release branch
+- **Release**: the version branch is PRed to main when ready; tagging triggers the release workflow
+
+## Commit messages
+
+Use [conventional commits](https://www.conventionalcommits.org/): `type: description` or `type(scope): description`.
+
+git-cliff groups commits into changelog sections by type:
+
+| Type       | Changelog group |
+|------------|-----------------|
+| `feat`     | Features        |
+| `fix`      | Bug Fixes       |
+| `refactor` | Refactor        |
+| `polish`   | Polish          |
+| `doc`      | Documentation   |
+| `test`     | Testing         |
+| `perf`     | Performance     |
+| `remove`   | Removed         |
+
+Non-conventional commits appear under "Changes". Co-Authored-By trailers are stripped automatically.
