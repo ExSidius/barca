@@ -1,172 +1,82 @@
 # CLI Reference
 
-All commands use the `uv run` prefix. If you've activated your virtualenv, you can omit it.
+The `barca` binary is the entry point. Once installed (e.g. `uv add barca`), the `barca` command
+is on your PATH.
 
 ## Commands
 
 ```
-uv run barca reindex                          Re-inspect Python modules, update DB
-uv run barca assets list                      List all indexed assets
-uv run barca assets show <id>                 Show asset detail
-uv run barca assets refresh <id>              Trigger materialization
-uv run barca assets refresh <id> -j <N>       Parallel partition workers
-uv run barca assets refresh <id> --stale-policy error|warn|pass
-uv run barca sensors list                     List all sensors
-uv run barca sensors show <id>                Show sensor detail + observation history
-uv run barca sensors trigger <id>             Manually trigger a sensor
-uv run barca jobs list                        List recent materializations
-uv run barca jobs show <id>                   Show job detail
-uv run barca run                              Run production mode (long-running)
-uv run barca dev                              Development mode — file watcher, live staleness
-uv run barca serve                            HTTP API + background scheduler
-uv run barca serve --port 8400                Custom port
-uv run barca serve --log-level info           Log level (debug, info, warning, error)
-uv run barca prune                            Remove history/artifacts unreachable from current DAG
-uv run barca reset [--db] [--artifacts] [--tmp]  Clean generated files
+barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
+barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
+barca history [-n N]                          Show recent run history
+barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
+barca serve [file.py ...] [--port N] [--watch] Run the HTTP API server
+barca version                                 Print version
+barca --help                                  Show help
 ```
 
-## reindex
+Shorthand: `barca pipeline.py` is rewritten to `barca get pipeline.py`.
 
-Discover all `@asset()`, `@sensor()`, `@effect()`, and `@sink()` decorated functions in your project. Computes definition hashes and upserts into the metadata database. Shows a three-way diff of what changed: added assets, removed assets, and renamed/moved assets.
+## get
+
+Execute the computation graph and return asset value(s). Cache-aware — only the needed subgraph
+runs, and unchanged steps are served from cache.
+
+If the first positional argument ends in `.py`, all arguments are treated as files (gets all
+assets, returning the final asset's value). Otherwise the first argument is the target asset name
+and the rest are files.
 
 ```bash
-uv run barca reindex
+barca get pipeline.py                 # all assets
+barca get summary pipeline.py         # a specific target
+barca get pipeline.py --no-cache      # execute everything fresh
+barca get pipeline.py --agent         # plain progress lines instead of a progress bar
+barca get pipeline.py -o value        # print just the final value (also: json | pretty)
 ```
 
-Rename detection uses two signals in priority order:
-1. AST match — a removed and an added asset have identical function bodies (covers file reorganisation).
-2. `name=` match — same explicit `name=` at a different location.
+## plan
 
-Removed assets are pruned from the active DAG but their history is preserved.
-
-## assets
-
-### list
-
-Show all indexed assets with their current status. Unsafe assets are visually distinguished. For dynamically partitioned assets whose partition-defining upstream has not yet been materialised, the partition set is shown as "pending".
+Parse the source files and emit the tiered execution plan as JSON, without running anything.
 
 ```bash
-uv run barca assets list
+barca plan pipeline.py
 ```
 
-### show
+## history
 
-Show detailed information for a single asset, including its latest materialization.
+Show recent runs from `.barca/metadata.db` — run id, command, status, step counts, and timing.
 
 ```bash
-uv run barca assets show 1
+barca history          # last 10 runs
+barca history -n 25    # last 25
 ```
 
-### refresh
+## stats
 
-Materialize an asset. For partitioned assets, use `-j` to control parallelism.
-
-By default, all upstream inputs must be fresh (`--stale-policy error`). Use `warn` to proceed with stale inputs (records `stale_inputs_used=true` and emits a warning), or `pass` to proceed silently.
-
-```bash
-uv run barca assets refresh 1                             # default: error on stale inputs
-uv run barca assets refresh 1 --stale-policy warn         # proceed with warning
-uv run barca assets refresh 1 --stale-policy pass         # proceed silently
-uv run barca assets refresh 1 -j 1                        # sequential
-uv run barca assets refresh 1 -j 8                        # 8 parallel workers
-```
-
-`refresh` does not cascade to downstream assets. Downstream becomes implicitly stale and is picked up on the next `barca run` pass or explicit refresh.
-
-## sensors
-
-### list
-
-Show all indexed sensors.
+Show aggregated execution statistics for a single asset: total materializations, timing
+percentiles (avg / median / p95 / max), cache hit rate, and recent runs.
 
 ```bash
-uv run barca sensors list
-```
-
-### show
-
-Show sensor detail and observation history.
-
-```bash
-uv run barca sensors show 1
-```
-
-### trigger
-
-Manually trigger a sensor and record an observation.
-
-```bash
-uv run barca sensors trigger 1
-```
-
-## jobs
-
-### list
-
-Show recent materialization jobs.
-
-```bash
-uv run barca jobs list
-```
-
-### show
-
-Show detail for a specific job.
-
-```bash
-uv run barca jobs show 1
-```
-
-## run
-
-Long-running production mode. Continuously maintains the DAG at each asset's declared freshness level. On each pass (topo order):
-
-- `Always` assets: materialise if stale and all upstreams fresh
-- `Schedule` assets: materialise if a cron tick has elapsed since last run
-- `Manual` assets: never auto-materialise
-- Sensors: observe on each `Schedule` tick (or `Manual` trigger)
-- Effects/Sinks: run when upstream freshens
-
-`Manual` freshness blocks downstream `Always` assets from auto-updating.
-
-If a pass is already running when the next tick arrives, the tick is skipped — passes do not overlap.
-
-```bash
-uv run barca run
-```
-
-## dev
-
-Development mode. Watches for file changes and updates asset staleness state in the UI in real time. Does not materialise anything — use `barca assets refresh` to materialise individual assets during development.
-
-```bash
-uv run barca dev
+barca stats summary pipeline.py
 ```
 
 ## serve
 
-Start the FastAPI HTTP server with a background scheduler. The scheduler uses the same semantics as `barca run`.
+Start a long-running HTTP server that exposes the orchestrator as a JSON API. Binds to
+`127.0.0.1` (local only, no auth). See [Server API](server-api.md) for the full endpoint
+reference.
 
 ```bash
-uv run barca serve
-uv run barca serve --port 8400 --log-level info
+barca serve pipeline.py                 # default port 8274
+barca serve pipeline.py --port 8400     # custom port
+barca serve pipeline.py --watch         # dev mode: re-parse the DAG on file change
 ```
 
-## prune
+`--watch` is a local-development convenience and is off by default; a production deployment serves
+a fixed set of files and does not need it.
 
-Remove all artifacts, materialisations, and DB records that are not reachable from the current active DAG. This includes removed assets, removed partition values, and old definition hash versions no longer referenced by any current asset. This is the only operation that permanently deletes history.
-
-```bash
-uv run barca prune
-```
-
-## reset
-
-Remove generated files and caches.
+## version
 
 ```bash
-uv run barca reset --db          # remove .barca/ (metadata database)
-uv run barca reset --artifacts   # remove .barcafiles/ (artifacts)
-uv run barca reset --tmp         # remove tmp/
-uv run barca reset --db --artifacts --tmp  # everything
+barca version
 ```

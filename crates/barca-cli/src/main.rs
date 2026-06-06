@@ -75,6 +75,20 @@ enum Cli {
         #[arg(required = true)]
         files: Vec<PathBuf>,
     },
+    /// Run a long-running HTTP server exposing the orchestrator as a JSON API
+    ///
+    /// Binds to 127.0.0.1 (local only, no auth). POST /run and /get trigger
+    /// async runs; poll GET /status/<run_id> for results.
+    Serve {
+        /// Python source files defining the DAG to serve (optional)
+        files: Vec<PathBuf>,
+        /// Port to bind on
+        #[arg(short, long, default_value = "8274")]
+        port: u16,
+        /// Dev mode: re-parse the DAG when source files change
+        #[arg(long)]
+        watch: bool,
+    },
     /// Print version information
     Version,
 }
@@ -155,6 +169,11 @@ fn main() {
         Cli::Plan { files } => plan_cmd(files, &python),
         Cli::History { limit } => history_cmd(limit),
         Cli::Stats { target, files } => stats_cmd(target, files, &python),
+        Cli::Serve {
+            files,
+            port,
+            watch,
+        } => serve_cmd(files, port, watch, &python),
         Cli::Version => {
             println!("barca {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -350,6 +369,22 @@ fn stats_cmd(
         }
     }
     Ok(())
+}
+
+fn serve_cmd(
+    files: Vec<PathBuf>,
+    port: u16,
+    watch: bool,
+    python: &std::path::Path,
+) -> Result<(), barca_core::BarcaError> {
+    let config = barca_server::ServeConfig {
+        files: files.iter().map(|p| p.display().to_string()).collect(),
+        host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        watch,
+        python: python.to_path_buf(),
+    };
+    barca_server::serve(config).map_err(|e| barca_core::BarcaError::Other(e.to_string()))
 }
 
 /// Read an artifact for display: inline JSON values, show metadata for binary formats.
