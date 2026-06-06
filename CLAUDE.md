@@ -79,3 +79,40 @@ benchmarks/chain_100/bench.sh 5   # (coming soon)
 4. **Single install** — `uv add barca` gives users everything
 5. **Turso for persistence** — Rust owns the DB; Python has no DB access
 6. **Artifact-based data passing** — serialized files (json/pickle/parquet) between worker batches
+
+## Git workflow
+
+- **Always use worktrees** for local development work
+- **Release branches**: `v<major>.<minor>.<patch>` off main — no descriptive suffix
+- **Topic branches**: one per issue, branched off main, PRed into the release branch
+- **Release**: the version branch is PRed to main when ready; tagging triggers the release workflow
+
+## Commit messages
+
+Use [conventional commits](https://www.conventionalcommits.org/): `type: description` or `type(scope): description`.
+
+git-cliff groups commits into changelog sections by type:
+
+| Type       | Changelog group |
+|------------|-----------------|
+| `feat`     | Features        |
+| `fix`      | Bug Fixes       |
+| `refactor` | Refactor        |
+| `polish`   | Polish          |
+| `doc`      | Documentation   |
+| `test`     | Testing         |
+| `perf`     | Performance     |
+| `remove`   | Removed         |
+
+Non-conventional commits appear under "Changes". Co-Authored-By trailers are stripped automatically.
+
+## Versioning
+
+Pre-1.0 — everything is unstable prototype work. Stay on `0.x.y` until the API and CLI
+surface are genuinely stable and battle-tested.
+
+- **Minor bump** (`0.x.0`): new capability area, new public surface (e.g. adding the HTTP API), or breaking changes
+- **Patch bump** (`0.x.y`): iteration within a capability — bug fixes, polish, performance, refactors
+
+Version must be consistent across `Cargo.toml` (workspace root + all crates) and `pyproject.toml`.
+Bump all of them together in a single commit at the start of a release branch.

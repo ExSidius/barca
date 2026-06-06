@@ -62,6 +62,19 @@ pub struct PlanStream {
     pub steps: Vec<String>,
 }
 
+/// Lightweight summary of a single DAG node, for the server's `/assets` listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetSummary {
+    /// Stable node id (continuity key), e.g. `pipeline.py:fetch`.
+    pub id: String,
+    /// Node kind: asset, sensor, or effect.
+    pub kind: crate::NodeKind,
+    /// Freshness policy (always / manual / schedule).
+    pub freshness: crate::Freshness,
+    /// Upstream node ids this node depends on (direct + collected), sorted.
+    pub inputs: Vec<String>,
+}
+
 // ─── Shared setup ────────────────────────────────────────────────────────────
 
 pub fn find_python() -> PathBuf {
@@ -737,6 +750,39 @@ pub fn stats(
     let db_path = db::ensure_db_dir()?;
     db::init_db_sync(&db_path)?;
     db::get_asset_stats_sync(&db_path, &target_id)
+}
+
+// ─── list_assets ──────────────────────────────────────────────────────────────
+
+/// Build the DAG and return a summary of every node (id, kind, freshness, inputs).
+/// Pure static analysis — no execution, no DB. Used by the server's `/assets` route.
+pub fn list_assets(
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<Vec<AssetSummary>, BarcaError> {
+    let dag = build_dag(file_args, python)?;
+    let summaries = dag
+        .topo_order()
+        .into_iter()
+        .filter_map(|id| dag.get_node(id))
+        .map(|node| {
+            let mut inputs: Vec<String> = node
+                .resolved_inputs
+                .values()
+                .chain(node.resolved_collected.values())
+                .cloned()
+                .collect();
+            inputs.sort();
+            inputs.dedup();
+            AssetSummary {
+                id: node.id.clone(),
+                kind: node.kind(),
+                freshness: node.extracted.freshness.clone(),
+                inputs,
+            }
+        })
+        .collect();
+    Ok(summaries)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

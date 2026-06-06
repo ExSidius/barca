@@ -10,5 +10,6 @@ path = "src/main.rs"
 
 [dependencies]
 barca-core = { path = "../barca-core" }
+barca-server = { path = "../barca-server" }
 clap = { workspace = true }
 serde_json = { workspace = true }
