@@ -83,16 +83,13 @@ def sensor(fn=None, *, retries=1, retry_backoff=0.0, **kwargs):
     return decorator
 
 
-def task(fn=None, *, after=None, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
+def task(fn=None, *, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
     """Declare a task node (always re-runs; never cached).
 
     Tasks model workflow-management steps — deploys, notifications, migrations,
     cache warming — that *do* something rather than produce cacheable data. They
     may appear anywhere in the graph and may depend on assets, sensors, or other
     tasks, but must not be an input to an asset or sensor.
-
-    Ordering-only dependencies (no data passed) are declared with
-    ``after=[other_task, ...]``.
 
     See `asset` for `retries` / `retry_backoff` semantics.
     """

@@ -29,9 +29,6 @@ pub enum DagError {
         upstream: String,
     },
 
-    #[error("after='{upstream}' on node '{node}' references an unknown node")]
-    UnresolvedAfter { node: String, upstream: String },
-
     #[error(
         "task '{task}' cannot be an input to {downstream_kind} '{downstream}' \
          (tasks are never cached, so this would poison caching)"
@@ -166,21 +163,6 @@ impl Dag {
                     }
                 }
             }
-
-            // Add execution-ordering edges for `after=[...]`. These carry no
-            // data — they are never recorded into resolved_inputs/collected, so
-            // the worker never receives them as inputs.
-            for after_ref in &node.after {
-                let upstream_name = after_ref.resolution_name();
-                let Some(upstream_key) = name_to_key.get(upstream_name) else {
-                    return Err(DagError::UnresolvedAfter {
-                        node: downstream_key.clone(),
-                        upstream: upstream_name.to_string(),
-                    });
-                };
-                let upstream_idx = index[upstream_key.as_str()];
-                graph.add_edge(upstream_idx, downstream_idx, EdgeKind::After);
-            }
         }
 
         let dag = Dag { graph, index };
@@ -259,16 +241,16 @@ impl Dag {
             .collect()
     }
 
-    /// Get upstream node IDs, excluding PartitionSource and After edges.
-    /// Used by the planner for chain detection — partition source and ordering
-    /// deps should force phase breaks, not chain bundling (and pass no data).
+    /// Get upstream node IDs, excluding PartitionSource edges.
+    /// Used by the planner for chain detection — partition source deps should
+    /// force phase breaks, not chain bundling (and pass no data).
     pub fn execution_upstream(&self, id: &str) -> Vec<&str> {
         let Some(&idx) = self.index.get(id) else {
             return vec![];
         };
         let mut result = Vec::new();
         for edge in self.graph.edges_directed(idx, Direction::Incoming) {
-            if !matches!(*edge.weight(), EdgeKind::PartitionSource | EdgeKind::After) {
+            if !matches!(*edge.weight(), EdgeKind::PartitionSource) {
                 let source_idx = edge.source();
                 result.push(self.graph[source_idx].id.as_str());
             }
@@ -276,14 +258,14 @@ impl Dag {
         result
     }
 
-    /// Get downstream node IDs, excluding PartitionSource and After edges.
+    /// Get downstream node IDs, excluding PartitionSource edges.
     pub fn execution_downstream(&self, id: &str) -> Vec<&str> {
         let Some(&idx) = self.index.get(id) else {
             return vec![];
         };
         let mut result = Vec::new();
         for edge in self.graph.edges_directed(idx, Direction::Outgoing) {
-            if !matches!(*edge.weight(), EdgeKind::PartitionSource | EdgeKind::After) {
+            if !matches!(*edge.weight(), EdgeKind::PartitionSource) {
                 let target_idx = edge.target();
                 result.push(self.graph[target_idx].id.as_str());
             }

@@ -10,7 +10,7 @@ Showcases:
 - ``@sensor(freshness=Schedule(...))`` for observing external state
 - ``@task`` for workflow-management steps that always re-run (never cached)
 - ``@task(inputs=...)`` for a task that consumes an upstream asset
-- ``@task(after=[...])`` for ordering-only task chains (no data passed)
+- ``@task(inputs={"_dep": dep})`` for ordering-only task chains (no data passed)
 - ``@asset(partitions=...)`` with static partitions
 - Partition inheritance — downstream assets auto-inherit upstream partitions
 - ``collect(asset)`` for aggregating all partitions of an upstream
@@ -152,7 +152,7 @@ def log_summary(summary):
 
 
 # ---------------------------------------------------------------------------
-# Workflow 7: Ordering-only task chain (no data passed) via `after=`
+# Workflow 7: Ordering-only task chain (no data passed) via `_` prefix
 #
 #   migrate → warm_cache → notify
 #
@@ -166,13 +166,13 @@ def migrate():
     print("[barca task] running migration")
 
 
-@task(after=[migrate])
-def warm_cache():
+@task(inputs={"_migrate": migrate})
+def warm_cache(_migrate):
     """Warm caches — only after the migration has run."""
     print("[barca task] warming cache")
 
 
-@task(after=[warm_cache])
-def notify():
+@task(inputs={"_warm_cache": warm_cache})
+def notify(_warm_cache):
     """Notify the team — only after the cache is warm."""
     print("[barca task] migration + cache warm complete")

@@ -167,7 +167,11 @@ def run_batch(batch):
                         break
                 if blocked_on is not None:
                     unavailable.add(full_node_id)
-                    _emit("blocked", node_id=full_node_id, reason=f"upstream '{blocked_on}' unavailable")
+                    _emit(
+                        "blocked",
+                        node_id=full_node_id,
+                        reason=f"upstream '{blocked_on}' unavailable",
+                    )
                     continue
 
                 try:
@@ -178,6 +182,9 @@ def run_batch(batch):
 
                     kwargs = {}
                     for param_name, upstream_id in step.get("inputs", {}).items():
+                        if param_name.startswith("_"):
+                            kwargs[param_name] = None
+                            continue
                         aligned_id = f"{upstream_id}[{suffix}]"
                         if aligned_id in cache:
                             kwargs[param_name] = cache[aligned_id]
@@ -221,6 +228,9 @@ def run_batch(batch):
 
                 kwargs = {}
                 for param_name, upstream_id in step.get("inputs", {}).items():
+                    if param_name.startswith("_"):
+                        kwargs[param_name] = None
+                        continue
                     if upstream_id in cache:
                         kwargs[param_name] = cache[upstream_id]
                     else:

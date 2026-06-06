@@ -654,29 +654,6 @@ def deploy(d):
 }
 
 #[test]
-fn dag_allows_task_after_task() {
-    use barca_core::dag::Dag;
-
-    let src = r#"
-from barca import task
-
-@task()
-def migrate():
-    pass
-
-@task()
-def warm_cache():
-    pass
-
-@task(after=[migrate, warm_cache])
-def notify():
-    pass
-"#;
-    let nodes = extract_nodes(src, "test.py").unwrap();
-    assert!(Dag::build(&nodes).is_ok());
-}
-
-#[test]
 fn dag_rejects_sensor_with_inputs() {
     use barca_core::dag::Dag;
 

@@ -1,37 +1,48 @@
-# Tasks And Workflow Management
+# Tasks and Workflow Management
 
-This document specifies how Barca models **tasks** — the workflow-management
-steps that live alongside asset pipelines but don't fit the asset model.
+Tasks are the counterpart to assets. Assets produce cached, provenance-tracked data. Tasks perform side-effects that always re-run.
 
-Even the cleanest data-science setups carry a tail of "do something" work:
-deploy a model, notify a channel, run a migration, warm a cache, copy files,
-trigger an external system. These *do* something rather than produce cacheable
-data, and they should always re-run. Modeling them as assets is awkward (they
-have no meaningful cached output); modeling them as side-effect leaves is too
-restrictive (they often sit in the middle of a flow and feed other steps).
-
-Barca models them with a first-class `@task` node.
-
-## Summary
-
-`@task` is the task-style counterpart to `@asset`:
+## Asset vs Task
 
 | | `@asset` | `@task` |
 |---|----------|---------|
-| Cached? | Yes | **No** — always re-runs |
-| Position in DAG | anywhere | anywhere |
-| May depend on | assets, sensors | assets, sensors, tasks |
-| May be an input to | assets, sensors, tasks | **tasks only** |
-| Run with | `barca get <asset>` | `barca run <task>` |
+| Cached? | Yes | No -- always re-runs |
+| Position in DAG | Anywhere | Anywhere |
+| May depend on | Assets, sensors | Assets, sensors, tasks |
+| May be input to | Assets, sensors, tasks | Tasks only |
+| Run with | `barca get` | `barca run` |
 
-The one hard rule: **a task may not be an input to an asset or sensor.** A task
-always re-runs, so feeding its output into a cacheable node would keep that node
-perpetually stale. Assets and sensors may freely be upstream of tasks.
+The hard rule: **a task cannot be an input to an asset or sensor.** A task always re-runs, so feeding its output into a cacheable node would keep that node perpetually stale. DAG validation rejects this with a clear error.
 
-You "**get**" an asset (cache-aware, maximally cached) and "**run**" a task
-(always executes). Barca encourages asset-based workflows but lets you sprinkle
-tasks in — it constructs and manages the DAG for you; you just don't get the
-caching for the task nodes.
+## Commands
+
+Use `barca get` for assets and `barca run` for tasks. Using the wrong command gives a clear error telling you which one to use.
+
+```bash
+# Materialize an asset (cache-aware).
+barca get trained_model pipeline.py
+
+# Run a task (always executes).
+barca run deploy pipeline.py
+```
+
+`barca run` executes the targeted task and everything upstream of it:
+
+- Upstream assets are materialized (cache-aware by default).
+- Upstream tasks always re-run.
+- Sensors always re-run.
+
+### Selective re-runs with `--burst`
+
+By default, `barca run` uses cached upstream assets when they are fresh. Use `--burst` to force-rerun specific assets:
+
+```bash
+# Re-train the model, use cached data for everything else.
+barca run deploy --burst trained_model pipeline.py
+
+# Force-rerun multiple assets.
+barca run deploy --burst raw_data,trained_model pipeline.py
+```
 
 ## Declaring tasks
 
@@ -39,78 +50,111 @@ caching for the task nodes.
 from barca import asset, task
 
 @asset()
-def model() -> dict:
-    return train(...)
+def trained_model() -> dict:
+    return train(data)
 
-# asset → task: a task that consumes an upstream asset.
-@task(inputs={"m": model})
-def deploy(m: dict) -> dict:
-    upload_to_endpoint(m)
-    return {"deployment_id": "abc123"}
+@task(inputs={"model": trained_model})
+def deploy(model: dict) -> dict:
+    endpoint = upload_to_endpoint(model)
+    return {"endpoint_id": endpoint.id}
 
-# task → task: a nested task consuming another task's output.
-@task(inputs={"deploy": deploy})
-def notify(deploy: dict) -> None:
-    send_slack(f"deployed {deploy['deployment_id']}")
+@task(inputs={"d": deploy})
+def notify(d: dict) -> None:
+    send_slack(f"deployed to {d['endpoint_id']}")
 ```
 
-### Ordering without data: `after=`
+Tasks use the same `inputs=` syntax as assets. The parameter name in the dict must match a parameter in the function signature.
 
-Tasks often have execution order but no data to pass (migrate → warm_cache →
-notify). Declare ordering-only dependencies with `after=[...]`. No data flows
-along these edges — they only force the referenced nodes to run first.
+## Ordering-only dependencies
+
+When a task needs another node to run first but does not consume its output, use the `_` prefix convention:
 
 ```python
 @task()
-def migrate(): ...
+def migrate_db() -> None:
+    run_migrations()
 
-@task(after=[migrate])
-def warm_cache(): ...
+@task(inputs={"_migrate": migrate_db})
+def warm_cache(_migrate: None) -> None:
+    refresh_all_caches()
 
-@task(after=[warm_cache])
-def notify(): ...
+@task(inputs={"_warm": warm_cache})
+def notify(_warm: None) -> None:
+    send_slack("migration and cache warm complete")
 ```
 
-## Running tasks: `barca run`
+The `_` prefix signals that the parameter exists only for ordering. The value is passed but typically ignored. This creates a clear sequential chain: `migrate_db` then `warm_cache` then `notify`.
 
-```bash
-barca run <task> file.py [--burst a,b]
+## Wiring assets into tasks
+
+Assets flow into tasks through `inputs=`, the same way assets flow into other assets:
+
+```python
+@asset()
+def raw_data() -> list:
+    return fetch_from_api()
+
+@asset(inputs={"data": raw_data})
+def trained_model(data: list) -> dict:
+    return fit(data)
+
+@task(inputs={"model": trained_model})
+def deploy(model: dict) -> dict:
+    return upload(model)
 ```
 
-- **Default** — every upstream `@asset` in the task's cone is **burst**
-  (force-rerun), so the run reflects fresh inputs end to end.
-- **`--burst a,b`** — only the named assets are force-rerun; every other asset
-  uses the cache normally. Use this to re-run selectively (e.g. re-train one
-  model while keeping expensive upstream data cached).
-- Tasks and sensors always re-run regardless of the burst set.
+When you run `barca run deploy pipeline.py`, barca materializes `raw_data` and `trained_model` (using cache when fresh), then executes `deploy` with the model output.
 
-Because the DAG is built from your declared dependencies, **targeting any node
-scopes the run to exactly that subtree.** Running a top-level "release" task
-pulls in everything behind it; running one sub-task runs just that sub-task and
-its upstreams.
+## Task composition
 
-```bash
-barca run notify_team iris_project/assets.py          # whole subtree
-barca run smoke_test  nested_project/assets.py         # scoped to one sub-task
-barca run release --burst trained_model assets.py      # selective re-run
+Tasks compose through declared dependencies. Each task declares its inputs, and barca builds the execution plan:
+
+```python
+@task(inputs={"model": trained_model})
+def deploy(model: dict) -> dict:
+    return upload(model)
+
+@task(inputs={"d": deploy})
+def smoke_test(d: dict) -> dict:
+    return run_tests(d["endpoint_id"])
+
+@task(inputs={"result": smoke_test})
+def notify(result: dict) -> None:
+    if result["passed"]:
+        send_slack("deploy succeeded")
+    else:
+        send_slack("deploy failed -- rolling back")
 ```
+
+Running `barca run notify pipeline.py` executes the full chain: materialize assets, deploy, smoke test, notify.
+
+Running `barca run smoke_test pipeline.py` runs only up to the smoke test -- `notify` is not in scope.
+
+## Retries
+
+Retries are declared per-task via decorator kwargs. Rust owns the retry loop.
+
+```python
+@task(retries=3, retry_backoff=1.0, inputs={"model": trained_model})
+def deploy(model: dict) -> dict:
+    return upload(model)
+```
+
+- `retries` -- total attempts (1 = no retry, 3 = up to 3 attempts). Default is 1.
+- `retry_backoff` -- base delay in seconds. Delay before attempt N is `retry_backoff * N`.
+
+Each retry is a fresh worker invocation. Retries do not cascade -- a parent task's retries do not re-run its children, and a child's retries do not trigger its parent.
+
+See [Error Handling](../patterns/06-error-handling.md) for details on failure propagation and common mistakes.
+
+## What tasks cannot do
+
+- **Cannot be inputs to assets.** An asset depending on a task would be perpetually stale. DAG validation rejects this.
+- **Cannot be inputs to sensors.** Same reason -- sensors are cached and tasks always re-run.
+- **Cannot use `barca get`.** Running `barca get` on a task name gives an error directing you to use `barca run`.
 
 ## Worked examples
 
-- [`examples/basic_app`](https://github.com/ExSidius/barca/tree/main/examples/basic_app) —
-  a task consuming an asset (`log_summary`) and an `after=` chain
-  (`migrate → warm_cache → notify`).
-- [`examples/iris_pipeline`](https://github.com/ExSidius/barca/tree/main/examples/iris_pipeline) —
-  a realistic mixed pipeline: data assets feed `deploy_model` (asset → task) and
-  `notify_team` (task → task).
-- [`examples/nested_tasks`](https://github.com/ExSidius/barca/tree/main/examples/nested_tasks) —
-  nested task hierarchies, `after=` ordering, assets-feeding-tasks, and run
-  scoping.
-
-## Future work
-
-For v1, task composition is expressed through declared dependencies
-(`inputs=` / `after=`) and scoped by targeting a node with `barca run`. Runtime
-**call-nesting** — a task body literally invoking other `@task` functions, with
-Barca statically tracing the calls to build the sub-DAG — is deferred to a later
-iteration.
+- [`examples/basic_app`](https://github.com/ExSidius/barca/tree/main/examples/basic_app) --
+  a task consuming an asset (`log_summary`) and an ordering-only chain
+  (`migrate` then `warm_cache` then `notify`).

@@ -5,7 +5,7 @@ management side of Barca. It shows the three ways tasks relate:
 
 1. **Assets feeding tasks** — a small ``config`` asset (cacheable) is consumed by
    tasks. Assets may be upstream of tasks; tasks may *not* be upstream of assets.
-2. **Ordering-only deps** (``after=``) — ``smoke_test`` runs after the deploys,
+2. **Ordering-only deps** (``_`` prefix) — ``smoke_test`` runs after the deploys,
    with no data passed.
 3. **Nested tasks** (task → task hierarchies) — ``release`` sits on top of the
    whole tree. Targeting any node scopes the run to just that subtree.
@@ -53,9 +53,9 @@ def deploy_api(cfg: dict) -> dict:
 # ─── Ordering-only dependency: smoke test runs AFTER the deploys ──────────────
 
 
-@task(after=[db_migrate, deploy_api])
-def smoke_test() -> dict:
-    """Smoke-test the deployment. Ordered after the deploys via ``after=`` —
+@task(inputs={"_db_migrate": db_migrate, "_deploy_api": deploy_api})
+def smoke_test(_db_migrate, _deploy_api) -> dict:
+    """Smoke-test the deployment. Ordered after the deploys via ``_`` prefix —
     no data is passed, it just must run last."""
     print("[task] running smoke tests")
     return {"passed": True}
@@ -64,8 +64,8 @@ def smoke_test() -> dict:
 # ─── Nested top-level task: the whole release ─────────────────────────────────
 
 
-@task(inputs={"migrate": db_migrate, "api": deploy_api}, after=[smoke_test])
-def release(migrate: dict, api: dict) -> dict:
+@task(inputs={"migrate": db_migrate, "api": deploy_api, "_smoke_test": smoke_test})
+def release(migrate: dict, api: dict, _smoke_test) -> dict:
     """Top-level release task. Depends on the sub-tasks (data + ordering), so
     ``barca run release`` pulls in the entire tree: config → migrate/deploy →
     smoke_test → release."""

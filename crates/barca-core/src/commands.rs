@@ -111,8 +111,8 @@ pub enum CachePolicy {
     /// Force-rerun every asset in the target's cone (`barca run`, default).
     BurstAll,
     /// Force-rerun only the named assets; all others stay cache-aware
-    /// (`barca run <task> --burst a,b`). Names are matched the same fuzzy way
-    /// as a CLI target (bare function name, `:name` suffix, or substring).
+    /// (`barca run <task> --burst a,b`). A name matches when it equals the
+    /// node's base id exactly, or matches the trailing `:name` segment.
     BurstSelective(Vec<String>),
 }
 
@@ -186,6 +186,21 @@ fn execute(
                     let available: Vec<&str> = dag.topo_order();
                     BarcaError::AssetNotFound(name.to_string(), available.join(", "))
                 })?;
+            // Enforce get/run semantics: `barca get` is for assets, `barca run` is for tasks.
+            if let Some(node) = dag.get_node(&id) {
+                let kind = node.kind();
+                if command_label == "get" && kind == crate::NodeKind::Task {
+                    return Err(BarcaError::Other(format!(
+                        "'{name}' is a task — use `barca run` instead"
+                    )));
+                }
+                if command_label == "run" && kind == crate::NodeKind::Asset {
+                    return Err(BarcaError::Other(format!(
+                        "'{name}' is an asset — use `barca get` instead"
+                    )));
+                }
+            }
+
             Some(id)
         }
         None => None,

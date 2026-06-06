@@ -80,7 +80,6 @@ fn try_extract_function(
 
     let freshness = extract_freshness(&keywords).unwrap_or(Freshness::default_for(kind));
     let inputs = extract_inputs(&keywords);
-    let after = extract_after(&keywords);
     let partitions = extract_partitions(&keywords, source);
     let explicit_name = extract_string_kwarg(&keywords, "name");
     let description = extract_string_kwarg(&keywords, "description");
@@ -104,7 +103,6 @@ fn try_extract_function(
         explicit_name,
         freshness,
         inputs,
-        after,
         partitions,
         sinks,
         timeout_seconds,
@@ -292,42 +290,6 @@ fn extract_inputs_from_dict(dict: &ast::ExprDict) -> SmallVec<[DeclaredInput; 4]
     }
 
     inputs
-}
-
-/// Extract `after=[node_a, node_b]` — execution-order-only dependencies.
-/// Accepts bare function references and `asset_ref("...")` calls.
-fn extract_after(keywords: &[&Keyword]) -> SmallVec<[NodeRef; 4]> {
-    for kw in keywords {
-        let Some(ref ident) = kw.arg else { continue };
-        if ident.as_str() != "after" {
-            continue;
-        }
-        if let Expr::List(list) = &kw.value {
-            return extract_node_ref_list(list);
-        }
-    }
-    SmallVec::new()
-}
-
-fn extract_node_ref_list(list: &ast::ExprList) -> SmallVec<[NodeRef; 4]> {
-    let mut refs = SmallVec::new();
-    for elt in &list.elts {
-        match elt {
-            Expr::Name(n) => refs.push(NodeRef::FunctionName(n.id.to_string())),
-            Expr::Call(call) => {
-                // Support asset_ref("path") inside after=[...].
-                if let Expr::Name(n) = call.func.as_ref()
-                    && n.id.as_str() == "asset_ref"
-                    && let Some(arg) = call.arguments.args.first()
-                    && let Some(s) = extract_string_literal(arg)
-                {
-                    refs.push(NodeRef::Canonical(s));
-                }
-            }
-            _ => {}
-        }
-    }
-    refs
 }
 
 fn extract_partitions(keywords: &[&Keyword], source: &str) -> HashMap<String, PartitionSpec> {
@@ -572,32 +534,6 @@ def my_task(data):
             Freshness::Schedule(CronExpr("*/5 * * * *".into()))
         );
         assert_eq!(nodes[1].kind, NodeKind::Task);
-    }
-
-    #[test]
-    fn test_after_kwarg() {
-        let src = r#"
-from barca import task
-
-@task()
-def migrate():
-    pass
-
-@task()
-def seed():
-    pass
-
-@task(after=[migrate, seed])
-def notify():
-    pass
-"#;
-        let nodes = extract_nodes(src, "test.py").unwrap();
-        let notify = nodes.iter().find(|n| n.function_name == "notify").unwrap();
-        assert_eq!(notify.kind, NodeKind::Task);
-        assert!(notify.inputs.is_empty());
-        assert_eq!(notify.after.len(), 2);
-        let names: Vec<&str> = notify.after.iter().map(|r| r.resolution_name()).collect();
-        assert_eq!(names, vec!["migrate", "seed"]);
     }
 
     #[test]

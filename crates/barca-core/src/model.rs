@@ -296,9 +296,6 @@ pub struct ExtractedNode {
     pub freshness: Freshness,
     /// Declared inputs (parameter → upstream mapping). Typically 0–4 items.
     pub inputs: SmallVec<[DeclaredInput; 4]>,
-    /// Execution-order-only dependencies from `@task(after=[...])`. No data is
-    /// passed along these — they only force the referenced nodes to run first.
-    pub after: SmallVec<[NodeRef; 4]>,
     /// Partition dimensions.
     pub partitions: HashMap<String, PartitionSpec>,
     /// Sink declarations (from stacked `@sink` decorators). Typically 0–2 items.
@@ -384,7 +381,4 @@ pub enum EdgeKind {
     Collect,
     /// Partition source: upstream defines the partition universe for downstream.
     PartitionSource,
-    /// Execution-ordering-only edge from `@task(after=[...])`. Forces the
-    /// upstream to run first but passes no data — never becomes a worker input.
-    After,
 }
