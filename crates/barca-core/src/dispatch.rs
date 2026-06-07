@@ -870,13 +870,31 @@ fn spawn_unit(
 }
 
 /// Handle a parallel dispatch request from a worker. Spawns sub-workers
-/// (each with their own Unix socket) to execute the submitted items, then
-/// collects and returns results.
+/// that all connect to a single shared Unix socket, then reads results
+/// concurrently using async I/O (tokio).
 fn handle_parallel_dispatch(
     items: &[protocol::SubmitItem],
     python_path: &PathBuf,
     artifact_dir: &str,
 ) -> Vec<ParallelResult> {
+    // Bridge into async — create a one-shot tokio runtime.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async_parallel_dispatch(items, python_path, artifact_dir))
+}
+
+/// Async implementation of parallel dispatch. Creates a single shared Unix socket
+/// listener, spawns all sub-worker processes pointing at it, then accepts and
+/// reads from all connections concurrently via `futures::future::join_all`.
+async fn async_parallel_dispatch(
+    items: &[protocol::SubmitItem],
+    python_path: &PathBuf,
+    artifact_dir: &str,
+) -> Vec<ParallelResult> {
+    use tokio::net::UnixListener;
+
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4);
@@ -940,15 +958,11 @@ fn handle_parallel_dispatch(
         }
     }
 
-    // Distribute valid steps across pool_size chunks (round-robin).
-    struct ChunkWorker {
-        child: std::process::Child,
-        batch_path: std::path::PathBuf,
-        socket_path: std::path::PathBuf,
-        listener: UnixListener,
-        original_indices: Vec<usize>,
+    if valid_steps.is_empty() {
+        return results;
     }
 
+    // Distribute valid steps across pool_size chunks (round-robin).
     let effective_pool = std::cmp::min(pool_size, valid_steps.len()).max(1);
     let mut chunks: Vec<(Vec<serde_json::Value>, Vec<usize>)> = (0..effective_pool)
         .map(|_| (Vec::new(), Vec::new()))
@@ -960,8 +974,33 @@ fn handle_parallel_dispatch(
         chunks[chunk_idx].1.push(se.original_index);
     }
 
-    // Phase 1: spawn one sub-worker per chunk (each with its own socket).
-    let mut workers: Vec<Result<ChunkWorker, Vec<usize>>> = Vec::new();
+    // Create ONE shared listener for all sub-workers.
+    let socket_path = protocol::socket_path(
+        "par-dispatch",
+        &format!("{:?}", std::thread::current().id()),
+    );
+    std::fs::remove_file(&socket_path).ok();
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            return items
+                .iter()
+                .map(|_| ParallelResult::Error {
+                    error: format!("socket bind: {e}"),
+                })
+                .collect();
+        }
+    };
+
+    // Spawn all sub-worker OS processes pointing at the SAME socket.
+    struct SpawnedWorker {
+        child: std::process::Child,
+        batch_path: std::path::PathBuf,
+        original_indices: Vec<usize>,
+    }
+
+    let socket_str = socket_path.to_str().unwrap_or("").to_string();
+    let mut spawned: Vec<SpawnedWorker> = Vec::new();
 
     for (chunk_idx, (steps, indices)) in chunks.into_iter().enumerate() {
         if steps.is_empty() {
@@ -986,7 +1025,6 @@ fn handle_parallel_dispatch(
                                 error: "failed to create batch file".to_string(),
                             };
                         }
-                        workers.push(Err(indices));
                         continue;
                     }
                 }
@@ -997,32 +1035,9 @@ fn handle_parallel_dispatch(
                         error: "failed to create temp file".to_string(),
                     };
                 }
-                workers.push(Err(indices));
                 continue;
             }
         };
-
-        // Create socket for this sub-worker.
-        let sub_socket_path = protocol::socket_path(
-            &format!("{:?}-par", std::thread::current().id()),
-            &format!("chunk-{chunk_idx}"),
-        );
-        std::fs::remove_file(&sub_socket_path).ok();
-        let sub_listener = match UnixListener::bind(&sub_socket_path) {
-            Ok(l) => l,
-            Err(e) => {
-                std::fs::remove_file(&batch_file).ok();
-                for &idx in &indices {
-                    results[idx] = ParallelResult::Error {
-                        error: format!("socket bind: {e}"),
-                    };
-                }
-                workers.push(Err(indices));
-                continue;
-            }
-        };
-
-        let sub_socket_str = sub_socket_path.to_str().unwrap_or("").to_string();
 
         match Command::new(python_path)
             .args(["-m", "barca._worker"])
@@ -1031,140 +1046,199 @@ fn handle_parallel_dispatch(
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
             .env("BARCA_WORKER", "1")
-            .env("BARCA_SOCKET", &sub_socket_str)
+            .env("BARCA_SOCKET", &socket_str)
             .spawn()
         {
             Ok(child) => {
-                workers.push(Ok(ChunkWorker {
+                spawned.push(SpawnedWorker {
                     child,
                     batch_path: batch_file,
-                    socket_path: sub_socket_path,
-                    listener: sub_listener,
                     original_indices: indices,
-                }));
+                });
             }
             Err(e) => {
                 std::fs::remove_file(&batch_file).ok();
-                std::fs::remove_file(&sub_socket_path).ok();
                 for &idx in &indices {
                     results[idx] = ParallelResult::Error {
                         error: format!("failed to spawn worker: {e}"),
                     };
                 }
-                workers.push(Err(indices));
             }
         }
     }
 
-    // Phase 2: collect results from each chunk worker via socket.
-    for entry in workers {
-        let Ok(mut cw) = entry else { continue };
+    if spawned.is_empty() {
+        std::fs::remove_file(&socket_path).ok();
+        return results;
+    }
 
-        // Accept sub-worker connection with timeout.
-        cw.listener.set_nonblocking(true).ok();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        let accept_result = loop {
-            match cw.listener.accept() {
-                Ok(conn) => break Ok(conn),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        break Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "sub-worker accept timeout",
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Err(e) => break Err(e),
+    // Accept all connections concurrently with a timeout.
+    let num_workers = spawned.len();
+    let mut streams: Vec<(tokio::net::UnixStream, Vec<usize>)> = Vec::new();
+    let mut failed_workers: Vec<usize> = Vec::new(); // indices into spawned
+
+    for worker_idx in 0..num_workers {
+        match tokio::time::timeout(Duration::from_secs(30), listener.accept()).await {
+            Ok(Ok((stream, _))) => {
+                // We don't know which worker connected in which order, but each
+                // worker processes its chunk sequentially. We'll match results
+                // by node_id after reading. For now, pair with worker_idx as placeholder.
+                streams.push((stream, Vec::new()));
             }
-        };
-
-        let (mut sub_socket, _) = match accept_result {
-            Ok(conn) => conn,
-            Err(_) => {
-                let _ = cw.child.wait();
-                std::fs::remove_file(&cw.batch_path).ok();
-                std::fs::remove_file(&cw.socket_path).ok();
-                for &idx in &cw.original_indices {
-                    results[idx] = ParallelResult::Error {
-                        error: "sub-worker failed to connect".to_string(),
-                    };
-                }
-                continue;
-            }
-        };
-        drop(cw.listener);
-        sub_socket
-            .set_read_timeout(Some(Duration::from_millis(500)))
-            .ok();
-
-        // Read messages from sub-worker socket.
-        let mut chunk_results: Vec<ParallelResult> = Vec::new();
-        loop {
-            match protocol::read_message::<_, WorkerMessage>(&mut sub_socket) {
-                Ok(Some(msg)) => match msg {
-                    WorkerMessage::StepCompleted { node_id, artifact } => {
-                        // Read the JSON artifact to get the actual value.
-                        let val = if artifact.format == "json" && !artifact.path.is_empty() {
-                            std::fs::read_to_string(&artifact.path)
-                                .ok()
-                                .and_then(|s| serde_json::from_str(&s).ok())
-                                .unwrap_or(serde_json::json!({
-                                    "path": artifact.path,
-                                    "format": artifact.format,
-                                    "size_bytes": artifact.size_bytes
-                                }))
-                        } else {
-                            serde_json::json!({
-                                "path": artifact.path,
-                                "format": artifact.format,
-                                "size_bytes": artifact.size_bytes
-                            })
-                        };
-                        let _ = node_id; // used for ordering (batch order)
-                        chunk_results.push(ParallelResult::Ok { result: val });
-                    }
-                    WorkerMessage::StepError { message, .. } => {
-                        chunk_results.push(ParallelResult::Error { error: message });
-                    }
-                    WorkerMessage::Blocked { .. } => {
-                        chunk_results.push(ParallelResult::Error {
-                            error: "step was blocked".to_string(),
-                        });
-                    }
-                    WorkerMessage::Submit { .. } => {
-                        // Nested parallel not yet supported in sub-workers.
-                        // Send back empty results so sub-worker doesn't hang.
-                        let empty_response =
-                            CoordinatorMessage::ParallelResponse { results: vec![] };
-                        protocol::write_message(&mut sub_socket, &empty_response).ok();
-                    }
-                    WorkerMessage::Heartbeat => {}
-                },
-                Ok(None) => break,
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    match cw.child.try_wait() {
-                        Ok(Some(_)) => break,
-                        Ok(None) => continue,
-                        Err(_) => break,
-                    }
-                }
-                Err(_) => break,
+            _ => {
+                failed_workers.push(worker_idx);
             }
         }
+    }
 
-        let _ = cw.child.wait();
-        std::fs::remove_file(&cw.batch_path).ok();
-        std::fs::remove_file(&cw.socket_path).ok();
-
-        // Map chunk results back to original indices.
-        for (step_pos, &original_idx) in cw.original_indices.iter().enumerate() {
-            if let Some(res) = chunk_results.get(step_pos) {
-                results[original_idx] = res.clone();
+    // If some workers failed to connect, mark their items as errors.
+    // Since we can't tell which worker failed (connection order != spawn order),
+    // we handle this after reading by checking for missing results.
+    // Only if ALL accepts failed do we know all workers failed.
+    if streams.is_empty() {
+        for sw in &mut spawned {
+            let _ = sw.child.wait();
+            std::fs::remove_file(&sw.batch_path).ok();
+            for &idx in &sw.original_indices {
+                results[idx] = ParallelResult::Error {
+                    error: "sub-worker failed to connect".to_string(),
+                };
             }
+        }
+        std::fs::remove_file(&socket_path).ok();
+        return results;
+    }
+
+    // Read from all workers CONCURRENTLY using futures::future::join_all.
+    // Each reader returns a Vec of (node_id, ParallelResult) pairs so we can
+    // match results back to original indices by node_id.
+    let python_clone = python_path.clone();
+    let art_dir = artifact_dir.to_string();
+
+    let read_futures: Vec<_> = streams
+        .into_iter()
+        .map(|(stream, _)| {
+            let python = python_clone.clone();
+            let art = art_dir.clone();
+            async move { read_worker_results(stream, &python, &art).await }
+        })
+        .collect();
+
+    let all_stream_results: Vec<Vec<(String, ParallelResult)>> =
+        futures::future::join_all(read_futures).await;
+
+    // Build a map from node_id -> ParallelResult for all results.
+    let mut node_results: HashMap<String, ParallelResult> = HashMap::new();
+    for stream_results in all_stream_results {
+        for (node_id, result) in stream_results {
+            node_results.insert(node_id, result);
+        }
+    }
+
+    // Map results back to original indices using the node_id convention:
+    // node_id = "{fn_ref}[_branch={original_index}]"
+    for sw in &spawned {
+        for &original_idx in &sw.original_indices {
+            let expected_node_id =
+                format!("{}[_branch={}]", items[original_idx].fn_ref, original_idx);
+            if let Some(res) = node_results.remove(&expected_node_id) {
+                results[original_idx] = res;
+            } else {
+                results[original_idx] = ParallelResult::Error {
+                    error: "worker exited without reporting result".to_string(),
+                };
+            }
+        }
+    }
+
+    // Cleanup: wait for all children, remove batch files and socket.
+    for sw in &mut spawned {
+        let _ = sw.child.wait();
+        std::fs::remove_file(&sw.batch_path).ok();
+    }
+    std::fs::remove_file(&socket_path).ok();
+
+    results
+}
+
+/// Read all messages from a single worker stream, returning (node_id, result) pairs.
+/// Handles nested parallel dispatch via recursive async calls.
+async fn read_worker_results(
+    mut stream: tokio::net::UnixStream,
+    python_path: &PathBuf,
+    artifact_dir: &str,
+) -> Vec<(String, ParallelResult)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut results: Vec<(String, ParallelResult)> = Vec::new();
+
+    loop {
+        // Read 4-byte length prefix.
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).await.is_err() {
+            break;
+        }
+        let len = u32::from_be_bytes(len_buf) as usize;
+
+        // Safety: reject absurdly large messages (> 256MB).
+        if len > 256 * 1024 * 1024 {
+            break;
+        }
+
+        // Read payload.
+        let mut payload = vec![0u8; len];
+        if stream.read_exact(&mut payload).await.is_err() {
+            break;
+        }
+
+        let msg: WorkerMessage = match serde_json::from_slice(&payload) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        match msg {
+            WorkerMessage::StepCompleted { node_id, artifact } => {
+                let val = if artifact.format == "json" && !artifact.path.is_empty() {
+                    std::fs::read_to_string(&artifact.path)
+                        .ok()
+                        .and_then(|s| serde_json::from_str(&s).ok())
+                        .unwrap_or(serde_json::Value::Null)
+                } else {
+                    serde_json::json!({
+                        "path": artifact.path,
+                        "format": artifact.format,
+                        "size_bytes": artifact.size_bytes
+                    })
+                };
+                results.push((node_id, ParallelResult::Ok { result: val }));
+            }
+            WorkerMessage::StepError {
+                node_id, message, ..
+            } => {
+                results.push((node_id, ParallelResult::Error { error: message }));
+            }
+            WorkerMessage::Blocked { node_id, .. } => {
+                results.push((
+                    node_id,
+                    ParallelResult::Error {
+                        error: "step was blocked".to_string(),
+                    },
+                ));
+            }
+            WorkerMessage::Submit { items } => {
+                // Nested parallel dispatch — recursive async call.
+                let nested_results =
+                    Box::pin(async_parallel_dispatch(&items, python_path, artifact_dir)).await;
+                let response = CoordinatorMessage::ParallelResponse {
+                    results: nested_results,
+                };
+                let resp_payload = serde_json::to_vec(&response).unwrap_or_default();
+                let header = (resp_payload.len() as u32).to_be_bytes();
+                let _ = stream.write_all(&header).await;
+                let _ = stream.write_all(&resp_payload).await;
+                let _ = stream.flush().await;
+            }
+            WorkerMessage::Heartbeat => {}
         }
     }
 
