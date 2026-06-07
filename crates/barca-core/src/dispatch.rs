@@ -1,12 +1,15 @@
 //! Phase execution engine — worker spawning, protocol parsing, partition expansion.
 
 use crate::planner::{Phase, StreamStep, WorkerStream, expand_partition_combos};
+use crate::protocol::{self, CoordinatorMessage, ParallelResult, WorkerMessage};
 use crate::scheduler::Unit;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// Reference to a materialized artifact on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -27,17 +30,6 @@ pub struct StepError {
     pub traceback: String,
     /// Number of attempts made before this failure became permanent.
     pub attempts: u32,
-}
-
-/// A work item from a `parallel()` request — one branch to dispatch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParallelWorkItem {
-    /// Function reference: "source_file.py:function_name"
-    pub fn_ref: String,
-    /// Positional args (JSON values).
-    pub args: Vec<serde_json::Value>,
-    /// Keyword args (JSON values).
-    pub kwargs: HashMap<String, serde_json::Value>,
 }
 
 /// A permanently-failed step (retry budget exhausted), for the metadata DB.
@@ -334,17 +326,6 @@ enum WorkerEvent {
         failures: Vec<(String, StepError)>,
         blocked: Vec<String>,
     },
-    /// A worker is requesting parallel dispatch of sub-tasks.
-    /// The worker is suspended (blocking on stdin) until we write a response.
-    #[allow(dead_code)]
-    ParallelRequest {
-        /// The worker's stdin pipe to write the response to when done.
-        response_pipe: std::process::ChildStdin,
-        /// The parent unit (kept alive while waiting).
-        parent_unit: Unit,
-        /// The work items to dispatch.
-        items: Vec<ParallelWorkItem>,
-    },
 }
 
 /// Execute a single phase. The pure `scheduler::Scheduler` owns all dispatch /
@@ -553,13 +534,6 @@ impl WorkerEvent {
                     blocked,
                 })
             }
-            WorkerEvent::ParallelRequest { .. } => {
-                // TODO(v0.2.0): Handle parallel dispatch. For now, parallel
-                // requests are handled in-band by the reader thread (see
-                // spawn_unit). This variant exists for the future async path
-                // where the coordinator manages parallel sub-workers.
-                None
-            }
         }
     }
 }
@@ -567,6 +541,10 @@ impl WorkerEvent {
 /// Serialize a unit's batch (merging any retry predecessor outputs into the
 /// provided map), spawn one Python worker, and start a reader thread that
 /// streams `StepCompleted` events and sends one `UnitFinished` on exit.
+///
+/// Communication uses a Unix domain socket (length-prefixed JSON frames).
+/// The worker connects to the socket and sends structured messages; stderr
+/// is only collected for crash diagnostics.
 fn spawn_unit(
     unit: &crate::scheduler::Unit,
     base_provided: &HashMap<String, ProvidedInput>,
@@ -597,77 +575,190 @@ fn spawn_unit(
         .keep()
         .map_err(|e| format!("failed to persist temp file: {e}"))?;
 
+    // Create a Unix listener socket for this worker.
+    let socket_path = protocol::socket_path(
+        &format!("{:?}", std::thread::current().id()),
+        &unit.stream_id,
+    );
+    // Remove stale socket if it exists (from a previous crashed run).
+    std::fs::remove_file(&socket_path).ok();
+    let listener = UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
+
+    let socket_path_str = socket_path.to_str().unwrap_or("").to_string();
+
     let mut child = match Command::new(python)
         .args(["-m", "barca._worker"])
         .arg(&batch_path)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .env("BARCA_WORKER", "1")
+        .env("BARCA_SOCKET", &socket_path_str)
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
             std::fs::remove_file(&batch_path).ok();
+            std::fs::remove_file(&socket_path).ok();
             return Err(format!("failed to spawn worker: {e}"));
         }
     };
 
     let stderr = child.stderr.take().expect("no stderr");
-    // Take stdin so the reader thread can use it for the parallel protocol.
-    let child_stdin = child.stdin.take().expect("no stdin");
     let tx_reader = tx.clone();
     let unit = unit.clone();
     let python_path = python.clone();
 
     std::thread::spawn(move || {
-        let reader = BufReader::new(stderr);
-        let mut error_lines: Vec<String> = Vec::new();
         let mut failures: Vec<(String, StepError)> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut completed: Vec<String> = Vec::new();
-        // Kept alive across all parallel_request calls — a worker may issue
-        // multiple parallel() calls during its lifetime.
-        let mut stdin_pipe = child_stdin;
 
-        for line in reader.lines() {
-            let Ok(line) = line else { break };
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(json_str) = line.strip_prefix(PROTOCOL_PREFIX_V2) {
-                let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) else {
-                    continue;
-                };
-
-                // ── parallel_request protocol ───────────────────────────
-                // The worker sends `{"parallel_request": [...]}` (no "type"
-                // field) when a task calls `parallel()`. The worker then
-                // blocks reading its stdin for the response.
-                if let Some(pr) = parsed.get("parallel_request") {
-                    let items: Vec<ParallelWorkItem> = match serde_json::from_value(pr.clone()) {
-                        Ok(items) => items,
-                        Err(e) => {
-                            eprintln!("[barca] failed to parse parallel request: {e}");
-                            // Send error responses so the worker doesn't hang
-                            let count = pr.as_array().map(|a| a.len()).unwrap_or(1);
-                            let response: Vec<serde_json::Value> = (0..count)
-                                .map(|_| serde_json::json!({"status": "error", "error": format!("failed to parse parallel request: {e}")}))
-                                .collect();
-                            let response_json = serde_json::to_string(&response)
-                                .unwrap_or_else(|_| "[]".to_string());
-                            let _ = stdin_pipe.write_all(response_json.as_bytes());
-                            let _ = stdin_pipe.write_all(b"\n");
-                            let _ = stdin_pipe.flush();
-                            continue;
+        // Accept the worker's socket connection (blocking with timeout).
+        listener.set_nonblocking(false).ok();
+        // Give the worker up to 30 seconds to connect.
+        let accept_result = {
+            use std::io::ErrorKind;
+            // Use a thread-safe accept with a reasonable timeout:
+            // We set the listener to non-blocking and poll.
+            listener.set_nonblocking(true).ok();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let mut result = Err(std::io::Error::new(ErrorKind::TimedOut, "accept timeout"));
+            loop {
+                match listener.accept() {
+                    Ok(conn) => {
+                        result = Ok(conn);
+                        break;
+                    }
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
                         }
-                    };
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            result
+        };
 
-                    {
-                        // Stage 3: batch parallel work items across pool_size
-                        // workers. Each worker handles a chunk of items
-                        // sequentially; workers run in parallel.
+        let (mut socket_stream, _) = match accept_result {
+            Ok(conn) => conn,
+            Err(_e) => {
+                // Worker failed to connect — collect stderr and treat as crash.
+                let reader = BufReader::new(stderr);
+                let error_lines: Vec<String> = reader
+                    .lines()
+                    .filter_map(|l| l.ok())
+                    .filter(|l| !l.is_empty() && !l.starts_with("BARCA:"))
+                    .collect();
+                let traceback = filter_traceback(&error_lines);
 
+                let _ = child.wait();
+                std::fs::remove_file(&batch_path).ok();
+                std::fs::remove_file(&socket_path).ok();
+
+                let uncompleted: Vec<String> = unit
+                    .steps
+                    .iter()
+                    .flat_map(|s| {
+                        if s.partition_keys.is_empty() {
+                            vec![s.step_id.display()]
+                        } else {
+                            s.partition_keys
+                                .iter()
+                                .map(|pk| pk.display_id(&s.step_id.base))
+                                .collect()
+                        }
+                    })
+                    .collect();
+                for node in &uncompleted {
+                    failures.push((
+                        node.clone(),
+                        StepError {
+                            error_type: "WorkerCrash".to_string(),
+                            message: "worker failed to connect to socket".to_string(),
+                            traceback: traceback.clone(),
+                            attempts: 0,
+                        },
+                    ));
+                }
+                if uncompleted.is_empty() {
+                    failures.push((
+                        "<unknown>".to_string(),
+                        StepError {
+                            error_type: "WorkerCrash".to_string(),
+                            message: "worker failed to connect to socket".to_string(),
+                            traceback,
+                            attempts: 0,
+                        },
+                    ));
+                }
+
+                tx_reader
+                    .send(WorkerEvent::UnitFinished {
+                        unit,
+                        failures,
+                        blocked,
+                    })
+                    .ok();
+                return;
+            }
+        };
+
+        // Only one connection needed.
+        drop(listener);
+        // Set a read timeout so we can detect worker death.
+        socket_stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
+
+        // ── Socket message loop ──────────────────────────────────────────
+        loop {
+            match protocol::read_message::<_, WorkerMessage>(&mut socket_stream) {
+                Ok(Some(msg)) => match msg {
+                    WorkerMessage::StepCompleted { node_id, artifact } => {
+                        completed.push(node_id.clone());
+                        let oref = OutputRef {
+                            path: artifact.path,
+                            format: artifact.format,
+                            size_bytes: artifact.size_bytes,
+                            elapsed_seconds: artifact.elapsed_seconds,
+                        };
+                        tx_reader
+                            .send(WorkerEvent::StepCompleted {
+                                node_id,
+                                output: oref,
+                            })
+                            .ok();
+                    }
+                    WorkerMessage::StepError {
+                        node_id,
+                        error_type,
+                        message,
+                        traceback,
+                        ..
+                    } => {
+                        let tb_lines: Vec<String> =
+                            traceback.lines().map(|l| l.to_string()).collect();
+                        failures.push((
+                            node_id,
+                            StepError {
+                                error_type,
+                                message,
+                                traceback: filter_traceback(&tb_lines),
+                                attempts: 0,
+                            },
+                        ));
+                    }
+                    WorkerMessage::Blocked { node_id, .. } => {
+                        blocked.push(node_id);
+                    }
+                    WorkerMessage::Submit { items } => {
+                        // Handle parallel dispatch — spawn sub-workers.
                         let artifact_dir = std::env::current_dir()
                             .map(|p| {
                                 p.join(".barca")
@@ -677,321 +768,52 @@ fn spawn_unit(
                             })
                             .unwrap_or_else(|_| ".barca/artifacts".to_string());
 
-                        let num_cpus = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4);
-                        let pool_size = std::cmp::min(items.len(), num_cpus);
+                        let results = handle_parallel_dispatch(&items, &python_path, &artifact_dir);
 
-                        // Build steps for all items first, tracking any
-                        // per-item parse errors.
-                        struct StepEntry {
-                            original_index: usize,
-                            step_json: serde_json::Value,
-                        }
-                        let mut step_entries: Vec<Result<StepEntry, (usize, serde_json::Value)>> =
-                            Vec::with_capacity(items.len());
-
-                        for (i, item) in items.iter().enumerate() {
-                            let (source_file, function_name) = match item.fn_ref.rsplit_once(':') {
-                                Some((file, func)) => (file.to_string(), func.to_string()),
-                                None => {
-                                    step_entries.push(Err((
-                                        i,
-                                        serde_json::json!({
-                                            "status": "error",
-                                            "error": format!("invalid fn_ref: {}", item.fn_ref)
-                                        }),
-                                    )));
-                                    continue;
-                                }
-                            };
-
-                            let direct_args: Vec<serde_json::Value> = item.args.clone();
-                            let mut direct_kwargs: serde_json::Map<String, serde_json::Value> =
-                                serde_json::Map::new();
-                            for (k, v) in &item.kwargs {
-                                direct_kwargs.insert(k.clone(), v.clone());
-                            }
-
-                            let branch_node_id = format!("{}[_branch={}]", item.fn_ref, i);
-                            let step = serde_json::json!({
-                                "node_id": &branch_node_id,
-                                "function_name": function_name,
-                                "source_file": source_file,
-                                "kind": "task",
-                                "inputs": {},
-                                "timeout_seconds": 300,
-                                "partition_keys": [],
-                                "serializer": "json",
-                                "direct_args": direct_args,
-                                "direct_kwargs": direct_kwargs,
-                            });
-                            step_entries.push(Ok(StepEntry {
-                                original_index: i,
-                                step_json: step,
-                            }));
-                        }
-
-                        // Separate valid steps from errors.
-                        let mut valid_steps: Vec<StepEntry> = Vec::new();
-                        // Pre-fill results array so we can place results by
-                        // original index.
-                        let mut results: Vec<serde_json::Value> =
-                            vec![serde_json::json!({"status": "ok", "result": null}); items.len()];
-                        for entry in step_entries {
-                            match entry {
-                                Ok(se) => valid_steps.push(se),
-                                Err((idx, err_json)) => {
-                                    results[idx] = err_json;
-                                }
-                            }
-                        }
-
-                        // Distribute valid steps across pool_size chunks
-                        // (round-robin for even distribution).
-                        struct ChunkWorker {
-                            child: std::process::Child,
-                            batch_path: std::path::PathBuf,
-                            /// The original indices of items in this chunk,
-                            /// in the order the worker will process them.
-                            original_indices: Vec<usize>,
-                        }
-
-                        let effective_pool = std::cmp::min(pool_size, valid_steps.len());
-                        let mut chunks: Vec<(Vec<serde_json::Value>, Vec<usize>)> = (0
-                            ..effective_pool)
-                            .map(|_| (Vec::new(), Vec::new()))
-                            .collect();
-
-                        for (round_idx, se) in valid_steps.into_iter().enumerate() {
-                            let chunk_idx = round_idx % effective_pool;
-                            chunks[chunk_idx].0.push(se.step_json);
-                            chunks[chunk_idx].1.push(se.original_index);
-                        }
-
-                        // Phase 1: spawn one worker per chunk.
-                        let mut workers: Vec<Result<ChunkWorker, Vec<usize>>> = Vec::new();
-
-                        for (chunk_idx, (steps, indices)) in chunks.into_iter().enumerate() {
-                            if steps.is_empty() {
-                                continue;
-                            }
-                            let batch = serde_json::json!({
-                                "stream_id": format!("parallel-chunk-{chunk_idx}"),
-                                "artifact_dir": &artifact_dir,
-                                "steps": steps,
-                                "provided_inputs": {}
-                            });
-
-                            let batch_json = serde_json::to_string(&batch).unwrap_or_default();
-                            let batch_file = match tempfile::NamedTempFile::new() {
-                                Ok(mut f) => {
-                                    let _ = f.write_all(batch_json.as_bytes());
-                                    match f.keep() {
-                                        Ok((_, path)) => path,
-                                        Err(_) => {
-                                            // Mark all items in this chunk as
-                                            // errors.
-                                            for &idx in &indices {
-                                                results[idx] = serde_json::json!({
-                                                    "status": "error",
-                                                    "error": "failed to create batch file"
-                                                });
-                                            }
-                                            workers.push(Err(indices));
-                                            continue;
-                                        }
-                                    }
-                                }
-                                Err(_) => {
-                                    for &idx in &indices {
-                                        results[idx] = serde_json::json!({
-                                            "status": "error",
-                                            "error": "failed to create temp file"
-                                        });
-                                    }
-                                    workers.push(Err(indices));
-                                    continue;
-                                }
-                            };
-
-                            match Command::new(&python_path)
-                                .args(["-m", "barca._worker"])
-                                .arg(&batch_file)
-                                .stdout(Stdio::inherit())
-                                .stderr(Stdio::piped())
-                                .stdin(Stdio::null())
-                                .env("BARCA_WORKER", "1")
-                                .spawn()
-                            {
-                                Ok(child) => {
-                                    workers.push(Ok(ChunkWorker {
-                                        child,
-                                        batch_path: batch_file,
-                                        original_indices: indices,
-                                    }));
-                                }
-                                Err(e) => {
-                                    std::fs::remove_file(&batch_file).ok();
-                                    for &idx in &indices {
-                                        results[idx] = serde_json::json!({
-                                            "status": "error",
-                                            "error": format!("failed to spawn worker: {e}")
-                                        });
-                                    }
-                                    workers.push(Err(indices));
-                                }
-                            }
-                        }
-
-                        // Phase 2: collect results from each chunk worker.
-                        // Each worker reports one result per step in batch
-                        // order via the BARCA:2 protocol.
-                        for entry in workers {
-                            let Ok(mut cw) = entry else { continue };
-
-                            let stderr = cw.child.stderr.take().expect("no stderr");
-                            let sub_reader = BufReader::new(stderr);
-                            // Collect results in the order the worker reports
-                            // them (same order as steps in the batch).
-                            let mut chunk_results: Vec<serde_json::Value> = Vec::new();
-
-                            for sub_line in sub_reader.lines() {
-                                let Ok(sub_line) = sub_line else { break };
-                                if let Some(json_str) = sub_line.strip_prefix(PROTOCOL_PREFIX_V2) {
-                                    if let Ok(msg) =
-                                        serde_json::from_str::<serde_json::Value>(json_str)
-                                    {
-                                        match msg.get("type").and_then(|v| v.as_str()) {
-                                            Some("result") => {
-                                                let mut val: Option<serde_json::Value> = None;
-                                                if let Some(artifact) = msg.get("artifact") {
-                                                    let path = artifact
-                                                        .get("path")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("");
-                                                    let format = artifact
-                                                        .get("format")
-                                                        .and_then(|v| v.as_str())
-                                                        .unwrap_or("json");
-                                                    if format == "json" && !path.is_empty() {
-                                                        if let Ok(content) =
-                                                            std::fs::read_to_string(path)
-                                                        {
-                                                            val =
-                                                                serde_json::from_str(&content).ok();
-                                                        }
-                                                    }
-                                                    if val.is_none() {
-                                                        val = Some(artifact.clone());
-                                                    }
-                                                }
-                                                chunk_results.push(serde_json::json!({
-                                                    "status": "ok",
-                                                    "result": val.unwrap_or(serde_json::Value::Null)
-                                                }));
-                                            }
-                                            Some("error") => {
-                                                let err_msg = msg
-                                                    .get("message")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("unknown error")
-                                                    .to_string();
-                                                chunk_results.push(serde_json::json!({
-                                                    "status": "error",
-                                                    "error": err_msg
-                                                }));
-                                            }
-                                            _ => {}
-                                        }
-                                    }
-                                }
-                            }
-
-                            let _ = cw.child.wait();
-                            std::fs::remove_file(&cw.batch_path).ok();
-
-                            // Map chunk results back to original indices.
-                            for (step_pos, original_idx) in cw.original_indices.iter().enumerate() {
-                                if let Some(res) = chunk_results.get(step_pos) {
-                                    results[*original_idx] = res.clone();
-                                }
-                                // If no result was reported for this step, the
-                                // pre-filled null/ok default remains.
-                            }
-                        }
-
-                        // Write combined response to parent's stdin pipe.
-                        let response_json =
-                            serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-                        let _ = stdin_pipe.write_all(response_json.as_bytes());
-                        let _ = stdin_pipe.write_all(b"\n");
-                        let _ = stdin_pipe.flush();
+                        // Write response to socket.
+                        let response = CoordinatorMessage::ParallelResponse { results };
+                        protocol::write_message(&mut socket_stream, &response).ok();
                     }
-                    // Continue reading stderr — the worker resumes after
-                    // reading the response and will eventually exit normally.
-                    continue;
+                    WorkerMessage::Heartbeat => {
+                        // Worker is alive — nothing to do.
+                    }
+                },
+                Ok(None) => {
+                    // Socket disconnected — worker exited cleanly.
+                    break;
                 }
-
-                match parsed.get("type").and_then(|v| v.as_str()) {
-                    Some("result") => {
-                        if let (Some(node_id), Some(artifact)) = (
-                            parsed.get("node_id").and_then(|v| v.as_str()),
-                            parsed.get("artifact"),
-                        ) {
-                            let oref = OutputRef {
-                                path: artifact
-                                    .get("path")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                format: artifact
-                                    .get("format")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string(),
-                                size_bytes: artifact
-                                    .get("size_bytes")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0),
-                                elapsed_seconds: parsed.get("elapsed").and_then(|v| v.as_f64()),
-                            };
-                            completed.push(node_id.to_string());
-                            tx_reader
-                                .send(WorkerEvent::StepCompleted {
-                                    node_id: node_id.to_string(),
-                                    output: oref,
-                                })
-                                .ok();
-                        }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    // No message yet — check if child is still alive.
+                    match child.try_wait() {
+                        Ok(Some(_)) => break, // child exited
+                        Ok(None) => continue, // still running
+                        Err(_) => break,
                     }
-                    Some("error") => {
-                        if let Some(node_id) = parsed.get("node_id").and_then(|v| v.as_str()) {
-                            failures.push((node_id.to_string(), parse_step_error(&parsed)));
-                        }
-                    }
-                    Some("blocked") => {
-                        if let Some(node_id) = parsed.get("node_id").and_then(|v| v.as_str()) {
-                            blocked.push(node_id.to_string());
-                        }
-                    }
-                    _ => {}
                 }
-            } else if !line.starts_with("BARCA:") {
-                error_lines.push(line);
+                Err(_) => {
+                    // Socket error — treat as crash.
+                    break;
+                }
             }
         }
 
-        // Drop the stdin pipe if still held — this signals EOF to the worker
-        // if it was somehow waiting.
-        drop(stdin_pipe);
+        // ── Collect stderr for crash diagnostics ─────────────────────────
+        // Read any remaining stderr lines (non-blocking drain).
+        let reader = BufReader::new(stderr);
+        let error_lines: Vec<String> = reader
+            .lines()
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.is_empty() && !l.starts_with("BARCA:"))
+            .collect();
 
         let status = child.wait();
         std::fs::remove_file(&batch_path).ok();
+        std::fs::remove_file(&socket_path).ok();
 
         // Hard-crash fallback: non-zero exit with no structured error reported.
-        // Report one WorkerCrash per uncompleted step so the scheduler can
-        // apply each step's retry policy and commands.rs can persist them all.
         let crashed = status.map(|s| !s.success()).unwrap_or(true);
         if crashed && failures.is_empty() {
             let traceback = filter_traceback(&error_lines);
@@ -1047,8 +869,311 @@ fn spawn_unit(
     Ok(())
 }
 
+/// Handle a parallel dispatch request from a worker. Spawns sub-workers
+/// (each with their own Unix socket) to execute the submitted items, then
+/// collects and returns results.
+fn handle_parallel_dispatch(
+    items: &[protocol::SubmitItem],
+    python_path: &PathBuf,
+    artifact_dir: &str,
+) -> Vec<ParallelResult> {
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let pool_size = std::cmp::min(items.len(), num_cpus);
+
+    // Build steps for all items, tracking per-item parse errors.
+    struct StepEntry {
+        original_index: usize,
+        step_json: serde_json::Value,
+    }
+    let mut step_entries: Vec<Result<StepEntry, (usize, String)>> = Vec::with_capacity(items.len());
+
+    for (i, item) in items.iter().enumerate() {
+        let (source_file, function_name) = match item.fn_ref.rsplit_once(':') {
+            Some((file, func)) => (file.to_string(), func.to_string()),
+            None => {
+                step_entries.push(Err((i, format!("invalid fn_ref: {}", item.fn_ref))));
+                continue;
+            }
+        };
+
+        let direct_args: Vec<serde_json::Value> = item.args.clone();
+        let mut direct_kwargs: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for (k, v) in &item.kwargs {
+            direct_kwargs.insert(k.clone(), v.clone());
+        }
+
+        let branch_node_id = format!("{}[_branch={}]", item.fn_ref, i);
+        let step = serde_json::json!({
+            "node_id": &branch_node_id,
+            "function_name": function_name,
+            "source_file": source_file,
+            "kind": "task",
+            "inputs": {},
+            "timeout_seconds": 300,
+            "partition_keys": [],
+            "serializer": "json",
+            "direct_args": direct_args,
+            "direct_kwargs": direct_kwargs,
+        });
+        step_entries.push(Ok(StepEntry {
+            original_index: i,
+            step_json: step,
+        }));
+    }
+
+    // Separate valid steps from errors.
+    let mut valid_steps: Vec<StepEntry> = Vec::new();
+    let mut results: Vec<ParallelResult> = (0..items.len())
+        .map(|_| ParallelResult::Ok {
+            result: serde_json::Value::Null,
+        })
+        .collect();
+
+    for entry in step_entries {
+        match entry {
+            Ok(se) => valid_steps.push(se),
+            Err((idx, err_msg)) => {
+                results[idx] = ParallelResult::Error { error: err_msg };
+            }
+        }
+    }
+
+    // Distribute valid steps across pool_size chunks (round-robin).
+    struct ChunkWorker {
+        child: std::process::Child,
+        batch_path: std::path::PathBuf,
+        socket_path: std::path::PathBuf,
+        listener: UnixListener,
+        original_indices: Vec<usize>,
+    }
+
+    let effective_pool = std::cmp::min(pool_size, valid_steps.len()).max(1);
+    let mut chunks: Vec<(Vec<serde_json::Value>, Vec<usize>)> = (0..effective_pool)
+        .map(|_| (Vec::new(), Vec::new()))
+        .collect();
+
+    for (round_idx, se) in valid_steps.into_iter().enumerate() {
+        let chunk_idx = round_idx % effective_pool;
+        chunks[chunk_idx].0.push(se.step_json);
+        chunks[chunk_idx].1.push(se.original_index);
+    }
+
+    // Phase 1: spawn one sub-worker per chunk (each with its own socket).
+    let mut workers: Vec<Result<ChunkWorker, Vec<usize>>> = Vec::new();
+
+    for (chunk_idx, (steps, indices)) in chunks.into_iter().enumerate() {
+        if steps.is_empty() {
+            continue;
+        }
+        let batch = serde_json::json!({
+            "stream_id": format!("parallel-chunk-{chunk_idx}"),
+            "artifact_dir": artifact_dir,
+            "steps": steps,
+            "provided_inputs": {}
+        });
+
+        let batch_json_str = serde_json::to_string(&batch).unwrap_or_default();
+        let batch_file = match tempfile::NamedTempFile::new() {
+            Ok(mut f) => {
+                let _ = f.write_all(batch_json_str.as_bytes());
+                match f.keep() {
+                    Ok((_, path)) => path,
+                    Err(_) => {
+                        for &idx in &indices {
+                            results[idx] = ParallelResult::Error {
+                                error: "failed to create batch file".to_string(),
+                            };
+                        }
+                        workers.push(Err(indices));
+                        continue;
+                    }
+                }
+            }
+            Err(_) => {
+                for &idx in &indices {
+                    results[idx] = ParallelResult::Error {
+                        error: "failed to create temp file".to_string(),
+                    };
+                }
+                workers.push(Err(indices));
+                continue;
+            }
+        };
+
+        // Create socket for this sub-worker.
+        let sub_socket_path = protocol::socket_path(
+            &format!("{:?}-par", std::thread::current().id()),
+            &format!("chunk-{chunk_idx}"),
+        );
+        std::fs::remove_file(&sub_socket_path).ok();
+        let sub_listener = match UnixListener::bind(&sub_socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                std::fs::remove_file(&batch_file).ok();
+                for &idx in &indices {
+                    results[idx] = ParallelResult::Error {
+                        error: format!("socket bind: {e}"),
+                    };
+                }
+                workers.push(Err(indices));
+                continue;
+            }
+        };
+
+        let sub_socket_str = sub_socket_path.to_str().unwrap_or("").to_string();
+
+        match Command::new(python_path)
+            .args(["-m", "barca._worker"])
+            .arg(&batch_file)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null())
+            .env("BARCA_WORKER", "1")
+            .env("BARCA_SOCKET", &sub_socket_str)
+            .spawn()
+        {
+            Ok(child) => {
+                workers.push(Ok(ChunkWorker {
+                    child,
+                    batch_path: batch_file,
+                    socket_path: sub_socket_path,
+                    listener: sub_listener,
+                    original_indices: indices,
+                }));
+            }
+            Err(e) => {
+                std::fs::remove_file(&batch_file).ok();
+                std::fs::remove_file(&sub_socket_path).ok();
+                for &idx in &indices {
+                    results[idx] = ParallelResult::Error {
+                        error: format!("failed to spawn worker: {e}"),
+                    };
+                }
+                workers.push(Err(indices));
+            }
+        }
+    }
+
+    // Phase 2: collect results from each chunk worker via socket.
+    for entry in workers {
+        let Ok(mut cw) = entry else { continue };
+
+        // Accept sub-worker connection with timeout.
+        cw.listener.set_nonblocking(true).ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let accept_result = loop {
+            match cw.listener.accept() {
+                Ok(conn) => break Ok(conn),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "sub-worker accept timeout",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(e) => break Err(e),
+            }
+        };
+
+        let (mut sub_socket, _) = match accept_result {
+            Ok(conn) => conn,
+            Err(_) => {
+                let _ = cw.child.wait();
+                std::fs::remove_file(&cw.batch_path).ok();
+                std::fs::remove_file(&cw.socket_path).ok();
+                for &idx in &cw.original_indices {
+                    results[idx] = ParallelResult::Error {
+                        error: "sub-worker failed to connect".to_string(),
+                    };
+                }
+                continue;
+            }
+        };
+        drop(cw.listener);
+        sub_socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .ok();
+
+        // Read messages from sub-worker socket.
+        let mut chunk_results: Vec<ParallelResult> = Vec::new();
+        loop {
+            match protocol::read_message::<_, WorkerMessage>(&mut sub_socket) {
+                Ok(Some(msg)) => match msg {
+                    WorkerMessage::StepCompleted { node_id, artifact } => {
+                        // Read the JSON artifact to get the actual value.
+                        let val = if artifact.format == "json" && !artifact.path.is_empty() {
+                            std::fs::read_to_string(&artifact.path)
+                                .ok()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or(serde_json::json!({
+                                    "path": artifact.path,
+                                    "format": artifact.format,
+                                    "size_bytes": artifact.size_bytes
+                                }))
+                        } else {
+                            serde_json::json!({
+                                "path": artifact.path,
+                                "format": artifact.format,
+                                "size_bytes": artifact.size_bytes
+                            })
+                        };
+                        let _ = node_id; // used for ordering (batch order)
+                        chunk_results.push(ParallelResult::Ok { result: val });
+                    }
+                    WorkerMessage::StepError { message, .. } => {
+                        chunk_results.push(ParallelResult::Error { error: message });
+                    }
+                    WorkerMessage::Blocked { .. } => {
+                        chunk_results.push(ParallelResult::Error {
+                            error: "step was blocked".to_string(),
+                        });
+                    }
+                    WorkerMessage::Submit { .. } => {
+                        // Nested parallel not yet supported in sub-workers.
+                        // Send back empty results so sub-worker doesn't hang.
+                        let empty_response =
+                            CoordinatorMessage::ParallelResponse { results: vec![] };
+                        protocol::write_message(&mut sub_socket, &empty_response).ok();
+                    }
+                    WorkerMessage::Heartbeat => {}
+                },
+                Ok(None) => break,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    match cw.child.try_wait() {
+                        Ok(Some(_)) => break,
+                        Ok(None) => continue,
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        let _ = cw.child.wait();
+        std::fs::remove_file(&cw.batch_path).ok();
+        std::fs::remove_file(&cw.socket_path).ok();
+
+        // Map chunk results back to original indices.
+        for (step_pos, &original_idx) in cw.original_indices.iter().enumerate() {
+            if let Some(res) = chunk_results.get(step_pos) {
+                results[original_idx] = res.clone();
+            }
+        }
+    }
+
+    results
+}
+
 /// Build a `StepError` from an `error` protocol message, filtering the
 /// traceback to user-relevant frames.
+#[cfg(test)]
 fn parse_step_error(parsed: &serde_json::Value) -> StepError {
     let raw_tb = parsed
         .get("traceback")

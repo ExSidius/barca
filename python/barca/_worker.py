@@ -21,10 +21,28 @@ from barca._artifacts import artifact_path, deserialize, detect_format, serializ
 
 
 _PROTOCOL_VERSION = 2
+_use_socket = False
 
 
 def _emit(msg_type, **fields):
-    """Emit a protocol message on stderr: BARCA:<version>:<json>"""
+    """Emit a protocol message — via socket if available, else stderr."""
+    if _use_socket:
+        from barca import _runtime
+
+        if msg_type == "result":
+            _runtime.emit_step_completed(fields["node_id"], fields["artifact"])
+        elif msg_type == "error":
+            _runtime.emit_step_error(
+                node_id=fields["node_id"],
+                error_type=fields["error_type"],
+                message=fields["message"],
+                traceback=fields["traceback"],
+                elapsed=fields.get("elapsed", 0.0),
+            )
+        elif msg_type == "blocked":
+            _runtime.emit_blocked(fields["node_id"], fields["reason"])
+        return
+    # Original stderr protocol
     payload = json.dumps({"type": msg_type, **fields})
     print(f"BARCA:{_PROTOCOL_VERSION}:{payload}", file=sys.stderr, flush=True)
 
@@ -282,14 +300,28 @@ def run_batch(batch):
 
 
 def main():
+    global _use_socket
+
     if len(sys.argv) < 2:
         print("Usage: python -m barca._worker <batch.json>", file=sys.stderr)
         sys.exit(1)
 
+    # Connect to executor's Unix socket if available.
+    from barca import _runtime
+
+    if _runtime.connect() is not None:
+        _use_socket = True
+        _runtime.start_heartbeat()
+
     with open(sys.argv[1]) as f:
         batch = json.load(f)
 
-    run_batch(batch)
+    try:
+        run_batch(batch)
+    finally:
+        if _use_socket:
+            _runtime.stop_heartbeat()
+            _runtime.disconnect()
 
 
 if __name__ == "__main__":

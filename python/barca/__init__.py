@@ -189,17 +189,17 @@ def parallel(*callables):
         else:
             raise TypeError(f"parallel() expects functools.partial objects, got {type(c).__name__}")
 
-    # Try socket-based dispatch first
     from barca import _runtime
 
     if _runtime.is_worker() and _runtime.connect() is not None:
+        # Inside a barca worker — dispatch via Unix socket to executor
         raw_results = _runtime.submit_and_wait(items)
         return [
             r.get("result") if r.get("status") == "ok" else ParallelError(r.get("error", "unknown"))
             for r in raw_results
         ]
 
-    # Standalone fallback — execute sequentially
+    # Not inside a worker — execute sequentially (standalone/testing)
     results = []
     for c in callables:
         try:
