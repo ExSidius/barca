@@ -47,3 +47,12 @@ def seed_data():
 ```
 
 Early prototypes of barca had an `after=` keyword for ordering-only edges. This was removed in favor of the `_` prefix convention on `inputs=`, which keeps a single mechanism for all dependency types. If you see `after=` in old examples, replace it with `inputs={"_name": upstream}`.
+
+## Naming convention
+
+The `_` prefix was chosen deliberately to signal "ordering-only" to barca.
+This intentionally overlaps with Python's convention for unused parameters —
+if barca won't pass a value, you shouldn't use the parameter anyway.
+
+If you have a linter warning about unused `_` parameters, add a
+`# noqa: ARG001` comment or configure your linter to allow `_`-prefixed params.

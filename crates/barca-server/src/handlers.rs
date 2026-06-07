@@ -156,17 +156,28 @@ fn start_run(state: AppState, target: Option<String>) -> String {
         let files = st.config.files.clone();
         let python = st.config.python.clone();
         let tgt = target.clone();
-        let res = tokio::time::timeout(
-            RUN_TIMEOUT,
-            tokio::task::spawn_blocking(move || {
-                commands::get(tgt.as_deref(), &files, &python, false, true)
-            }),
-        )
-        .await;
+
+        // NOTE: spawn_blocking tasks cannot be aborted — they run on OS threads
+        // that Tokio cannot interrupt. If the timeout fires, the blocking thread
+        // will continue running in the background until it finishes naturally.
+        // However, `_guard` (the run_mutex) is NOT dropped until this entire async
+        // block completes, so no concurrent run can start and race on the DB even
+        // if the orphaned blocking task is still finishing up.
+        let join_handle = tokio::task::spawn_blocking(move || {
+            commands::get(tgt.as_deref(), &files, &python, false, true)
+        });
+        let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
+
+        // On timeout, report failure to the client immediately. The blocking task
+        // may still be running, but _guard prevents concurrent run starts.
+        let outcome = match res {
+            Ok(inner) => Ok(inner),
+            Err(_elapsed) => Err(()),
+        };
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.finished_at = Some(now_ts());
-            match res {
+            match outcome {
                 Ok(Ok(Ok(result))) => {
                     r.status = RunStatus::Complete;
                     r.result = Some(result);
@@ -185,6 +196,8 @@ fn start_run(state: AppState, target: Option<String>) -> String {
                 }
             }
         }
+        // _guard is dropped here — after the result has been recorded. Even on
+        // timeout, the mutex is held until this point, preventing DB races.
     });
 
     handle
@@ -218,15 +231,22 @@ fn start_run_task(state: AppState, target: String) -> String {
         let files = st.config.files.clone();
         let python = st.config.python.clone();
         let tgt = target.clone();
-        let res = tokio::time::timeout(
-            RUN_TIMEOUT,
-            tokio::task::spawn_blocking(move || commands::run(&tgt, &files, &python, None, true)),
-        )
-        .await;
+
+        // NOTE: Same spawn_blocking caveat as start_run — see comment above.
+        // The _guard prevents concurrent DB writes even if this task outlives
+        // the timeout.
+        let join_handle =
+            tokio::task::spawn_blocking(move || commands::run(&tgt, &files, &python, None, true));
+        let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
+
+        let outcome = match res {
+            Ok(inner) => Ok(inner),
+            Err(_elapsed) => Err(()),
+        };
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.finished_at = Some(now_ts());
-            match res {
+            match outcome {
                 Ok(Ok(Ok(result))) => {
                     r.status = RunStatus::Complete;
                     r.result = Some(result);
@@ -245,6 +265,7 @@ fn start_run_task(state: AppState, target: String) -> String {
                 }
             }
         }
+        // _guard dropped here — mutex held through timeout, preventing races.
     });
 
     handle

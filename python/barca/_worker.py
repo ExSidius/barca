@@ -184,8 +184,12 @@ def run_batch(batch):
                     if "direct_args" in step or "direct_kwargs" in step:
                         d_args = step.get("direct_args", [])
                         d_kwargs = step.get("direct_kwargs", {})
+                        timeout = step.get("timeout_seconds", 0)
                         t0 = time.time()
-                        result = fn(*d_args, **d_kwargs)
+                        if timeout and timeout > 0:
+                            result = _run_with_timeout(lambda: fn(*d_args, **d_kwargs), {}, timeout)
+                        else:
+                            result = fn(*d_args, **d_kwargs)
                         elapsed = time.time() - t0
                         cache[full_node_id] = result
                         _materialize(result, full_node_id, art_dir, step, elapsed)
@@ -241,8 +245,12 @@ def run_batch(batch):
                 if "direct_args" in step or "direct_kwargs" in step:
                     d_args = step.get("direct_args", [])
                     d_kwargs = step.get("direct_kwargs", {})
+                    timeout = step.get("timeout_seconds", 0)
                     t0 = time.time()
-                    result = fn(*d_args, **d_kwargs)
+                    if timeout and timeout > 0:
+                        result = _run_with_timeout(lambda: fn(*d_args, **d_kwargs), {}, timeout)
+                    else:
+                        result = fn(*d_args, **d_kwargs)
                     elapsed = time.time() - t0
                     cache[node_id] = result
                     _materialize(result, node_id, art_dir, step, elapsed)

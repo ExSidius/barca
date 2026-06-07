@@ -535,6 +535,8 @@ fn collect_parallel_calls_from_stmts(stmts: &[Stmt], results: &mut Vec<ParallelC
 }
 
 /// Check if an expression is a call to `parallel()` or `parallel_map()` and extract it.
+/// Recursively descends into sub-expressions (call args, ternaries, lists, tuples,
+/// list comprehensions) to find nested parallel() calls.
 fn collect_parallel_calls_from_expr(expr: &Expr, results: &mut Vec<ParallelCall>) {
     if let Expr::Call(call) = expr {
         if let Expr::Name(n) = call.func.as_ref() {
@@ -550,6 +552,34 @@ fn collect_parallel_calls_from_expr(expr: &Expr, results: &mut Vec<ParallelCall>
                 _ => {}
             }
         }
+        // Not a parallel/parallel_map call — descend into call arguments
+        for arg in &call.arguments.args {
+            collect_parallel_calls_from_expr(arg, results);
+        }
+        return;
+    }
+
+    // Descend into other expression forms
+    match expr {
+        Expr::If(e) => {
+            collect_parallel_calls_from_expr(&e.body, results);
+            collect_parallel_calls_from_expr(&e.test, results);
+            collect_parallel_calls_from_expr(&e.orelse, results);
+        }
+        Expr::List(l) => {
+            for elt in &l.elts {
+                collect_parallel_calls_from_expr(elt, results);
+            }
+        }
+        Expr::Tuple(t) => {
+            for elt in &t.elts {
+                collect_parallel_calls_from_expr(elt, results);
+            }
+        }
+        Expr::ListComp(lc) => {
+            collect_parallel_calls_from_expr(&lc.elt, results);
+        }
+        _ => {}
     }
 }
 

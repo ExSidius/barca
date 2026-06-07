@@ -95,7 +95,7 @@ def deploy_all(model):
 
     for region, result in zip(regions, results):
         if isinstance(result, ParallelError):
-            log.error(f"Deploy to {region} failed: {result.message}")
+            log.error(f"Deploy to {region} failed: {result.error}")
         else:
             log.info(f"Deploy to {region} succeeded: {result}")
 
@@ -104,8 +104,8 @@ def deploy_all(model):
 
 Key behaviors:
 
-- Each branch retries independently using the sub-task's `retries=` policy before surfacing a `ParallelError`.
-- `ParallelError.message` contains the stringified exception from the failed branch.
+- In v0.2.0, parallel branches use default retry settings (1 attempt, no retry). Per-branch retry configuration via the sub-task's `retries=` policy is planned for a future release.
+- `ParallelError.error` contains the stringified exception from the failed branch.
 - The parent task continues executing after `parallel()` returns, regardless of branch failures.
 
 ## Common mistakes
