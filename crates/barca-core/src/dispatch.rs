@@ -706,12 +706,14 @@ fn spawn_unit(
                                 direct_kwargs.insert(k.clone(), v.clone());
                             }
 
-                            // Create a minimal batch JSON.
+                            // Create a minimal batch JSON. Each branch gets a
+                            // unique node_id so artifacts don't collide.
+                            let branch_node_id = format!("{}[_branch={}]", item.fn_ref, i);
                             let batch = serde_json::json!({
                                 "stream_id": format!("parallel-{i}"),
                                 "artifact_dir": &artifact_dir,
                                 "steps": [{
-                                    "node_id": &item.fn_ref,
+                                    "node_id": &branch_node_id,
                                     "function_name": function_name,
                                     "source_file": source_file,
                                     "kind": "task",
