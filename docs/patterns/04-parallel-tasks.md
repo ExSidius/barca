@@ -1,57 +1,167 @@
-# Pattern: Parallel Tasks
+# Pattern: Parallel tasks
 
-> Coming in a future release.
+Run multiple independent tasks concurrently within a single task function using the `parallel()` primitive.
 
-Run multiple independent tasks concurrently within a single function using the `parallel()` primitive.
+## The right way
 
-## The planned API
+### 1. Static known calls
+
+When you know the exact set of work at write time, pass explicit partials:
 
 ```python
+from functools import partial
 from barca import task, parallel
 
 @task
-def task_a():
-    return fetch_from_api("service-a")
+def deploy_us(model):
+    return push_to_region("us-east-1", model)
 
 @task
-def task_b():
-    return fetch_from_api("service-b")
+def deploy_eu(model):
+    return push_to_region("eu-west-1", model)
 
 @task
-def task_c():
-    return fetch_from_api("service-c")
-
-@task
-def aggregate():
-    a, b, c = parallel(task_a(), task_b(), task_c())
-    return merge(a, b, c)
+def deploy_all(model):
+    us_result, eu_result = parallel(
+        partial(deploy_us, model),
+        partial(deploy_eu, model),
+    )
+    return {"us": us_result, "eu": eu_result}
 ```
 
-`parallel()` will accept any number of task or asset calls and return their results in argument order. Under the hood, barca will schedule them into the same execution tier so they run in separate worker processes simultaneously.
+### 2. Dynamic fan-out
 
-## Current behavior
-
-Without `parallel()`, barca determines concurrency from the DAG structure. Steps that share the same tier (i.e., have no dependencies on each other) already run in parallel across worker processes.
+When the set of work is determined at runtime, unpack a generator of partials:
 
 ```python
-# These two assets have no dependency relationship, so barca
-# already runs them in parallel in separate workers.
-@asset
-def users():
-    return load("users.csv")
+from functools import partial
+from barca import task, parallel
 
-@asset
-def products():
-    return load("products.csv")
+@task
+def deploy(region, model):
+    return push_to_region(region, model)
 
-# This asset depends on both, so it runs in the next tier.
-@asset(inputs={"u": users, "p": products})
-def report(u, p):
-    return join(u, p)
+@task
+def deploy_all(model):
+    regions = ["us-east-1", "eu-west-1", "ap-southeast-1"]
+    results = parallel(*(partial(deploy, r, model) for r in regions))
+    return dict(zip(regions, results))
 ```
 
-The `parallel()` primitive will add the ability to express concurrency explicitly inside a function body, rather than relying solely on DAG-level tier assignment.
+### 3. parallel_map sugar
 
-## What to use today
+For the common case of applying one task across an iterable with shared kwargs:
 
-Structure your DAG so that independent steps have no edges between them. Barca will automatically schedule them in the same tier and dispatch them to separate workers. This gives you parallelism without any special syntax.
+```python
+from barca import task, parallel_map
+
+@task
+def deploy(region, model):
+    return push_to_region(region, model)
+
+@task
+def deploy_all(model):
+    regions = ["us-east-1", "eu-west-1", "ap-southeast-1"]
+    results = parallel_map(deploy, regions, model=model)
+    return dict(zip(regions, results))
+```
+
+`parallel_map(fn, items, **kwargs)` is equivalent to `parallel(*(partial(fn, item, **kwargs) for item in items))`.
+
+## How it works
+
+- Each argument to `parallel()` must be a `functools.partial` wrapping a `@task`-decorated function.
+- The parent worker sends the work list to Rust via the stderr JSON protocol (`BARCA:2:{...}`).
+- Rust spawns one worker process per branch, executing them in parallel.
+- Results are collected and returned to the parent in argument order.
+- Each result is either the return value or a `ParallelError` instance (Promise.allSettled semantics -- no branch failure crashes the parent).
+
+## Error handling
+
+Failed branches do not raise exceptions in the parent. Instead, the corresponding position in the results tuple contains a `ParallelError` object:
+
+```python
+from barca import task, parallel, ParallelError
+from functools import partial
+
+@task
+def deploy(region, model):
+    return push_to_region(region, model)
+
+@task
+def deploy_all(model):
+    regions = ["us-east-1", "eu-west-1", "ap-southeast-1"]
+    results = parallel(*(partial(deploy, r, model) for r in regions))
+
+    for region, result in zip(regions, results):
+        if isinstance(result, ParallelError):
+            log.error(f"Deploy to {region} failed: {result.message}")
+        else:
+            log.info(f"Deploy to {region} succeeded: {result}")
+
+    return results
+```
+
+Key behaviors:
+
+- Each branch retries independently using the sub-task's `retries=` policy before surfacing a `ParallelError`.
+- `ParallelError.message` contains the stringified exception from the failed branch.
+- The parent task continues executing after `parallel()` returns, regardless of branch failures.
+
+## Common mistakes
+
+### 1. Passing non-partial callables
+
+```python
+# Wrong -- bare function reference, not a partial
+results = parallel(deploy_us, deploy_eu)
+
+# Right
+results = parallel(partial(deploy_us, model), partial(deploy_eu, model))
+```
+
+All arguments must be `functools.partial` instances so Rust can serialize the function target and arguments for dispatch to worker processes.
+
+### 2. Expecting exceptions to propagate
+
+```python
+# Wrong -- this will not catch branch failures
+try:
+    results = parallel(partial(deploy_us, model), partial(deploy_eu, model))
+except Exception:
+    handle_failure()
+
+# Right -- check each result individually
+results = parallel(partial(deploy_us, model), partial(deploy_eu, model))
+for r in results:
+    if isinstance(r, ParallelError):
+        handle_failure(r)
+```
+
+### 3. Using parallel() in an @asset body
+
+```python
+# Wrong -- parallel() is only valid inside @task functions
+@asset
+def my_asset():
+    return parallel(partial(fetch_a), partial(fetch_b))
+
+# Right -- use @task for imperative orchestration
+@task
+def my_task():
+    return parallel(partial(fetch_a), partial(fetch_b))
+```
+
+Assets define the static DAG and cannot spawn dynamic sub-work. Use `@task` for imperative orchestration patterns.
+
+### 4. Calling parallel() with raw function calls (eager evaluation trap)
+
+```python
+# Wrong -- deploy_us(model) executes immediately in the parent process
+results = parallel(deploy_us(model), deploy_eu(model))
+
+# Right -- partial defers execution to the child workers
+results = parallel(partial(deploy_us, model), partial(deploy_eu, model))
+```
+
+Passing `deploy_us(model)` calls the function eagerly in the parent, then passes the return value (not a partial) to `parallel()`. Use `partial()` to defer execution to the spawned worker processes.
