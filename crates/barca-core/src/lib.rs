@@ -9,6 +9,7 @@ pub mod model;
 pub mod parse;
 pub mod planner;
 pub mod scheduler;
+pub mod work_plan;
 
 pub use dag::Dag;
 pub use model::*;
