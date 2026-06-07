@@ -664,9 +664,9 @@ fn spawn_unit(
                     };
 
                     {
-                        // Stage 3: spawn sub-workers for each parallel work
-                        // item, collect results, and write the combined
-                        // response back to the parent worker's stdin pipe.
+                        // Stage 3: batch parallel work items across pool_size
+                        // workers. Each worker handles a chunk of items
+                        // sequentially; workers run in parallel.
 
                         let artifact_dir = std::env::current_dir()
                             .map(|p| {
@@ -677,28 +677,35 @@ fn spawn_unit(
                             })
                             .unwrap_or_else(|_| ".barca/artifacts".to_string());
 
-                        // Phase 1: spawn all sub-workers at once for true
-                        // parallelism in execution.
-                        struct SubWorker {
-                            child: std::process::Child,
-                            batch_path: std::path::PathBuf,
+                        let num_cpus = std::thread::available_parallelism()
+                            .map(|n| n.get())
+                            .unwrap_or(4);
+                        let pool_size = std::cmp::min(items.len(), num_cpus);
+
+                        // Build steps for all items first, tracking any
+                        // per-item parse errors.
+                        struct StepEntry {
+                            original_index: usize,
+                            step_json: serde_json::Value,
                         }
-                        let mut children: Vec<Result<SubWorker, serde_json::Value>> = Vec::new();
+                        let mut step_entries: Vec<Result<StepEntry, (usize, serde_json::Value)>> =
+                            Vec::with_capacity(items.len());
 
                         for (i, item) in items.iter().enumerate() {
-                            // Parse fn_ref into source_file and function_name.
                             let (source_file, function_name) = match item.fn_ref.rsplit_once(':') {
                                 Some((file, func)) => (file.to_string(), func.to_string()),
                                 None => {
-                                    children.push(Err(serde_json::json!({
-                                        "status": "error",
-                                        "error": format!("invalid fn_ref: {}", item.fn_ref)
-                                    })));
+                                    step_entries.push(Err((
+                                        i,
+                                        serde_json::json!({
+                                            "status": "error",
+                                            "error": format!("invalid fn_ref: {}", item.fn_ref)
+                                        }),
+                                    )));
                                     continue;
                                 }
                             };
 
-                            // Build positional args and keyword args separately.
                             let direct_args: Vec<serde_json::Value> = item.args.clone();
                             let mut direct_kwargs: serde_json::Map<String, serde_json::Value> =
                                 serde_json::Map::new();
@@ -706,24 +713,73 @@ fn spawn_unit(
                                 direct_kwargs.insert(k.clone(), v.clone());
                             }
 
-                            // Create a minimal batch JSON. Each branch gets a
-                            // unique node_id so artifacts don't collide.
                             let branch_node_id = format!("{}[_branch={}]", item.fn_ref, i);
+                            let step = serde_json::json!({
+                                "node_id": &branch_node_id,
+                                "function_name": function_name,
+                                "source_file": source_file,
+                                "kind": "task",
+                                "inputs": {},
+                                "timeout_seconds": 300,
+                                "partition_keys": [],
+                                "serializer": "json",
+                                "direct_args": direct_args,
+                                "direct_kwargs": direct_kwargs,
+                            });
+                            step_entries.push(Ok(StepEntry {
+                                original_index: i,
+                                step_json: step,
+                            }));
+                        }
+
+                        // Separate valid steps from errors.
+                        let mut valid_steps: Vec<StepEntry> = Vec::new();
+                        // Pre-fill results array so we can place results by
+                        // original index.
+                        let mut results: Vec<serde_json::Value> =
+                            vec![serde_json::json!({"status": "ok", "result": null}); items.len()];
+                        for entry in step_entries {
+                            match entry {
+                                Ok(se) => valid_steps.push(se),
+                                Err((idx, err_json)) => {
+                                    results[idx] = err_json;
+                                }
+                            }
+                        }
+
+                        // Distribute valid steps across pool_size chunks
+                        // (round-robin for even distribution).
+                        struct ChunkWorker {
+                            child: std::process::Child,
+                            batch_path: std::path::PathBuf,
+                            /// The original indices of items in this chunk,
+                            /// in the order the worker will process them.
+                            original_indices: Vec<usize>,
+                        }
+
+                        let effective_pool = std::cmp::min(pool_size, valid_steps.len());
+                        let mut chunks: Vec<(Vec<serde_json::Value>, Vec<usize>)> = (0
+                            ..effective_pool)
+                            .map(|_| (Vec::new(), Vec::new()))
+                            .collect();
+
+                        for (round_idx, se) in valid_steps.into_iter().enumerate() {
+                            let chunk_idx = round_idx % effective_pool;
+                            chunks[chunk_idx].0.push(se.step_json);
+                            chunks[chunk_idx].1.push(se.original_index);
+                        }
+
+                        // Phase 1: spawn one worker per chunk.
+                        let mut workers: Vec<Result<ChunkWorker, Vec<usize>>> = Vec::new();
+
+                        for (chunk_idx, (steps, indices)) in chunks.into_iter().enumerate() {
+                            if steps.is_empty() {
+                                continue;
+                            }
                             let batch = serde_json::json!({
-                                "stream_id": format!("parallel-{i}"),
+                                "stream_id": format!("parallel-chunk-{chunk_idx}"),
                                 "artifact_dir": &artifact_dir,
-                                "steps": [{
-                                    "node_id": &branch_node_id,
-                                    "function_name": function_name,
-                                    "source_file": source_file,
-                                    "kind": "task",
-                                    "inputs": {},
-                                    "timeout_seconds": 300,
-                                    "partition_keys": [],
-                                    "serializer": "json",
-                                    "direct_args": direct_args,
-                                    "direct_kwargs": direct_kwargs,
-                                }],
+                                "steps": steps,
                                 "provided_inputs": {}
                             });
 
@@ -734,19 +790,27 @@ fn spawn_unit(
                                     match f.keep() {
                                         Ok((_, path)) => path,
                                         Err(_) => {
-                                            children.push(Err(serde_json::json!({
-                                                "status": "error",
-                                                "error": "failed to create batch file"
-                                            })));
+                                            // Mark all items in this chunk as
+                                            // errors.
+                                            for &idx in &indices {
+                                                results[idx] = serde_json::json!({
+                                                    "status": "error",
+                                                    "error": "failed to create batch file"
+                                                });
+                                            }
+                                            workers.push(Err(indices));
                                             continue;
                                         }
                                     }
                                 }
                                 Err(_) => {
-                                    children.push(Err(serde_json::json!({
-                                        "status": "error",
-                                        "error": "failed to create temp file"
-                                    })));
+                                    for &idx in &indices {
+                                        results[idx] = serde_json::json!({
+                                            "status": "error",
+                                            "error": "failed to create temp file"
+                                        });
+                                    }
+                                    workers.push(Err(indices));
                                     continue;
                                 }
                             };
@@ -761,110 +825,99 @@ fn spawn_unit(
                                 .spawn()
                             {
                                 Ok(child) => {
-                                    children.push(Ok(SubWorker {
+                                    workers.push(Ok(ChunkWorker {
                                         child,
                                         batch_path: batch_file,
+                                        original_indices: indices,
                                     }));
                                 }
                                 Err(e) => {
                                     std::fs::remove_file(&batch_file).ok();
-                                    children.push(Err(serde_json::json!({
-                                        "status": "error",
-                                        "error": format!("failed to spawn worker: {e}")
-                                    })));
+                                    for &idx in &indices {
+                                        results[idx] = serde_json::json!({
+                                            "status": "error",
+                                            "error": format!("failed to spawn worker: {e}")
+                                        });
+                                    }
+                                    workers.push(Err(indices));
                                 }
                             }
                         }
 
-                        // Phase 2: collect results from each sub-worker
-                        // sequentially. The Python processes are already
-                        // running in parallel; we just read each one's stderr
-                        // in turn.
-                        let mut results: Vec<serde_json::Value> =
-                            Vec::with_capacity(children.len());
+                        // Phase 2: collect results from each chunk worker.
+                        // Each worker reports one result per step in batch
+                        // order via the BARCA:2 protocol.
+                        for entry in workers {
+                            let Ok(mut cw) = entry else { continue };
 
-                        for entry in children {
-                            match entry {
-                                Err(err_json) => {
-                                    results.push(err_json);
-                                }
-                                Ok(mut sw) => {
-                                    let stderr = sw.child.stderr.take().expect("no stderr");
-                                    let sub_reader = BufReader::new(stderr);
-                                    let mut sub_result: Option<serde_json::Value> = None;
-                                    let mut sub_error: Option<String> = None;
+                            let stderr = cw.child.stderr.take().expect("no stderr");
+                            let sub_reader = BufReader::new(stderr);
+                            // Collect results in the order the worker reports
+                            // them (same order as steps in the batch).
+                            let mut chunk_results: Vec<serde_json::Value> = Vec::new();
 
-                                    for sub_line in sub_reader.lines() {
-                                        let Ok(sub_line) = sub_line else { break };
-                                        if let Some(json_str) =
-                                            sub_line.strip_prefix(PROTOCOL_PREFIX_V2)
-                                        {
-                                            if let Ok(parsed) =
-                                                serde_json::from_str::<serde_json::Value>(json_str)
-                                            {
-                                                match parsed.get("type").and_then(|v| v.as_str()) {
-                                                    Some("result") => {
-                                                        if let Some(artifact) =
-                                                            parsed.get("artifact")
+                            for sub_line in sub_reader.lines() {
+                                let Ok(sub_line) = sub_line else { break };
+                                if let Some(json_str) = sub_line.strip_prefix(PROTOCOL_PREFIX_V2) {
+                                    if let Ok(msg) =
+                                        serde_json::from_str::<serde_json::Value>(json_str)
+                                    {
+                                        match msg.get("type").and_then(|v| v.as_str()) {
+                                            Some("result") => {
+                                                let mut val: Option<serde_json::Value> = None;
+                                                if let Some(artifact) = msg.get("artifact") {
+                                                    let path = artifact
+                                                        .get("path")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("");
+                                                    let format = artifact
+                                                        .get("format")
+                                                        .and_then(|v| v.as_str())
+                                                        .unwrap_or("json");
+                                                    if format == "json" && !path.is_empty() {
+                                                        if let Ok(content) =
+                                                            std::fs::read_to_string(path)
                                                         {
-                                                            let path = artifact
-                                                                .get("path")
-                                                                .and_then(|v| v.as_str())
-                                                                .unwrap_or("");
-                                                            let format = artifact
-                                                                .get("format")
-                                                                .and_then(|v| v.as_str())
-                                                                .unwrap_or("json");
-                                                            if format == "json" && !path.is_empty()
-                                                            {
-                                                                if let Ok(content) =
-                                                                    std::fs::read_to_string(path)
-                                                                {
-                                                                    sub_result =
-                                                                        serde_json::from_str(
-                                                                            &content,
-                                                                        )
-                                                                        .ok();
-                                                                }
-                                                            }
-                                                            if sub_result.is_none() {
-                                                                sub_result = Some(artifact.clone());
-                                                            }
+                                                            val =
+                                                                serde_json::from_str(&content).ok();
                                                         }
                                                     }
-                                                    Some("error") => {
-                                                        let msg = parsed
-                                                            .get("message")
-                                                            .and_then(|v| v.as_str())
-                                                            .unwrap_or("unknown error");
-                                                        sub_error = Some(msg.to_string());
+                                                    if val.is_none() {
+                                                        val = Some(artifact.clone());
                                                     }
-                                                    _ => {}
                                                 }
+                                                chunk_results.push(serde_json::json!({
+                                                    "status": "ok",
+                                                    "result": val.unwrap_or(serde_json::Value::Null)
+                                                }));
                                             }
+                                            Some("error") => {
+                                                let err_msg = msg
+                                                    .get("message")
+                                                    .and_then(|v| v.as_str())
+                                                    .unwrap_or("unknown error")
+                                                    .to_string();
+                                                chunk_results.push(serde_json::json!({
+                                                    "status": "error",
+                                                    "error": err_msg
+                                                }));
+                                            }
+                                            _ => {}
                                         }
                                     }
-
-                                    let _ = sw.child.wait();
-                                    std::fs::remove_file(&sw.batch_path).ok();
-
-                                    if let Some(err) = sub_error {
-                                        results.push(serde_json::json!({
-                                            "status": "error",
-                                            "error": err
-                                        }));
-                                    } else if let Some(val) = sub_result {
-                                        results.push(serde_json::json!({
-                                            "status": "ok",
-                                            "result": val
-                                        }));
-                                    } else {
-                                        results.push(serde_json::json!({
-                                            "status": "ok",
-                                            "result": null
-                                        }));
-                                    }
                                 }
+                            }
+
+                            let _ = cw.child.wait();
+                            std::fs::remove_file(&cw.batch_path).ok();
+
+                            // Map chunk results back to original indices.
+                            for (step_pos, original_idx) in cw.original_indices.iter().enumerate() {
+                                if let Some(res) = chunk_results.get(step_pos) {
+                                    results[*original_idx] = res.clone();
+                                }
+                                // If no result was reported for this step, the
+                                // pre-filled null/ok default remains.
                             }
                         }
 
