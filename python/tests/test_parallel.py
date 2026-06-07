@@ -268,6 +268,216 @@ class TestGetRunEnforcement:
             barca.run("my_asset", f)
 
 
+# ─── Invariants ──────────────────────────────────────────────────────────────
+
+
+class TestParallelInvariants:
+    def test_same_function_different_args(self, tmp_path):
+        """parallel_map over one function with different args — each gets unique result."""
+        # This is THE test that catches the artifact path collision bug.
+        # If all branches write to the same path, results will be wrong.
+        f = write_module(
+            tmp_path,
+            "pipeline.py",
+            """
+            from functools import partial
+            from barca import task, parallel
+
+            @task()
+            def work(i: int) -> dict:
+                return {"i": i}
+
+            @task()
+            def fan_out() -> list:
+                return parallel(*(partial(work, i) for i in range(10)))
+            """,
+        )
+        result = barca.run("fan_out", f)
+        assert isinstance(result, list)
+        assert len(result) == 10
+        # INVARIANT: each result has a unique value matching its input
+        values = [r["i"] for r in result]
+        assert values == list(range(10)), f"Got {values}, expected [0..9]"
+
+    @pytest.mark.xfail(
+        reason="Parallel branches run sequentially — parallel dispatch not yet wired for this pattern",
+        strict=False,
+    )
+    def test_wall_clock_parallelism(self, tmp_path):
+        """4 branches x 500ms each should complete in well under sequential time."""
+        import time
+
+        f = write_module(
+            tmp_path,
+            "pipeline.py",
+            """
+            import time
+            from functools import partial
+            from barca import task, parallel
+
+            @task()
+            def slow(i: int) -> int:
+                time.sleep(0.5)
+                return i
+
+            @task()
+            def fan_out_4() -> list:
+                return parallel(*(partial(slow, i) for i in range(4)))
+            """,
+        )
+        t0 = time.time()
+        result = barca.run("fan_out_4", f)
+        elapsed = time.time() - t0
+        # If sequential: 4 * 0.5 = 2.0s minimum. If parallel: ~0.5s + overhead
+        # Allow generous margin for subprocess startup but must be < sequential time
+        assert elapsed < 1.8, f"Took {elapsed:.2f}s — parallel is not actually parallel!"
+        assert len(result) == 4
+        assert set(result) == {0, 1, 2, 3}
+
+    def test_crash_mid_batch_no_silent_none(self, tmp_path):
+        """A crashing branch must surface an error, never silent None/null.
+
+        When a parallel branch calls os._exit(), the worker process dies.
+        Barca must NOT silently return None — it should either:
+        - Propagate a ParallelError for that branch, or
+        - Fail the entire task with a BarcaError (WorkerCrash).
+        Either is acceptable; silent None is not.
+        """
+        f = write_module(
+            tmp_path,
+            "pipeline.py",
+            """
+            import os
+            from functools import partial
+            from barca import task, parallel, ParallelError
+
+            @task()
+            def crash() -> int:
+                os._exit(137)
+
+            @task()
+            def ok_task(i: int) -> int:
+                return i
+
+            @task()
+            def fan_out() -> list:
+                results = parallel(
+                    partial(ok_task, 1),
+                    partial(crash),
+                    partial(ok_task, 3),
+                )
+                # INVARIANT: every result is either a value or a ParallelError
+                # Never None/null silently
+                output = []
+                for r in results:
+                    if isinstance(r, ParallelError):
+                        output.append({"error": str(r)})
+                    else:
+                        output.append(r)
+                return output
+            """,
+        )
+        # A crash in a parallel branch should either:
+        # 1. Return results with a ParallelError for the crashed branch, or
+        # 2. Raise BarcaError for the whole task (worker crash propagation)
+        # INVARIANT: it must NOT silently return None for the crashed branch
+        try:
+            result = barca.run("fan_out", f)
+            # If we get results, verify no None values
+            assert len(result) == 3
+            assert result[0] == 1
+            assert result[2] == 3
+            # The crashed branch must be an error, not None
+            assert result[1] is not None, "Crashed branch returned None — silent data loss!"
+            assert "error" in result[1], f"Crashed branch returned {result[1]} instead of error"
+        except BarcaError as e:
+            # Acceptable: the crash propagated as a hard failure
+            assert "crash" in str(e).lower() or "worker" in str(e).lower(), (
+                f"BarcaError raised but doesn't mention crash/worker: {e}"
+            )
+
+    def test_parallel_map_large_n(self, tmp_path):
+        """100 items via parallel_map — all results correct and ordered."""
+        f = write_module(
+            tmp_path,
+            "pipeline.py",
+            """
+            from functools import partial
+            from barca import task, parallel
+
+            @task()
+            def square(n: int) -> int:
+                return n * n
+
+            @task()
+            def compute_squares() -> list:
+                return parallel(*(partial(square, i) for i in range(100)))
+            """,
+        )
+        result = barca.run("compute_squares", f)
+        assert len(result) == 100
+        # INVARIANT: results are ordered and correct
+        expected = [i * i for i in range(100)]
+        assert result == expected, (
+            f"First mismatch at index {next(i for i, (a, b) in enumerate(zip(result, expected)) if a != b)}"
+        )
+
+    def test_no_result_is_none_on_success(self, tmp_path):
+        """Every successfully-executed branch returns its actual value, never None."""
+        f = write_module(
+            tmp_path,
+            "pipeline.py",
+            """
+            from functools import partial
+            from barca import task, parallel
+
+            @task()
+            def identity(x: int) -> int:
+                return x
+
+            @task()
+            def fan_out() -> list:
+                return parallel(*(partial(identity, i) for i in range(20)))
+            """,
+        )
+        result = barca.run("fan_out", f)
+        # INVARIANT: no None values when all tasks succeed
+        for i, r in enumerate(result):
+            assert r is not None, f"result[{i}] is None — silent data loss"
+            assert r == i, f"result[{i}] = {r}, expected {i}"
+
+    def test_nested_parallel_standalone(self, tmp_path):
+        """Nested parallel() calls work (at least in standalone/sequential mode)."""
+        f = write_module(
+            tmp_path,
+            "pipeline.py",
+            """
+            from functools import partial
+            from barca import task, parallel
+
+            @task()
+            def inner_work(i: int) -> int:
+                return i * 10
+
+            @task()
+            def outer_branch(group: int) -> list:
+                return parallel(*(partial(inner_work, group * 10 + i) for i in range(3)))
+
+            @task()
+            def nested() -> list:
+                return parallel(
+                    partial(outer_branch, 0),
+                    partial(outer_branch, 1),
+                )
+            """,
+        )
+        result = barca.run("nested", f)
+        # Outer has 2 branches, each returning a list of 3
+        assert len(result) == 2
+        assert result[0] == [0, 10, 20]
+        assert result[1] == [100, 110, 120]
+
+
 # ─── Ordering-only deps ─────────────────────────────────────────────────────
 
 
