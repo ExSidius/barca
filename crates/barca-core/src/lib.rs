@@ -8,6 +8,7 @@ pub mod hash;
 pub mod model;
 pub mod parse;
 pub mod planner;
+pub mod protocol;
 pub mod scheduler;
 pub mod work_plan;
 
