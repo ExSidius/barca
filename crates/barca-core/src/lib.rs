@@ -4,6 +4,7 @@ pub mod cone;
 pub mod dag;
 pub mod db;
 pub mod dispatch;
+pub mod executor;
 pub mod hash;
 pub mod model;
 pub mod parse;

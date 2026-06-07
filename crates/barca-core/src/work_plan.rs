@@ -267,6 +267,11 @@ impl WorkPlan {
             .collect()
     }
 
+    /// Return a reference to a parallel group by id.
+    pub fn group(&self, id: ParallelGroupId) -> Option<&ParallelGroup> {
+        self.groups.get(&id)
+    }
+
     // ─── Mutations ─────────────────────────────────────────────────────────
 
     /// Transition an item from Ready to Running.
