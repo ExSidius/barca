@@ -7,10 +7,6 @@ parses these statically from source without importing.
 
 from __future__ import annotations
 
-import json
-import os
-import sys
-
 __version__ = "0.1.5"
 
 __all__ = [
@@ -36,10 +32,6 @@ __all__ = [
     "stats",
     "BarcaError",
 ]
-
-# True when running inside a barca worker process (set by Rust via env var).
-_BARCA_WORKER = os.environ.get("BARCA_WORKER") == "1"
-
 
 # ─── Freshness markers ───────────────────────────────────────────────────────
 
@@ -172,57 +164,48 @@ def parallel(*callables):
     function. Returns a list of results (or ParallelError objects) in argument
     order.
 
-    When running inside a barca worker (BARCA_WORKER=1), uses the stderr/stdin
+    When running inside a barca worker (BARCA_SOCKET set), uses the Unix socket
     protocol to request Rust to dispatch branches as separate workers. When
     running standalone, executes sequentially.
     """
-    if not _BARCA_WORKER:
-        # Standalone: execute sequentially, collecting errors as ParallelError.
-        results = []
-        for c in callables:
-            try:
-                results.append(c())
-            except Exception as e:
-                results.append(ParallelError(f"{type(e).__name__}: {e}"))
-        return results
+    if not callables:
+        return []
 
-    # Build work items from the callables (must be functools.partial objects).
+    # Build work items from partials
     items = []
     for c in callables:
         if hasattr(c, "func") and hasattr(c, "args") and hasattr(c, "keywords"):
-            # It's a functools.partial.
             fn = c.func
             fn_name = fn.__name__
-            # Get the source file from the function's code object.
-            source_file = getattr(fn, "__code__", None)
-            source_file = getattr(source_file, "co_filename", "") if source_file else ""
+            source_file = getattr(getattr(fn, "__code__", None), "co_filename", "") or ""
             fn_ref = f"{source_file}:{fn_name}" if source_file else fn_name
             items.append(
                 {
                     "fn_ref": fn_ref,
                     "args": list(c.args),
-                    "kwargs": dict(c.keywords),
+                    "kwargs": dict(c.keywords) if c.keywords else {},
                 }
             )
         else:
             raise TypeError(f"parallel() expects functools.partial objects, got {type(c).__name__}")
 
-    # Send request to Rust via stderr protocol.
-    request = json.dumps({"parallel_request": items})
-    print(f"BARCA:2:{request}", file=sys.stderr, flush=True)
+    # Try socket-based dispatch first
+    from barca import _runtime
 
-    # Block and read response from stdin.
-    response_line = sys.stdin.readline()
-    if not response_line:
-        raise RuntimeError("parallel(): no response from orchestrator")
+    if _runtime.is_worker() and _runtime.connect() is not None:
+        raw_results = _runtime.submit_and_wait(items)
+        return [
+            r.get("result") if r.get("status") == "ok" else ParallelError(r.get("error", "unknown"))
+            for r in raw_results
+        ]
 
-    response = json.loads(response_line)
+    # Standalone fallback — execute sequentially
     results = []
-    for item in response:
-        if item.get("status") == "ok":
-            results.append(item.get("result"))
-        else:
-            results.append(ParallelError(item.get("error", "unknown error")))
+    for c in callables:
+        try:
+            results.append(c())
+        except Exception as e:
+            results.append(ParallelError(f"{type(e).__name__}: {e}"))
     return results
 
 
