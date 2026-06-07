@@ -177,8 +177,14 @@ def parallel(*callables):
     running standalone, executes sequentially.
     """
     if not _BARCA_WORKER:
-        # Standalone: execute sequentially.
-        return [c() for c in callables]
+        # Standalone: execute sequentially, collecting errors as ParallelError.
+        results = []
+        for c in callables:
+            try:
+                results.append(c())
+            except Exception as e:
+                results.append(ParallelError(f"{type(e).__name__}: {e}"))
+        return results
 
     # Build work items from the callables (must be functools.partial objects).
     items = []
