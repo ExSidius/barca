@@ -7,6 +7,7 @@ is on your PATH.
 
 ```
 barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
+barca run <task> <file.py> [--burst a,b]     Run a task (always re-runs)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
 barca history [-l N]                          Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
@@ -33,6 +34,21 @@ barca get pipeline.py --no-cache      # execute everything fresh
 barca get pipeline.py --agent         # plain progress lines instead of a progress bar
 barca get pipeline.py -o value        # print just the final value (also: json | pretty)
 ```
+
+## run
+
+Execute a task and its dependency cone. Tasks always re-run (they are never cached). By default,
+all upstream assets in the cone are also force-rerun (cache-busted). Use `--burst` to selectively
+re-run only named upstream assets while leaving others cache-aware.
+
+```bash
+barca run deploy pipeline.py             # run task + bust all upstream caches
+barca run deploy pipeline.py --burst fetch,transform  # only bust named assets
+```
+
+Unlike `barca get`, which targets assets and respects the cache, `barca run` is for tasks that
+produce side effects (deploys, notifications, reports). The task's upstream assets are re-run by
+default to ensure the task sees fresh data.
 
 ## plan
 

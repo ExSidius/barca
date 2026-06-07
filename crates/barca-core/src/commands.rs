@@ -67,7 +67,7 @@ pub struct PlanStream {
 pub struct AssetSummary {
     /// Stable node id (continuity key), e.g. `pipeline.py:fetch`.
     pub id: String,
-    /// Node kind: asset, sensor, or effect.
+    /// Node kind: asset, sensor, or task.
     pub kind: crate::NodeKind,
     /// Freshness policy (always / manual / schedule).
     pub freshness: crate::Freshness,

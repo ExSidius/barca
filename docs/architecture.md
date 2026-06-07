@@ -61,7 +61,7 @@ pyproject.toml              Maturin build (binary + Python stubs in one wheel)
 
 1. **Rust binary** (`barca get <file.py>`):
    - Parses Python with ruff's AST — pure static analysis, never imports user code.
-   - Builds a petgraph DAG from `@asset` / `@sensor` / `@effect` decorators.
+   - Builds a petgraph DAG from `@asset` / `@sensor` / `@task` decorators.
    - Generates a tiered execution plan, persists plan + results to a local Turso/libSQL DB.
    - Spawns Python worker processes per batch (`python -m barca._worker`).
 
@@ -87,10 +87,10 @@ pyproject.toml              Maturin build (binary + Python stubs in one wheel)
 |------|-----------|-------------------|--------|--------------|
 | **asset** | `@asset()` | `Always` | Yes (by `run_hash`) | Yes |
 | **sensor** | `@sensor()` | `Manual` | No (always re-runs) | Yes |
-| **effect** | `@effect()` | `Always` | No (always re-runs) | No (leaf node) |
+| **task** | `@task()` | `Always` | No (always re-runs) | Yes (to other tasks) |
 
-Sensors bring external state into the graph and return `(update_detected, output)`. Effects are
-leaf nodes that push graph state outward and run after their upstreams.
+Sensors bring external state into the graph and return `(update_detected, output)`. Tasks
+produce side effects and always re-run; they can be inputs to other tasks.
 
 ## Storage
 

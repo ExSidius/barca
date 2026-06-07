@@ -14,6 +14,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets", get(handlers::assets))
         .route("/assets/{name}", get(handlers::asset_detail))
         .route("/run", post(handlers::run))
+        .route("/run/{target}", post(handlers::run_target))
         .route("/get/{target}", post(handlers::get_target))
         .route("/status/{run_id}", get(handlers::status))
         .with_state(state)

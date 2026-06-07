@@ -404,10 +404,55 @@ pub fn execute_phase(
             for action in $actions {
                 match action {
                     Action::Spawn(unit) => {
-                        if let Err(e) =
-                            spawn_unit(&unit, provided_inputs, &phase_outputs, python, &tx)
-                        {
-                            spawn_error.get_or_insert(e);
+                        let spawn_result =
+                            spawn_unit(&unit, provided_inputs, &phase_outputs, python, &tx);
+                        if let Err(ref msg) = spawn_result {
+                            spawn_error.get_or_insert(msg.clone());
+                            // Synthesize a failure event so the scheduler decrements in_flight
+                            let synth_failures: Vec<(String, StepError)> = unit
+                                .steps
+                                .iter()
+                                .map(|s| {
+                                    (
+                                        s.step_id.display(),
+                                        StepError {
+                                            error_type: "SpawnError".to_string(),
+                                            message: msg.clone(),
+                                            traceback: String::new(),
+                                            attempts: 0,
+                                        },
+                                    )
+                                })
+                                .collect();
+                            let synth_event = SchedEvent::UnitFinished {
+                                unit: unit.clone(),
+                                failures: synth_failures,
+                                blocked: vec![],
+                            };
+                            // Feed synthesized event directly into the scheduler
+                            let synth_actions = sched.on_event(synth_event, Instant::now());
+                            // Process any resulting actions (recursion-safe: spawn
+                            // failures won't produce another Spawn for the same unit)
+                            for sa in synth_actions {
+                                match sa {
+                                    Action::Spawn(u) => {
+                                        if let Err(e2) = spawn_unit(
+                                            &u,
+                                            provided_inputs,
+                                            &phase_outputs,
+                                            python,
+                                            &tx,
+                                        ) {
+                                            spawn_error.get_or_insert(e2);
+                                        }
+                                    }
+                                    Action::SetTimer(at) => next_timer = Some(at),
+                                    Action::EmitFailed(node_id, error) => {
+                                        failures.push(StepFailure { node_id, error });
+                                    }
+                                    Action::Finished => done = true,
+                                }
+                            }
                         }
                     }
                     Action::SetTimer(at) => next_timer = Some(at),
@@ -581,10 +626,9 @@ fn spawn_unit(
         let mut failures: Vec<(String, StepError)> = Vec::new();
         let mut blocked: Vec<String> = Vec::new();
         let mut completed: Vec<String> = Vec::new();
-        // Held until a parallel_request arrives; consumed at most once per
-        // worker lifetime (a worker issues at most one parallel() call before
-        // resuming normal execution).
-        let mut stdin_pipe: Option<std::process::ChildStdin> = Some(child_stdin);
+        // Kept alive across all parallel_request calls — a worker may issue
+        // multiple parallel() calls during its lifetime.
+        let mut stdin_pipe = child_stdin;
 
         for line in reader.lines() {
             let Ok(line) = line else { break };
@@ -601,10 +645,25 @@ fn spawn_unit(
                 // field) when a task calls `parallel()`. The worker then
                 // blocks reading its stdin for the response.
                 if let Some(pr) = parsed.get("parallel_request") {
-                    let items: Vec<ParallelWorkItem> =
-                        serde_json::from_value(pr.clone()).unwrap_or_default();
+                    let items: Vec<ParallelWorkItem> = match serde_json::from_value(pr.clone()) {
+                        Ok(items) => items,
+                        Err(e) => {
+                            eprintln!("[barca] failed to parse parallel request: {e}");
+                            // Send error responses so the worker doesn't hang
+                            let count = pr.as_array().map(|a| a.len()).unwrap_or(1);
+                            let response: Vec<serde_json::Value> = (0..count)
+                                .map(|_| serde_json::json!({"status": "error", "error": format!("failed to parse parallel request: {e}")}))
+                                .collect();
+                            let response_json = serde_json::to_string(&response)
+                                .unwrap_or_else(|_| "[]".to_string());
+                            let _ = stdin_pipe.write_all(response_json.as_bytes());
+                            let _ = stdin_pipe.write_all(b"\n");
+                            let _ = stdin_pipe.flush();
+                            continue;
+                        }
+                    };
 
-                    if let Some(mut pipe) = stdin_pipe.take() {
+                    {
                         // Stage 3: spawn sub-workers for each parallel work
                         // item, collect results, and write the combined
                         // response back to the parent worker's stdin pipe.
@@ -639,12 +698,10 @@ fn spawn_unit(
                                 }
                             };
 
-                            // Build kwargs from the item's args and kwargs.
+                            // Build positional args and keyword args separately.
+                            let direct_args: Vec<serde_json::Value> = item.args.clone();
                             let mut direct_kwargs: serde_json::Map<String, serde_json::Value> =
                                 serde_json::Map::new();
-                            for (j, arg) in item.args.iter().enumerate() {
-                                direct_kwargs.insert(format!("_arg{j}"), arg.clone());
-                            }
                             for (k, v) in &item.kwargs {
                                 direct_kwargs.insert(k.clone(), v.clone());
                             }
@@ -661,6 +718,8 @@ fn spawn_unit(
                                     "inputs": {},
                                     "timeout_seconds": 300,
                                     "partition_keys": [],
+                                    "serializer": "json",
+                                    "direct_args": direct_args,
                                     "direct_kwargs": direct_kwargs,
                                 }],
                                 "provided_inputs": {}
@@ -810,9 +869,9 @@ fn spawn_unit(
                         // Write combined response to parent's stdin pipe.
                         let response_json =
                             serde_json::to_string(&results).unwrap_or_else(|_| "[]".to_string());
-                        let _ = pipe.write_all(response_json.as_bytes());
-                        let _ = pipe.write_all(b"\n");
-                        let _ = pipe.flush();
+                        let _ = stdin_pipe.write_all(response_json.as_bytes());
+                        let _ = stdin_pipe.write_all(b"\n");
+                        let _ = stdin_pipe.flush();
                     }
                     // Continue reading stderr — the worker resumes after
                     // reading the response and will eventually exit normally.
@@ -884,7 +943,16 @@ fn spawn_unit(
             let uncompleted: Vec<String> = unit
                 .steps
                 .iter()
-                .map(|s| s.step_id.display())
+                .flat_map(|s| {
+                    if s.partition_keys.is_empty() {
+                        vec![s.step_id.display()]
+                    } else {
+                        s.partition_keys
+                            .iter()
+                            .map(|pk| pk.display_id(&s.step_id.base))
+                            .collect()
+                    }
+                })
                 .filter(|d| !completed.contains(d))
                 .collect();
             if uncompleted.is_empty() {

@@ -86,9 +86,9 @@ pub async fn asset_detail(
 
     let files = state.config.files.clone();
     let python = state.config.python.clone();
-    let lookup = name.clone();
-    let stats =
-        tokio::task::spawn_blocking(move || commands::stats(&lookup, &files, &python)).await??;
+    let resolved_id = summary.id.clone();
+    let stats = tokio::task::spawn_blocking(move || commands::stats(&resolved_id, &files, &python))
+        .await??;
 
     Ok(Json(json!({
         "asset": summary,
@@ -99,6 +99,12 @@ pub async fn asset_detail(
 /// `POST /run` — trigger a full run; returns a polling handle immediately.
 pub async fn run(State(state): State<AppState>) -> Json<Value> {
     let handle = start_run(state, None);
+    Json(json!({ "run_id": handle }))
+}
+
+/// `POST /run/{target}` — trigger a task run; returns a polling handle.
+pub async fn run_target(State(state): State<AppState>, Path(target): Path<String>) -> Json<Value> {
+    let handle = start_run_task(state, target);
     Json(json!({ "run_id": handle }))
 }
 
@@ -155,6 +161,66 @@ fn start_run(state: AppState, target: Option<String>) -> String {
             tokio::task::spawn_blocking(move || {
                 commands::get(tgt.as_deref(), &files, &python, false, true)
             }),
+        )
+        .await;
+
+        if let Some(mut r) = st.runs.get_mut(&h) {
+            r.finished_at = Some(now_ts());
+            match res {
+                Ok(Ok(Ok(result))) => {
+                    r.status = RunStatus::Complete;
+                    r.result = Some(result);
+                }
+                Ok(Ok(Err(e))) => {
+                    r.status = RunStatus::Failed;
+                    r.error = Some(e.to_string());
+                }
+                Ok(Err(e)) => {
+                    r.status = RunStatus::Failed;
+                    r.error = Some(format!("background task failed: {e}"));
+                }
+                Err(_) => {
+                    r.status = RunStatus::Failed;
+                    r.error = Some(format!("run timed out after {}s", RUN_TIMEOUT.as_secs()));
+                }
+            }
+        }
+    });
+
+    handle
+}
+
+/// Insert a `Pending` run for a task, spawn the background execution via
+/// `commands::run`, and return the server-side handle.
+fn start_run_task(state: AppState, target: String) -> String {
+    let handle = db::generate_run_id();
+    state.runs.insert(
+        handle.clone(),
+        RunState {
+            handle: handle.clone(),
+            status: RunStatus::Pending,
+            result: None,
+            error: None,
+            started_at: now_ts(),
+            finished_at: None,
+        },
+    );
+
+    let st = state.clone();
+    let h = handle.clone();
+    tokio::spawn(async move {
+        let _guard = st.run_mutex.lock().await;
+
+        if let Some(mut r) = st.runs.get_mut(&h) {
+            r.status = RunStatus::Running;
+        }
+
+        let files = st.config.files.clone();
+        let python = st.config.python.clone();
+        let tgt = target.clone();
+        let res = tokio::time::timeout(
+            RUN_TIMEOUT,
+            tokio::task::spawn_blocking(move || commands::run(&tgt, &files, &python, None, true)),
         )
         .await;
 

@@ -521,6 +521,14 @@ fn collect_parallel_calls_from_stmts(stmts: &[Stmt], results: &mut Vec<ParallelC
                 collect_parallel_calls_from_stmts(&try_stmt.orelse, results);
                 collect_parallel_calls_from_stmts(&try_stmt.finalbody, results);
             }
+            Stmt::Match(m) => {
+                for case in &m.cases {
+                    collect_parallel_calls_from_stmts(&case.body, results);
+                }
+            }
+            Stmt::AugAssign(a) => {
+                collect_parallel_calls_from_expr(&a.value, results);
+            }
             _ => {}
         }
     }
@@ -552,14 +560,17 @@ fn extract_parallel_call(call: &ast::ExprCall) -> ParallelCall {
 
     for arg in &call.arguments.args {
         match arg {
-            // partial(func_name, ...) — extract func_name
+            // partial(func_name, ...) or functools.partial(func_name, ...) — extract func_name
             Expr::Call(inner_call) => {
-                if let Expr::Name(n) = inner_call.func.as_ref() {
-                    if n.id.as_str() == "partial" {
-                        if let Some(first_arg) = inner_call.arguments.args.first() {
-                            if let Expr::Name(func_name) = first_arg {
-                                static_refs.push(NodeRef::FunctionName(func_name.id.to_string()));
-                            }
+                let is_partial = match inner_call.func.as_ref() {
+                    Expr::Name(n) => n.id.as_str() == "partial",
+                    Expr::Attribute(a) => a.attr.as_str() == "partial",
+                    _ => false,
+                };
+                if is_partial {
+                    if let Some(first_arg) = inner_call.arguments.args.first() {
+                        if let Expr::Name(func_name) = first_arg {
+                            static_refs.push(NodeRef::FunctionName(func_name.id.to_string()));
                         }
                     }
                 }
@@ -608,12 +619,15 @@ fn extract_refs_from_starred(expr: &Expr, refs: &mut Vec<NodeRef>) {
         // Generator expression: (partial(func, ...) for ... in ...)
         Expr::Generator(genexpr) => {
             if let Expr::Call(inner_call) = genexpr.elt.as_ref() {
-                if let Expr::Name(n) = inner_call.func.as_ref() {
-                    if n.id.as_str() == "partial" {
-                        if let Some(first_arg) = inner_call.arguments.args.first() {
-                            if let Expr::Name(func_name) = first_arg {
-                                refs.push(NodeRef::FunctionName(func_name.id.to_string()));
-                            }
+                let is_partial = match inner_call.func.as_ref() {
+                    Expr::Name(n) => n.id.as_str() == "partial",
+                    Expr::Attribute(a) => a.attr.as_str() == "partial",
+                    _ => false,
+                };
+                if is_partial {
+                    if let Some(first_arg) = inner_call.arguments.args.first() {
+                        if let Expr::Name(func_name) = first_arg {
+                            refs.push(NodeRef::FunctionName(func_name.id.to_string()));
                         }
                     }
                 }
@@ -622,12 +636,15 @@ fn extract_refs_from_starred(expr: &Expr, refs: &mut Vec<NodeRef>) {
         // List comprehension: [partial(func, ...) for ... in ...]
         Expr::ListComp(comp) => {
             if let Expr::Call(inner_call) = comp.elt.as_ref() {
-                if let Expr::Name(n) = inner_call.func.as_ref() {
-                    if n.id.as_str() == "partial" {
-                        if let Some(first_arg) = inner_call.arguments.args.first() {
-                            if let Expr::Name(func_name) = first_arg {
-                                refs.push(NodeRef::FunctionName(func_name.id.to_string()));
-                            }
+                let is_partial = match inner_call.func.as_ref() {
+                    Expr::Name(n) => n.id.as_str() == "partial",
+                    Expr::Attribute(a) => a.attr.as_str() == "partial",
+                    _ => false,
+                };
+                if is_partial {
+                    if let Some(first_arg) = inner_call.arguments.args.first() {
+                        if let Expr::Name(func_name) = first_arg {
+                            refs.push(NodeRef::FunctionName(func_name.id.to_string()));
                         }
                     }
                 }

@@ -180,9 +180,16 @@ def run_batch(batch):
                         modules[source] = load_module(source)
                     fn = getattr(modules[source], step["function_name"])
 
-                    # Direct kwargs from parallel() dispatch — skip artifact lookup.
-                    if "direct_kwargs" in step:
-                        kwargs = {k: v for k, v in step["direct_kwargs"].items()}
+                    # Direct args/kwargs from parallel() dispatch — skip artifact lookup.
+                    if "direct_args" in step or "direct_kwargs" in step:
+                        d_args = step.get("direct_args", [])
+                        d_kwargs = step.get("direct_kwargs", {})
+                        t0 = time.time()
+                        result = fn(*d_args, **d_kwargs)
+                        elapsed = time.time() - t0
+                        cache[full_node_id] = result
+                        _materialize(result, full_node_id, art_dir, step, elapsed)
+                        continue
                     else:
                         kwargs = {}
                         for param_name, upstream_id in step.get("inputs", {}).items():
@@ -230,9 +237,16 @@ def run_batch(batch):
                     modules[source] = load_module(source)
                 fn = getattr(modules[source], step["function_name"])
 
-                # Direct kwargs from parallel() dispatch — skip artifact lookup.
-                if "direct_kwargs" in step:
-                    kwargs = {k: v for k, v in step["direct_kwargs"].items()}
+                # Direct args/kwargs from parallel() dispatch — skip artifact lookup.
+                if "direct_args" in step or "direct_kwargs" in step:
+                    d_args = step.get("direct_args", [])
+                    d_kwargs = step.get("direct_kwargs", {})
+                    t0 = time.time()
+                    result = fn(*d_args, **d_kwargs)
+                    elapsed = time.time() - t0
+                    cache[node_id] = result
+                    _materialize(result, node_id, art_dir, step, elapsed)
+                    continue
                 else:
                     kwargs = {}
                     for param_name, upstream_id in step.get("inputs", {}).items():

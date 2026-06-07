@@ -1,6 +1,6 @@
 # Pattern: Ordering-Only Dependencies
 
-When you need one step to run after another but do not need the upstream step's data. Use the `_` prefix convention to skip artifact deserialization.
+When you need one step to run after another but do not need the upstream step's data. Use the `_` prefix convention to signal ordering-only intent.
 
 ## The right way
 
@@ -16,12 +16,12 @@ def seed_data():
     insert_seed_records()
 ```
 
-The `_migrate` parameter name starts with `_`, which tells barca to establish the DAG edge (ensuring `migrate_db` finishes before `seed_data` starts) but skip deserializing the upstream artifact. The function body never references `_migrate`.
+The `_migrate` parameter name starts with `_`, which tells barca to establish the DAG edge (ensuring `migrate_db` finishes before `seed_data` starts) and pass `None` to the function instead of the upstream value. The function body never references `_migrate`.
 
 ## Why this works
 
-- **No wasted I/O.** Without the `_` prefix, barca would serialize `migrate_db`'s return value to disk, then deserialize it into `seed_data`'s worker process -- all for a value you never use. The `_` prefix eliminates both the write and the read.
-- **Intent is explicit.** Anyone reading the code immediately sees that the dependency is for ordering, not data flow. The parameter exists in the signature to satisfy static analysis, but the `_` prefix signals "don't bother loading this."
+- **Intent is explicit.** Anyone reading the code immediately sees that the dependency is for ordering, not data flow. The parameter exists in the signature to satisfy static analysis, but the `_` prefix signals "I don't use this value."
+- **Value is not passed.** The function receives `None` for `_`-prefixed parameters, making it clear the dependency is structural. The upstream artifact is still materialized and cached as normal -- the `_` prefix only affects what the downstream function sees.
 - **DAG is still correct.** The edge is still present in the execution plan. Barca will still schedule `seed_data` in a later tier than `migrate_db`.
 
 ## Common mistakes
@@ -29,13 +29,13 @@ The `_migrate` parameter name starts with `_`, which tells barca to establish th
 ### Using a normal parameter name and ignoring it
 
 ```python
-# Works but wasteful
+# Works but unclear intent
 @task(inputs={"migrate": migrate_db})
-def seed_data(migrate):  # never used, but barca still deserializes it
+def seed_data(migrate):  # never used, but barca still passes the value
     insert_seed_records()
 ```
 
-This is functionally correct but forces barca to serialize and deserialize an artifact you never read. On large return values this can add meaningful latency. Use the `_` prefix to opt out.
+This is functionally correct but unclear to readers -- the parameter looks like it carries data. Use the `_` prefix to signal that the dependency is for ordering only and the value is not needed.
 
 ### Trying to use `after=`
 
