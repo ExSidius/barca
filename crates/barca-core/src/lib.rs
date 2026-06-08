@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod commands;
 pub mod cone;
+pub mod coordinator;
 pub mod dag;
 pub mod db;
 pub mod dispatch;
