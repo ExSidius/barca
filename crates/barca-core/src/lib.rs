@@ -7,6 +7,7 @@ pub mod db;
 pub mod dispatch;
 pub mod executor;
 pub mod hash;
+pub mod io_loop;
 pub mod model;
 pub mod parse;
 pub mod planner;

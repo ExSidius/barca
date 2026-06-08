@@ -512,6 +512,36 @@ impl Coordinator {
         self.skipped.iter().copied().collect()
     }
 
+    // ─── I/O loop helpers ─────────────────────────────────────────────────
+
+    /// Return the worker pool size.
+    pub fn pool_size(&self) -> usize {
+        self.pool_size
+    }
+
+    /// Return whether a worker is currently executing an item.
+    pub fn is_executing(&self, worker_id: usize) -> bool {
+        self.executing.contains_key(&worker_id)
+    }
+
+    /// Return the item a worker is currently executing, if any.
+    pub fn executing_item(&self, worker_id: usize) -> Option<ItemId> {
+        self.executing.get(&worker_id).copied()
+    }
+
+    /// Pop the next item from a worker's queue and mark it as executing.
+    /// Returns None if the queue is empty.
+    pub fn pop_next(&mut self, worker_id: usize) -> Option<ItemId> {
+        let item_id = self.queues[worker_id].pop_front()?;
+        self.executing.insert(worker_id, item_id);
+        Some(item_id)
+    }
+
+    /// Return whether an item is in the done set.
+    pub fn is_done(&self, item_id: ItemId) -> bool {
+        self.done.contains(&item_id)
+    }
+
     // ─── Internal helpers ─────────────────────────────────────────────────
 
     /// Find the shortest queue, preferring non-suspended workers.
@@ -662,7 +692,7 @@ impl Coordinator {
 
     /// If all workers are suspended but there are items in queues, spawn a
     /// temporary worker to break the deadlock.
-    fn check_deadlock(&self) -> Option<Action> {
+    pub fn check_deadlock(&self) -> Option<Action> {
         // All workers must be either suspended or idle (not executing)
         let active_workers = (0..self.pool_size)
             .filter(|w| !self.suspended.contains_key(w) && self.executing.contains_key(w))
