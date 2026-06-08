@@ -9,7 +9,11 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Monotonically increasing counter to ensure unique socket paths per dispatch.
+static DISPATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Reference to a materialized artifact on disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -576,12 +580,13 @@ fn spawn_unit(
         .map_err(|e| format!("failed to persist temp file: {e}"))?;
 
     // Create a Unix listener socket for this worker.
-    let socket_path = protocol::socket_path(
-        &format!("{:?}", std::thread::current().id()),
-        &unit.stream_id,
+    // Use PID + atomic counter for a unique path per spawn (safe across retries).
+    let spawn_id = format!(
+        "{}-{}",
+        std::process::id(),
+        DISPATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
-    // Remove stale socket if it exists (from a previous crashed run).
-    std::fs::remove_file(&socket_path).ok();
+    let socket_path = protocol::socket_path("unit", &spawn_id);
     let listener = UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
 
     let socket_path_str = socket_path.to_str().unwrap_or("").to_string();
@@ -885,15 +890,16 @@ fn handle_parallel_dispatch(
     rt.block_on(async_parallel_dispatch(items, python_path, artifact_dir))
 }
 
-/// Async implementation of parallel dispatch. Creates a single shared Unix socket
-/// listener, spawns all sub-worker processes pointing at it, then accepts and
-/// reads from all connections concurrently via `futures::future::join_all`.
+/// Async implementation of parallel dispatch. Each chunk gets its OWN dedicated
+/// Unix socket listener (no shared listener). All chunks run concurrently via
+/// `futures::future::join_all`, with each future: bind → spawn → accept → read.
+/// This eliminates the accept-ordering problem and scales to arbitrary N.
 async fn async_parallel_dispatch(
     items: &[protocol::SubmitItem],
     python_path: &PathBuf,
     artifact_dir: &str,
 ) -> Vec<ParallelResult> {
-    use tokio::net::UnixListener;
+    use tokio::net::UnixListener as TokioUnixListener;
 
     let num_cpus = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -974,189 +980,198 @@ async fn async_parallel_dispatch(
         chunks[chunk_idx].1.push(se.original_index);
     }
 
-    // Create ONE shared listener for all sub-workers.
-    let socket_path = protocol::socket_path(
-        "par-dispatch",
-        &format!("{:?}", std::thread::current().id()),
+    eprintln!(
+        "[barca:par] dispatching {} items across {} chunks",
+        items.len(),
+        effective_pool
     );
-    std::fs::remove_file(&socket_path).ok();
-    let listener = match UnixListener::bind(&socket_path) {
-        Ok(l) => l,
-        Err(e) => {
-            return items
-                .iter()
-                .map(|_| ParallelResult::Error {
-                    error: format!("socket bind: {e}"),
-                })
-                .collect();
-        }
-    };
 
-    // Spawn all sub-worker OS processes pointing at the SAME socket.
-    struct SpawnedWorker {
-        child: std::process::Child,
-        batch_path: std::path::PathBuf,
-        original_indices: Vec<usize>,
-    }
-
-    let socket_str = socket_path.to_str().unwrap_or("").to_string();
-    let mut spawned: Vec<SpawnedWorker> = Vec::new();
-
-    for (chunk_idx, (steps, indices)) in chunks.into_iter().enumerate() {
-        if steps.is_empty() {
-            continue;
-        }
-        let batch = serde_json::json!({
-            "stream_id": format!("parallel-chunk-{chunk_idx}"),
-            "artifact_dir": artifact_dir,
-            "steps": steps,
-            "provided_inputs": {}
-        });
-
-        let batch_json_str = serde_json::to_string(&batch).unwrap_or_default();
-        let batch_file = match tempfile::NamedTempFile::new() {
-            Ok(mut f) => {
-                let _ = f.write_all(batch_json_str.as_bytes());
-                match f.keep() {
-                    Ok((_, path)) => path,
-                    Err(_) => {
-                        for &idx in &indices {
-                            results[idx] = ParallelResult::Error {
-                                error: "failed to create batch file".to_string(),
-                            };
-                        }
-                        continue;
-                    }
-                }
-            }
-            Err(_) => {
-                for &idx in &indices {
-                    results[idx] = ParallelResult::Error {
-                        error: "failed to create temp file".to_string(),
-                    };
-                }
-                continue;
-            }
-        };
-
-        match Command::new(python_path)
-            .args(["-m", "barca._worker"])
-            .arg(&batch_file)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::piped())
-            .stdin(Stdio::null())
-            .env("BARCA_WORKER", "1")
-            .env("BARCA_SOCKET", &socket_str)
-            .spawn()
-        {
-            Ok(child) => {
-                spawned.push(SpawnedWorker {
-                    child,
-                    batch_path: batch_file,
-                    original_indices: indices,
-                });
-            }
-            Err(e) => {
-                std::fs::remove_file(&batch_file).ok();
-                for &idx in &indices {
-                    results[idx] = ParallelResult::Error {
-                        error: format!("failed to spawn worker: {e}"),
-                    };
-                }
-            }
-        }
-    }
-
-    if spawned.is_empty() {
-        std::fs::remove_file(&socket_path).ok();
-        return results;
-    }
-
-    // Accept all connections concurrently with a timeout.
-    let num_workers = spawned.len();
-    let mut streams: Vec<(tokio::net::UnixStream, Vec<usize>)> = Vec::new();
-    let mut failed_workers: Vec<usize> = Vec::new(); // indices into spawned
-
-    for worker_idx in 0..num_workers {
-        match tokio::time::timeout(Duration::from_secs(30), listener.accept()).await {
-            Ok(Ok((stream, _))) => {
-                // We don't know which worker connected in which order, but each
-                // worker processes its chunk sequentially. We'll match results
-                // by node_id after reading. For now, pair with worker_idx as placeholder.
-                streams.push((stream, Vec::new()));
-            }
-            _ => {
-                failed_workers.push(worker_idx);
-            }
-        }
-    }
-
-    // If some workers failed to connect, mark their items as errors.
-    // Since we can't tell which worker failed (connection order != spawn order),
-    // we handle this after reading by checking for missing results.
-    // Only if ALL accepts failed do we know all workers failed.
-    if streams.is_empty() {
-        for sw in &mut spawned {
-            let _ = sw.child.wait();
-            std::fs::remove_file(&sw.batch_path).ok();
-            for &idx in &sw.original_indices {
-                results[idx] = ParallelResult::Error {
-                    error: "sub-worker failed to connect".to_string(),
-                };
-            }
-        }
-        std::fs::remove_file(&socket_path).ok();
-        return results;
-    }
-
-    // Read from all workers CONCURRENTLY using futures::future::join_all.
-    // Each reader returns a Vec of (node_id, ParallelResult) pairs so we can
-    // match results back to original indices by node_id.
-    let python_clone = python_path.clone();
-    let art_dir = artifact_dir.to_string();
-
-    let read_futures: Vec<_> = streams
+    // Each chunk gets its OWN listener + worker. All run concurrently.
+    let chunk_futures: Vec<_> = chunks
         .into_iter()
-        .map(|(stream, _)| {
-            let python = python_clone.clone();
-            let art = art_dir.clone();
-            async move { read_worker_results(stream, &python, &art).await }
+        .enumerate()
+        .filter(|(_, (steps, _))| !steps.is_empty())
+        .map(|(chunk_idx, (steps, indices))| {
+            let python = python_path.clone();
+            let art_dir = artifact_dir.to_string();
+            let items_ref = items;
+            async move {
+                eprintln!("[barca:par] chunk {chunk_idx}: binding socket...");
+                // Each chunk gets a unique socket path.
+                let chunk_id = format!(
+                    "{}-{}",
+                    std::process::id(),
+                    DISPATCH_COUNTER.fetch_add(1, Ordering::Relaxed)
+                );
+                let sock_path = protocol::socket_path("par", &chunk_id);
+
+                let listener = match TokioUnixListener::bind(&sock_path) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let errors: Vec<(usize, ParallelResult)> = indices
+                            .iter()
+                            .map(|&idx| {
+                                (
+                                    idx,
+                                    ParallelResult::Error {
+                                        error: format!("socket bind: {e}"),
+                                    },
+                                )
+                            })
+                            .collect();
+                        return errors;
+                    }
+                };
+
+                // Write batch file.
+                let batch = serde_json::json!({
+                    "stream_id": format!("parallel-chunk-{chunk_idx}"),
+                    "artifact_dir": &art_dir,
+                    "steps": steps,
+                    "provided_inputs": {}
+                });
+                let batch_json_str = serde_json::to_string(&batch).unwrap_or_default();
+                let batch_path = match tempfile::NamedTempFile::new() {
+                    Ok(mut f) => {
+                        use std::io::Write;
+                        let _ = f.write_all(batch_json_str.as_bytes());
+                        match f.keep() {
+                            Ok((_, path)) => path,
+                            Err(_) => {
+                                std::fs::remove_file(&sock_path).ok();
+                                return indices
+                                    .iter()
+                                    .map(|&idx| {
+                                        (
+                                            idx,
+                                            ParallelResult::Error {
+                                                error: "failed to create batch file".to_string(),
+                                            },
+                                        )
+                                    })
+                                    .collect();
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        std::fs::remove_file(&sock_path).ok();
+                        return indices
+                            .iter()
+                            .map(|&idx| {
+                                (
+                                    idx,
+                                    ParallelResult::Error {
+                                        error: "failed to create temp file".to_string(),
+                                    },
+                                )
+                            })
+                            .collect();
+                    }
+                };
+
+                let socket_str = sock_path.to_str().unwrap_or("").to_string();
+
+                eprintln!("[barca:par] chunk {chunk_idx}: spawning worker...");
+                // Spawn worker pointing at THIS chunk's dedicated socket.
+                let mut child = match Command::new(&python)
+                    .args(["-m", "barca._worker"])
+                    .arg(&batch_path)
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::piped())
+                    .stdin(Stdio::null())
+                    .env("BARCA_WORKER", "1")
+                    .env("BARCA_SOCKET", &socket_str)
+                    .spawn()
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        std::fs::remove_file(&batch_path).ok();
+                        std::fs::remove_file(&sock_path).ok();
+                        return indices
+                            .iter()
+                            .map(|&idx| {
+                                (
+                                    idx,
+                                    ParallelResult::Error {
+                                        error: format!("failed to spawn worker: {e}"),
+                                    },
+                                )
+                            })
+                            .collect();
+                    }
+                };
+
+                eprintln!("[barca:par] chunk {chunk_idx}: waiting for accept...");
+                // Accept exactly ONE connection (this worker's).
+                let stream =
+                    match tokio::time::timeout(Duration::from_secs(30), listener.accept()).await {
+                        Ok(Ok((s, _))) => s,
+                        _ => {
+                            let _ = child.wait();
+                            std::fs::remove_file(&batch_path).ok();
+                            std::fs::remove_file(&sock_path).ok();
+                            return indices
+                                .iter()
+                                .map(|&idx| {
+                                    (
+                                        idx,
+                                        ParallelResult::Error {
+                                            error: "sub-worker failed to connect".to_string(),
+                                        },
+                                    )
+                                })
+                                .collect();
+                        }
+                    };
+
+                eprintln!("[barca:par] chunk {chunk_idx}: accepted connection, reading...");
+                // Drop listener early — only one connection needed.
+                drop(listener);
+
+                // Read all messages from this worker.
+                let stream_results = read_worker_results(stream, &python, &art_dir).await;
+                eprintln!(
+                    "[barca:par] chunk {chunk_idx}: done, {} results",
+                    stream_results.len()
+                );
+
+                // Map node_id results back to original indices.
+                let mut node_map: HashMap<String, ParallelResult> = HashMap::new();
+                for (node_id, res) in stream_results {
+                    node_map.insert(node_id, res);
+                }
+
+                let mut chunk_results: Vec<(usize, ParallelResult)> = Vec::new();
+                for &idx in &indices {
+                    let expected_node_id = format!("{}[_branch={}]", items_ref[idx].fn_ref, idx);
+                    let res = node_map.remove(&expected_node_id).unwrap_or_else(|| {
+                        ParallelResult::Error {
+                            error: "worker exited without reporting result".to_string(),
+                        }
+                    });
+                    chunk_results.push((idx, res));
+                }
+
+                // Cleanup.
+                let _ = child.wait();
+                std::fs::remove_file(&batch_path).ok();
+                std::fs::remove_file(&sock_path).ok();
+
+                chunk_results
+            }
         })
         .collect();
 
-    let all_stream_results: Vec<Vec<(String, ParallelResult)>> =
-        futures::future::join_all(read_futures).await;
+    // Run ALL chunk futures concurrently — true parallelism!
+    let all_chunk_results: Vec<Vec<(usize, ParallelResult)>> =
+        futures::future::join_all(chunk_futures).await;
 
-    // Build a map from node_id -> ParallelResult for all results.
-    let mut node_results: HashMap<String, ParallelResult> = HashMap::new();
-    for stream_results in all_stream_results {
-        for (node_id, result) in stream_results {
-            node_results.insert(node_id, result);
+    // Merge chunk results into the final results vec.
+    for chunk_results in all_chunk_results {
+        for (idx, res) in chunk_results {
+            results[idx] = res;
         }
     }
-
-    // Map results back to original indices using the node_id convention:
-    // node_id = "{fn_ref}[_branch={original_index}]"
-    for sw in &spawned {
-        for &original_idx in &sw.original_indices {
-            let expected_node_id =
-                format!("{}[_branch={}]", items[original_idx].fn_ref, original_idx);
-            if let Some(res) = node_results.remove(&expected_node_id) {
-                results[original_idx] = res;
-            } else {
-                results[original_idx] = ParallelResult::Error {
-                    error: "worker exited without reporting result".to_string(),
-                };
-            }
-        }
-    }
-
-    // Cleanup: wait for all children, remove batch files and socket.
-    for sw in &mut spawned {
-        let _ = sw.child.wait();
-        std::fs::remove_file(&sw.batch_path).ok();
-    }
-    std::fs::remove_file(&socket_path).ok();
 
     results
 }
