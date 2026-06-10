@@ -496,9 +496,13 @@ async fn resume_frozen(
                             .unwrap_or(serde_json::Value::Null);
                         ParallelResult::Ok { result: val }
                     } else {
-                        ParallelResult::Error {
-                            error: "failed".to_string(),
-                        }
+                        let error = coord
+                            .failed_items()
+                            .into_iter()
+                            .find(|(fid, _)| *fid == iid)
+                            .map(|(_, msg)| msg.to_string())
+                            .unwrap_or_else(|| "failed".to_string());
+                        ParallelResult::Error { error }
                     }
                 })
                 .collect();
@@ -609,7 +613,7 @@ fn graceful_kill(child: &mut Child) {
             Ok(Some(_)) => return,
             _ => {}
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(200));
         match child.try_wait() {
             Ok(Some(_)) => return,
             _ => {}

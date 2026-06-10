@@ -310,6 +310,15 @@ def run_daemon():
         sys.exit(1)
     _use_socket = True
 
+    # Install SIGTERM handler so graceful_kill triggers a clean exit
+    # (flushes stdio, runs atexit) instead of the default immediate termination.
+    import signal
+
+    def _on_sigterm(_signum, _frame):
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
     modules = {}
     art_dir = str(Path(".barca/artifacts").resolve())
     Path(art_dir).mkdir(parents=True, exist_ok=True)
