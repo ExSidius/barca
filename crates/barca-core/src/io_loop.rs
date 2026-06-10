@@ -281,7 +281,10 @@ pub async fn run(
                         let (group_id, _child_ids) = coord.on_parallel_requested(item_id, specs);
 
                         // SIGSTOP the requesting worker, move it to frozen list
-                        let handle = workers.remove(&worker_id).unwrap();
+                        let Some(handle) = workers.remove(&worker_id) else {
+                            eprintln!("[barca] Submit from unknown worker {worker_id}, ignoring");
+                            continue;
+                        };
                         #[cfg(unix)]
                         unsafe {
                             libc::kill(handle.child.id() as i32, libc::SIGSTOP);

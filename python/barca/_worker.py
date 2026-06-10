@@ -386,7 +386,7 @@ def run_daemon():
         except (BrokenPipeError, ConnectionResetError, OSError):
             # Socket was closed (e.g. replacement worker killed) — exit cleanly.
             break
-        except Exception as exc:
+        except BaseException as exc:
             elapsed = time.time() - t0
             tb = traceback.format_exc()
             try:
