@@ -273,6 +273,7 @@ pub async fn run(
                                     retry_backoff_seconds: 0.0,
                                     serializer: None,
                                     upstream_inputs: HashMap::new(),
+                                    kind: "task".to_string(),
                                     is_dynamic: false,
                                 }
                             })
@@ -647,7 +648,7 @@ fn build_step_json(item: &crate::coordinator::Item, coord: &Coordinator) -> serd
         "node_id": item.step_id.display(),
         "function_name": item.spec.function_name,
         "source_file": item.spec.source_file,
-        "kind": "task",
+        "kind": &item.spec.kind,
         "inputs": inputs,
         "timeout_seconds": item.spec.timeout_seconds,
         "direct_args": item.spec.direct_args,
