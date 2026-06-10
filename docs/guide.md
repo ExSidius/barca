@@ -4,7 +4,7 @@ This guide walks you through building a real pipeline with barca, from a single 
 
 ## Prerequisites
 
-- Python >= 3.10
+- Python >= 3.12
 - barca installed (`pip install barca`)
 
 Verify it works:

@@ -35,7 +35,7 @@ crates/
       cone.rs               Dependency-cone analysis for definition hashing
       dag.rs                petgraph DAG construction + validation
       planner.rs            Phase/stream execution planning
-      dispatch.rs           Spawns `python -m barca._worker`, parses the stderr protocol
+      dispatch.rs           Coordinates worker pool via UDS, manages the global ready queue
       cache.rs              run_hash computation for cache lookups
       hash.rs               SHA-256 definition/run hashing
       db.rs                 Turso/libSQL persistence (.barca/metadata.db)
@@ -59,17 +59,22 @@ pyproject.toml              Maturin build (binary + Python stubs in one wheel)
 
 ## How it works
 
-1. **Rust binary** (`barca get <file.py>`):
+1. **Rust coordinator** (`barca get <file.py>`):
    - Parses Python with ruff's AST — pure static analysis, never imports user code.
    - Builds a petgraph DAG from `@asset` / `@sensor` / `@task` decorators.
    - Generates a tiered execution plan, persists plan + results to a local Turso/libSQL DB.
-   - Spawns Python worker processes per batch (`python -m barca._worker`).
+   - Maintains a pool of stateless Python worker processes and a global ready queue.
+   - Workers pull one task at a time from the ready queue via Unix domain socket (UDS).
 
-2. **Python worker** (`python -m barca._worker <batch.json>`):
-   - Receives a batch of steps + artifact references from Rust.
+2. **Python worker** (`python -m barca._worker`):
+   - Stateless: connects to the coordinator's UDS and pulls one task at a time from the
+     global ready queue.
    - Imports user modules via `importlib.util.spec_from_file_location`.
-   - Executes steps, serializes results (json / pickle / parquet), and reports back over a
-     stderr JSON protocol (`BARCA:2:{…}`). No DB access — Rust owns all persistence.
+   - Executes the task, serializes results (json / pickle / parquet), and reports back over
+     the Unix domain socket protocol. No DB access — Rust owns all persistence.
+   - For `parallel()` calls: the coordinator freezes the calling worker (SIGSTOP), spawns a
+     temp replacement to maintain pool capacity, and adds the child items to the ready queue.
+     When all children complete, the temp is killed and the parent is resumed (SIGCONT).
 
 3. **Python stubs** (`from barca import asset, …`):
    - Pure no-ops so user code runs standalone and gets IDE/type support.

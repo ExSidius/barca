@@ -33,7 +33,7 @@ def flaky_api_data() -> dict:
 
 ## How the retry loop works
 
-Rust's scheduler owns retries entirely:
+Rust's coordinator owns retries entirely:
 
 1. The worker process runs the function.
 2. If the function raises an exception, the worker reports failure back to Rust.
@@ -86,7 +86,7 @@ def deploy(model: dict) -> None:
     raise RuntimeError("gave up")
 ```
 
-This defeats Rust's retry tracking. The scheduler sees one attempt that either succeeds or fails after internal looping. Use `retries=3, retry_backoff=1.0` on the decorator instead.
+This defeats Rust's retry tracking. The coordinator sees one attempt that either succeeds or fails after internal looping. Use `retries=3, retry_backoff=1.0` on the decorator instead.
 
 ### Expecting parent retries to cover sub-task failures
 
@@ -97,7 +97,7 @@ def release(model: dict) -> None:
     notify()
 ```
 
-Calling `@task` functions directly is just a regular Python call -- barca does not manage it. If `deploy` is a separate `@task`, wire it through `inputs=` so the scheduler can retry it independently.
+Calling `@task` functions directly is just a regular Python call -- barca does not manage it. If `deploy` is a separate `@task`, wire it through `inputs=` so the coordinator can retry it independently.
 
 ### Catching all exceptions to prevent retries
 

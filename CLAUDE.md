@@ -27,19 +27,21 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
 
 ### How it works
 
-1. **Rust binary** (`barca get <file.py>`):
+1. **Rust coordinator** (`barca get <file.py>`):
    - Parses Python using ruff's AST (no import, pure static analysis)
    - Builds a petgraph DAG from `@asset`/`@sensor`/`@task` decorators
    - Generates a tiered execution plan (JSON)
    - Persists plan + results to local Turso/libSQL database (`.barca/metadata.db`)
-   - Spawns Python worker processes per batch (`python -m barca._worker`)
+   - Maintains a pool of stateless Python workers and a global ready queue
+   - Workers connect via Unix domain socket (UDS) and pull one task at a time
 
-2. **Python worker** (`python -m barca._worker <batch.json>`):
-   - Receives a batch of steps + artifact references from Rust
+2. **Python worker** (`python -m barca._worker`):
+   - Stateless: connects to the coordinator's UDS and pulls one task at a time
    - Imports user modules via `importlib.util.spec_from_file_location`
-   - Executes steps sequentially within a batch (Rust parallelises across batches)
-   - Serializes results to artifact files (json/pickle/parquet)
-   - Reports results back to Rust via a stderr JSON protocol (`BARCA:2:{...}`)
+   - Executes the task, serializes results to artifact files (json/pickle/parquet)
+   - Reports results back to Rust via the Unix domain socket protocol
+   - For `parallel()`: coordinator freezes the caller (SIGSTOP), spawns a temp replacement,
+     adds children to the ready queue; on completion kills the temp, resumes the caller (SIGCONT)
    - No DB access — Rust owns all persistence
 
 3. **Python stubs** (`from barca import asset, ...`):
