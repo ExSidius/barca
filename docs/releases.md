@@ -1,120 +1,76 @@
 # Releases
 
-This file scopes Barca by release so the MVP does not quietly expand.
+This file scopes barca by release so the scope does not quietly expand.
 
-## 0.1
+## 0.1.x (shipped)
 
-Goal:
+The Rust rewrite. Replaced the pure-Python prototype with a hybrid Rust+Python
+architecture: Rust parses, plans, and dispatches; Python executes.
 
-- ship a usable local orchestrator with a strong Python authoring model
+Shipped:
 
-### 0.1.1
+- `@asset` with dependency tracking (`inputs=`), caching (`run_hash`), partitions
+- `@sensor` for external state observation
+- `@task` for side-effect operations (always re-runs, never cached)
+- `@sink` for writing outputs to disk
+- `partitions()`, `partitions_from()`, `collect()` for partition workflows
+- Static analysis via ruff (never imports user code)
+- Turso/libSQL for persistence (`.barca/metadata.db`)
+- CLI: `barca get`, `barca run`, `barca plan`, `barca history`, `barca stats`
+- `barca serve` HTTP API (axum)
+- Retries with backoff (`retries=`, `retry_backoff=`)
+- Benchmarks: 13-97x faster than Dagster/Prefect across all workloads
 
-Goal:
+## 0.2.0 (current)
 
-- implement the first workflow end to end
-- establish the Python package skeleton
+The execution engine rewrite. Replaced the old per-thread dispatch system with
+a stateless worker pool coordinated via Unix domain sockets.
 
-Included:
+Shipped:
 
-- first workflow only:
-  - one decorated asset
-  - no inputs
-  - JSON output path for simple scalar values
-- basic Python package skeleton:
-  - `@asset`
-  - metadata attachment on decorated functions
-  - inspection helper for no-input assets
-  - JSON serializer for supported simple values
-- indexing for the first workflow
-- materialization for the first workflow
-- append-only metadata records for:
-  - assets
-  - asset definitions
-  - materializations
-- `.barcafiles` layout for the first workflow
-- preflight `definition_hash` consistency check
-- cache reuse for the first workflow
-- basic CLI with:
-  - asset list
-  - asset detail
-  - trigger materialization
+- **UDS coordination protocol**: length-prefixed JSON over Unix domain sockets,
+  290K msg/s at 128 workers
+- **Stateless workers**: pull one task at a time from a global ready queue. No
+  pre-assigned queues, no head-of-line blocking.
+- **`parallel()` and `parallel_map()`**: dynamic fan-out at runtime via
+  SIGSTOP/SIGCONT. Scales to 1000+ items, nested parallel works recursively.
+- **Type-safe coordinator**: `load_phase()` consumes the planner's Phase directly.
+  StepId on every Item. Step accounting invariant (assert on count mismatch).
+- **orjson** optional dependency for faster Python serialization
+- **-4000 lines net**: removed executor.rs, scheduler.rs, work_plan.rs, old dispatch loop
 
-Explicitly out of scope for 0.1.1:
+Issues closed: [#70](https://github.com/ExSidius/barca/issues/70) (UDS communication),
+[#58](https://github.com/ExSidius/barca/issues/58) (asset vs task model)
 
-- upstream dependencies
-- `load_inputs(...)`
-- partitions
-- sensors
-- tasks
-- schedules/reconciler loop
-- retries/timeouts/cancellation
-- notebook helpers beyond plain import-and-call
-- advanced artifact formats beyond JSON
+## 0.3.0 (planned)
 
-### 0.1 full scope
+Goal: scheduling, remote I/O, observability.
 
-Included:
+Planned:
 
-- pure Python uv workspace (3 packages: core, CLI, server)
-- asset autodiscovery from decorator semantics
-- `@asset` workflow with dependency tracking
-- `@sensor` workflow with observation history
-- `@task` workflow (side-effect operations)
-- schedule-driven reconciliation with:
-  - `manual`
-  - `always`
-  - `cron(...)`
-- preflight definition hash consistency checks
-- append-only history for definitions and materializations
-- provenance-based cache reuse
-- partitions with `partitions(iterable)`
-- HTTP API (FastAPI) + background scheduler
-- CLI for all operations (no server required)
-- free-threaded Python (3.14t) for parallel partition execution
+- **Cron scheduling enforcement** — `Schedule("0 5 * * *")` actually runs on
+  schedule, for both assets and tasks
+  ([#54](https://github.com/ExSidius/barca/issues/54))
+- **Remote storage for @sink** — S3, R2, GCS, ADLS via pluggable backends
+  ([#55](https://github.com/ExSidius/barca/issues/55))
+- **Backend abstraction** — pluggable DB + storage, enabling Docker and shared
+  deployments ([#56](https://github.com/ExSidius/barca/issues/56))
+- **APM integration** — Datadog + Sentry for observability
+  ([#59](https://github.com/ExSidius/barca/issues/59))
+- **Alerting hooks** — Slack webhooks, email notifications
+  ([#52](https://github.com/ExSidius/barca/issues/52))
 
-Planned for later in 0.1:
+## Future (unscoped)
 
-- notebook workflow with `load_inputs(...) -> dict`
-- timeout support on assets, sensors, and tasks
-- fixed retry policy (3 attempts, exponential backoff)
-- cancellation
+Not yet assigned to a release:
 
-Explicitly out of scope for 0.1:
-
-- replay beyond what partitions already account for
-- backfill beyond what partitions already account for
+- Partition filtering on CLI (`--partition` flag)
+  ([#57](https://github.com/ExSidius/barca/issues/57))
+- File versioning for artifacts
+  ([#61](https://github.com/ExSidius/barca/issues/61))
+- Reproducible Docker benchmarks
+  ([#65](https://github.com/ExSidius/barca/issues/65))
+- Notebook integration (load_inputs, materialize, read_asset)
 - TUI
-- full job/pipeline DSL
-- configurable retry policy
-- distributed execution
-- advanced task idempotency semantics
-- automatic rename/move continuity merging
-- web UI (deferred — CLI and HTTP API cover operator needs)
-
-## 0.2
-
-Goal:
-
-- add operator power and historical execution workflows without changing the core asset-first model
-
-Planned additions:
-
-- TUI
-- explicit replay support
-- explicit backfill support
-- historical provenance selection
-- richer historical navigation
-
-## Notes
-
-Release boundaries matter here.
-
-Barca 0.1 should prove that:
-
-- the asset-first API is pleasant
-- provenance-based caching works
-- schedule-driven reconciliation works
-- the CLI and HTTP API are strong enough to operate the system
-
-Once that is true, 0.2 can safely add historical/operator power without destabilizing the core model.
+- Distributed execution (multi-machine)
+- Web UI

@@ -296,6 +296,10 @@ def daily_at_5am() -> dict:
     return {"scheduled": True}
 ```
 
+> **Note**: In v0.2.0, `Always` and `Manual` work as expected. `Schedule` cron enforcement
+> is declared but not yet enforced at runtime — scheduled assets behave like `Always` until
+> cron enforcement ships in v0.3.0 ([#54](https://github.com/ExSidius/barca/issues/54)).
+
 ## 10. Inspecting plans
 
 `barca plan` is your debugging tool. It shows you exactly what barca will do without executing anything.
