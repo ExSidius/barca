@@ -48,6 +48,9 @@ Goal: scheduling, remote I/O, observability.
 
 Planned:
 
+- **Reproducible Docker benchmarks** — containerized cross-framework comparisons
+  with proper timeouts and resource constraints
+  ([#65](https://github.com/ExSidius/barca/issues/65))
 - **Cron scheduling enforcement** — `Schedule("0 5 * * *")` actually runs on
   schedule, for both assets and tasks
   ([#54](https://github.com/ExSidius/barca/issues/54))
@@ -68,8 +71,6 @@ Not yet assigned to a release:
   ([#57](https://github.com/ExSidius/barca/issues/57))
 - File versioning for artifacts
   ([#61](https://github.com/ExSidius/barca/issues/61))
-- Reproducible Docker benchmarks
-  ([#65](https://github.com/ExSidius/barca/issues/65))
 - Notebook integration (load_inputs, materialize, read_asset)
 - TUI
 - Distributed execution (multi-machine)
