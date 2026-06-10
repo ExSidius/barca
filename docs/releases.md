@@ -46,7 +46,7 @@ Explicitly out of scope for 0.1.1:
 - `load_inputs(...)`
 - partitions
 - sensors
-- effects
+- tasks
 - schedules/reconciler loop
 - retries/timeouts/cancellation
 - notebook helpers beyond plain import-and-call
@@ -60,7 +60,7 @@ Included:
 - asset autodiscovery from decorator semantics
 - `@asset` workflow with dependency tracking
 - `@sensor` workflow with observation history
-- `@effect` workflow
+- `@task` workflow (side-effect operations)
 - schedule-driven reconciliation with:
   - `manual`
   - `always`
@@ -76,7 +76,7 @@ Included:
 Planned for later in 0.1:
 
 - notebook workflow with `load_inputs(...) -> dict`
-- timeout support on assets, sensors, and effects
+- timeout support on assets, sensors, and tasks
 - fixed retry policy (3 attempts, exponential backoff)
 - cancellation
 
@@ -88,7 +88,7 @@ Explicitly out of scope for 0.1:
 - full job/pipeline DSL
 - configurable retry policy
 - distributed execution
-- advanced effect idempotency semantics
+- advanced task idempotency semantics
 - automatic rename/move continuity merging
 - web UI (deferred — CLI and HTTP API cover operator needs)
 

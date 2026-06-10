@@ -22,7 +22,7 @@ Recommended decorator shape additions:
 ```python
 @asset(..., timeout_seconds=300)
 @sensor(..., timeout_seconds=300)
-@effect(..., timeout_seconds=300)
+@task(..., timeout_seconds=300)
 ```
 
 Timeouts are expressed in seconds.

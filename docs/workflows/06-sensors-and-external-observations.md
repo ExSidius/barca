@@ -52,7 +52,7 @@ def parse_inbox(paths: tuple[bool, list[str]]) -> list[dict[str, str]]:
     ...
 
 
-@effect(inputs={"rows": parse_inbox}, freshness=Schedule("0 * * * *"))
+@task(inputs={"rows": parse_inbox}, freshness=Schedule("0 * * * *"))
 def publish_rows(rows: list[dict[str, str]]) -> None:
     ...
 ```

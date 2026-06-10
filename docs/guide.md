@@ -1,6 +1,6 @@
 # Barca guide
 
-This guide walks you through building a real pipeline with barca, from a single function to a multi-stage DAG with sensors, effects, and partitions.
+This guide walks you through building a real pipeline with barca, from a single function to a multi-stage DAG with sensors, tasks, and partitions.
 
 ## Prerequisites
 
@@ -210,29 +210,29 @@ def process_inbox(files: list[str]) -> dict:
 
 Sensors are never cached -- they always re-run. Downstream assets only execute when the sensor reports `True` as the first element.
 
-## 6. Effects
+## 6. Tasks
 
-Effects are leaf nodes that perform side effects. They can depend on assets but nothing can depend on them.
+Tasks handle side effects -- deploying, notifying, writing to external systems. They always re-run and are never cached.
 
 ```python
-from barca import asset, effect
+from barca import asset, task
 
 @asset()
 def daily_report() -> dict:
     return {"revenue": 42000, "orders": 150}
 
-@effect(inputs={"report": daily_report})
+@task(inputs={"report": daily_report})
 def send_slack_notification(report: dict) -> None:
     # In production, this would call Slack's API
     print(f"Daily revenue: ${report['revenue']:,}")
 
-@effect(inputs={"report": daily_report})
+@task(inputs={"report": daily_report})
 def write_to_s3(report: dict) -> None:
     # In production, this would upload to S3
     print(f"Uploading report with {report['orders']} orders")
 ```
 
-Both effects run in the same phase (they're independent of each other) after `daily_report` completes.
+Both tasks run in the same phase (they're independent of each other) after `daily_report` completes. Use `barca run` to execute tasks.
 
 ## 7. Partitions
 
@@ -264,11 +264,11 @@ Barca can parse multiple Python files. Assets can reference functions across fil
 my_project/
   sources.py      # @asset defs for raw data
   transforms.py   # @asset defs that depend on sources
-  effects.py      # @effect defs
+  tasks.py        # @task defs
 ```
 
 ```bash
-barca get my_project/sources.py my_project/transforms.py my_project/effects.py
+barca get my_project/sources.py my_project/transforms.py my_project/tasks.py
 ```
 
 Barca merges all discovered nodes into a single DAG and plans execution across the full graph.
@@ -320,7 +320,7 @@ Here's a complete pipeline that uses everything:
 
 ```python
 # pipeline.py
-from barca import asset, sensor, effect, partitions, collect
+from barca import asset, sensor, task, partitions, collect
 
 # Sensor: poll for new data
 @sensor()
@@ -350,8 +350,8 @@ def report(lake_status, data: dict) -> dict:
     _, status = lake_status
     return {"source": status["path"], **data}
 
-# Side effects
-@effect(inputs={"report": report})
+# Side-effect task
+@task(inputs={"report": report})
 def notify(report: dict) -> None:
     print(f"Pipeline complete: {report['total_rows']} rows from {report['tables']} tables")
 ```

@@ -50,23 +50,22 @@ def daily_report() -> dict:
 ```python
 @sink(
     path: str,
-    serializer: SerializerKind,
 )
 ```
 
 Stacked on an `@asset` to write the asset's output to a path when it materialises. Paths are fsspec-compatible (local, `s3://`, `gs://`, etc.). Multiple `@sink` decorators may be stacked on the same asset.
 
 ```python
-from barca import asset, sink, Always, JsonSerializer
+from barca import asset, sink, Always
 
 @asset(freshness=Always)
-@sink('./output.json', serializer=JsonSerializer)
-@sink('s3://my-bucket/output.json', serializer=JsonSerializer)
+@sink('./output.json')
+@sink('s3://my-bucket/output.json')
 def banana() -> dict:
     return {'a': 1}
 ```
 
-Sinks are leaf nodes — no other asset may list a sink as an input. A sink failure does not fail the parent asset, but is surfaced prominently in `assets list` and job logs.
+Sinks are leaf nodes — no other asset may list a sink as an input. A sink failure does not fail the parent asset, but is surfaced prominently in logs.
 
 ::: barca.sink
     options:

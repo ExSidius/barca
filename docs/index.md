@@ -2,7 +2,7 @@
 
 **The invisible asset orchestrator.** Rust plans it. Python runs it. You just write functions.
 
-Barca is a hybrid Rust+Python asset orchestrator that discovers functions decorated with `@asset()`, `@sensor()`, and `@effect()`, builds a dependency graph via static analysis (no imports), generates a phased execution plan, and dispatches work to Python workers -- all in under 40ms of framework overhead.
+Barca is a hybrid Rust+Python asset orchestrator that discovers functions decorated with `@asset()`, `@sensor()`, and `@task()`, builds a dependency graph via static analysis (no imports), generates a phased execution plan, and dispatches work to Python workers -- all in under 40ms of framework overhead.
 
 ```python
 from barca import asset
@@ -41,7 +41,7 @@ pip install barca
 |------|-----------|--------|-------------|
 | **asset** | `@asset()` | Yes | Yes |
 | **sensor** | `@sensor()` | No (always re-runs) | Yes |
-| **effect** | `@effect()` | No (always re-runs) | No (leaf node) |
+| **task** | `@task()` | No (always re-runs) | No (leaf node) |
 
 ## Docs
 

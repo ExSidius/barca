@@ -15,17 +15,9 @@ uv run pytest tests/ -v              # run tests
 
 ```bash
 cd examples/basic_app && uv sync
-uv run barca reindex
-uv run barca assets list
-uv run barca assets refresh 1
-```
-
-Or the iris ML pipeline:
-
-```bash
-cd examples/iris_pipeline && uv sync
-uv run barca reindex
-uv run barca assets refresh 1        # cascades all upstream deps
+uv run barca get pipeline.py         # materialize all assets
+uv run barca plan pipeline.py        # inspect the execution plan
+uv run barca run pipeline.py         # run tasks + upstream assets
 ```
 
 ## How it works
