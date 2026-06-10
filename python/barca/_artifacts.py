@@ -129,14 +129,14 @@ def deserialize(path: Path | str, fmt: str) -> Any:
 def _deserialize_parquet(path: Path) -> Any:
     """Read a parquet file. Prefers pandas if available, then polars."""
     try:
-        import pandas as pd  # ty: ignore[unresolved-import]
+        import pandas as pd
 
         return pd.read_parquet(str(path))
     except ImportError:
         pass
 
     try:
-        import polars as pl  # ty: ignore[unresolved-import]
+        import polars as pl
 
         return pl.read_parquet(str(path))
     except ImportError:

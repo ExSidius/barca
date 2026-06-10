@@ -12,6 +12,11 @@ import socket
 import struct
 import threading
 
+try:
+    import orjson  # ty: ignore[unresolved-import]
+except ImportError:
+    orjson = None  # type: ignore[assignment]
+
 
 # ─── Socket connection ────────────────────────────────────────────────────────
 
@@ -49,7 +54,7 @@ def send_message(msg: dict) -> None:
     """Send a length-prefixed JSON message to the executor."""
     assert _socket is not None, "send_message called before connect()"
     with _socket_lock:
-        payload = json.dumps(msg).encode("utf-8")
+        payload = orjson.dumps(msg) if orjson else json.dumps(msg).encode("utf-8")
         header = struct.pack(">I", len(payload))
         _socket.sendall(header + payload)
 
@@ -64,7 +69,7 @@ def recv_message() -> dict:
         payload = _recv_exact(length)
         if not payload:
             raise RuntimeError("executor disconnected mid-message")
-        return json.loads(payload)
+        return orjson.loads(payload) if orjson else json.loads(payload)
 
 
 def _recv_exact(n: int) -> bytes | None:

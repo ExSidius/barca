@@ -252,7 +252,7 @@ fn execute(
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
     let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
-    let mut all_attempts: HashMap<String, u32> = HashMap::new();
+    let all_attempts: HashMap<String, u32> = HashMap::new();
     let mut steps_executed = 0;
 
     // Progress bar setup.
@@ -446,51 +446,130 @@ fn execute(
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
-
-        // Progress callback — update bar as each step completes from any worker.
-        let mut on_step = |node_id: &str, output: &dispatch::OutputRef| {
-            if let Some(e) = output.elapsed_seconds {
-                elapsed_so_far += e;
-            }
-            completed_steps += 1;
-            if let Some(ref bar) = pb {
-                bar.set_position(completed_steps as u64);
-                let remaining = if total_estimated > 0.0 {
-                    (total_estimated - elapsed_so_far).max(0.0)
-                } else if completed_steps > 0 {
-                    let avg = elapsed_so_far / completed_steps as f64;
-                    avg * (total_steps - completed_steps) as f64
+        let mut coord = crate::coordinator::Coordinator::new();
+        let loaded = coord.load_phase(&filtered_phase, &provided);
+        let expected: usize = filtered_phase
+            .streams
+            .iter()
+            .flat_map(|s| &s.steps)
+            .map(|st| {
+                if st.partition_keys.is_empty() {
+                    1
                 } else {
-                    0.0
-                };
-                let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
-                if remaining > 0.5 {
-                    bar.set_prefix(format!("{}left", fmt_eta(remaining)));
-                } else {
-                    bar.set_prefix("   done ");
+                    st.partition_keys.len()
                 }
-                bar.set_message(format!("{short_name} done"));
-            } else if agent_mode {
-                eprintln!(
-                    "[barca] step:{} completed {:.1}s ({}/{})",
-                    node_id,
-                    output.elapsed_seconds.unwrap_or(0.0),
-                    completed_steps,
-                    total_steps
-                );
-            }
+            })
+            .sum();
+        assert_eq!(
+            loaded, expected,
+            "plan/coordinator step count mismatch: loaded {loaded}, expected {expected}"
+        );
+
+        // Progress callback — update bar as each step completes.
+        let on_step_cb: crate::io_loop::StepCallback<'_> =
+            Box::new(|node_id: &str, artifact: &serde_json::Value| {
+                let elapsed_s = artifact.get("elapsed_seconds").and_then(|v| v.as_f64());
+                if let Some(e) = elapsed_s {
+                    elapsed_so_far += e;
+                }
+                completed_steps += 1;
+                if let Some(ref bar) = pb {
+                    bar.set_position(completed_steps as u64);
+                    let remaining = if total_estimated > 0.0 {
+                        (total_estimated - elapsed_so_far).max(0.0)
+                    } else if completed_steps > 0 {
+                        let avg = elapsed_so_far / completed_steps as f64;
+                        avg * (total_steps - completed_steps) as f64
+                    } else {
+                        0.0
+                    };
+                    let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
+                    if remaining > 0.5 {
+                        bar.set_prefix(format!("{}left", fmt_eta(remaining)));
+                    } else {
+                        bar.set_prefix("   done ");
+                    }
+                    bar.set_message(format!("{short_name} done"));
+                } else if agent_mode {
+                    eprintln!(
+                        "[barca] step:{} completed {:.1}s ({}/{})",
+                        node_id,
+                        elapsed_s.unwrap_or(0.0),
+                        completed_steps,
+                        total_steps
+                    );
+                }
+            });
+
+        // Run the coordinator via io_loop
+        let io_config = crate::io_loop::IoConfig {
+            python: python.clone(),
+            pool_size,
+            run_id: run_id.clone(),
         };
 
-        let phase_result =
-            dispatch::execute_phase(&filtered_phase, &provided, python, Some(&mut on_step));
-        if phase_error.is_none() {
-            phase_error = phase_result.error;
+        // Use a multi-thread runtime for io_loop — the current_thread runtime (used
+        // for Turso DB) doesn't drive spawned tasks concurrently enough for the
+        // worker I/O task pattern.
+        let io_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| BarcaError::Other(format!("failed to create io runtime: {e}")))?;
+        let phase_err = io_rt.block_on(crate::io_loop::run(
+            &mut coord,
+            &io_config,
+            Some(on_step_cb),
+        ));
+        drop(io_rt);
+        if let Err(e) = phase_err {
+            if phase_error.is_none() {
+                phase_error = Some(e);
+            }
         }
-        for (base, n) in phase_result.attempts {
-            all_attempts.insert(base, n);
+
+        // Collect results from coordinator
+        let mut phase_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
+        for (&item_id, artifact_val) in coord.outputs() {
+            let node_id = coord.item(item_id).step_id.display();
+            let oref = dispatch::OutputRef {
+                path: artifact_val
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                format: artifact_val
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("json")
+                    .to_string(),
+                size_bytes: artifact_val
+                    .get("size_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                elapsed_seconds: artifact_val.get("elapsed_seconds").and_then(|v| v.as_f64()),
+            };
+            phase_outputs.insert(node_id, oref);
         }
-        all_failures.extend(phase_result.failures);
-        let phase_outputs = phase_result.outputs;
+
+        // Collect failures
+        for (item_id, error_msg) in coord.failed_items() {
+            let node_id = coord.item(item_id).step_id.display();
+            all_failures.push(dispatch::StepFailure {
+                node_id,
+                error: dispatch::StepError {
+                    error_type: "WorkerError".to_string(),
+                    message: error_msg.to_string(),
+                    traceback: String::new(),
+                    attempts: coord.item(item_id).attempts,
+                },
+            });
+        }
+
+        // Propagate failures into phase_error if not already set
+        if !coord.failed_items().is_empty() && phase_error.is_none() {
+            let (_fid, msg) = coord.failed_items()[0];
+            phase_error = Some(msg.to_string());
+        }
 
         let step_order: Vec<String> = filtered_phase
             .streams

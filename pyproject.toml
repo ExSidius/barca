@@ -26,6 +26,7 @@ Repository = "https://github.com/ExSidius/barca"
 
 [project.optional-dependencies]
 parquet = ["pyarrow", "pandas"]
+fast = ["orjson"]
 
 [tool.maturin]
 bindings = "bin"

@@ -299,8 +299,116 @@ def run_batch(batch):
             _materialize(result, node_id, art_dir, step, elapsed)
 
 
+def run_daemon():
+    """Daemon mode: read execute commands from socket, run each step, send results."""
+    global _use_socket
+
+    from barca import _runtime
+
+    if _runtime.connect() is None:
+        print("BARCA_SOCKET not set", file=sys.stderr)
+        sys.exit(1)
+    _use_socket = True
+
+    modules = {}
+    art_dir = str(Path(".barca/artifacts").resolve())
+    Path(art_dir).mkdir(parents=True, exist_ok=True)
+
+    while True:
+        try:
+            msg = _runtime.recv_message()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            break
+        except Exception:
+            break
+
+        if msg.get("type") == "done":
+            break
+
+        if msg.get("type") != "execute":
+            continue
+
+        step = msg.get("step", {})
+        node_id = step.get("node_id", "unknown")
+        t0 = time.time()
+
+        try:
+            source = str(Path(step["source_file"]).resolve())
+            if source not in modules:
+                modules[source] = load_module(source)
+            fn = getattr(modules[source], step["function_name"])
+
+            # Direct args/kwargs from parallel() dispatch.
+            d_args = step.get("direct_args", [])
+            d_kwargs = step.get("direct_kwargs", {})
+
+            # Resolve dag_inputs as function arguments.
+            inputs = step.get("inputs", {})
+            kwargs = dict(d_kwargs) if d_kwargs else {}
+            for param, artifact_path_str in inputs.items():
+                if artifact_path_str and Path(artifact_path_str).exists():
+                    # Infer format from file extension
+                    ext = Path(artifact_path_str).suffix.lstrip(".")
+                    fmt = {"json": "json", "pkl": "pickle", "parquet": "parquet"}.get(ext, "json")
+                    kwargs[param] = deserialize(artifact_path_str, fmt)
+
+            timeout = step.get("timeout_seconds", 0)
+            if d_args:
+                if timeout and timeout > 0:
+                    result = _run_with_timeout(lambda: fn(*d_args, **kwargs), {}, timeout)
+                else:
+                    result = fn(*d_args, **kwargs)
+            else:
+                if timeout and timeout > 0:
+                    result = _run_with_timeout(lambda: fn(**kwargs), {}, timeout)
+                else:
+                    result = fn(**kwargs)
+
+            elapsed = time.time() - t0
+
+            # Serialize result to artifact.
+            serializer = step.get("serializer", "json")
+            fmt = serializer if serializer else detect_format(result)
+            out_path = artifact_path(art_dir, node_id, fmt)
+            serialize(result, out_path, fmt)
+            size = Path(out_path).stat().st_size
+
+            _runtime.emit_step_completed(
+                node_id,
+                {
+                    "path": str(out_path),
+                    "format": fmt,
+                    "size_bytes": size,
+                    "elapsed_seconds": elapsed,
+                },
+            )
+
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Socket was closed (e.g. replacement worker killed) — exit cleanly.
+            break
+        except Exception as exc:
+            elapsed = time.time() - t0
+            tb = traceback.format_exc()
+            try:
+                _runtime.emit_step_error(
+                    node_id=node_id,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    traceback=tb,
+                    elapsed=elapsed,
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+
+    _runtime.disconnect()
+
+
 def main():
     global _use_socket
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--daemon":
+        run_daemon()
+        return
 
     if len(sys.argv) < 2:
         print("Usage: python -m barca._worker <batch.json>", file=sys.stderr)

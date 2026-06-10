@@ -5,15 +5,12 @@ pub mod coordinator;
 pub mod dag;
 pub mod db;
 pub mod dispatch;
-pub mod executor;
 pub mod hash;
 pub mod io_loop;
 pub mod model;
 pub mod parse;
 pub mod planner;
 pub mod protocol;
-pub mod scheduler;
-pub mod work_plan;
 
 pub use dag::Dag;
 pub use model::*;
