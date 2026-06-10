@@ -364,18 +364,18 @@ pub async fn run(
         }
     }
 
-    // Cleanup: kill all active and frozen workers
+    // Cleanup: gracefully terminate workers. Send SIGTERM first to let
+    // Python flush buffered stdout, then SIGKILL after a brief wait if
+    // the process hasn't exited yet.
     for (_, mut w) in workers {
-        let _ = w.child.kill();
-        let _ = w.child.wait();
+        graceful_kill(&mut w.child);
     }
     for mut fw in frozen {
         #[cfg(unix)]
         unsafe {
             libc::kill(fw.child.id() as i32, libc::SIGCONT);
         }
-        let _ = fw.child.kill();
-        let _ = fw.child.wait();
+        graceful_kill(&mut fw.child);
     }
     std::fs::remove_file(&socket_path).ok();
 
@@ -590,6 +590,33 @@ async fn spawn_worker(
         _task: task,
         executing: None,
     })
+}
+
+// ─── Process lifecycle ────────────────────────────────────────────────────────
+
+/// Gracefully terminate a child process. Sends SIGTERM first to let the process
+/// flush buffered stdout/stderr, then falls back to SIGKILL after a brief wait.
+fn graceful_kill(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        // Send SIGTERM for a graceful shutdown.
+        unsafe {
+            libc::kill(child.id() as i32, libc::SIGTERM);
+        }
+        // Give the process a moment to flush and exit.
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => {}
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            _ => {}
+        }
+    }
+    // Fallback: SIGKILL (or platform kill on non-unix).
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

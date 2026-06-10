@@ -551,24 +551,36 @@ fn execute(
             phase_outputs.insert(node_id, oref);
         }
 
-        // Collect failures
+        // Collect failures — parallel branch failures (group members) are
+        // contained within the group and surfaced as ParallelError to the parent,
+        // so they should NOT abort the entire phase.
+        let mut first_non_group_failure: Option<String> = None;
         for (item_id, error_msg) in coord.failed_items() {
-            let node_id = coord.item(item_id).step_id.display();
+            let item = coord.item(item_id);
+            if item.group.is_some() {
+                // Parallel branch failure — handled by the group/parent, not a phase error.
+                continue;
+            }
+            let node_id = item.step_id.display();
+            if first_non_group_failure.is_none() {
+                first_non_group_failure = Some(error_msg.to_string());
+            }
             all_failures.push(dispatch::StepFailure {
                 node_id,
                 error: dispatch::StepError {
                     error_type: "WorkerError".to_string(),
                     message: error_msg.to_string(),
                     traceback: String::new(),
-                    attempts: coord.item(item_id).attempts,
+                    attempts: item.attempts,
                 },
             });
         }
 
-        // Propagate failures into phase_error if not already set
-        if !coord.failed_items().is_empty() && phase_error.is_none() {
-            let (_fid, msg) = coord.failed_items()[0];
-            phase_error = Some(msg.to_string());
+        // Propagate non-group failures into phase_error if not already set
+        if let Some(msg) = first_non_group_failure {
+            if phase_error.is_none() {
+                phase_error = Some(msg);
+            }
         }
 
         let step_order: Vec<String> = filtered_phase

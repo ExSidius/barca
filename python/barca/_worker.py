@@ -346,6 +346,10 @@ def run_daemon():
             inputs = step.get("inputs", {})
             kwargs = dict(d_kwargs) if d_kwargs else {}
             for param, artifact_path_str in inputs.items():
+                # Skip ordering-only deps (underscore-prefixed params carry no data).
+                if param.startswith("_"):
+                    kwargs[param] = None
+                    continue
                 if artifact_path_str and Path(artifact_path_str).exists():
                     # Infer format from file extension
                     ext = Path(artifact_path_str).suffix.lstrip(".")
@@ -365,6 +369,10 @@ def run_daemon():
                     result = fn(**kwargs)
 
             elapsed = time.time() - t0
+
+            # Sensors return (updated: bool, data) tuples — unpack for downstream.
+            if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
+                _updated, result = result
 
             # Serialize result to artifact.
             serializer = step.get("serializer", "json")

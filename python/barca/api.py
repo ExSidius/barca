@@ -136,7 +136,7 @@ def run(
     Returns the deserialized value of the target task directly (or ``None``).
     """
     args: list[str] = ["run", target, *files]
-    if burst is not None:
+    if burst is not None and len(burst) > 0:
         args += ["--burst", ",".join(burst)]
     result = _exec(args)
     output = result.get("final_output")

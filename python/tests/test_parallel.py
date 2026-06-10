@@ -299,10 +299,6 @@ class TestParallelInvariants:
         values = [r["i"] for r in result]
         assert values == list(range(10)), f"Got {values}, expected [0..9]"
 
-    @pytest.mark.xfail(
-        reason="Parallel branches run sequentially — parallel dispatch not yet wired for this pattern",
-        strict=False,
-    )
     def test_wall_clock_parallelism(self, tmp_path):
         """4 branches x 500ms each should complete in well under sequential time."""
         import time
