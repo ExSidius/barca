@@ -71,7 +71,7 @@ Not yet assigned to a release:
   ([#57](https://github.com/ExSidius/barca/issues/57))
 - File versioning for artifacts
   ([#61](https://github.com/ExSidius/barca/issues/61))
-- Notebook integration (load_inputs, materialize, read_asset)
+- Notebook integration
 - TUI
 - Distributed execution (multi-machine)
 - Web UI

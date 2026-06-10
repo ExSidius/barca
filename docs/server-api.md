@@ -92,7 +92,7 @@ GET /assets/{name}     → { "asset": AssetSummary | null, "stats": AssetStats }
 
 `AssetSummary` is `{ id, kind, freshness, inputs }`. `{name}` matches by asset name or full
 node id; an unknown name returns `404`. `AssetStats` carries run counts, timing percentiles,
-and cache hit rate (see [models](api/models.md)).
+and cache hit rate.
 
 ### Plan
 

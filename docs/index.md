@@ -47,5 +47,5 @@ pip install barca
 
 - [Guide](guide.md) -- step-by-step tutorial from first asset to full pipeline
 - [Architecture](architecture.md) -- system design and internals
-- [Benchmarks](benchmarks.md) -- performance comparison vs. Dagster and Prefect
+- [Framework Comparison](framework-comparison.md) -- aesthetics, transparency, and benchmarks vs. Dagster, Prefect, Airflow
 - [API Reference](api/decorators.md) -- decorator and helper docs

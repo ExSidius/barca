@@ -437,7 +437,7 @@ This is consistent with the broader Barca rule that historical definitions and m
 
 For `partitions_from(...)`, the partition set is resolved lazily at refresh/run time, not at index time. The partition-defining asset must be materialised before the partitioned asset can determine its partitions. Until then:
 
-- `barca assets list` shows “partitions: pending” for the partitioned asset
+- `barca plan` shows “partitions: pending” for the partitioned asset
 - the partitioned asset cannot be materialised
 - same staleness rules apply: if the partition-defining asset is stale and `--stale-policy error` (the default), the partitioned asset cannot be refreshed
 

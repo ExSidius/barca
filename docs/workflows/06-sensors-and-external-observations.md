@@ -6,7 +6,7 @@ The core idea is to add sensors as first-class graph nodes:
 
 - sensors pull external state into the graph
 - assets transform graph values
-- effects push graph values back out to external systems
+- tasks push graph values back out to external systems
 
 This workflow assumes the Barca core constraints documented in [../core-constraints.md](../core-constraints.md).
 
@@ -29,9 +29,9 @@ Sensors use `Manual` or `Schedule` freshness only — `Always` is not valid for 
 
 Sensors should:
 
-- be autodiscovered like assets and effects
+- be autodiscovered like assets and tasks
 - be renderable in the same DAG UI
-- produce typed outputs that assets and effects can consume
+- produce typed outputs that assets and tasks can consume
 - explicitly report whether they observed a meaningful update
 - use the `freshness` primitive
 - record versioned observation history
@@ -39,7 +39,7 @@ Sensors should:
 ## Example
 
 ```python
-from barca import sensor, asset, effect, Schedule
+from barca import sensor, asset, task, Schedule
 
 
 @sensor(freshness=Schedule("*/5 * * * *"))
@@ -127,7 +127,7 @@ That gives the system room to grow later without breaking the API shape.
 
 ## Sensor history
 
-Sensors should be append-only like assets and effects.
+Sensors should be append-only like assets and tasks.
 
 That means Barca should keep:
 
@@ -159,7 +159,7 @@ Observation records should include at least:
 
 ## Freshness and staleness
 
-Sensors should share the same broad stale-state machinery as assets and effects:
+Sensors should share the same broad stale-state machinery as assets and tasks:
 
 - `fresh`
 - `stale_waiting_for_schedule`
@@ -184,17 +184,17 @@ When a sensor returns `updated_detected=False`:
 For the MVP:
 
 - assets may depend on assets or sensors
-- effects may depend on assets or sensors
+- tasks may depend on assets or sensors
 - sensors should not depend on other nodes in the first version
-- effects should not be inputs to anything in the first version
+- tasks should not be inputs to assets or sensors
 
 That keeps the model directional and easier to reason about.
 
-## Why sensors are like inverse effects
+## Why sensors are like inverse tasks
 
 This is the right intuition.
 
-- effects send graph state out into the world
+- tasks send graph state out into the world
 - sensors bring world state into the graph
 
 They are opposites operationally, but they can share:
@@ -214,7 +214,7 @@ The UI should make it obvious which nodes are:
 
 - sensors
 - assets
-- effects
+- tasks
 
 That matters because operators need to know where uncontrolled external state enters the graph.
 
@@ -231,7 +231,7 @@ Useful sensor UI details:
 For the MVP:
 
 - add `@sensor`
-- allow sensors as inputs to assets and effects
+- allow sensors as inputs to assets and tasks
 - use `freshness` (not `schedule`) — sensors accept `Manual` or `Schedule` only
 - require sensors to return `updated_detected` plus payload
 - pass the full `(update_detected, output)` tuple to downstream inputs
@@ -245,7 +245,7 @@ This gives Barca an explicit and honest model for external dependencies without 
 
 - A sensor can be autodiscovered from decorator metadata.
 - A sensor can feed an asset.
-- A sensor can feed an effect.
+- A sensor can feed a task.
 - A sensor can return `(False, payload)` to indicate a successful poll with no meaningful update.
 - Sensor observations are recorded historically rather than overwritten.
 - A sensor observation with `updated_detected=True` can mark downstream assets stale.

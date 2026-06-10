@@ -7,10 +7,6 @@
 - Sensors as first-class nodes with observation history
 - Sensor-aware CLI display (observation info instead of materialization info)
 
-### Planned
-
-- Notebook helpers (`load_inputs()`, `materialize()`, `read_asset()`, `list_versions()`) for interactive/notebook workflows
-
 ## [0.1.0] - 2025
 
 ### Added
