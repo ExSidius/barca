@@ -383,8 +383,20 @@ def run_daemon():
             if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
                 _updated, result = result
 
+            # Convert ParallelError instances so results are JSON-serializable.
+            from barca import ParallelError
+
+            def _make_serializable(v):
+                if isinstance(v, ParallelError):
+                    return v.to_dict()
+                if isinstance(v, list):
+                    return [_make_serializable(x) for x in v]
+                return v
+
+            result = _make_serializable(result)
+
             # Serialize result to artifact.
-            serializer = step.get("serializer", "json")
+            serializer = step.get("serializer")
             fmt = serializer if serializer else detect_format(result)
             out_path = artifact_path(art_dir, node_id, fmt)
             serialize(result, out_path, fmt)

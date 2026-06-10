@@ -657,6 +657,6 @@ fn build_step_json(item: &crate::coordinator::Item, coord: &Coordinator) -> serd
         "timeout_seconds": item.spec.timeout_seconds,
         "direct_args": item.spec.direct_args,
         "direct_kwargs": item.spec.direct_kwargs,
-        "serializer": item.spec.serializer.as_deref().unwrap_or("json"),
+        "serializer": item.spec.serializer.as_deref(),
     })
 }

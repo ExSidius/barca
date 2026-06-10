@@ -156,6 +156,9 @@ class ParallelError:
     def __str__(self) -> str:
         return self.error
 
+    def to_dict(self) -> dict:
+        return {"__parallel_error__": True, "error": self.error}
+
 
 def parallel(*callables):
     """Run callables in parallel across worker processes.
