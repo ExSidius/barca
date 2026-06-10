@@ -30,8 +30,8 @@ Shipped:
 
 - **UDS coordination protocol**: length-prefixed JSON over Unix domain sockets,
   290K msg/s at 128 workers
-- **Stateless workers**: pull one task at a time from a global ready queue. No
-  pre-assigned queues, no head-of-line blocking.
+- **Stateless workers**: receive one task at a time from Rust via a global ready queue.
+  No pre-assigned queues, no head-of-line blocking.
 - **`parallel()` and `parallel_map()`**: dynamic fan-out at runtime via
   SIGSTOP/SIGCONT. Scales to 1000+ items, nested parallel works recursively.
 - **Type-safe coordinator**: `load_phase()` consumes the planner's Phase directly.

@@ -33,10 +33,10 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
    - Generates a tiered execution plan (JSON)
    - Persists plan + results to local Turso/libSQL database (`.barca/metadata.db`)
    - Maintains a pool of stateless Python workers and a global ready queue
-   - Workers connect via Unix domain socket (UDS) and pull one task at a time
+   - Rust assigns one task at a time to idle workers via Unix domain socket (UDS)
 
 2. **Python worker** (`python -m barca._worker`):
-   - Stateless: connects to the coordinator's UDS and pulls one task at a time
+   - Stateless: connects to the coordinator's UDS and receives one task at a time
    - Imports user modules via `importlib.util.spec_from_file_location`
    - Executes the task, serializes results to artifact files (json/pickle/parquet)
    - Reports results back to Rust via the Unix domain socket protocol

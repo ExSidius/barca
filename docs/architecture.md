@@ -64,11 +64,11 @@ pyproject.toml              Maturin build (binary + Python stubs in one wheel)
    - Builds a petgraph DAG from `@asset` / `@sensor` / `@task` decorators.
    - Generates a tiered execution plan, persists plan + results to a local Turso/libSQL DB.
    - Maintains a pool of stateless Python worker processes and a global ready queue.
-   - Workers pull one task at a time from the ready queue via Unix domain socket (UDS).
+   - Rust assigns one task at a time to idle workers via Unix domain socket (UDS).
 
 2. **Python worker** (`python -m barca._worker`):
-   - Stateless: connects to the coordinator's UDS and pulls one task at a time from the
-     global ready queue.
+   - Stateless: connects to the coordinator's UDS and receives one task at a time from
+     the global ready queue.
    - Imports user modules via `importlib.util.spec_from_file_location`.
    - Executes the task, serializes results (json / pickle / parquet), and reports back over
      the Unix domain socket protocol. No DB access — Rust owns all persistence.

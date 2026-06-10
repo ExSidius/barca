@@ -16,7 +16,7 @@ Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 
 Barca uses a **stateless worker pool** with **Unix domain sockets** for coordination:
 - Rust owns a global ready queue and assigns one task at a time to idle workers
-- Workers pull tasks, execute, report back — no pre-assigned queues
+- Workers receive tasks, execute, report back — no pre-assigned queues
 - `parallel()` uses **SIGSTOP/SIGCONT** to freeze the requesting worker, spawn a temp replacement, and dispatch children across the pool
 - Nested `parallel()` works recursively (frozen processes stack, active pool stays at `pool_size`)
 

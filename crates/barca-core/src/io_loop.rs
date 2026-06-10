@@ -1,4 +1,4 @@
-//! Async I/O layer — stateless workers pulling from a global ready queue.
+//! Async I/O layer — stateless workers receiving tasks from a global ready queue.
 //!
 //! Workers are ephemeral executors. After each task, they report back and Rust
 //! assigns the next ready item. On parallel(), the requesting worker is SIGSTOP'd,

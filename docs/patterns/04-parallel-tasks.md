@@ -73,7 +73,7 @@ def deploy_all(model):
 - Each argument to `parallel()` must be a `functools.partial` wrapping a `@task`-decorated function.
 - The parent worker sends the work items to Rust via Unix domain socket.
 - Rust freezes the parent worker (SIGSTOP), spawns a temp replacement to maintain pool capacity, and adds the child items to the global ready queue.
-- Idle workers pull children from the queue and execute them in parallel.
+- Rust assigns children to idle workers, which execute them in parallel.
 - When all children complete, Rust kills the temp replacement, resumes the parent (SIGCONT), and sends the results back.
 - Results are collected and returned to the parent in argument order.
 - Each result is either the return value or a `ParallelError` instance (Promise.allSettled semantics -- no branch failure crashes the parent).

@@ -72,11 +72,11 @@ problems:
 - **No scheduling intelligence**: Round-robin assignment couldn't account for cache
   locality, task priority, or runtime estimates.
 
-### Why pull-based
+### Why a global ready queue with Rust-driven assignment
 
 - **Zero waste**: No idle worker has an empty queue while another worker has a full one.
   Every worker always executes the highest-priority available task.
-- **Natural backpressure**: If one task is slow, other workers simply pull more tasks.
+- **Natural backpressure**: If one task is slow, Rust assigns more tasks to idle workers.
   No reshuffling needed.
 - **Simple parallel()**: When a worker calls `parallel()`, its children enter the
   global ready set. Any idle worker picks them up. No redistribution.
