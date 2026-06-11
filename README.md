@@ -207,6 +207,7 @@ def prices(ticker: str) -> dict:
 ```
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
+barca list <file.py> [file.py ...]         List all definitions with deps
 barca history [--limit N]                    Show recent run history
 barca stats <target> <file.py> ...         Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server
