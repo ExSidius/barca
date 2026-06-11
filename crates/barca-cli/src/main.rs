@@ -90,6 +90,12 @@ enum Cli {
         #[arg(long)]
         watch: bool,
     },
+    /// List all discovered definitions (assets, tasks, sensors) with their deps
+    List {
+        /// Python source files containing definitions
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+    },
     /// Print version information
     Version,
 }
@@ -170,6 +176,7 @@ fn main() {
         Cli::Plan { files } => plan_cmd(files, &python),
         Cli::History { limit } => history_cmd(limit),
         Cli::Stats { target, files } => stats_cmd(target, files, &python),
+        Cli::List { files } => list_cmd(files, &python),
         Cli::Serve { files, port, watch } => serve_cmd(files, port, watch, &python),
         Cli::Version => {
             println!("barca {}", env!("CARGO_PKG_VERSION"));
@@ -290,6 +297,60 @@ fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::Bar
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let result = barca_core::commands::plan(&file_args, python)?;
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    Ok(())
+}
+
+fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
+    let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    let assets = barca_core::commands::list_assets(&file_args, python)?;
+    if assets.is_empty() {
+        println!("No definitions found.");
+        return Ok(());
+    }
+    let max_name = assets.iter().map(|a| a.id.len()).max().unwrap_or(4).max(4);
+    let max_kind = 6; // "sensor" is the longest
+    println!(
+        "{:<wn$}  {:<wk$}  {:<10}  {}",
+        "NAME",
+        "KIND",
+        "FRESHNESS",
+        "DEPS",
+        wn = max_name,
+        wk = max_kind,
+    );
+    println!("{}", "-".repeat(max_name + max_kind + 20));
+    for a in &assets {
+        let kind = serde_json::to_value(&a.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| format!("{:?}", a.kind).to_lowercase());
+        let freshness = serde_json::to_value(&a.freshness)
+            .ok()
+            .and_then(|v| {
+                let ty = v.get("type")?.as_str()?;
+                if ty == "Schedule" {
+                    let cron = v.get("value").and_then(|c| c.as_str()).unwrap_or("?");
+                    Some(format!("cron: {cron}"))
+                } else {
+                    Some(ty.to_lowercase())
+                }
+            })
+            .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
+        let deps = if a.inputs.is_empty() {
+            "-".to_string()
+        } else {
+            a.inputs.join(", ")
+        };
+        println!(
+            "{:<wn$}  {:<wk$}  {:<10}  {}",
+            a.id,
+            kind,
+            freshness,
+            deps,
+            wn = max_name,
+            wk = max_kind,
+        );
+    }
     Ok(())
 }
 

@@ -55,6 +55,10 @@ pub fn ensure_db_dir() -> Result<String, BarcaError> {
         .map_err(|e| BarcaError::Db(format!("failed to create .barca dir: {e}")))?;
     fs::create_dir_all(db_dir.join("artifacts"))
         .map_err(|e| BarcaError::Db(format!("failed to create artifacts dir: {e}")))?;
+    let gitignore = db_dir.join(".gitignore");
+    if !gitignore.exists() {
+        let _ = fs::write(&gitignore, "*\n");
+    }
     Ok(db_dir.join("metadata.db").to_string_lossy().to_string())
 }
 

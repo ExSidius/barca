@@ -30,7 +30,7 @@ def summary(data: list[dict]) -> dict:
 
 ```
 $ barca get pipeline.py
-{"elapsed_seconds":0.042,"steps_executed":2,"phases":2,"final_output":{"count":3,"total":6}}
+{"elapsed_seconds":0.27,"final_output":{"count":3,"total":6},"phases":1,"run_id":"...","steps_executed":2}
 ```
 
 No config files. No YAML. No daemon. Just functions and a fast binary.
@@ -46,7 +46,7 @@ uv add barca
 This gives you:
 - The `barca` CLI binary (compiled Rust)
 - Python API: `barca.get()`, `barca.plan()`
-- Decorator stubs for `@asset`, `@sensor`, `@effect` (IDE autocomplete + type checking)
+- Decorator stubs for `@asset`, `@sensor`, `@task` (IDE autocomplete + type checking)
 
 For optional parquet (DataFrame) support:
 
@@ -164,17 +164,11 @@ sensor (that would poison caching). Run a task with `barca run <task>`.
 def publish(report: str) -> None:
     print(f"Publishing: {report}")
 
-# Ordering-only deps (no data passed) via after=.
-@task()
-def migrate(): ...
-
-@task(after=[migrate])
-def warm_cache(): ...
 ```
 
 ### `@sink`
 
-Stacks on `@asset` to write outputs to files.
+Declares a sink output target (stacks on `@asset`; file writing coming soon).
 
 ```python
 @asset()
@@ -213,7 +207,8 @@ def prices(ticker: str) -> dict:
 ```
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
-barca history [-n N]                        Show recent run history
+barca list <file.py> [file.py ...]         List all definitions with deps
+barca history [--limit N]                    Show recent run history
 barca stats <target> <file.py> ...         Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server
 barca --help                               Show help
@@ -235,7 +230,7 @@ barca serve pipeline.py --watch          # dev mode: re-parse DAG on file change
 Runs are async: `POST` returns a `run_id` immediately, then you poll `/status/{run_id}`.
 
 ```bash
-curl localhost:8274/health                       # {"status":"ok","version":"0.1.5"}
+curl localhost:8274/health                       # {"status":"ok","version":"0.2.1"}
 curl localhost:8274/assets                       # list assets + deps
 curl localhost:8274/plan                          # execution plan JSON
 curl -XPOST localhost:8274/run                    # → {"run_id":"…"}; poll /status/<id>
@@ -272,8 +267,15 @@ $ barca plan pipeline.py
 {
   "total_steps": 2,
   "phases": [
-    { "reason": "Independent", "streams": [{"stream_id": 0, "steps": ["raw_data"]}] },
-    { "reason": "Dependent",   "streams": [{"stream_id": 1, "steps": ["summary"]}] }
+    {
+      "reason": "Initial",
+      "streams": [
+        {
+          "stream_id": "p0-w0",
+          "steps": ["pipeline.py:raw_data", "pipeline.py:summary"]
+        }
+      ]
+    }
   ]
 }
 ```
@@ -286,9 +288,10 @@ Output is a JSON summary:
 
 ```json
 {
-  "elapsed_seconds": 0.042,
+  "run_id": "...",
+  "elapsed_seconds": 0.27,
   "steps_executed": 2,
-  "phases": 2,
+  "phases": 1,
   "final_output": {"count": 3, "total": 6}
 }
 ```
@@ -298,7 +301,7 @@ Use `--no-cache` to skip cache lookups and execute everything fresh.
 Diagnostics go to stderr:
 
 ```
-[barca] 2 nodes, 1 edges, 2 phases, 2 streams | plan: 1.2ms | exec: 38ms | total: 40ms
+[barca] 2/2 steps done in 0.0s
 ```
 
 ## Benchmarks
