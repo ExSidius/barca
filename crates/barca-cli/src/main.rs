@@ -36,6 +36,25 @@ enum Cli {
         #[arg(long)]
         agent: bool,
     },
+    /// Run a task (and its cone) — always re-runs, bursting upstream asset caches
+    ///
+    /// Like `get`, but for task-style workflows: tasks always execute, and by
+    /// default every upstream asset is force-rerun. Use `--burst` to re-run only
+    /// selected assets while the rest stay cached.
+    Run {
+        /// TARGET file.py [file.py ...] — target task is required
+        #[arg(required = true)]
+        args: Vec<String>,
+        /// Comma-separated asset names to force-rerun. Omit to burst ALL upstream assets.
+        #[arg(long, value_delimiter = ',')]
+        burst: Option<Vec<String>>,
+        /// Output format
+        #[arg(short, long, default_value = "json")]
+        output: OutputMode,
+        /// Agent-friendly output: plain structured progress lines instead of visual progress bar
+        #[arg(long)]
+        agent: bool,
+    },
     /// Parse source files and emit the execution plan as JSON
     Plan {
         /// Python source files containing @asset definitions
@@ -55,6 +74,21 @@ enum Cli {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
+    },
+    /// Run a long-running HTTP server exposing the orchestrator as a JSON API
+    ///
+    /// Binds to 127.0.0.1 (local only, no auth). POST /run and /get trigger
+    /// async runs; poll GET /status/<run_id> for results.
+    Serve {
+        /// Python source files defining the DAG to serve
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Port to bind on
+        #[arg(short, long, default_value = "8274")]
+        port: u16,
+        /// Dev mode: re-parse the DAG when source files change
+        #[arg(long)]
+        watch: bool,
     },
     /// Print version information
     Version,
@@ -112,9 +146,31 @@ fn main() {
             }
             get_cmd(target, files, &python, output, no_cache, agent)
         }
+        Cli::Run {
+            args,
+            burst,
+            output,
+            agent,
+        } => {
+            let (target, files) = split_target_files(args);
+            let Some(target) = target else {
+                eprintln!(
+                    "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                );
+                std::process::exit(1);
+            };
+            if files.is_empty() {
+                eprintln!(
+                    "error: no .py files provided\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                );
+                std::process::exit(1);
+            }
+            run_cmd(target, files, &python, burst, output, agent)
+        }
         Cli::Plan { files } => plan_cmd(files, &python),
         Cli::History { limit } => history_cmd(limit),
         Cli::Stats { target, files } => stats_cmd(target, files, &python),
+        Cli::Serve { files, port, watch } => serve_cmd(files, port, watch, &python),
         Cli::Version => {
             println!("barca {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -167,6 +223,55 @@ fn get_cmd(
                 "Run {} | {} in {:.3}s ({} step{}, {} phase{})",
                 result.run_id,
                 label,
+                result.elapsed_seconds,
+                result.steps_executed,
+                if result.steps_executed == 1 { "" } else { "s" },
+                result.phases,
+                if result.phases == 1 { "" } else { "s" }
+            );
+            if let Some(ref val) = final_output {
+                println!("\nValue:\n{}", serde_json::to_string_pretty(val).unwrap());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn run_cmd(
+    target: String,
+    files: Vec<PathBuf>,
+    python: &PathBuf,
+    burst: Option<Vec<String>>,
+    mode: OutputMode,
+    agent: bool,
+) -> Result<(), barca_core::BarcaError> {
+    let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    let result = barca_core::commands::run(&target, &file_args, python, burst, agent)?;
+    let final_output = result.final_output.as_ref().map(read_final_output);
+
+    match mode {
+        OutputMode::Json => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "run_id": result.run_id,
+                    "elapsed_seconds": result.elapsed_seconds,
+                    "steps_executed": result.steps_executed,
+                    "phases": result.phases,
+                    "final_output": final_output,
+                })
+            );
+        }
+        OutputMode::Value => {
+            if let Some(ref val) = final_output {
+                println!("{}", serde_json::to_string_pretty(val).unwrap());
+            }
+        }
+        OutputMode::Pretty => {
+            println!(
+                "Run {} | ran '{}' in {:.3}s ({} step{}, {} phase{})",
+                result.run_id,
+                target,
                 result.elapsed_seconds,
                 result.steps_executed,
                 if result.steps_executed == 1 { "" } else { "s" },
@@ -239,19 +344,44 @@ fn stats_cmd(
     println!("Cache hit rate: {:.1}%", stats.cache_hit_rate * 100.0);
     if !stats.recent_runs.is_empty() {
         println!("\nRecent runs:");
-        println!("  {:<10} {:<9} {:<20}", "ELAPSED", "STATUS", "CREATED");
+        println!(
+            "  {:<10} {:<9} {:<8} {:<20}",
+            "ELAPSED", "STATUS", "ATTEMPTS", "CREATED"
+        );
         for entry in &stats.recent_runs {
             let elapsed_str = entry
                 .elapsed_seconds
                 .map(|e| format!("{:.3}s", e))
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "  {:<10} {:<9} {:<20}",
-                elapsed_str, entry.status, entry.created_at,
+                "  {:<10} {:<9} {:<8} {:<20}",
+                elapsed_str, entry.status, entry.attempts, entry.created_at,
             );
+            if entry.status == "failed"
+                && let Some(msg) = &entry.error_message
+                && !msg.is_empty()
+            {
+                println!("      └─ {msg}");
+            }
         }
     }
     Ok(())
+}
+
+fn serve_cmd(
+    files: Vec<PathBuf>,
+    port: u16,
+    watch: bool,
+    python: &std::path::Path,
+) -> Result<(), barca_core::BarcaError> {
+    let config = barca_server::ServeConfig {
+        files: files.iter().map(|p| p.display().to_string()).collect(),
+        host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        port,
+        watch,
+        python: python.to_path_buf(),
+    };
+    barca_server::serve(config).map_err(|e| barca_core::BarcaError::Other(e.to_string()))
 }
 
 /// Read an artifact for display: inline JSON values, show metadata for binary formats.

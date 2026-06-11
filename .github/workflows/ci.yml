@@ -1,8 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [main, rust-rewrite, v0.1.1-engine-refactor]
   pull_request:
     branches: [main]
 

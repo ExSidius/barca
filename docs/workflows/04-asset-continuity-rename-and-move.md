@@ -30,7 +30,7 @@ That tradeoff is intentional.
 
 ## Reindex diff
 
-Every `barca reindex` (and every `barca run` pass) shows a three-way diff of what changed since the last index:
+Every `barca get` or `barca run` pass shows a three-way diff of what changed since the last index:
 
 - **Added** assets: name
 - **Removed** assets: name (pruned from active DAG, history preserved)

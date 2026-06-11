@@ -122,6 +122,29 @@ def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
     return output
 
 
+def run(
+    target: str,
+    *files: str,
+    burst: list[str] | None = None,
+) -> Any:
+    """Run a task (and its cone), bursting upstream asset caches.
+
+    Tasks always re-run. By default every upstream asset is force-rerun; pass
+    ``burst=["asset_name", ...]`` to re-run only those assets while the rest
+    stay cached.
+
+    Returns the deserialized value of the target task directly (or ``None``).
+    """
+    args: list[str] = ["run", target, *files]
+    if burst is not None and len(burst) > 0:
+        args += ["--burst", ",".join(burst)]
+    result = _exec(args)
+    output = result.get("final_output")
+    if output is not None:
+        return _read_output(output)
+    return output
+
+
 def plan(file: str, *extra_files: str) -> dict:
     """Return the execution plan as a dict.
 

@@ -14,18 +14,49 @@ import importlib.util
 import json
 import sys
 import time
+import traceback
 from pathlib import Path
 
 from barca._artifacts import artifact_path, deserialize, detect_format, serialize
 
 
 _PROTOCOL_VERSION = 2
+_use_socket = False
 
 
 def _emit(msg_type, **fields):
-    """Emit a protocol message on stderr: BARCA:<version>:<json>"""
+    """Emit a protocol message — via socket if available, else stderr."""
+    if _use_socket:
+        from barca import _runtime
+
+        if msg_type == "result":
+            _runtime.emit_step_completed(fields["node_id"], fields["artifact"])
+        elif msg_type == "error":
+            _runtime.emit_step_error(
+                node_id=fields["node_id"],
+                error_type=fields["error_type"],
+                message=fields["message"],
+                traceback=fields["traceback"],
+                elapsed=fields.get("elapsed", 0.0),
+            )
+        elif msg_type == "blocked":
+            _runtime.emit_blocked(fields["node_id"], fields["reason"])
+        return
+    # Original stderr protocol
     payload = json.dumps({"type": msg_type, **fields})
     print(f"BARCA:{_PROTOCOL_VERSION}:{payload}", file=sys.stderr, flush=True)
+
+
+def _emit_error(node_id, exc, elapsed=0.0):
+    """Emit a structured failure for a single step. Rust owns the retry decision."""
+    _emit(
+        "error",
+        node_id=node_id,
+        error_type=type(exc).__name__,
+        message=str(exc),
+        traceback=traceback.format_exc(),
+        elapsed=elapsed,
+    )
 
 
 def load_module(source_file):
@@ -86,9 +117,43 @@ def _resolve_input(raw_value):
     return raw_value
 
 
+def _execute(fn, kwargs, step):
+    """Run a step function with optional timeout, unpacking sensor tuples."""
+    timeout = step.get("timeout_seconds", 0)
+    t0 = time.perf_counter()
+    if timeout and timeout > 0:
+        result = _run_with_timeout(fn, kwargs, timeout)
+    else:
+        result = fn(**kwargs) if kwargs else fn()
+    elapsed = time.perf_counter() - t0
+
+    # Sensors return (updated: bool, data) tuples — unpack for downstream.
+    if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
+        _updated, result = result
+    return result, elapsed
+
+
+def _materialize(result, node_id, art_dir, step, elapsed):
+    """Serialize a result to its artifact and emit a `result` protocol message."""
+    explicit_fmt = step.get("serializer")
+    fmt = detect_format(result, explicit=explicit_fmt)
+    path = artifact_path(art_dir, node_id, fmt)
+    size = serialize(result, path, fmt)
+    _emit(
+        "result",
+        node_id=node_id,
+        artifact={"path": str(path), "format": fmt, "size_bytes": size},
+        elapsed=elapsed,
+    )
+
+
 def run_batch(batch):
     cache = {}
     modules = {}
+    # node_ids (base or partition-suffixed) that failed or were blocked. A step is
+    # skipped (blocked) if any input it depends on is unavailable — this lets
+    # independent chains bundled in the same batch finish even when one fails.
+    unavailable = set()
 
     # Artifact directory for writing outputs.
     art_dir = batch.get("artifact_dir")
@@ -102,121 +167,298 @@ def run_batch(batch):
         cache[key] = _resolve_input(value)
 
     for step in batch["steps"]:
-        source = str(Path(step["source_file"]).resolve())
-        if source not in modules:
-            modules[source] = load_module(source)
-
-        fn = getattr(modules[source], step["function_name"])
-
         partition_keys = step.get("partition_keys", [])
         if partition_keys:
             # Late partition expansion: worker loops over partition_keys internally.
-            # Each partition key is a dict like {"ticker": "AAPL"}.
+            # Each partition key is a dict like {"ticker": "AAPL"}. Partitions are
+            # independent — one bad partition does not block the others.
             for pk in partition_keys:
-                # Resolve inputs with partition alignment.
-                kwargs = {}
-                for param_name, upstream_id in step.get("inputs", {}).items():
-                    suffix = ",".join(f"{k}={v}" for k, v in sorted(pk.items()))
-                    aligned_id = f"{upstream_id}[{suffix}]"
-                    if aligned_id in cache:
-                        kwargs[param_name] = cache[aligned_id]
-                    elif upstream_id in cache:
-                        kwargs[param_name] = cache[upstream_id]
-                    else:
-                        raise RuntimeError(
-                            f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
-                            f"Tried aligned '{aligned_id}' and base '{upstream_id}'. "
-                            f"Available: {list(cache.keys())}"
-                        )
-
-                # Inject partition values as kwargs (e.g., ticker="AAPL").
-                kwargs.update(pk)
-
-                timeout = step.get("timeout_seconds", 0)
-                t0 = time.perf_counter()
-                if timeout and timeout > 0:
-                    result = _run_with_timeout(fn, kwargs, timeout)
-                else:
-                    result = fn(**kwargs) if kwargs else fn()
-                elapsed = time.perf_counter() - t0
-
-                # Sensors return (updated: bool, data) tuples — unpack for downstream.
-                if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
-                    _updated, result = result
-
-                # Build partition-qualified node_id for cache and artifact.
                 suffix = ",".join(f"{k}={v}" for k, v in sorted(pk.items()))
                 full_node_id = f"{step['node_id']}[{suffix}]"
-                cache[full_node_id] = result
 
-                # Serialize to artifact file.
-                explicit_fmt = step.get("serializer")
-                fmt = detect_format(result, explicit=explicit_fmt)
-                path = artifact_path(art_dir, full_node_id, fmt)
-                size = serialize(result, path, fmt)
-
-                _emit(
-                    "result",
-                    node_id=full_node_id,
-                    artifact={"path": str(path), "format": fmt, "size_bytes": size},
-                    elapsed=elapsed,
-                )
-        else:
-            # Unpartitioned — existing code path.
-            # Resolve inputs: check local cache (includes provided_inputs).
-            kwargs = {}
-            for param_name, upstream_id in step.get("inputs", {}).items():
-                if upstream_id in cache:
-                    kwargs[param_name] = cache[upstream_id]
-                else:
-                    raise RuntimeError(
-                        f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
-                        f"Available: {list(cache.keys())}"
+                # Is any upstream this partition depends on unavailable?
+                blocked_on = None
+                for _param, upstream_id in step.get("inputs", {}).items():
+                    aligned_id = f"{upstream_id}[{suffix}]"
+                    if aligned_id in unavailable or upstream_id in unavailable:
+                        blocked_on = upstream_id
+                        break
+                if blocked_on is not None:
+                    unavailable.add(full_node_id)
+                    _emit(
+                        "blocked",
+                        node_id=full_node_id,
+                        reason=f"upstream '{blocked_on}' unavailable",
                     )
+                    continue
 
-            # Inject partition values as kwargs (e.g., ticker="AAPL").
-            if "partition" in step:
-                kwargs.update(step["partition"])
+                try:
+                    source = str(Path(step["source_file"]).resolve())
+                    if source not in modules:
+                        modules[source] = load_module(source)
+                    fn = getattr(modules[source], step["function_name"])
 
-            # User's print() goes to stdout (visible in terminal).
-            # Protocol messages go to stderr (Rust reads this).
+                    # Direct args/kwargs from parallel() dispatch — skip artifact lookup.
+                    if "direct_args" in step or "direct_kwargs" in step:
+                        d_args = step.get("direct_args", [])
+                        d_kwargs = step.get("direct_kwargs", {})
+                        timeout = step.get("timeout_seconds", 0)
+                        t0 = time.time()
+                        if timeout and timeout > 0:
+                            result = _run_with_timeout(lambda: fn(*d_args, **d_kwargs), {}, timeout)
+                        else:
+                            result = fn(*d_args, **d_kwargs)
+                        elapsed = time.time() - t0
+                        cache[full_node_id] = result
+                        _materialize(result, full_node_id, art_dir, step, elapsed)
+                        continue
+                    else:
+                        kwargs = {}
+                        for param_name, upstream_id in step.get("inputs", {}).items():
+                            if param_name.startswith("_"):
+                                kwargs[param_name] = None
+                                continue
+                            aligned_id = f"{upstream_id}[{suffix}]"
+                            if aligned_id in cache:
+                                kwargs[param_name] = cache[aligned_id]
+                            elif upstream_id in cache:
+                                kwargs[param_name] = cache[upstream_id]
+                            else:
+                                raise RuntimeError(
+                                    f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
+                                    f"Tried aligned '{aligned_id}' and base '{upstream_id}'. "
+                                    f"Available: {list(cache.keys())}"
+                                )
+                        kwargs.update(pk)  # inject partition values (e.g., ticker="AAPL").
+
+                    result, elapsed = _execute(fn, kwargs, step)
+                except Exception as exc:
+                    unavailable.add(full_node_id)
+                    _emit_error(full_node_id, exc)
+                    continue
+
+                cache[full_node_id] = result
+                _materialize(result, full_node_id, art_dir, step, elapsed)
+        else:
+            node_id = step["node_id"]
+
+            # Is any upstream this step depends on unavailable?
+            blocked_on = None
+            for _param, upstream_id in step.get("inputs", {}).items():
+                if upstream_id in unavailable:
+                    blocked_on = upstream_id
+                    break
+            if blocked_on is not None:
+                unavailable.add(node_id)
+                _emit("blocked", node_id=node_id, reason=f"upstream '{blocked_on}' unavailable")
+                continue
+
+            try:
+                source = str(Path(step["source_file"]).resolve())
+                if source not in modules:
+                    modules[source] = load_module(source)
+                fn = getattr(modules[source], step["function_name"])
+
+                # Direct args/kwargs from parallel() dispatch — skip artifact lookup.
+                if "direct_args" in step or "direct_kwargs" in step:
+                    d_args = step.get("direct_args", [])
+                    d_kwargs = step.get("direct_kwargs", {})
+                    timeout = step.get("timeout_seconds", 0)
+                    t0 = time.time()
+                    if timeout and timeout > 0:
+                        result = _run_with_timeout(lambda: fn(*d_args, **d_kwargs), {}, timeout)
+                    else:
+                        result = fn(*d_args, **d_kwargs)
+                    elapsed = time.time() - t0
+                    cache[node_id] = result
+                    _materialize(result, node_id, art_dir, step, elapsed)
+                    continue
+                else:
+                    kwargs = {}
+                    for param_name, upstream_id in step.get("inputs", {}).items():
+                        if param_name.startswith("_"):
+                            kwargs[param_name] = None
+                            continue
+                        if upstream_id in cache:
+                            kwargs[param_name] = cache[upstream_id]
+                        else:
+                            raise RuntimeError(
+                                f"Input '{param_name}' (from '{upstream_id}') not found in cache. "
+                                f"Available: {list(cache.keys())}"
+                            )
+                    if "partition" in step:
+                        kwargs.update(step["partition"])
+
+                result, elapsed = _execute(fn, kwargs, step)
+            except Exception as exc:
+                unavailable.add(node_id)
+                _emit_error(node_id, exc)
+                continue
+
+            cache[node_id] = result
+            _materialize(result, node_id, art_dir, step, elapsed)
+
+
+def run_daemon():
+    """Daemon mode: read execute commands from socket, run each step, send results."""
+    global _use_socket
+
+    from barca import _runtime
+
+    if _runtime.connect() is None:
+        print("BARCA_SOCKET not set", file=sys.stderr)
+        sys.exit(1)
+    _use_socket = True
+
+    # Install SIGTERM handler so graceful_kill triggers a clean exit
+    # (flushes stdio, runs atexit) instead of the default immediate termination.
+    import signal
+
+    def _on_sigterm(_signum, _frame):
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+
+    modules = {}
+    art_dir = str(Path(".barca/artifacts").resolve())
+    Path(art_dir).mkdir(parents=True, exist_ok=True)
+
+    while True:
+        try:
+            msg = _runtime.recv_message()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            break
+        except Exception:
+            break
+
+        if msg.get("type") == "done":
+            break
+
+        if msg.get("type") != "execute":
+            continue
+
+        step = msg.get("step", {})
+        node_id = step.get("node_id", "unknown")
+        t0 = time.time()
+
+        try:
+            source = str(Path(step["source_file"]).resolve())
+            if source not in modules:
+                modules[source] = load_module(source)
+            fn = getattr(modules[source], step["function_name"])
+
+            # Direct args/kwargs from parallel() dispatch.
+            d_args = step.get("direct_args", [])
+            d_kwargs = step.get("direct_kwargs", {})
+
+            # Resolve dag_inputs as function arguments.
+            inputs = step.get("inputs", {})
+            kwargs = dict(d_kwargs) if d_kwargs else {}
+            for param, artifact_path_str in inputs.items():
+                # Skip ordering-only deps (underscore-prefixed params carry no data).
+                if param.startswith("_"):
+                    kwargs[param] = None
+                    continue
+                if artifact_path_str and Path(artifact_path_str).exists():
+                    # Infer format from file extension
+                    ext = Path(artifact_path_str).suffix.lstrip(".")
+                    fmt = {"json": "json", "pkl": "pickle", "parquet": "parquet"}.get(ext, "json")
+                    kwargs[param] = deserialize(artifact_path_str, fmt)
+
             timeout = step.get("timeout_seconds", 0)
-            t0 = time.perf_counter()
-            if timeout and timeout > 0:
-                result = _run_with_timeout(fn, kwargs, timeout)
+            if d_args:
+                if timeout and timeout > 0:
+                    result = _run_with_timeout(lambda: fn(*d_args, **kwargs), {}, timeout)
+                else:
+                    result = fn(*d_args, **kwargs)
             else:
-                result = fn(**kwargs) if kwargs else fn()
-            elapsed = time.perf_counter() - t0
+                if timeout and timeout > 0:
+                    result = _run_with_timeout(lambda: fn(**kwargs), {}, timeout)
+                else:
+                    result = fn(**kwargs)
+
+            elapsed = time.time() - t0
 
             # Sensors return (updated: bool, data) tuples — unpack for downstream.
             if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
                 _updated, result = result
 
-            cache[step["node_id"]] = result
+            # Convert ParallelError instances so results are JSON-serializable.
+            from barca import ParallelError
 
-            # Serialize to artifact file.
-            explicit_fmt = step.get("serializer")
-            fmt = detect_format(result, explicit=explicit_fmt)
-            path = artifact_path(art_dir, step["node_id"], fmt)
-            size = serialize(result, path, fmt)
+            def _make_serializable(v):
+                if isinstance(v, ParallelError):
+                    return v.to_dict()
+                if isinstance(v, list):
+                    return [_make_serializable(x) for x in v]
+                return v
 
-            _emit(
-                "result",
-                node_id=step["node_id"],
-                artifact={"path": str(path), "format": fmt, "size_bytes": size},
-                elapsed=elapsed,
+            result = _make_serializable(result)
+
+            # Serialize result to artifact.
+            serializer = step.get("serializer")
+            fmt = serializer if serializer else detect_format(result)
+            out_path = artifact_path(art_dir, node_id, fmt)
+            serialize(result, out_path, fmt)
+            size = Path(out_path).stat().st_size
+
+            _runtime.emit_step_completed(
+                node_id,
+                {
+                    "path": str(out_path),
+                    "format": fmt,
+                    "size_bytes": size,
+                    "elapsed_seconds": elapsed,
+                },
             )
+
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Socket was closed (e.g. replacement worker killed) — exit cleanly.
+            break
+        except BaseException as exc:
+            elapsed = time.time() - t0
+            tb = traceback.format_exc()
+            try:
+                _runtime.emit_step_error(
+                    node_id=node_id,
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    traceback=tb,
+                    elapsed=elapsed,
+                )
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                break
+
+    _runtime.disconnect()
 
 
 def main():
+    global _use_socket
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "--daemon":
+        run_daemon()
+        return
+
     if len(sys.argv) < 2:
         print("Usage: python -m barca._worker <batch.json>", file=sys.stderr)
         sys.exit(1)
 
+    # Connect to executor's Unix socket if available.
+    from barca import _runtime
+
+    if _runtime.connect() is not None:
+        _use_socket = True
+        _runtime.start_heartbeat()
+
     with open(sys.argv[1]) as f:
         batch = json.load(f)
 
-    run_batch(batch)
+    try:
+        run_batch(batch)
+    finally:
+        if _use_socket:
+            _runtime.stop_heartbeat()
+            _runtime.disconnect()
 
 
 if __name__ == "__main__":

@@ -24,8 +24,10 @@ pub enum NodeKind {
     Asset,
     /// `@sensor` — observes external state, returns `(updated: bool, output)`.
     Sensor,
-    /// `@effect` — side-effect leaf node, cannot be an input to other nodes.
-    Effect,
+    /// `@task` — never cached, always re-runs; may appear anywhere in the DAG.
+    /// May depend on assets/sensors/tasks, but must not be upstream of an
+    /// asset or sensor (that would poison caching).
+    Task,
 }
 
 // ─── Freshness ───────────────────────────────────────────────────────────────
@@ -46,7 +48,7 @@ impl Freshness {
     /// Default freshness for a given node kind.
     pub fn default_for(kind: NodeKind) -> Self {
         match kind {
-            NodeKind::Asset | NodeKind::Effect => Freshness::Always,
+            NodeKind::Asset | NodeKind::Task => Freshness::Always,
             NodeKind::Sensor => Freshness::Manual,
         }
     }
@@ -278,6 +280,19 @@ pub enum SerializerKind {
     Yaml,
 }
 
+// ─── Parallel calls ──────────────────────────────────────────────────────────
+
+/// A parallel work item extracted from a `parallel()` call in a task body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParallelCall {
+    /// Function references in this parallel() call. Each is a @task function.
+    /// Empty if the call is fully dynamic (can't be resolved statically).
+    pub static_refs: Vec<NodeRef>,
+    /// Whether this parallel() call has dynamic (non-static) arguments
+    /// that need runtime expansion (like generators or splat of variables).
+    pub is_dynamic: bool,
+}
+
 // ─── Extracted node ──────────────────────────────────────────────────────────
 
 /// A fully extracted node from Python source — the output of parsing.
@@ -300,6 +315,10 @@ pub struct ExtractedNode {
     pub sinks: SmallVec<[SinkDecl; 2]>,
     /// Timeout in seconds.
     pub timeout_seconds: u32,
+    /// Total number of attempts on failure (1 = no retry).
+    pub retries: u32,
+    /// Base backoff in seconds between attempts; delay = `retry_backoff_seconds * attempt`.
+    pub retry_backoff_seconds: f64,
     /// Human-readable description.
     pub description: Option<String>,
     /// Metadata tags.
@@ -318,6 +337,9 @@ pub struct ExtractedNode {
     pub cone_hash: String,
     /// Explicit artifact serializer override from `@asset(serializer="parquet")`.
     pub artifact_serializer: Option<SerializerKind>,
+    /// Parallel calls found in this task's function body.
+    /// Only populated for `@task` nodes. Empty for assets/sensors.
+    pub parallel_calls: Vec<ParallelCall>,
 }
 
 impl ExtractedNode {

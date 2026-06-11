@@ -29,8 +29,15 @@ pub enum DagError {
         upstream: String,
     },
 
-    #[error("effect '{effect}' cannot be used as input to '{downstream}'")]
-    EffectAsInput { effect: String, downstream: String },
+    #[error(
+        "task '{task}' cannot be an input to {downstream_kind} '{downstream}' \
+         (tasks are never cached, so this would poison caching)"
+    )]
+    TaskAsInput {
+        task: String,
+        downstream: String,
+        downstream_kind: &'static str,
+    },
 
     #[error("duplicate continuity key: '{key}' defined in both '{first}' and '{second}'")]
     DuplicateKey {
@@ -109,12 +116,22 @@ impl Dag {
 
                 let upstream_idx = index[upstream_key.as_str()];
 
-                // Validate: effects cannot be inputs.
-                if graph[upstream_idx].kind() == NodeKind::Effect {
-                    return Err(DagError::EffectAsInput {
-                        effect: upstream_key.clone(),
-                        downstream: downstream_key.clone(),
-                    });
+                // Validate: tasks cannot be an input to an asset or sensor.
+                // (Tasks always re-run and never cache, so feeding a task's output
+                // into a cacheable node would make that node perpetually stale.)
+                if graph[upstream_idx].kind() == NodeKind::Task {
+                    let downstream_kind = match node.kind {
+                        NodeKind::Asset => Some("asset"),
+                        NodeKind::Sensor => Some("sensor"),
+                        NodeKind::Task => None,
+                    };
+                    if let Some(downstream_kind) = downstream_kind {
+                        return Err(DagError::TaskAsInput {
+                            task: upstream_key.clone(),
+                            downstream: downstream_key.clone(),
+                            downstream_kind,
+                        });
+                    }
                 }
 
                 let edge_kind = if input.collected {
@@ -225,15 +242,15 @@ impl Dag {
     }
 
     /// Get upstream node IDs, excluding PartitionSource edges.
-    /// Used by the planner for chain detection — partition source deps
-    /// should force phase breaks, not chain bundling.
+    /// Used by the planner for chain detection — partition source deps should
+    /// force phase breaks, not chain bundling (and pass no data).
     pub fn execution_upstream(&self, id: &str) -> Vec<&str> {
         let Some(&idx) = self.index.get(id) else {
             return vec![];
         };
         let mut result = Vec::new();
         for edge in self.graph.edges_directed(idx, Direction::Incoming) {
-            if *edge.weight() != EdgeKind::PartitionSource {
+            if !matches!(*edge.weight(), EdgeKind::PartitionSource) {
                 let source_idx = edge.source();
                 result.push(self.graph[source_idx].id.as_str());
             }
@@ -248,7 +265,7 @@ impl Dag {
         };
         let mut result = Vec::new();
         for edge in self.graph.edges_directed(idx, Direction::Outgoing) {
-            if *edge.weight() != EdgeKind::PartitionSource {
+            if !matches!(*edge.weight(), EdgeKind::PartitionSource) {
                 let target_idx = edge.target();
                 result.push(self.graph[target_idx].id.as_str());
             }

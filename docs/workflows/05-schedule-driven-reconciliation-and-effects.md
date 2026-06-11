@@ -1,6 +1,6 @@
-# Freshness-Driven Run And Effects
+# Freshness-Driven Run And Tasks
 
-This document specifies how Barca decides when assets, sensors, and side effects are eligible to run.
+This document specifies how Barca decides when assets, sensors, and tasks are eligible to run.
 
 The goal is to keep the orchestration model small:
 
@@ -13,7 +13,7 @@ This workflow assumes the Barca core constraints documented in [../core-constrai
 
 ## Summary
 
-Every asset, sensor, and effect declares a `freshness` value that controls when Barca keeps it up to date during `barca run`.
+Every asset, sensor, and task declares a `freshness` value that controls when Barca keeps it up to date during `barca run`.
 
 ```python
 @asset()                                    # freshness=Always (default)
@@ -23,28 +23,28 @@ Every asset, sensor, and effect declares a `freshness` value that controls when 
 @sensor(freshness=Manual)                   # Always is not valid for sensors
 @sensor(freshness=Schedule("*/5 * * * *"))
 
-@effect()                                   # freshness=Always (default)
-@effect(freshness=Manual)
-@effect(freshness=Schedule("0 6 * * *"))
+@task()                                     # freshness=Always (default)
+@task(freshness=Manual)
+@task(freshness=Schedule("0 6 * * *"))
 ```
 
 Where:
 
 - `freshness` controls how eagerly Barca keeps a stale node up to date
-- staleness is still computed from provenance
+- staleness is computed from provenance
 - `barca run` discovers stale nodes and materialises them when eligible
 
 ## Freshness kinds
 
 ### `Always`
 
-The default for `@asset` and `@effect`. Barca keeps this asset fresh automatically — any upstream change cascades through and re-materialises it during `barca run`.
+The default for `@asset` and `@task`. Barca keeps this asset fresh automatically — any upstream change cascades through and re-materialises it during `barca run`.
 
 **`Manual` freshness blocks downstream**: if any transitive upstream asset has `Manual` freshness, downstream `Always` assets cannot auto-update. They remain stale until the `Manual` upstream is explicitly refreshed.
 
 ### `Manual`
 
-Barca never auto-updates this asset, even when stale. Only refreshed via explicit `barca assets refresh`. Useful for source data or pinned inputs that should not change without deliberate action.
+Barca never auto-updates this asset, even when stale. Only refreshed via explicit request. Useful for source data or pinned inputs that should not change without deliberate action.
 
 ### `Schedule("cron_expr")`
 
@@ -95,11 +95,13 @@ Behavior:
 ```
 
 ```python
-@effect(
+@task(
     name: str | None = None,
     inputs: dict[str, NodeRefLike] | None = None,
     freshness: Freshness = Always,
     timeout_seconds: int = 300,
+    retries: int = 1,
+    retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
 )
@@ -111,7 +113,7 @@ Behavior:
 
 ## Timeout policy
 
-Assets, sensors, and effects all support:
+Assets, sensors, and tasks all support:
 
 ```python
 timeout_seconds: int = 300
@@ -134,7 +136,7 @@ This timeout applies per attempt. If an attempt exceeds the timeout, Barca termi
 `Schedule` assets: materialise if a cron tick has elapsed since last run.
 `Manual` assets: never auto-materialise.
 Sensors: observe on each `Schedule` tick (or `Manual` trigger).
-Effects/Sinks: run when upstream freshens.
+Tasks/Sinks: run when upstream freshens.
 
 If a pass is already running when the next tick arrives, the tick is skipped — passes do not overlap.
 
@@ -170,12 +172,12 @@ The full `(update_detected, output)` tuple is passed as input to downstream asse
 
 Sensors return `(update_detected: bool, output)`. When `update_detected=True`, downstream assets become stale. When `update_detected=False`, downstream assets do not become stale (no meaningful change was detected).
 
-## Effects
+## Tasks
 
-Effects are standalone side-effect functions — sending email, writing to a database, calling an external API. Use `@effect` for arbitrary side-effects. Use `@sink` for writing asset outputs to file paths.
+Tasks handle side effects — sending email, writing to a database, calling an external API. Use `@task` for side-effect operations. Use `@sink` for writing asset outputs to file paths.
 
 ```python
-from barca import asset, effect, sensor, Schedule
+from barca import asset, task, sensor, Schedule
 
 @sensor(freshness=Schedule("0 5 * * *"))
 def upstream_db_rows() -> tuple[bool, list[dict[str, str]]]:
@@ -186,23 +188,23 @@ def report_rows(rows: tuple[bool, list[dict[str, str]]]) -> list[dict[str, str]]
     _, data = rows
     return data
 
-@effect(inputs={"rows": report_rows}, freshness=Schedule("0 6 * * *"))
+@task(inputs={"rows": report_rows}, freshness=Schedule("0 6 * * *"))
 def send_report(rows: list[dict[str, str]]) -> None:
     ...
 ```
 
-Effects are leaf nodes — no other asset may list an effect as an input.
+Tasks must not be an input to an asset or sensor (a task always re-runs, so feeding its output into a cacheable node would keep that node perpetually stale).
 
 ## Sinks
 
 `@sink` is a decorator stacked on `@asset` for writing outputs to file paths. Paths are fsspec-compatible (local, `s3://`, `gs://`, etc.).
 
 ```python
-from barca import asset, sink, Always, JsonSerializer
+from barca import asset, sink, Always
 
 @asset(freshness=Always)
-@sink('./report.json', serializer=JsonSerializer)
-@sink('s3://my-bucket/report.json', serializer=JsonSerializer)
+@sink('./report.json')
+@sink('s3://my-bucket/report.json')
 def report() -> dict:
     return {"rows": 42}
 ```
@@ -235,9 +237,9 @@ At 5:00, each stale partition becomes independently eligible.
 - A sensor with `freshness=Schedule(...)` records observations on its cron cadence.
 - An asset with `freshness=Schedule(...)` becomes runnable only when its cron window opens.
 - A downstream asset can be stale at 5:10 and still not runnable until its 6:00 schedule.
-- Assets and effects may consume sensors as inputs (receiving the full tuple).
-- Effects use the same `freshness` primitive as assets.
-- Effects record successful executions against current upstream provenance.
+- Assets and tasks may consume sensors as inputs (receiving the full tuple).
+- Tasks use the same `freshness` primitive as assets.
+- Tasks record successful executions against current upstream provenance.
 - Partitioned assets evaluate staleness and eligibility per partition.
 - `Manual` freshness blocks downstream `Always` assets from auto-updating.
 - `Always` is not valid for sensors.

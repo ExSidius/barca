@@ -102,13 +102,13 @@ History accumulates over time. `barca prune` is the only operation that permanen
 
 ## Freshness declarations
 
-Every asset, sensor, and effect declares how eagerly Barca keeps its output up to date. The `freshness` parameter is the core primitive — not `schedule`.
+Every asset, sensor, and task declares how eagerly Barca keeps its output up to date. The `freshness` parameter is the core primitive — not `schedule`.
 
 Three freshness kinds exist:
 
-- `Always` (default for `@asset` and `@effect`): Barca keeps this asset fresh automatically. Any upstream change cascades through and re-materialises it during `barca run`.
-- `Manual`: Barca never auto-updates this asset, even when stale. Only refreshed via explicit `barca assets refresh`. **`Manual` freshness blocks downstream**: a downstream `Always` asset cannot be auto-materialised if any of its transitive upstream assets has `Manual` freshness.
-- `Schedule("cron_expr")`: Barca refreshes this asset when a cron tick has elapsed since last run.
+- `Always` (default for `@asset` and `@task`): Barca keeps this node fresh automatically. Any upstream change cascades through and re-materialises it during `barca run`.
+- `Manual`: Barca never auto-updates this node, even when stale. Only refreshed via explicit request. **`Manual` freshness blocks downstream**: a downstream `Always` asset cannot be auto-materialised if any of its transitive upstream assets has `Manual` freshness.
+- `Schedule("cron_expr")`: Barca refreshes this node when a cron tick has elapsed since last run.
 
 Sensors use `Manual` or `Schedule` only — `Always` is not valid for sensors (polling frequency must be declared explicitly).
 

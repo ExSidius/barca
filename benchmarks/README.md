@@ -53,6 +53,22 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 | `etl_duckdb` | 12 | raw → staging → marts | Parallel sources |
 | `large_payloads` | 5 | linear chain, 10k rows/step | None (sequential) |
 
+### Partitioned workloads
+
+| Benchmark | Steps | Topology | Parallelism |
+|---|---|---|---|
+| `partitioned_chain` | 150 | 3 assets × 50 partitions | Parallel partitions |
+| `partitioned_etl` | — | ETL with partitioning | Parallel partitions |
+| `partitioned_fan_in` | — | Fan-in with partitions | Partition-aligned |
+| `partitioned_10k` | ~10k | Docker-based cross-framework | Parallel partitions |
+
+### Dynamic dispatch & resilience (v0.2.0)
+
+| Benchmark | Steps | What it tests |
+|---|---|---|
+| `parallel_tasks` | N (param) | `parallel()` runtime dispatch — SIGSTOP/SIGCONT, temp workers |
+| `resilience_pileup` | 18 | Failure/retry behavior — one flaky chain shouldn't stall healthy work |
+
 ## Running benchmarks
 
 ```bash

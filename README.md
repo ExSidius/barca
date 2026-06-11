@@ -121,7 +121,7 @@ That's it. Barca parses your Python source with [ruff](https://github.com/astral
 ## Decorators
 
 ```python
-from barca import asset, sensor, effect, sink, unsafe
+from barca import asset, sensor, task, sink, unsafe
 from barca import Always, Manual, Schedule
 from barca import partitions, partitions_from, collect, asset_ref
 ```
@@ -151,14 +151,25 @@ def inbox_files() -> tuple[bool, list[str]]:
     return bool(files), [str(f) for f in files]
 ```
 
-### `@effect`
+### `@task`
 
-Side-effect leaf node. Never cached, can't be used as input.
+Workflow-management step — deploys, notifications, migrations, cache warming.
+Always re-runs (never cached). May appear anywhere in the graph and may depend
+on assets, sensors, or other tasks, but must **not** be an input to an asset or
+sensor (that would poison caching). Run a task with `barca run <task>`.
 
 ```python
-@effect(inputs={"report": report})
+# A task consuming an upstream asset (asset → task).
+@task(inputs={"report": report})
 def publish(report: str) -> None:
     print(f"Publishing: {report}")
+
+# Ordering-only deps (no data passed) via after=.
+@task()
+def migrate(): ...
+
+@task(after=[migrate])
+def warm_cache(): ...
 ```
 
 ### `@sink`
@@ -176,7 +187,7 @@ def my_data() -> dict:
 
 | Marker | Behavior |
 |--------|----------|
-| `Always` | Auto-materializes whenever stale (default for `@effect`) |
+| `Always` | Auto-materializes whenever stale (default for `@asset` and `@task`) |
 | `Manual` | Only runs on explicit refresh |
 | `Schedule("0 5 * * *")` | Cron expression |
 
@@ -202,10 +213,37 @@ def prices(ticker: str) -> dict:
 ```
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
+barca history [-n N]                        Show recent run history
+barca stats <target> <file.py> ...         Show timing/cache stats for an asset
+barca serve [file.py ...] [--port N]       Run the HTTP API server
 barca --help                               Show help
 ```
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
+
+## Server
+
+`barca serve` starts a long-running HTTP server that exposes the orchestrator as a
+JSON API — for triggering runs programmatically, polling status, and (in the future)
+a web UI. It binds to `127.0.0.1` by default (local only, no auth).
+
+```bash
+barca serve pipeline.py --port 8274      # default port 8274
+barca serve pipeline.py --watch          # dev mode: re-parse DAG on file change
+```
+
+Runs are async: `POST` returns a `run_id` immediately, then you poll `/status/{run_id}`.
+
+```bash
+curl localhost:8274/health                       # {"status":"ok","version":"0.1.5"}
+curl localhost:8274/assets                       # list assets + deps
+curl localhost:8274/plan                          # execution plan JSON
+curl -XPOST localhost:8274/run                    # → {"run_id":"…"}; poll /status/<id>
+curl -XPOST localhost:8274/get/summary            # run a single target
+curl localhost:8274/status/<run_id>               # poll run status + result
+```
+
+See [docs/server-api.md](docs/server-api.md) for the full endpoint reference.
 
 ## Python API
 
@@ -337,11 +375,11 @@ pyproject.toml              Maturin build config
 
 ### Node kinds
 
-| Kind | Decorator | Cached | Can be input |
+| Kind | Decorator | Cached | Can be input to |
 |------|-----------|--------|-------------|
-| **asset** | `@asset()` | Yes | Yes |
-| **sensor** | `@sensor()` | No | Yes |
-| **effect** | `@effect()` | No | No (leaf) |
+| **asset** | `@asset()` | Yes | assets, sensors, tasks |
+| **sensor** | `@sensor()` | No | assets, sensors, tasks |
+| **task** | `@task()` | No | tasks only (not assets/sensors) |
 
 ## Development
 

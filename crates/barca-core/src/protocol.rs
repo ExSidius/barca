@@ -1,0 +1,431 @@
+//! Unix socket message protocol for bidirectional communication between
+//! the Rust executor (coordinator) and Python workers.
+//!
+//! ## Framing
+//!
+//! Length-prefixed JSON frames:
+//! ```text
+//! [4 bytes: u32 big-endian message length][JSON payload bytes]
+//! ```
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::io::{self, Read, Write};
+
+// ─── Worker → Coordinator ────────────────────────────────────────────────────
+
+/// Messages sent from a Python worker to the Rust coordinator.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkerMessage {
+    /// A step completed successfully with an artifact.
+    StepCompleted {
+        node_id: String,
+        artifact: ArtifactRef,
+    },
+    /// A step failed with a structured error.
+    StepError {
+        node_id: String,
+        error_type: String,
+        message: String,
+        traceback: String,
+        elapsed: f64,
+    },
+    /// A step was blocked because an upstream failed.
+    Blocked { node_id: String, reason: String },
+    /// Worker is requesting parallel dispatch of sub-tasks.
+    /// Worker blocks on socket read until it receives ParallelResponse.
+    Submit { items: Vec<SubmitItem> },
+    /// Periodic heartbeat — worker is alive and working.
+    Heartbeat,
+}
+
+/// A work item submitted via parallel().
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitItem {
+    /// Function reference: "module.py:function_name"
+    pub fn_ref: String,
+    /// Positional arguments (JSON values).
+    pub args: Vec<serde_json::Value>,
+    /// Keyword arguments (JSON values).
+    pub kwargs: HashMap<String, serde_json::Value>,
+}
+
+/// Reference to a materialized artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtifactRef {
+    pub path: String,
+    pub format: String,
+    pub size_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_seconds: Option<f64>,
+}
+
+// ─── Coordinator → Worker ────────────────────────────────────────────────────
+
+/// Messages sent from the Rust coordinator to a Python worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CoordinatorMessage {
+    /// Response to a Submit request — results for all submitted items.
+    ParallelResponse { results: Vec<ParallelResult> },
+    /// Request the worker to shut down gracefully.
+    Cancel { reason: String },
+}
+
+/// Result of a single parallel branch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ParallelResult {
+    Ok { result: serde_json::Value },
+    Error { error: String },
+}
+
+// ─── Framing functions ───────────────────────────────────────────────────────
+
+/// Encode a message as a length-prefixed JSON frame.
+pub fn encode_message<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
+    let payload =
+        serde_json::to_vec(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let len = payload.len() as u32;
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&payload);
+    Ok(frame)
+}
+
+/// Write a message to a stream (socket/pipe).
+pub fn write_message<W: Write, T: Serialize>(writer: &mut W, msg: &T) -> io::Result<()> {
+    let frame = encode_message(msg)?;
+    writer.write_all(&frame)?;
+    writer.flush()
+}
+
+/// Read a message from a stream (socket/pipe). Blocks until complete.
+/// Returns None on EOF (clean disconnect).
+pub fn read_message<R: Read, T: for<'de> Deserialize<'de>>(
+    reader: &mut R,
+) -> io::Result<Option<T>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    // Safety: reject absurdly large messages (> 256MB)
+    if len > 256 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("message too large: {len} bytes"),
+        ));
+    }
+
+    let mut payload = vec![0u8; len];
+    reader.read_exact(&mut payload)?;
+    let msg = serde_json::from_slice(&payload)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(Some(msg))
+}
+
+// ─── Socket path helper ──────────────────────────────────────────────────────
+
+/// Generate a unique socket path for a worker.
+pub fn socket_path(run_id: &str, worker_id: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("barca-sockets");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join(format!("{run_id}-{worker_id}.sock"))
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn test_encode_decode_worker_message() {
+        let msg = WorkerMessage::StepCompleted {
+            node_id: "load_data".to_string(),
+            artifact: ArtifactRef {
+                path: "/tmp/artifacts/load_data.json".to_string(),
+                format: "json".to_string(),
+                size_bytes: 1024,
+                elapsed_seconds: Some(0.42),
+            },
+        };
+
+        let frame = encode_message(&msg).unwrap();
+        let mut cursor = Cursor::new(frame);
+        let decoded: Option<WorkerMessage> = read_message(&mut cursor).unwrap();
+        let decoded = decoded.expect("should decode a message");
+
+        match decoded {
+            WorkerMessage::StepCompleted { node_id, artifact } => {
+                assert_eq!(node_id, "load_data");
+                assert_eq!(artifact.path, "/tmp/artifacts/load_data.json");
+                assert_eq!(artifact.format, "json");
+                assert_eq!(artifact.size_bytes, 1024);
+                assert_eq!(artifact.elapsed_seconds, Some(0.42));
+            }
+            _ => panic!("expected StepCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_coordinator_message() {
+        let msg = CoordinatorMessage::ParallelResponse {
+            results: vec![
+                ParallelResult::Ok {
+                    result: serde_json::json!({"value": 42}),
+                },
+                ParallelResult::Error {
+                    error: "timeout".to_string(),
+                },
+            ],
+        };
+
+        let frame = encode_message(&msg).unwrap();
+        let mut cursor = Cursor::new(frame);
+        let decoded: Option<CoordinatorMessage> = read_message(&mut cursor).unwrap();
+        let decoded = decoded.expect("should decode a message");
+
+        match decoded {
+            CoordinatorMessage::ParallelResponse { results } => {
+                assert_eq!(results.len(), 2);
+                match &results[0] {
+                    ParallelResult::Ok { result } => {
+                        assert_eq!(result, &serde_json::json!({"value": 42}));
+                    }
+                    _ => panic!("expected Ok"),
+                }
+                match &results[1] {
+                    ParallelResult::Error { error } => {
+                        assert_eq!(error, "timeout");
+                    }
+                    _ => panic!("expected Error"),
+                }
+            }
+            _ => panic!("expected ParallelResponse"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_submit() {
+        let msg = WorkerMessage::Submit {
+            items: vec![
+                SubmitItem {
+                    fn_ref: "tasks.py:process_chunk".to_string(),
+                    args: vec![serde_json::json!(1), serde_json::json!("hello")],
+                    kwargs: HashMap::from([
+                        ("timeout".to_string(), serde_json::json!(30)),
+                        ("retries".to_string(), serde_json::json!(3)),
+                    ]),
+                },
+                SubmitItem {
+                    fn_ref: "tasks.py:process_chunk".to_string(),
+                    args: vec![serde_json::json!(2)],
+                    kwargs: HashMap::new(),
+                },
+            ],
+        };
+
+        let frame = encode_message(&msg).unwrap();
+        let mut cursor = Cursor::new(frame);
+        let decoded: Option<WorkerMessage> = read_message(&mut cursor).unwrap();
+        let decoded = decoded.expect("should decode a message");
+
+        match decoded {
+            WorkerMessage::Submit { items } => {
+                assert_eq!(items.len(), 2);
+                assert_eq!(items[0].fn_ref, "tasks.py:process_chunk");
+                assert_eq!(items[0].args.len(), 2);
+                assert_eq!(items[0].kwargs.get("timeout"), Some(&serde_json::json!(30)));
+                assert_eq!(items[1].args.len(), 1);
+                assert!(items[1].kwargs.is_empty());
+            }
+            _ => panic!("expected Submit"),
+        }
+    }
+
+    #[test]
+    fn test_read_write_stream() {
+        let msg = WorkerMessage::StepError {
+            node_id: "transform".to_string(),
+            error_type: "ValueError".to_string(),
+            message: "invalid input".to_string(),
+            traceback: "Traceback (most recent call last):\n  ...".to_string(),
+            elapsed: 1.5,
+        };
+
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &msg).unwrap();
+
+        let mut cursor = Cursor::new(buffer);
+        let decoded: Option<WorkerMessage> = read_message(&mut cursor).unwrap();
+        let decoded = decoded.expect("should decode a message");
+
+        match decoded {
+            WorkerMessage::StepError {
+                node_id,
+                error_type,
+                message,
+                traceback,
+                elapsed,
+            } => {
+                assert_eq!(node_id, "transform");
+                assert_eq!(error_type, "ValueError");
+                assert_eq!(message, "invalid input");
+                assert!(traceback.contains("Traceback"));
+                assert!((elapsed - 1.5).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected StepError"),
+        }
+    }
+
+    #[test]
+    fn test_read_eof_returns_none() {
+        let empty: &[u8] = &[];
+        let mut cursor = Cursor::new(empty);
+        let result: io::Result<Option<WorkerMessage>> = read_message(&mut cursor);
+        assert!(result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reject_oversized_message() {
+        // Craft a frame header claiming > 256MB
+        let huge_len: u32 = 256 * 1024 * 1024 + 1;
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&huge_len.to_be_bytes());
+        // Add a few bytes so read_exact for the length succeeds
+        frame.extend_from_slice(&[0u8; 16]);
+
+        let mut cursor = Cursor::new(frame);
+        let result: io::Result<Option<WorkerMessage>> = read_message(&mut cursor);
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("message too large"));
+    }
+
+    #[test]
+    fn test_multiple_messages_on_stream() {
+        let messages = vec![
+            WorkerMessage::Heartbeat,
+            WorkerMessage::StepCompleted {
+                node_id: "step_1".to_string(),
+                artifact: ArtifactRef {
+                    path: "/tmp/step_1.json".to_string(),
+                    format: "json".to_string(),
+                    size_bytes: 512,
+                    elapsed_seconds: None,
+                },
+            },
+            WorkerMessage::Blocked {
+                node_id: "step_2".to_string(),
+                reason: "upstream step_1 failed".to_string(),
+            },
+        ];
+
+        let mut buffer = Vec::new();
+        for msg in &messages {
+            write_message(&mut buffer, msg).unwrap();
+        }
+
+        let mut cursor = Cursor::new(buffer);
+
+        // Read first: Heartbeat
+        let msg1: WorkerMessage = read_message(&mut cursor).unwrap().unwrap();
+        assert!(matches!(msg1, WorkerMessage::Heartbeat));
+
+        // Read second: StepCompleted
+        let msg2: WorkerMessage = read_message(&mut cursor).unwrap().unwrap();
+        match msg2 {
+            WorkerMessage::StepCompleted { node_id, .. } => assert_eq!(node_id, "step_1"),
+            _ => panic!("expected StepCompleted"),
+        }
+
+        // Read third: Blocked
+        let msg3: WorkerMessage = read_message(&mut cursor).unwrap().unwrap();
+        match msg3 {
+            WorkerMessage::Blocked { node_id, reason } => {
+                assert_eq!(node_id, "step_2");
+                assert_eq!(reason, "upstream step_1 failed");
+            }
+            _ => panic!("expected Blocked"),
+        }
+
+        // Read fourth: EOF
+        let msg4: Option<WorkerMessage> = read_message(&mut cursor).unwrap();
+        assert!(msg4.is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_roundtrip() {
+        let msg = WorkerMessage::Heartbeat;
+        let frame = encode_message(&msg).unwrap();
+
+        // Heartbeat should be very small (just the tag)
+        // 4 bytes length prefix + a small JSON payload
+        assert!(frame.len() < 50, "heartbeat frame should be compact");
+
+        let mut cursor = Cursor::new(frame);
+        let decoded: Option<WorkerMessage> = read_message(&mut cursor).unwrap();
+        assert!(matches!(decoded, Some(WorkerMessage::Heartbeat)));
+    }
+
+    #[test]
+    fn test_parallel_result_ok_and_error() {
+        let msg = CoordinatorMessage::ParallelResponse {
+            results: vec![
+                ParallelResult::Ok {
+                    result: serde_json::json!([1, 2, 3]),
+                },
+                ParallelResult::Error {
+                    error: "division by zero".to_string(),
+                },
+                ParallelResult::Ok {
+                    result: serde_json::json!(null),
+                },
+            ],
+        };
+
+        let mut buffer = Vec::new();
+        write_message(&mut buffer, &msg).unwrap();
+
+        let mut cursor = Cursor::new(buffer);
+        let decoded: CoordinatorMessage = read_message(&mut cursor).unwrap().unwrap();
+
+        match decoded {
+            CoordinatorMessage::ParallelResponse { results } => {
+                assert_eq!(results.len(), 3);
+
+                // First: Ok with array
+                match &results[0] {
+                    ParallelResult::Ok { result } => {
+                        assert_eq!(result, &serde_json::json!([1, 2, 3]));
+                    }
+                    _ => panic!("expected Ok"),
+                }
+
+                // Second: Error
+                match &results[1] {
+                    ParallelResult::Error { error } => {
+                        assert_eq!(error, "division by zero");
+                    }
+                    _ => panic!("expected Error"),
+                }
+
+                // Third: Ok with null
+                match &results[2] {
+                    ParallelResult::Ok { result } => {
+                        assert!(result.is_null());
+                    }
+                    _ => panic!("expected Ok"),
+                }
+            }
+            _ => panic!("expected ParallelResponse"),
+        }
+    }
+}

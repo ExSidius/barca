@@ -62,6 +62,19 @@ pub struct PlanStream {
     pub steps: Vec<String>,
 }
 
+/// Lightweight summary of a single DAG node, for the server's `/assets` listing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssetSummary {
+    /// Stable node id (continuity key), e.g. `pipeline.py:fetch`.
+    pub id: String,
+    /// Node kind: asset, sensor, or task.
+    pub kind: crate::NodeKind,
+    /// Freshness policy (always / manual / schedule).
+    pub freshness: crate::Freshness,
+    /// Upstream node ids this node depends on (direct + collected), sorted.
+    pub inputs: Vec<String>,
+}
+
 // ─── Shared setup ────────────────────────────────────────────────────────────
 
 pub fn find_python() -> PathBuf {
@@ -88,14 +101,73 @@ fn default_pool_size() -> usize {
         .unwrap_or(4)
 }
 
-// ─── get ─────────────────────────────────────────────────────────────────────
+// ─── get / run ─────────────────────────────────────────────────────────────────
 
+/// How the engine treats cached asset materializations for this invocation.
+#[derive(Debug, Clone)]
+pub enum CachePolicy {
+    /// Normal cache-aware behavior — reuse fresh asset artifacts (`barca get`).
+    CacheAware,
+    /// Force-rerun every asset in the target's cone (`barca run`, default).
+    BurstAll,
+    /// Force-rerun only the named assets; all others stay cache-aware
+    /// (`barca run <task> --burst a,b`). A name matches when it equals the
+    /// node's base id exactly, or matches the trailing `:name` segment.
+    BurstSelective(Vec<String>),
+}
+
+/// `barca get` — cache-aware execution of an asset (or all assets).
 pub fn get(
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
     no_cache: bool,
     agent_mode: bool,
+) -> Result<GetResult, BarcaError> {
+    execute(
+        target_name,
+        file_args,
+        python,
+        no_cache,
+        agent_mode,
+        CachePolicy::CacheAware,
+        "get",
+    )
+}
+
+/// `barca run` — execute a task (and its cone), bursting upstream asset caches.
+/// `burst == None` bursts all upstream assets; `Some(names)` bursts only those.
+pub fn run(
+    target_name: &str,
+    file_args: &[String],
+    python: &PathBuf,
+    burst: Option<Vec<String>>,
+    agent_mode: bool,
+) -> Result<GetResult, BarcaError> {
+    let policy = match burst {
+        None => CachePolicy::BurstAll,
+        Some(names) => CachePolicy::BurstSelective(names),
+    };
+    execute(
+        Some(target_name),
+        file_args,
+        python,
+        false,
+        agent_mode,
+        policy,
+        "run",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute(
+    target_name: Option<&str>,
+    file_args: &[String],
+    python: &PathBuf,
+    no_cache: bool,
+    agent_mode: bool,
+    policy: CachePolicy,
+    command_label: &str,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
     let run_id = db::generate_run_id();
@@ -114,6 +186,21 @@ pub fn get(
                     let available: Vec<&str> = dag.topo_order();
                     BarcaError::AssetNotFound(name.to_string(), available.join(", "))
                 })?;
+            // Enforce get/run semantics: `barca get` is for assets, `barca run` is for tasks.
+            if let Some(node) = dag.get_node(&id) {
+                let kind = node.kind();
+                if command_label == "get" && kind == crate::NodeKind::Task {
+                    return Err(BarcaError::Other(format!(
+                        "'{name}' is a task — use `barca run` instead"
+                    )));
+                }
+                if command_label == "run" && kind == crate::NodeKind::Asset {
+                    return Err(BarcaError::Other(format!(
+                        "'{name}' is an asset — use `barca get` instead"
+                    )));
+                }
+            }
+
             Some(id)
         }
         None => None,
@@ -138,7 +225,7 @@ pub fn get(
     db::create_run_sync(
         &db_path,
         &run_id,
-        "get",
+        command_label,
         &file_args.join(" "),
         target_name,
         Some(exec_plan.total_steps),
@@ -163,6 +250,9 @@ pub fn get(
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
+    // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
+    let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
+    let all_attempts: HashMap<String, u32> = HashMap::new();
     let mut steps_executed = 0;
 
     // Progress bar setup.
@@ -244,14 +334,35 @@ pub fn get(
                 let display_id = step.step_id.display();
                 let base_node = dag.get_node(base_id);
 
-                // Sensors always re-run.
-                if base_node.is_some_and(|n| n.kind() == crate::NodeKind::Sensor) {
+                // Sensors and tasks always re-run — never cached.
+                if base_node.is_some_and(|n| {
+                    matches!(n.kind(), crate::NodeKind::Sensor | crate::NodeKind::Task)
+                }) {
                     uncached_steps.push(step.clone());
                     continue;
                 }
 
                 // Skip cache lookups when no_cache is set.
                 if no_cache {
+                    uncached_steps.push(step.clone());
+                    continue;
+                }
+
+                // Burst policy (`barca run`): force-rerun assets in/named by the
+                // burst set, bypassing the cache. Tasks/sensors already re-ran above.
+                let bursted = match &policy {
+                    CachePolicy::CacheAware => false,
+                    CachePolicy::BurstAll => {
+                        base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+                    }
+                    CachePolicy::BurstSelective(names) => {
+                        base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+                            && names.iter().any(|name| {
+                                base_id == name || base_id.ends_with(&format!(":{name}"))
+                            })
+                    }
+                };
+                if bursted {
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -280,7 +391,7 @@ pub fn get(
                 let cached = rt.block_on(async {
                     let mut rows = conn
                         .query(
-                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
+                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
                             [display_id.clone(), run_h.clone()],
                         )
                         .await
@@ -335,47 +446,142 @@ pub fn get(
             .sum::<usize>();
 
         let provided = dispatch::build_provided_inputs(&filtered_phase, &all_outputs);
-
-        // Progress callback — update bar as each step completes from any worker.
-        let mut on_step = |node_id: &str, output: &dispatch::OutputRef| {
-            if let Some(e) = output.elapsed_seconds {
-                elapsed_so_far += e;
-            }
-            completed_steps += 1;
-            if let Some(ref bar) = pb {
-                bar.set_position(completed_steps as u64);
-                let remaining = if total_estimated > 0.0 {
-                    (total_estimated - elapsed_so_far).max(0.0)
-                } else if completed_steps > 0 {
-                    let avg = elapsed_so_far / completed_steps as f64;
-                    avg * (total_steps - completed_steps) as f64
+        let mut coord = crate::coordinator::Coordinator::new();
+        let loaded = coord.load_phase(&filtered_phase, &provided);
+        let expected: usize = filtered_phase
+            .streams
+            .iter()
+            .flat_map(|s| &s.steps)
+            .map(|st| {
+                if st.partition_keys.is_empty() {
+                    1
                 } else {
-                    0.0
-                };
-                let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
-                if remaining > 0.5 {
-                    bar.set_prefix(format!("{}left", fmt_eta(remaining)));
-                } else {
-                    bar.set_prefix("   done ");
+                    st.partition_keys.len()
                 }
-                bar.set_message(format!("{short_name} done"));
-            } else if agent_mode {
-                eprintln!(
-                    "[barca] step:{} completed {:.1}s ({}/{})",
-                    node_id,
-                    output.elapsed_seconds.unwrap_or(0.0),
-                    completed_steps,
-                    total_steps
-                );
-            }
+            })
+            .sum();
+        assert_eq!(
+            loaded, expected,
+            "plan/coordinator step count mismatch: loaded {loaded}, expected {expected}"
+        );
+
+        // Progress callback — update bar as each step completes.
+        let on_step_cb: crate::io_loop::StepCallback<'_> =
+            Box::new(|node_id: &str, artifact: &serde_json::Value| {
+                let elapsed_s = artifact.get("elapsed_seconds").and_then(|v| v.as_f64());
+                if let Some(e) = elapsed_s {
+                    elapsed_so_far += e;
+                }
+                completed_steps += 1;
+                if let Some(ref bar) = pb {
+                    bar.set_position(completed_steps as u64);
+                    let remaining = if total_estimated > 0.0 {
+                        (total_estimated - elapsed_so_far).max(0.0)
+                    } else if completed_steps > 0 {
+                        let avg = elapsed_so_far / completed_steps as f64;
+                        avg * (total_steps - completed_steps) as f64
+                    } else {
+                        0.0
+                    };
+                    let short_name = node_id.rsplit(':').next().unwrap_or(node_id);
+                    if remaining > 0.5 {
+                        bar.set_prefix(format!("{}left", fmt_eta(remaining)));
+                    } else {
+                        bar.set_prefix("   done ");
+                    }
+                    bar.set_message(format!("{short_name} done"));
+                } else if agent_mode {
+                    eprintln!(
+                        "[barca] step:{} completed {:.1}s ({}/{})",
+                        node_id,
+                        elapsed_s.unwrap_or(0.0),
+                        completed_steps,
+                        total_steps
+                    );
+                }
+            });
+
+        // Run the coordinator via io_loop
+        let io_config = crate::io_loop::IoConfig {
+            python: python.clone(),
+            pool_size,
+            run_id: run_id.clone(),
         };
 
-        let phase_result =
-            dispatch::execute_phase(&filtered_phase, &provided, python, Some(&mut on_step));
-        if phase_error.is_none() {
-            phase_error = phase_result.error;
+        // Use a multi-thread runtime for io_loop — the current_thread runtime (used
+        // for Turso DB) doesn't drive spawned tasks concurrently enough for the
+        // worker I/O task pattern.
+        let io_rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| BarcaError::Other(format!("failed to create io runtime: {e}")))?;
+        let phase_err = io_rt.block_on(crate::io_loop::run(
+            &mut coord,
+            &io_config,
+            Some(on_step_cb),
+        ));
+        drop(io_rt);
+        if let Err(e) = phase_err {
+            if phase_error.is_none() {
+                phase_error = Some(e);
+            }
         }
-        let phase_outputs = phase_result.outputs;
+
+        // Collect results from coordinator
+        let mut phase_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
+        for (&item_id, artifact_val) in coord.outputs() {
+            let node_id = coord.item(item_id).step_id.display();
+            let oref = dispatch::OutputRef {
+                path: artifact_val
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                format: artifact_val
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("json")
+                    .to_string(),
+                size_bytes: artifact_val
+                    .get("size_bytes")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                elapsed_seconds: artifact_val.get("elapsed_seconds").and_then(|v| v.as_f64()),
+            };
+            phase_outputs.insert(node_id, oref);
+        }
+
+        // Collect failures — parallel branch failures (group members) are
+        // contained within the group and surfaced as ParallelError to the parent,
+        // so they should NOT abort the entire phase.
+        let mut first_non_group_failure: Option<String> = None;
+        for (item_id, error_msg) in coord.failed_items() {
+            let item = coord.item(item_id);
+            if item.group.is_some() {
+                // Parallel branch failure — handled by the group/parent, not a phase error.
+                continue;
+            }
+            let node_id = item.step_id.display();
+            if first_non_group_failure.is_none() {
+                first_non_group_failure = Some(error_msg.to_string());
+            }
+            all_failures.push(dispatch::StepFailure {
+                node_id,
+                error: dispatch::StepError {
+                    error_type: "WorkerError".to_string(),
+                    message: error_msg.to_string(),
+                    traceback: String::new(),
+                    attempts: item.attempts,
+                },
+            });
+        }
+
+        // Propagate non-group failures into phase_error if not already set
+        if let Some(msg) = first_non_group_failure {
+            if phase_error.is_none() {
+                phase_error = Some(msg);
+            }
+        }
 
         let step_order: Vec<String> = filtered_phase
             .streams
@@ -454,8 +660,10 @@ pub fn get(
                 .elapsed_seconds
                 .map(|e| e.to_string())
                 .unwrap_or_default();
+            let base = crate::StepId::parse(node_id).base_id().to_string();
+            let attempts = all_attempts.get(&base).copied().unwrap_or(1);
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''))",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7)",
                 [
                     node_id.clone(),
                     run_h.clone(),
@@ -463,6 +671,55 @@ pub fn get(
                     oref.format.clone(),
                     oref.size_bytes.to_string(),
                     elapsed_str,
+                    attempts.to_string(),
+                ],
+            )
+            .await
+            .ok();
+        }
+
+        // Persist permanently-failed steps as `status='failed'` rows (artifact
+        // columns NULL). Failed rows are never served as cache hits.
+        // Use all_attempts (exec_attempts) for parity with success rows —
+        // scheduler dispatch counts can overstate for blocked descendants.
+        for failure in &all_failures {
+            let node_id = &failure.node_id;
+            let sid = crate::StepId::parse(node_id);
+            let base = sid.base_id().to_string();
+            let def_hash = dag
+                .get_node(sid.base_id())
+                .map(|n| n.definition_hash.as_str())
+                .unwrap_or("");
+            let partition_key = if sid.partition.is_empty() {
+                None
+            } else {
+                Some(sid.partition.suffix())
+            };
+            let upstream_ids: Vec<String> = dag
+                .get_node(sid.base_id())
+                .map(|n| {
+                    n.resolved_inputs
+                        .values()
+                        .chain(n.resolved_collected.values())
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let run_h = cache::compute_run_hash(
+                def_hash,
+                partition_key.as_deref(),
+                upstream_ids.iter(),
+                &cached_run_hashes,
+            );
+            let attempts = all_attempts.get(&base).copied().unwrap_or(failure.error.attempts);
+            conn.execute(
+                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
+                [
+                    node_id.clone(),
+                    run_h,
+                    failure.error.message.clone(),
+                    failure.error.traceback.clone(),
+                    attempts.to_string(),
                 ],
             )
             .await
@@ -599,6 +856,39 @@ pub fn stats(
     let db_path = db::ensure_db_dir()?;
     db::init_db_sync(&db_path)?;
     db::get_asset_stats_sync(&db_path, &target_id)
+}
+
+// ─── list_assets ──────────────────────────────────────────────────────────────
+
+/// Build the DAG and return a summary of every node (id, kind, freshness, inputs).
+/// Pure static analysis — no execution, no DB. Used by the server's `/assets` route.
+pub fn list_assets(
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<Vec<AssetSummary>, BarcaError> {
+    let dag = build_dag(file_args, python)?;
+    let summaries = dag
+        .topo_order()
+        .into_iter()
+        .filter_map(|id| dag.get_node(id))
+        .map(|node| {
+            let mut inputs: Vec<String> = node
+                .resolved_inputs
+                .values()
+                .chain(node.resolved_collected.values())
+                .cloned()
+                .collect();
+            inputs.sort();
+            inputs.dedup();
+            AssetSummary {
+                id: node.id.clone(),
+                kind: node.kind(),
+                freshness: node.extracted.freshness.clone(),
+                inputs,
+            }
+        })
+        .collect();
+    Ok(summaries)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -20,7 +20,7 @@ trim = true
 render_always = false
 
 [git]
-conventional_commits = false
+conventional_commits = true
 filter_unconventional = false
 split_commits = false
 commit_preprocessors = [
@@ -29,15 +29,15 @@ commit_preprocessors = [
 ]
 commit_parsers = [
     { message = "^[Mm]erge", skip = true },
-    { message = "^[Ff]eat", group = "Features" },
-    { message = "^[Ff]ix", group = "Bug Fixes" },
-    { message = "^[Rr]efactor", group = "Refactor" },
-    { message = "^[Pp]olish", group = "Polish" },
-    { message = "^[Dd]oc", group = "Documentation" },
-    { message = "^[Tt]est", group = "Testing" },
-    { message = "^[Pp]erf", group = "Performance" },
-    { message = "^[Dd]rop|^[Rr]emove", group = "Removed" },
-    { message = "^[Bb]ump|^[Rr]elease|^[Vv]0\\.", group = "Release" },
+    { type = "feat", group = "Features" },
+    { type = "fix", group = "Bug Fixes" },
+    { type = "refactor", group = "Refactor" },
+    { type = "polish", group = "Polish" },
+    { type = "doc", group = "Documentation" },
+    { type = "test", group = "Testing" },
+    { type = "perf", group = "Performance" },
+    { type = "remove", group = "Removed" },
+    { type = "release", group = "Release" },
     { message = ".*", group = "Changes" },
 ]
 filter_commits = false

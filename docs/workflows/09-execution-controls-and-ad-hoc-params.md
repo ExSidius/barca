@@ -8,7 +8,7 @@ This workflow assumes the Barca core constraints documented in [../core-constrai
 
 For the MVP:
 
-- assets, sensors, and effects all support `timeout_seconds`, defaulting to `300`
+- assets, sensors, and tasks all support `timeout_seconds`, defaulting to `300`
 - failed attempts retry 3 times with exponential backoff
 - running work must be visible in real time in UI and TUI
 - users can cancel running work in real time
@@ -22,7 +22,7 @@ Recommended decorator shape additions:
 ```python
 @asset(..., timeout_seconds=300)
 @sensor(..., timeout_seconds=300)
-@effect(..., timeout_seconds=300)
+@task(..., timeout_seconds=300)
 ```
 
 Timeouts are expressed in seconds.
@@ -121,11 +121,11 @@ def square(x: int) -> int:
     return x**2
 ```
 
-Users should be able to materialize this with ad hoc params like:
+Users should be able to run this with ad hoc params like:
 
-```python
-materialize(square, params={"x": 7})
-materialize(square, params={"x": 14})
+```bash
+barca get square pipeline.py --param x=7
+barca get square pipeline.py --param x=14
 ```
 
 ## Why ad hoc params matter
@@ -190,15 +190,14 @@ Both should participate in cache identity, but only partitions define managed su
 
 For the MVP:
 
-- allow ad hoc params in materialization/read helpers
+- allow ad hoc params in CLI and execution helpers
 - include params in `run_hash`
 - do not force every repeated input into partitions
 
 Useful shapes:
 
-```python
-materialize(square, params={"x": 7})
-read_asset(square, params={"x": 7})
+```bash
+barca get square pipeline.py --param x=7
 ```
 
 ## Failure model for pure assets
@@ -215,11 +214,11 @@ Barca does not need to add more complicated automatic healing behavior in the MV
 
 ## Acceptance criteria
 
-- Assets, sensors, and effects all support `timeout_seconds=300` by default.
+- Assets, sensors, and tasks all support `timeout_seconds=300` by default.
 - Failed attempts retry up to 3 times with exponential backoff.
 - Running nodes are visible in UI and TUI.
 - Users can cancel running nodes in real time.
 - Cancelled runs are marked `cancelled` and remain incomplete.
-- Ad hoc params are supported in materialization/read helpers.
+- Ad hoc params are supported in CLI invocations.
 - Ad hoc params are included in cache identity.
 - Repeated calls with the same code, upstream provenance, and params reuse cache immediately.

@@ -1,6 +1,6 @@
 # Decorators
 
-Core decorators for defining assets, sensors, effects, sinks, and related primitives.
+Core decorators for defining assets, sensors, tasks, sinks, and related primitives.
 
 ## @asset
 
@@ -50,23 +50,22 @@ def daily_report() -> dict:
 ```python
 @sink(
     path: str,
-    serializer: SerializerKind,
 )
 ```
 
 Stacked on an `@asset` to write the asset's output to a path when it materialises. Paths are fsspec-compatible (local, `s3://`, `gs://`, etc.). Multiple `@sink` decorators may be stacked on the same asset.
 
 ```python
-from barca import asset, sink, Always, JsonSerializer
+from barca import asset, sink, Always
 
 @asset(freshness=Always)
-@sink('./output.json', serializer=JsonSerializer)
-@sink('s3://my-bucket/output.json', serializer=JsonSerializer)
+@sink('./output.json')
+@sink('s3://my-bucket/output.json')
 def banana() -> dict:
     return {'a': 1}
 ```
 
-Sinks are leaf nodes — no other asset may list a sink as an input. A sink failure does not fail the parent asset, but is surfaced prominently in `assets list` and job logs.
+Sinks are leaf nodes — no other asset may list a sink as an input. A sink failure does not fail the parent asset, but is surfaced prominently in logs.
 
 ::: barca.sink
     options:
@@ -107,42 +106,62 @@ Sensors are source nodes only — they have no upstream inputs.
 
 ::: barca.SensorWrapper
 
-## @effect
+## @task
 
 ```python
-@effect(
+@task(
     name: str | None = None,
     inputs: dict[str, NodeRefLike] | None = None,
     freshness: Freshness = Always,
     timeout_seconds: int = 300,
+    retries: int = 1,
+    retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
 )
 ```
 
-Declares a standalone side-effect function — sending email, writing to a database, calling an external API. Effects take upstream inputs and produce no meaningful output. Use `@effect` for arbitrary side-effects; use `@sink` for writing asset outputs to file paths.
+Declares a **task** — a workflow-management step such as a deploy, notification,
+migration, or cache warm. Tasks always re-run and are never cached, so they're
+the right home for "do something" operations that don't produce cacheable data.
 
-Effects are leaf nodes — no other asset may list an effect as an input.
+- They may appear **anywhere** in the graph (not just at the leaves).
+- They may depend on assets, sensors, or other tasks (via `inputs=`).
+- For ordering-only dependencies (no data needed), use the `_` prefix convention:
+  `inputs={"_dep": some_node}`. The `_` prefix tells barca to skip artifact
+  deserialization — the parameter receives `None`.
+- They must **not** be an input to an asset or sensor (a task always re-runs, so
+  feeding its output into a cacheable node would keep that node perpetually
+  stale).
+
+Run a task with [`barca run`](../cli.md). By default `barca run` force-reruns
+every upstream asset; `--burst a,b` re-runs only the named assets.
 
 ```python
-from barca import asset, effect, Always
+from barca import asset, task
 
 @asset()
 def report() -> dict:
     return {"rows": 42}
 
-@effect(inputs={"data": report}, freshness=Always)
+# Asset -> task: a task consuming an upstream asset.
+@task(inputs={"data": report})
 def send_email(data: dict) -> None:
     print(f"Sending report: {data}")
+
+# Ordering-only: migrate runs first, notify doesn't need its data.
+@task()
+def migrate() -> None:
+    run_migration()
+
+@task(inputs={"_migrate": migrate})
+def notify(_migrate) -> None:
+    send_slack("migration done")
 ```
 
-::: barca.effect
+::: barca.task
     options:
       show_source: false
-
-## EffectWrapper
-
-::: barca.EffectWrapper
 
 ## @unsafe
 

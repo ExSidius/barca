@@ -15,17 +15,9 @@ uv run pytest tests/ -v              # run tests
 
 ```bash
 cd examples/basic_app && uv sync
-uv run barca reindex
-uv run barca assets list
-uv run barca assets refresh 1
-```
-
-Or the iris ML pipeline:
-
-```bash
-cd examples/iris_pipeline && uv sync
-uv run barca reindex
-uv run barca assets refresh 1        # cascades all upstream deps
+uv run barca get pipeline.py         # materialize all assets
+uv run barca plan pipeline.py        # inspect the execution plan
+uv run barca run pipeline.py         # run tasks + upstream assets
 ```
 
 ## How it works
@@ -55,7 +47,7 @@ uv run pytest tests/test_server.py -v
 
 ## Free-threaded Python
 
-Barca defaults to Python 3.14t (free-threaded, GIL disabled) via `.python-version`. This enables true thread parallelism for partitioned assets.
+Barca defaults to Python 3.14t (free-threaded) via `.python-version`.
 
 To opt out and use standard Python:
 
