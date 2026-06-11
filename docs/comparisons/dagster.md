@@ -113,7 +113,7 @@ The user's error is 6 frames deep in dagster internals.
 ### `dg list defs` — discoverability command
 
 Shows a clean table of every asset, deps, group, kind. Answers "what does the framework
-see?" without running anything. Barca needs an equivalent (`barca list`).
+see?" without running anything. Barca's `barca list` command (added in 0.2.1) fills this gap.
 
 ### Scaffolded `.gitignore`
 

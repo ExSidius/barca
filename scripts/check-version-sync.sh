@@ -2,11 +2,22 @@
 # Verify all version strings are consistent across the project.
 set -euo pipefail
 
-CORE=$(grep '^version' crates/barca-core/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-CLI=$(grep '^version' crates/barca-cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-SERVER=$(grep '^version' crates/barca-server/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-PY_TOML=$(grep '^version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-PY_INIT=$(grep '__version__' python/barca/__init__.py | sed 's/.*"\(.*\)".*/\1/')
+extract() {
+    local file="$1" pattern="$2"
+    local val
+    val=$(grep "$pattern" "$file" | head -1 | sed 's/.*"\(.*\)".*/\1/' || true)
+    if [ -z "$val" ]; then
+        echo "ERROR: could not extract version from $file (pattern: $pattern)" >&2
+        exit 1
+    fi
+    echo "$val"
+}
+
+CORE=$(extract crates/barca-core/Cargo.toml '^version')
+CLI=$(extract crates/barca-cli/Cargo.toml '^version')
+SERVER=$(extract crates/barca-server/Cargo.toml '^version')
+PY_TOML=$(extract pyproject.toml '^version')
+PY_INIT=$(extract python/barca/__init__.py '__version__')
 
 ERRORS=0
 for name_ver in "barca-cli:$CLI" "barca-server:$SERVER" "pyproject.toml:$PY_TOML" "__init__.py:$PY_INIT"; do

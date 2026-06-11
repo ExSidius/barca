@@ -326,8 +326,16 @@ fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::Bar
             .unwrap_or_else(|| format!("{:?}", a.kind).to_lowercase());
         let freshness = serde_json::to_value(&a.freshness)
             .ok()
-            .and_then(|v| v.get("type").and_then(|t| t.as_str().map(String::from)))
-            .unwrap_or_else(|| format!("{:?}", a.freshness));
+            .and_then(|v| {
+                let ty = v.get("type")?.as_str()?;
+                if ty == "Schedule" {
+                    let cron = v.get("value").and_then(|c| c.as_str()).unwrap_or("?");
+                    Some(format!("cron: {cron}"))
+                } else {
+                    Some(ty.to_lowercase())
+                }
+            })
+            .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
         let deps = if a.inputs.is_empty() {
             "-".to_string()
         } else {
