@@ -15,6 +15,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
 use turso::Builder;
 
 /// Format seconds as a fixed-width time string for progress display.
@@ -124,6 +125,19 @@ pub fn get(
     no_cache: bool,
     agent_mode: bool,
 ) -> Result<GetResult, BarcaError> {
+    get_streaming(target_name, file_args, python, no_cache, agent_mode, None)
+}
+
+/// Like [`get`] but streams live [`RunEvent`]s to `event_tx` as the run
+/// progresses (logs, step completion). Logs are persisted to the DB regardless.
+pub fn get_streaming(
+    target_name: Option<&str>,
+    file_args: &[String],
+    python: &PathBuf,
+    no_cache: bool,
+    agent_mode: bool,
+    event_tx: Option<UnboundedSender<crate::RunEvent>>,
+) -> Result<GetResult, BarcaError> {
     execute(
         target_name,
         file_args,
@@ -132,6 +146,7 @@ pub fn get(
         agent_mode,
         CachePolicy::CacheAware,
         "get",
+        event_tx,
     )
 }
 
@@ -143,6 +158,18 @@ pub fn run(
     python: &PathBuf,
     burst: Option<Vec<String>>,
     agent_mode: bool,
+) -> Result<GetResult, BarcaError> {
+    run_streaming(target_name, file_args, python, burst, agent_mode, None)
+}
+
+/// Like [`run`] but streams live [`RunEvent`]s to `event_tx`.
+pub fn run_streaming(
+    target_name: &str,
+    file_args: &[String],
+    python: &PathBuf,
+    burst: Option<Vec<String>>,
+    agent_mode: bool,
+    event_tx: Option<UnboundedSender<crate::RunEvent>>,
 ) -> Result<GetResult, BarcaError> {
     let policy = match burst {
         None => CachePolicy::BurstAll,
@@ -156,6 +183,7 @@ pub fn run(
         agent_mode,
         policy,
         "run",
+        event_tx,
     )
 }
 
@@ -168,6 +196,7 @@ fn execute(
     agent_mode: bool,
     policy: CachePolicy,
     command_label: &str,
+    event_tx: Option<UnboundedSender<crate::RunEvent>>,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
     let run_id = db::generate_run_id();
@@ -250,6 +279,8 @@ fn execute(
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
+    // Captured user stdout (node_id, line), persisted to the DB after the run.
+    let mut logs_buffer: Vec<(String, String)> = Vec::new();
     // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
     let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
     let all_attempts: HashMap<String, u32> = HashMap::new();
@@ -501,6 +532,22 @@ fn execute(
                 }
             });
 
+        // Event sink — buffer log lines for DB persistence, and forward every
+        // event live to the caller's channel (the HTTP server) if present.
+        let event_tx_phase = event_tx.clone();
+        let on_event_cb: crate::io_loop::EventCallback<'_> = Box::new(|ev: crate::RunEvent| {
+            if let crate::RunEvent::Log {
+                ref node_id,
+                ref line,
+            } = ev
+            {
+                logs_buffer.push((node_id.clone(), line.clone()));
+            }
+            if let Some(ref tx) = event_tx_phase {
+                let _ = tx.send(ev);
+            }
+        });
+
         // Run the coordinator via io_loop
         let io_config = crate::io_loop::IoConfig {
             python: python.clone(),
@@ -519,6 +566,7 @@ fn execute(
             &mut coord,
             &io_config,
             Some(on_step_cb),
+            Some(on_event_cb),
         ));
         drop(io_rt);
         if let Err(e) = phase_err {
@@ -729,6 +777,10 @@ fn execute(
 
     let steps_cached = cached_node_ids.len();
     let elapsed = t0.elapsed().as_secs_f64();
+
+    // Persist captured stdout. Rust owns persistence — logs land in the DB
+    // regardless of how the run was triggered (CLI or server).
+    let _ = db::insert_logs_sync(&db_path, &run_id, &logs_buffer);
 
     // Propagate worker error after persisting partial results.
     if let Some(error) = phase_error {

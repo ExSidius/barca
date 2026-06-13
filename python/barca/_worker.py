@@ -10,7 +10,9 @@ Protocol:
   - No DB access — Rust owns all persistence
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import sys
 import time
@@ -18,6 +20,45 @@ import traceback
 from pathlib import Path
 
 from barca._artifacts import artifact_path, deserialize, detect_format, serialize
+
+
+class _LineEmitter(io.TextIOBase):
+    """A stdout proxy that streams complete lines to the coordinator as they
+    are written, so user `print()` output shows up live in the UI — while still
+    passing the text through to the real stdout, preserving the terminal
+    behaviour CLI users expect. Buffers a partial trailing line until the next
+    newline or an explicit flush."""
+
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self._buf = ""
+        # The real stdout, captured before redirect_stdout swaps sys.stdout.
+        self._passthrough = sys.stdout
+
+    def write(self, s):
+        from barca import _runtime
+
+        # Tee to the real stdout so `print()` still shows on the terminal.
+        try:
+            self._passthrough.write(s)
+        except Exception:
+            pass
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            _runtime.emit_log(self.node_id, line)
+        return len(s)
+
+    def flush(self):
+        from barca import _runtime
+
+        try:
+            self._passthrough.flush()
+        except Exception:
+            pass
+        if self._buf:
+            _runtime.emit_log(self.node_id, self._buf)
+            self._buf = ""
 
 
 _PROTOCOL_VERSION = 2
@@ -366,16 +407,20 @@ def run_daemon():
                     kwargs[param] = deserialize(artifact_path_str, fmt)
 
             timeout = step.get("timeout_seconds", 0)
-            if d_args:
-                if timeout and timeout > 0:
-                    result = _run_with_timeout(lambda: fn(*d_args, **kwargs), {}, timeout)
+            # Capture user stdout and stream it live, line by line.
+            emitter = _LineEmitter(node_id)
+            with contextlib.redirect_stdout(emitter):
+                if d_args:
+                    if timeout and timeout > 0:
+                        result = _run_with_timeout(lambda: fn(*d_args, **kwargs), {}, timeout)
+                    else:
+                        result = fn(*d_args, **kwargs)
                 else:
-                    result = fn(*d_args, **kwargs)
-            else:
-                if timeout and timeout > 0:
-                    result = _run_with_timeout(lambda: fn(**kwargs), {}, timeout)
-                else:
-                    result = fn(**kwargs)
+                    if timeout and timeout > 0:
+                        result = _run_with_timeout(lambda: fn(**kwargs), {}, timeout)
+                    else:
+                        result = fn(**kwargs)
+                emitter.flush()
 
             elapsed = time.time() - t0
 

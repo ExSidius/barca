@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::coordinator::{Coordinator, GroupId, ItemId, ItemSpec};
+use crate::events::RunEvent;
 use crate::protocol::{CoordinatorMessage, ParallelResult, WorkerMessage};
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -28,6 +29,9 @@ pub struct IoConfig {
 
 /// Callback invoked on each step completion with (node_id, artifact_json).
 pub type StepCallback<'a> = Box<dyn FnMut(&str, &serde_json::Value) + 'a>;
+
+/// Callback invoked with each live [`RunEvent`] as a run progresses.
+pub type EventCallback<'a> = Box<dyn FnMut(RunEvent) + 'a>;
 
 // ─── Worker handle ───────────────────────────────────────────────────────────
 
@@ -110,6 +114,7 @@ pub async fn run(
     coord: &mut Coordinator,
     config: &IoConfig,
     mut on_step: Option<StepCallback<'_>>,
+    mut on_event: Option<EventCallback<'_>>,
 ) -> Result<(), String> {
     let socket_path = crate::protocol::socket_path(&config.run_id, "main");
     std::fs::remove_file(&socket_path).ok();
@@ -177,6 +182,16 @@ pub async fn run(
                         if let Some(ref mut cb) = on_step {
                             cb(node_id, &artifact_val);
                         }
+                        if let Some(ref mut ev) = on_event {
+                            ev(RunEvent::StepFinished {
+                                node_id: node_id.clone(),
+                                ok: true,
+                                elapsed_seconds: artifact_val
+                                    .get("elapsed_seconds")
+                                    .and_then(|v| v.as_f64()),
+                                error: None,
+                            });
+                        }
                         coord.on_item_completed(item_id);
 
                         // Mark worker idle
@@ -205,6 +220,14 @@ pub async fn run(
                             .and_then(|w| w.executing)
                             .expect("StepError but worker has no executing item");
 
+                        if let Some(ref mut ev) = on_event {
+                            ev(RunEvent::StepFinished {
+                                node_id: coord.item(item_id).step_id.display(),
+                                ok: false,
+                                elapsed_seconds: None,
+                                error: Some(message.clone()),
+                            });
+                        }
                         coord.on_item_failed(item_id, message);
 
                         if let Some(w) = workers.get_mut(&worker_id) {
@@ -246,6 +269,13 @@ pub async fn run(
                             &mut next_worker_id,
                         )
                         .await;
+                    }
+                    WorkerMessage::Log { node_id, line } => {
+                        // A line of user stdout — forward live; the caller persists
+                        // it to the DB. Does not change worker/coordinator state.
+                        if let Some(ref mut ev) = on_event {
+                            ev(RunEvent::Log { node_id, line });
+                        }
                     }
                     WorkerMessage::Submit { items } => {
                         let item_id = workers

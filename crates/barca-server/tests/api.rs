@@ -134,3 +134,39 @@ async fn status_for_unknown_run_returns_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn events_for_unknown_run_returns_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(fixture_config(dir.path()));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/events/deadbeef")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn logs_for_unknown_run_returns_empty() {
+    // Unknown run id → empty list, not an error: logs are durable history and
+    // "no rows" is a valid answer.
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(fixture_config(dir.path()));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/logs/deadbeef")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert_eq!(json["logs"], serde_json::json!([]));
+}

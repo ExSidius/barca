@@ -1,12 +1,14 @@
 //! Shared server state and in-memory run tracking.
 
+use barca_core::RunEvent;
 use barca_core::commands::{AssetSummary, GetResult, PlanResult};
 use dashmap::DashMap;
 use serde::Serialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::broadcast;
 
 /// Configuration for a `barca serve` instance. Built by the CLI and handed to
 /// [`crate::serve`].
@@ -64,15 +66,60 @@ pub struct DagCache {
     pub plan: Option<PlanResult>,
 }
 
+/// Live event channel for one run: a broadcast for subscribers plus a backlog
+/// so a client that subscribes a beat after the run starts still receives the
+/// events emitted before it connected (the "replay backlog, then stream live"
+/// pattern). Durable history lives in the DB; this is the live tap.
+#[derive(Clone)]
+pub struct RunChannel {
+    tx: broadcast::Sender<RunEvent>,
+    backlog: Arc<Mutex<Vec<RunEvent>>>,
+}
+
+impl Default for RunChannel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RunChannel {
+    pub fn new() -> Self {
+        let (tx, _) = broadcast::channel(1024);
+        Self {
+            tx,
+            backlog: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Record an event to the backlog and broadcast it to live subscribers.
+    /// Push-before-send under the lock so a subscriber snapshotting the backlog
+    /// (while holding the lock) can't miss or duplicate an event.
+    pub fn emit(&self, event: RunEvent) {
+        let mut backlog = self.backlog.lock().unwrap();
+        backlog.push(event.clone());
+        let _ = self.tx.send(event);
+    }
+
+    /// Snapshot the current backlog and subscribe to live events atomically.
+    pub fn snapshot_and_subscribe(&self) -> (Vec<RunEvent>, broadcast::Receiver<RunEvent>) {
+        let backlog = self.backlog.lock().unwrap();
+        let snapshot = backlog.clone();
+        let rx = self.tx.subscribe();
+        (snapshot, rx)
+    }
+}
+
 /// Cloneable application state shared across all axum handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServeConfig>,
     pub runs: Arc<DashMap<String, RunState>>,
     pub cache: Arc<RwLock<DagCache>>,
+    /// Live event channels per run handle (logs + step/run lifecycle).
+    pub events: Arc<DashMap<String, RunChannel>>,
     /// Serializes run execution so only one pipeline executes at a time,
     /// preventing concurrent DB writes from racing on the shared metadata.db.
-    pub run_mutex: Arc<Mutex<()>>,
+    pub run_mutex: Arc<AsyncMutex<()>>,
 }
 
 impl AppState {
@@ -81,7 +128,8 @@ impl AppState {
             config: Arc::new(config),
             runs: Arc::new(DashMap::new()),
             cache: Arc::new(RwLock::new(DagCache::default())),
-            run_mutex: Arc::new(Mutex::new(())),
+            events: Arc::new(DashMap::new()),
+            run_mutex: Arc::new(AsyncMutex::new(())),
         }
     }
 }

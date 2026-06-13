@@ -136,7 +136,112 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
         )
         .await
         .map_err(|e| BarcaError::Db(format!("failed to create runs table: {e}")))?;
+
+        // Captured user stdout, one row per line. Rust owns persistence; workers
+        // stream lines over the socket and the coordinator writes them here.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL,
+                node_id TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                line TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            )",
+            (),
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to create logs table: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_logs_run ON logs(run_id, seq)",
+            (),
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to create logs index: {e}")))?;
         Ok(())
+    })
+}
+
+/// One captured stdout line for a run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogEntry {
+    pub node_id: String,
+    pub seq: i64,
+    pub line: String,
+}
+
+/// Persist captured stdout lines for a run, in order. `lines` is (node_id, line).
+pub fn insert_logs_sync(
+    db_path: &str,
+    run_id: &str,
+    lines: &[(String, String)],
+) -> Result<(), BarcaError> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        for (seq, (node_id, line)) in lines.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO logs (run_id, node_id, seq, line) VALUES (?1, ?2, ?3, ?4)",
+                (
+                    run_id.to_string(),
+                    node_id.clone(),
+                    seq as i64,
+                    line.clone(),
+                ),
+            )
+            .await
+            .ok();
+        }
+        Ok(())
+    })
+}
+
+/// Fetch all persisted log lines for a run, in order.
+pub fn get_logs_sync(db_path: &str, run_id: &str) -> Result<Vec<LogEntry>, BarcaError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        let mut rows = conn
+            .query(
+                "SELECT node_id, seq, line FROM logs WHERE run_id = ?1 ORDER BY seq ASC",
+                [run_id.to_string()],
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query logs: {e}")))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read log row: {e}")))?
+        {
+            out.push(LogEntry {
+                node_id: row.get::<String>(0).unwrap_or_default(),
+                seq: row.get::<i64>(1).unwrap_or_default(),
+                line: row.get::<String>(2).unwrap_or_default(),
+            });
+        }
+        Ok(out)
     })
 }
 
@@ -555,6 +660,57 @@ pub fn get_avg_elapsed_for_partitioned_sync(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn logs_round_trip_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+
+        let lines = vec![
+            ("a.py:load".to_string(), "loading…".to_string()),
+            ("a.py:load".to_string(), "read 30/150".to_string()),
+            ("a.py:load".to_string(), "done".to_string()),
+        ];
+        insert_logs_sync(&db_path, "run123", &lines).unwrap();
+
+        let got = get_logs_sync(&db_path, "run123").unwrap();
+        assert_eq!(got.len(), 3);
+        // Order preserved via the seq column.
+        assert_eq!(got[0].seq, 0);
+        assert_eq!(got[0].line, "loading…");
+        assert_eq!(got[1].line, "read 30/150");
+        assert_eq!(got[2].line, "done");
+        assert_eq!(got[0].node_id, "a.py:load");
+    }
+
+    #[test]
+    fn logs_are_scoped_by_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+
+        insert_logs_sync(&db_path, "runA", &[("n".to_string(), "a-line".to_string())]).unwrap();
+        insert_logs_sync(&db_path, "runB", &[("n".to_string(), "b-line".to_string())]).unwrap();
+
+        let a = get_logs_sync(&db_path, "runA").unwrap();
+        let b = get_logs_sync(&db_path, "runB").unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].line, "a-line");
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].line, "b-line");
+        // Unknown run yields no rows, not an error.
+        assert!(get_logs_sync(&db_path, "nope").unwrap().is_empty());
+    }
+
+    #[test]
+    fn insert_empty_logs_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+        insert_logs_sync(&db_path, "run", &[]).unwrap();
+        assert!(get_logs_sync(&db_path, "run").unwrap().is_empty());
+    }
 
     #[test]
     fn round_trip_persist_and_query() {

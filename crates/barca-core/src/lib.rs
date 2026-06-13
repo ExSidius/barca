@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod dag;
 pub mod db;
 pub mod dispatch;
+pub mod events;
 pub mod hash;
 pub mod io_loop;
 pub mod model;
@@ -13,6 +14,7 @@ pub mod planner;
 pub mod protocol;
 
 pub use dag::Dag;
+pub use events::RunEvent;
 pub use model::*;
 pub use planner::{ExecutionPlan, ResourceConfig, expand_partition_combos};
 
