@@ -306,6 +306,37 @@
   box-shadow: 0 0 6px -1px var(--status-running);
   animation: barca-pulse var(--dur-pulse) var(--ease-in-out) infinite;
 }
+.barca-insp-note {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.barca-insp-error {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  background: var(--status-failed-bg);
+  border: 1px solid var(--status-failed-line);
+  border-radius: var(--radius-md);
+}
+.barca-insp-error-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--status-failed);
+}
+.barca-insp-error-msg {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-default);
+  word-break: break-word;
+}
 
 /* ---------- Empty / placeholder ---------- */
 .barca-empty {

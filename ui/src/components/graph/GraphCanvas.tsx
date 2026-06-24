@@ -11,7 +11,7 @@ import {
   type NodeTypes,
 } from '@xyflow/react'
 import { AssetNode } from './AssetNode'
-import { buildGraph, type LayoutDir, type GraphNode } from '@/lib/graph'
+import { buildGraph, edgeClassName, type LayoutDir, type GraphNode } from '@/lib/graph'
 import type { AssetSummary, StatusKind } from '@/lib/types'
 
 // Defined once, outside the component — a fresh object each render is a perf bug.
@@ -79,14 +79,15 @@ export function GraphCanvas({
 
   const edges = useMemo(
     () =>
-      base.edges.map((e) => {
-        const hot = e.source === selected || e.target === selected
-        return {
-          ...e,
-          className: [e.className, hot ? 'hot' : ''].join(' ').trim(),
-        }
-      }),
-    [base.edges, selected],
+      base.edges.map((e) => ({
+        ...e,
+        className: edgeClassName({
+          sourceStatus: statuses?.[e.source],
+          targetStatus: statuses?.[e.target],
+          hot: e.source === selected || e.target === selected,
+        }),
+      })),
+    [base.edges, selected, statuses],
   )
 
   const onNodeClick = useCallback((_: unknown, n: Node) => onSelect(n.id), [onSelect])

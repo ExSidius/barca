@@ -8,6 +8,7 @@ use serde::Serialize;
 
 /// A single event in a run's lifecycle. Serialized as the SSE payload.
 #[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RunEvent {
     /// The run has begun (emitted by the server before execution starts).
@@ -19,8 +20,10 @@ pub enum RunEvent {
         node_id: String,
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         elapsed_seconds: Option<f64>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
         error: Option<String>,
     },
     /// The run finished (emitted by the server once execution completes).

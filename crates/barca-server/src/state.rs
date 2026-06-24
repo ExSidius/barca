@@ -29,6 +29,7 @@ pub struct ServeConfig {
 
 /// Lifecycle of an async run tracked by the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     /// Accepted, not yet started.
@@ -44,6 +45,7 @@ pub enum RunStatus {
 /// In-memory record of a single run. The server-side `handle` is the polling id
 /// returned by `POST /run`; the real DB run id lives inside `result` once complete.
 #[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct RunState {
     /// Server-side polling handle (see `/status/{run_id}`).
     pub handle: String,

@@ -26,8 +26,10 @@ pub struct RunRecord {
 
 /// Aggregated statistics for a single asset node.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct AssetStats {
     pub node_id: String,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub total_runs: i64,
     pub avg_elapsed_seconds: Option<f64>,
     pub median_elapsed_seconds: Option<f64>,
@@ -39,6 +41,7 @@ pub struct AssetStats {
 
 /// One materialization entry for asset stats.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct AssetRunEntry {
     pub elapsed_seconds: Option<f64>,
     pub status: String,
@@ -46,6 +49,7 @@ pub struct AssetRunEntry {
     /// Error message for `status='failed'` rows (None for successes).
     pub error_message: Option<String>,
     /// Number of attempts made.
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub attempts: i64,
 }
 
@@ -164,8 +168,10 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
 
 /// One captured stdout line for a run.
 #[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct LogEntry {
     pub node_id: String,
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
     pub seq: i64,
     pub line: String,
 }

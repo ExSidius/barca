@@ -37,6 +37,7 @@ fn fmt_eta(secs: f64) -> String {
 // ─── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct GetResult {
     pub run_id: String,
     pub elapsed_seconds: f64,
@@ -46,18 +47,21 @@ pub struct GetResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlanResult {
     pub total_steps: usize,
     pub phases: Vec<PlanPhase>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlanPhase {
     pub reason: String,
     pub streams: Vec<PlanStream>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlanStream {
     pub stream_id: String,
     pub steps: Vec<String>,
@@ -65,6 +69,7 @@ pub struct PlanStream {
 
 /// Lightweight summary of a single DAG node, for the server's `/assets` listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct AssetSummary {
     /// Stable node id (continuity key), e.g. `pipeline.py:fetch`.
     pub id: String,

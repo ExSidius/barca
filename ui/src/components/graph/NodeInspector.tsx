@@ -1,9 +1,11 @@
-import { X, Download, Play, Terminal } from 'lucide-react'
+import { X, Download, Play, Terminal, CircleAlert } from 'lucide-react'
+import { match } from 'ts-pattern'
 import { Button, IconButton, StatusBadge, Tag, StatusDot, LogViewer } from '@/components'
 import { useTriggerGet } from '@/hooks/useTriggerGet'
 import { useTriggerRun } from '@/hooks/useTriggerRun'
 import { freshnessLabel } from '@/lib/status'
 import { shortName } from '@/lib/graph'
+import { runFeedback } from '@/lib/runFeedback'
 import type { AssetSummary, StatusKind, LogLine } from '@/lib/types'
 
 interface NodeInspectorProps {
@@ -14,9 +16,38 @@ interface NodeInspectorProps {
   logs: LogLine[]
   /** Whether a run is currently streaming. */
   running: boolean
+  /** Failure message for this node, if the last run failed. */
+  error: string | null
   /** Fired when a get/run is triggered, with the run handle + target node id. */
   onTrigger: (handle: string, nodeId: string) => void
   onClose: () => void
+}
+
+/** Output (log) panel — the live/streaming and completed-with-output surface. */
+function OutputPanel({ logs, live }: { logs: LogLine[]; live: boolean }) {
+  return (
+    <div className="barca-insp-logs">
+      <div className="barca-insp-logs-head">
+        <Terminal size={12} />
+        <span>output</span>
+        {live && <span className="barca-insp-logs-live">live</span>}
+      </div>
+      <LogViewer lines={logs} live={live} height={220} />
+    </div>
+  )
+}
+
+/** Failure callout — surfaces a run/step error message. */
+function ErrorPanel({ title, message }: { title: string; message: string }) {
+  return (
+    <div className="barca-insp-error">
+      <div className="barca-insp-error-head">
+        <CircleAlert size={13} />
+        <span>{title}</span>
+      </div>
+      <div className="barca-insp-error-msg">{message}</div>
+    </div>
+  )
 }
 
 export function NodeInspector({
@@ -24,6 +55,7 @@ export function NodeInspector({
   status,
   logs,
   running,
+  error,
   onTrigger,
   onClose,
 }: NodeInspectorProps) {
@@ -43,7 +75,21 @@ export function NodeInspector({
     })
   }
 
-  const showLogs = running || logs.length > 0
+  // Presentation logic (pure, tested) decides the feedback descriptor; this
+  // component only maps each descriptor variant to elements. Exhaustive on both
+  // sides — no run state can render nothing by accident.
+  const feedback = match(runFeedback(status, logs, error))
+    .with({ kind: 'idle' }, () => null)
+    .with({ kind: 'streaming' }, (f) => <OutputPanel logs={f.logs} live />)
+    .with({ kind: 'output' }, (f) => <OutputPanel logs={f.logs} live={false} />)
+    .with({ kind: 'done' }, () => <div className="barca-insp-note">done · no output</div>)
+    .with({ kind: 'failed' }, (f) => (
+      <>
+        <ErrorPanel title="run failed" message={f.error ?? 'unknown error'} />
+        {f.logs.length > 0 && <OutputPanel logs={f.logs} live={false} />}
+      </>
+    ))
+    .exhaustive()
 
   return (
     <div className="barca-inspector">
@@ -109,21 +155,12 @@ export function NodeInspector({
           </Button>
         </div>
 
-        {showLogs && (
-          <div className="barca-insp-logs">
-            <div className="barca-insp-logs-head">
-              <Terminal size={12} />
-              <span>output</span>
-              {running && <span className="barca-insp-logs-live">live</span>}
-            </div>
-            <LogViewer lines={logs} live={running} height={220} />
-          </div>
-        )}
+        {feedback}
 
+        {/* Failure of the trigger request itself (network/404), distinct from a
+            run that started and then failed. */}
         {trigger.isError && (
-          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--status-failed)' }}>
-            {(trigger.error as Error).message}
-          </span>
+          <ErrorPanel title={`could not start ${verb}`} message={(trigger.error as Error).message} />
         )}
       </div>
     </div>

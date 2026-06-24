@@ -24,18 +24,16 @@ export function shortName(id: string): string {
 }
 
 /**
- * Run status per asset isn't available from static analysis (`GET /assets`),
- * so nodes render neutral until the live event stream lands. Centralized here
- * so wiring real status later is a one-line change.
+ * Resting node status before any run. Static analysis (`GET /assets`) carries
+ * no run state — live status is overlaid from the event stream downstream
+ * (see GraphCanvas + `overlayRunStatus`), never decided here.
  */
-function statusFor(_asset: AssetSummary): StatusKind {
-  return 'queued'
-}
+const RESTING_STATUS: StatusKind = 'queued'
 
 /**
- * Build positioned React Flow nodes + edges from the asset graph. Pure: same
- * input → same output. Re-run only on structure or direction change, never on
- * a status tick.
+ * Build positioned React Flow nodes + edges from the asset graph — purely
+ * structural. Same input → same output; re-run only on structure or direction
+ * change, never on a status tick (status is merged in afterward).
  */
 export function buildGraph(assets: AssetSummary[], dir: LayoutDir) {
   const byId = new Map(assets.map((a) => [a.id, a]))
@@ -70,7 +68,7 @@ export function buildGraph(assets: AssetSummary[], dir: LayoutDir) {
         id: a.id,
         name: shortName(a.id),
         kind: a.kind,
-        status: statusFor(a),
+        status: RESTING_STATUS,
       },
       // dagre centers nodes; React Flow positions by top-left.
       position: { x: p.x - DAG_NODE_WIDTH / 2, y: p.y - DAG_NODE_HEIGHT / 2 },
@@ -79,19 +77,42 @@ export function buildGraph(assets: AssetSummary[], dir: LayoutDir) {
     }
   })
 
-  const edges: Edge[] = deps.map((e) => {
-    const live =
-      byId.get(e.target)?.kind !== undefined &&
-      statusFor(byId.get(e.target)!) === 'running' &&
-      statusFor(byId.get(e.source)!) === 'success'
-    return {
-      id: `${e.source}->${e.target}`,
-      source: e.source,
-      target: e.target,
-      type: 'smoothstep',
-      className: live ? 'live' : '',
-    }
-  })
+  const edges: Edge[] = deps.map((e) => ({
+    id: `${e.source}->${e.target}`,
+    source: e.source,
+    target: e.target,
+    type: 'smoothstep',
+  }))
 
   return { nodes, edges }
+}
+
+/**
+ * Overlay an optimistic "running" status onto the triggered node so the click
+ * feels instant before the first event lands. Pure — given the stream-derived
+ * statuses, returns the map the graph should render.
+ */
+export function overlayRunStatus(
+  statuses: Record<string, StatusKind>,
+  running: boolean,
+  nodeId: string | null,
+): Record<string, StatusKind> {
+  if (running && nodeId && !statuses[nodeId]) {
+    return { ...statuses, [nodeId]: 'running' }
+  }
+  return statuses
+}
+
+/**
+ * Classify an edge from the *overlaid* statuses of its endpoints. `live` (cyan,
+ * flowing) means a fresh upstream is feeding a running downstream; `hot` means
+ * the edge touches the selected node. Pure → testable; rendered via CSS class.
+ */
+export function edgeClassName(opts: {
+  sourceStatus?: StatusKind
+  targetStatus?: StatusKind
+  hot: boolean
+}): string {
+  const live = opts.sourceStatus === 'success' && opts.targetStatus === 'running'
+  return [live ? 'live' : '', opts.hot ? 'hot' : ''].filter(Boolean).join(' ')
 }

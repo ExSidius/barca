@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 /// The three kinds of node in a barca DAG.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     /// `@asset` — produces and caches a value.
@@ -34,6 +35,7 @@ pub enum NodeKind {
 
 /// Freshness policy — determines when a node is eligible for execution.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "type", content = "value")]
 pub enum Freshness {
     /// Auto-materializes whenever stale and all upstreams are fresh.
@@ -56,6 +58,7 @@ impl Freshness {
 
 /// A validated 5-field cron expression.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct CronExpr(pub String);
 
 // ─── Partition specification ─────────────────────────────────────────────────

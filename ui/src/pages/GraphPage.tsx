@@ -7,7 +7,7 @@ import { useAssets } from '@/hooks/useAssets'
 import { useHealth } from '@/hooks/useHealth'
 import { useRunStream } from '@/hooks/useRunStream'
 import { sourceFile, pipelineName } from '@/lib/pipeline'
-import type { LayoutDir } from '@/lib/graph'
+import { overlayRunStatus, type LayoutDir } from '@/lib/graph'
 import type { StatusKind } from '@/lib/types'
 
 const LEGEND: StatusKind[] = ['success', 'running', 'queued', 'failed']
@@ -32,13 +32,13 @@ export function GraphPage() {
 
   // Live status overlay: stream-derived, plus an optimistic "running" on the
   // triggered node so the click feels instant before the first event lands.
-  const statuses = useMemo(() => {
-    const s: Record<string, StatusKind> = { ...stream.statuses }
-    if (run && stream.running && !s[run.nodeId]) s[run.nodeId] = 'running'
-    return s
-  }, [stream.statuses, stream.running, run])
+  const statuses = useMemo(
+    () => overlayRunStatus(stream.statuses, stream.running, run?.nodeId ?? null),
+    [stream.statuses, stream.running, run],
+  )
 
   const selectedStatus = (selected && statuses[selected]) || 'queued'
+  const selectedError = (selected && stream.errors[selected]) || null
 
   return (
     <div className="barca-view">
@@ -93,6 +93,7 @@ export function GraphPage() {
             status={selectedStatus}
             logs={stream.logs}
             running={stream.running}
+            error={selectedError}
             onTrigger={(handle, nodeId) => setRun({ handle, nodeId })}
             onClose={() => setSelected(null)}
           />
