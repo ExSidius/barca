@@ -14,8 +14,7 @@ export TS_RS_EXPORT_DIR="$OUT"
 cargo test --manifest-path "$REPO/Cargo.toml" -p barca-core --features ts export_bindings
 cargo test --manifest-path "$REPO/Cargo.toml" -p barca-server --features ts export_bindings
 
-# Normalize trailing whitespace so the output matches the repo's pre-commit hook
-# (ts-rs leaves some) — keeps the CI drift check (git diff --exit-code) stable.
-perl -i -pe 's/[ \t]+$//' "$OUT"/*.ts
-
+# Note: ts-rs leaves some trailing whitespace; the repo's pre-commit hook strips
+# it on commit, so committed bindings stay clean. CI drift checks should run the
+# same whitespace hook before `git diff --exit-code`.
 echo "regenerated TS bindings → $OUT"
