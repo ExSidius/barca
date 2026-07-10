@@ -31,6 +31,8 @@ __all__ = [
     "history",
     "stats",
     "BarcaError",
+    "Client",
+    "Run",
 ]
 
 # ─── Freshness markers ───────────────────────────────────────────────────────
@@ -225,3 +227,4 @@ def parallel_map(fn, items, **kwargs):
 # ─── Python API ──────────────────────────────────────────────────────────────
 
 from barca.api import BarcaError, get, history, plan, run, stats  # noqa: E402
+from barca.client import Client, Run  # noqa: E402

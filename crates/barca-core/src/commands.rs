@@ -236,12 +236,15 @@ fn execute(
         .build()
         .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
 
-    let db = rt.block_on(async {
-        Builder::new_local(&db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
-    })?;
+    let db = {
+        let _g = db::db_guard();
+        rt.block_on(async {
+            Builder::new_local(&db_path)
+                .build()
+                .await
+                .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
+        })
+    }?;
     let conn = db
         .connect()
         .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
@@ -388,23 +391,26 @@ fn execute(
                     &cached_run_hashes,
                 );
 
-                let cached = rt.block_on(async {
-                    let mut rows = conn
-                        .query(
-                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
-                            [display_id.clone(), run_h.clone()],
-                        )
-                        .await
-                        .unwrap();
-                    rows.next().await.unwrap().and_then(|row| {
-                        Some(dispatch::OutputRef {
-                            path: row.get::<String>(0).ok()?,
-                            format: row.get::<String>(1).ok()?,
-                            size_bytes: row.get::<i64>(2).ok()? as u64,
-                            elapsed_seconds: None,
+                let cached = {
+                    let _g = db::db_guard();
+                    rt.block_on(async {
+                        let mut rows = conn
+                            .query(
+                                "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
+                                [display_id.clone(), run_h.clone()],
+                            )
+                            .await
+                            .unwrap();
+                        rows.next().await.unwrap().and_then(|row| {
+                            Some(dispatch::OutputRef {
+                                path: row.get::<String>(0).ok()?,
+                                format: row.get::<String>(1).ok()?,
+                                size_bytes: row.get::<i64>(2).ok()? as u64,
+                                elapsed_seconds: None,
+                            })
                         })
                     })
-                });
+                };
 
                 if let Some(oref) = cached {
                     all_outputs.insert(display_id.clone(), oref);
@@ -648,7 +654,9 @@ fn execute(
     }
 
     // Persist all executed outputs (including partial results on failure).
-    rt.block_on(async {
+    {
+        let _g = db::db_guard();
+        rt.block_on(async {
         for (node_id, oref) in &all_outputs {
             if cached_node_ids.contains(node_id) {
                 continue;
@@ -725,7 +733,8 @@ fn execute(
             .await
             .ok();
         }
-    });
+        });
+    }
 
     let steps_cached = cached_node_ids.len();
     let elapsed = t0.elapsed().as_secs_f64();

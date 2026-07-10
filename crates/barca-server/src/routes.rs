@@ -17,5 +17,6 @@ pub fn router(state: AppState) -> Router {
         .route("/run/{target}", post(handlers::run_target))
         .route("/get/{target}", post(handlers::get_target))
         .route("/status/{run_id}", get(handlers::status))
+        .route("/schedule", get(handlers::schedule))
         .with_state(state)
 }

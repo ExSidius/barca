@@ -114,6 +114,41 @@ pub async fn get_target(State(state): State<AppState>, Path(target): Path<String
     Json(json!({ "run_id": handle }))
 }
 
+/// `GET /schedule` — list scheduled jobs with next fire time and last run status.
+/// Reads the scheduler's published registry; volatile fields (next fire, live
+/// status) are computed per request.
+pub async fn schedule(State(state): State<AppState>) -> Json<Value> {
+    use chrono::Local;
+    use croner::Cron;
+    use std::str::FromStr;
+
+    let now = Local::now();
+    let jobs = state.schedule.read().map(|g| g.clone()).unwrap_or_default();
+    let items: Vec<Value> = jobs
+        .into_iter()
+        .map(|j| {
+            let next_fire = Cron::from_str(&j.cron)
+                .ok()
+                .and_then(|c| c.find_next_occurrence(&now, false).ok())
+                .map(|t| t.timestamp());
+            let last_status = j
+                .last_handle
+                .as_ref()
+                .and_then(|h| state.runs.get(h).map(|r| r.status));
+            json!({
+                "id": j.id,
+                "cron": j.cron,
+                "kind": j.kind,
+                "next_fire": next_fire,
+                "last_fired": j.last_fired,
+                "last_run": j.last_handle,
+                "last_status": last_status,
+            })
+        })
+        .collect();
+    Json(json!(items))
+}
+
 /// `GET /status/{run_id}` — poll an in-flight or finished run.
 pub async fn status(
     State(state): State<AppState>,
@@ -128,7 +163,7 @@ pub async fn status(
 
 /// Insert a `Pending` run, spawn the background execution task, and return the
 /// server-side handle. The real DB run id is surfaced in the completed payload.
-fn start_run(state: AppState, target: Option<String>) -> String {
+pub(crate) fn start_run(state: AppState, target: Option<String>) -> String {
     let handle = db::generate_run_id();
     state.runs.insert(
         handle.clone(),
@@ -145,9 +180,9 @@ fn start_run(state: AppState, target: Option<String>) -> String {
     let st = state.clone();
     let h = handle.clone();
     tokio::spawn(async move {
-        // Serialize runs so only one pipeline executes at a time, preventing
-        // concurrent writes to the shared metadata.db.
-        let _guard = st.run_mutex.lock().await;
+        // Bound concurrency: acquire a run slot. Runs execute in parallel; the
+        // shared metadata.db is kept safe by barca-core's process-wide DB lock.
+        let _permit = st.run_slots.acquire().await.ok();
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.status = RunStatus::Running;
@@ -159,17 +194,15 @@ fn start_run(state: AppState, target: Option<String>) -> String {
 
         // NOTE: spawn_blocking tasks cannot be aborted — they run on OS threads
         // that Tokio cannot interrupt. If the timeout fires, the blocking thread
-        // will continue running in the background until it finishes naturally.
-        // However, `_guard` (the run_mutex) is NOT dropped until this entire async
-        // block completes, so no concurrent run can start and race on the DB even
-        // if the orphaned blocking task is still finishing up.
+        // continues in the background until it finishes naturally; the DB lock in
+        // barca-core still guards its writes against any concurrent run.
         let join_handle = tokio::task::spawn_blocking(move || {
             commands::get(tgt.as_deref(), &files, &python, false, true)
         });
         let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
 
         // On timeout, report failure to the client immediately. The blocking task
-        // may still be running, but _guard prevents concurrent run starts.
+        // may still be running; barca-core's DB lock still guards its writes.
         let outcome = match res {
             Ok(inner) => Ok(inner),
             Err(_elapsed) => Err(()),
@@ -196,8 +229,7 @@ fn start_run(state: AppState, target: Option<String>) -> String {
                 }
             }
         }
-        // _guard is dropped here — after the result has been recorded. Even on
-        // timeout, the mutex is held until this point, preventing DB races.
+        // The run slot is released here, freeing capacity for a queued run.
     });
 
     handle
@@ -205,7 +237,7 @@ fn start_run(state: AppState, target: Option<String>) -> String {
 
 /// Insert a `Pending` run for a task, spawn the background execution via
 /// `commands::run`, and return the server-side handle.
-fn start_run_task(state: AppState, target: String) -> String {
+pub(crate) fn start_run_task(state: AppState, target: String) -> String {
     let handle = db::generate_run_id();
     state.runs.insert(
         handle.clone(),
@@ -222,7 +254,7 @@ fn start_run_task(state: AppState, target: String) -> String {
     let st = state.clone();
     let h = handle.clone();
     tokio::spawn(async move {
-        let _guard = st.run_mutex.lock().await;
+        let _permit = st.run_slots.acquire().await.ok();
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.status = RunStatus::Running;
@@ -233,8 +265,7 @@ fn start_run_task(state: AppState, target: String) -> String {
         let tgt = target.clone();
 
         // NOTE: Same spawn_blocking caveat as start_run — see comment above.
-        // The _guard prevents concurrent DB writes even if this task outlives
-        // the timeout.
+        // barca-core's DB lock guards writes even if this task outlives the timeout.
         let join_handle =
             tokio::task::spawn_blocking(move || commands::run(&tgt, &files, &python, None, true));
         let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
@@ -265,7 +296,7 @@ fn start_run_task(state: AppState, target: String) -> String {
                 }
             }
         }
-        // _guard dropped here — mutex held through timeout, preventing races.
+        // The run slot is released here, freeing capacity for a queued run.
     });
 
     handle
