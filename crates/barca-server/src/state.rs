@@ -5,8 +5,16 @@ use dashmap::DashMap;
 use serde::Serialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+
+/// How many runs may execute concurrently by default (one per available core).
+fn default_run_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
 
 /// Configuration for a `barca serve` instance. Built by the CLI and handed to
 /// [`crate::serve`].
@@ -21,6 +29,12 @@ pub struct ServeConfig {
     /// Dev-mode hot reload: re-parse the DAG when source files change.
     /// Off by default; has no effect on the production serving path.
     pub watch: bool,
+    /// Whether the cron scheduler fires `Schedule(...)` assets. On by default;
+    /// disabled with `barca serve --no-schedule`.
+    pub schedule: bool,
+    /// Timezone cron expressions are evaluated in: `local` (default), `utc`, or
+    /// an IANA name like `America/New_York`. Set via `--timezone`.
+    pub timezone: String,
     /// Python interpreter used for execution (and dynamic-partition resolution).
     pub python: PathBuf,
 }
@@ -64,15 +78,38 @@ pub struct DagCache {
     pub plan: Option<PlanResult>,
 }
 
+/// Durable, mutable view of one scheduled job, published by the scheduler and
+/// read by `GET /schedule`. The volatile bits (next fire time, live run status)
+/// are computed at request time from `cron` and `last_handle`.
+#[derive(Clone, Debug, Serialize)]
+pub struct JobStatus {
+    /// Full node id (the run target).
+    pub id: String,
+    /// The node's cron expression.
+    pub cron: String,
+    /// Node kind (asset / sensor / task).
+    pub kind: barca_core::NodeKind,
+    /// Last time the scheduler fired this job (unix epoch seconds), if ever.
+    pub last_fired: Option<i64>,
+    /// Handle of the most recent run the scheduler triggered for this job.
+    pub last_handle: Option<String>,
+}
+
 /// Cloneable application state shared across all axum handlers.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<ServeConfig>,
     pub runs: Arc<DashMap<String, RunState>>,
     pub cache: Arc<RwLock<DagCache>>,
-    /// Serializes run execution so only one pipeline executes at a time,
-    /// preventing concurrent DB writes from racing on the shared metadata.db.
-    pub run_mutex: Arc<Mutex<()>>,
+    /// Bounds how many runs execute concurrently. Runs execute Python in
+    /// parallel; the shared metadata.db is kept race-free by a process-wide DB
+    /// lock in `barca-core`, not by serializing whole runs.
+    pub run_slots: Arc<Semaphore>,
+    /// Live scheduler view, published by the scheduler and read by `GET /schedule`.
+    pub schedule: Arc<RwLock<Vec<JobStatus>>>,
+    /// Bumped by the `--watch` file watcher on every DAG invalidation, so the
+    /// scheduler can re-read its job set without a restart.
+    pub dag_generation: Arc<AtomicU64>,
 }
 
 impl AppState {
@@ -81,7 +118,9 @@ impl AppState {
             config: Arc::new(config),
             runs: Arc::new(DashMap::new()),
             cache: Arc::new(RwLock::new(DagCache::default())),
-            run_mutex: Arc::new(Mutex::new(())),
+            run_slots: Arc::new(Semaphore::new(default_run_concurrency())),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            dag_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }

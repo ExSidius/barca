@@ -7,7 +7,7 @@ parses these statically from source without importing.
 
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "asset",
@@ -31,6 +31,8 @@ __all__ = [
     "history",
     "stats",
     "BarcaError",
+    "Client",
+    "Run",
 ]
 
 # ─── Freshness markers ───────────────────────────────────────────────────────
@@ -225,3 +227,4 @@ def parallel_map(fn, items, **kwargs):
 # ─── Python API ──────────────────────────────────────────────────────────────
 
 from barca.api import BarcaError, get, history, plan, run, stats  # noqa: E402
+from barca.client import Client, Run  # noqa: E402

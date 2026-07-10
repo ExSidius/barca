@@ -243,7 +243,7 @@ Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn
 | **Run history / lineage** | Full event log, asset catalog | Flow run tracking, task states | DagRun/TaskInstance records | Basic: rows in SQLite, no UI | Planned — just more DB rows ([#50]) |
 | **Retry on failure** | Built-in per-op retries | Built-in per-task retries | Built-in retries + SLAs | No — fails and persists partial results | Planned — `@asset(retries=3, retry_backoff=2.0)` ([#51]) |
 | **Alerting / notifications** | Sensors + hooks | Automations, Slack/email | Email, Slack, PagerDuty | No | Planned — Slack + Resend hooks via `barca.toml` ([#52]) |
-| **Scheduling** | Built-in cron + sensors | Built-in via deployments | Core feature (scheduler daemon) | Parsed but not enforced yet | Planned — cron enforcement in `barca serve` ([#54], depends on [#53]) |
+| **Scheduling** | Built-in cron + sensors | Built-in via deployments | Core feature (scheduler daemon) | Cron enforcement in `barca serve`: timezone-aware, durable catch-up, parallel runs, `GET /schedule` | Shipped ([#54]); per-tick replay of long outages not supported |
 | **Server mode** | Built-in (dagster dev) | Built-in (prefect server) | Built-in (webserver + scheduler) | No | Planned — `barca serve` with HTTP API ([#53]) |
 | **Remote storage** | Pluggable I/O managers (S3, GCS, etc.) | Result storage backends | XCom + external storage hooks | Local filesystem only | Planned — pluggable DB + artifact backends ([#55], [#56]) |
 | **Docker / containers** | Supported via Kubernetes executor | Supported via Docker infra | Celery/Kubernetes executors | Not built-in | Trivial once backends are pluggable ([#56]) |

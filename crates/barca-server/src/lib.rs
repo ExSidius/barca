@@ -13,9 +13,11 @@
 mod error;
 mod handlers;
 mod routes;
+mod scheduler;
 mod state;
 mod watch;
 
+pub use scheduler::{ScheduleInfo, describe_schedule};
 pub use state::ServeConfig;
 
 use state::AppState;
@@ -51,6 +53,7 @@ async fn serve_async(config: ServeConfig) -> Result<(), ServeError> {
     let addr = std::net::SocketAddr::new(config.host, config.port);
     let n_files = config.files.len();
     let watch = config.watch;
+    let schedule = config.schedule;
 
     let state = AppState::new(config);
 
@@ -60,6 +63,11 @@ async fn serve_async(config: ServeConfig) -> Result<(), ServeError> {
         std::time::Duration::from_secs(300),
         std::time::Duration::from_secs(3600),
     ));
+
+    // Fire `Schedule(...)` assets on their cron ticks (local time). On by default.
+    if schedule {
+        tokio::spawn(scheduler::run_scheduler(state.clone()));
+    }
 
     // Dev-mode hot reload. The watcher must be held for the server's lifetime.
     let _watcher = if watch {

@@ -296,9 +296,14 @@ def daily_at_5am() -> dict:
     return {"scheduled": True}
 ```
 
-> **Note**: In v0.2.0, `Always` and `Manual` work as expected. `Schedule` cron enforcement
-> is declared but not yet enforced at runtime — scheduled assets behave like `Always` until
-> cron enforcement ships in v0.3.0 ([#54](https://github.com/ExSidius/barca/issues/54)).
+> **Note**: `Schedule` freshness is enforced by the long-running server. Run
+> `barca serve pipeline.py` and the scheduler fires each scheduled asset on its cron tick
+> (evaluated in local time by default; `--timezone` to change). Last-fire times are
+> persisted, so a job whose tick passed while the server was down fires once to catch up on
+> restart. Inspect the schedule with `barca list pipeline.py` (scheduled definitions show
+> their next fire time) or `GET /schedule`, and
+> disable it with `--no-schedule`. A one-shot `barca get`/`barca run` does *not* consult the
+> clock — it materializes on demand. See [Scheduling](server-api.md#scheduling).
 
 ## 10. Inspecting plans
 
