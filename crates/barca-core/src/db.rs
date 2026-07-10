@@ -6,7 +6,24 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard};
 use turso::Builder;
+
+/// Process-wide serialization of `metadata.db` operations. The server can run
+/// multiple pipelines in parallel (they execute Python concurrently), but their
+/// brief reads/writes to the shared SQLite file must not overlap. Every DB
+/// helper — and the inline cache-check/persist ops in `commands::execute` — holds
+/// this guard for the duration of its (short) database work, so runs never race
+/// on the file without depending on WAL support. A one-shot CLI run leaves it
+/// uncontended.
+static DB_LOCK: Mutex<()> = Mutex::new(());
+
+/// Acquire the process-wide DB lock (recovering from a poisoned mutex — a prior
+/// panic mid-op leaves the data intact for our purposes). Hold the returned
+/// guard only across a single database operation; never across Python execution.
+pub fn db_guard() -> MutexGuard<'static, ()> {
+    DB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Record of a single run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +80,7 @@ pub fn ensure_db_dir() -> Result<String, BarcaError> {
 }
 
 pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -136,6 +154,80 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
         )
         .await
         .map_err(|e| BarcaError::Db(format!("failed to create runs table: {e}")))?;
+
+        // Scheduler durability: the last time each scheduled node was fired, as
+        // unix epoch seconds. Lets `barca serve` catch up a single missed tick
+        // after downtime instead of silently skipping it.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schedule_state (
+                node_id TEXT PRIMARY KEY,
+                last_fired_at INTEGER NOT NULL
+            )",
+            (),
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to create schedule_state table: {e}")))?;
+        Ok(())
+    })
+}
+
+/// Load the last-fired time (unix epoch seconds) for every scheduled node.
+pub fn get_schedule_state_sync(db_path: &str) -> Result<HashMap<String, i64>, BarcaError> {
+    let _g = db_guard();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        let mut rows = conn
+            .query("SELECT node_id, last_fired_at FROM schedule_state", ())
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query schedule_state: {e}")))?;
+        let mut out = HashMap::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let node_id = row.get::<String>(0).unwrap_or_default();
+            let last = row.get::<i64>(1).unwrap_or_default();
+            if !node_id.is_empty() {
+                out.insert(node_id, last);
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Record that a scheduled node fired at `epoch_secs` (unix epoch seconds).
+pub fn upsert_schedule_state_sync(
+    db_path: &str,
+    node_id: &str,
+    epoch_secs: i64,
+) -> Result<(), BarcaError> {
+    let _g = db_guard();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        conn.execute(
+            "INSERT INTO schedule_state (node_id, last_fired_at) VALUES (?1, ?2)
+             ON CONFLICT(node_id) DO UPDATE SET last_fired_at = ?2",
+            [node_id.to_string(), epoch_secs.to_string()],
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to upsert schedule_state: {e}")))?;
         Ok(())
     })
 }
@@ -148,6 +240,7 @@ pub fn persist_outputs_sync(
     if outputs.is_empty() {
         return Ok(());
     }
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -211,6 +304,7 @@ pub fn create_run_sync(
     target: Option<&str>,
     steps_total: Option<usize>,
 ) -> Result<(), BarcaError> {
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -248,6 +342,7 @@ pub fn finish_run_sync(
     steps_cached: usize,
     elapsed_seconds: f64,
 ) -> Result<(), BarcaError> {
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -278,6 +373,7 @@ pub fn finish_run_sync(
 
 /// Retrieve recent run records, newest first.
 pub fn get_recent_runs_sync(db_path: &str, limit: usize) -> Result<Vec<RunRecord>, BarcaError> {
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -329,6 +425,7 @@ pub fn get_recent_runs_sync(db_path: &str, limit: usize) -> Result<Vec<RunRecord
 
 /// Get aggregated stats for a specific asset/node.
 pub fn get_asset_stats_sync(db_path: &str, node_id: &str) -> Result<AssetStats, BarcaError> {
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -473,6 +570,7 @@ pub fn get_avg_elapsed_sync(
     if node_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -517,6 +615,7 @@ pub fn get_avg_elapsed_for_partitioned_sync(
     if base_node_ids.is_empty() {
         return Ok(HashMap::new());
     }
+    let _g = db_guard();
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -603,6 +702,54 @@ mod tests {
         assert_eq!(path, ".barca/artifacts/test.py--foo.json");
         assert_eq!(format, "json");
         assert_eq!(size, 15);
+    }
+
+    #[test]
+    fn schedule_state_round_trips_and_upserts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+
+        // Empty to start.
+        assert!(get_schedule_state_sync(&db_path).unwrap().is_empty());
+
+        upsert_schedule_state_sync(&db_path, "test.py:daily", 1_000).unwrap();
+        upsert_schedule_state_sync(&db_path, "test.py:poll", 2_000).unwrap();
+        let state = get_schedule_state_sync(&db_path).unwrap();
+        assert_eq!(state.get("test.py:daily"), Some(&1_000));
+        assert_eq!(state.get("test.py:poll"), Some(&2_000));
+
+        // Upsert overwrites the same node rather than inserting a duplicate.
+        upsert_schedule_state_sync(&db_path, "test.py:daily", 3_000).unwrap();
+        let state = get_schedule_state_sync(&db_path).unwrap();
+        assert_eq!(state.len(), 2);
+        assert_eq!(state.get("test.py:daily"), Some(&3_000));
+    }
+
+    #[test]
+    fn concurrent_writes_are_serialized_safely() {
+        // Eight threads write runs at once. The process-wide DB lock must keep
+        // them from racing on the SQLite file — all rows land, none error.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+
+        let mut handles = vec![];
+        for i in 0..8 {
+            let p = db_path.clone();
+            handles.push(std::thread::spawn(move || {
+                let rid = format!("run{i:02}");
+                create_run_sync(&p, &rid, "get", "f.py", None, Some(1)).unwrap();
+                finish_run_sync(&p, &rid, "success", 1, 0, 0.1).unwrap();
+                upsert_schedule_state_sync(&p, &format!("f.py:node{i}"), i).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(get_recent_runs_sync(&db_path, 100).unwrap().len(), 8);
+        assert_eq!(get_schedule_state_sync(&db_path).unwrap().len(), 8);
     }
 
     // ─── OutputRef artifact persistence tests ────────────────────────────────

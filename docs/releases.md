@@ -46,14 +46,26 @@ Issues closed: [#70](https://github.com/ExSidius/barca/issues/70) (UDS communica
 
 Goal: scheduling, remote I/O, observability.
 
+Delivered:
+
+- **Cron scheduling enforcement** — `barca serve` fires `Schedule("0 5 * * *")`
+  assets, sensors, and tasks on their cron tick
+  ([#54](https://github.com/ExSidius/barca/issues/54)). Includes:
+  - **Durable catch-up** — last-fire times persist; a job whose tick passed
+    during downtime fires once on restart.
+  - **Configurable timezone** — `--timezone local|utc|<IANA>`.
+  - **Parallel runs** — independent runs execute concurrently (bounded pool),
+    with DB writes serialized; a job never overlaps itself.
+  - **Observability** — `GET /schedule` and `barca list <files>` (next fire times);
+    live reload under `--watch`.
+- **Python server client** — `barca.Client` (stdlib-only) to trigger runs, poll
+  status, and inspect schedules over the HTTP API.
+
 Planned:
 
 - **Reproducible Docker benchmarks** — containerized cross-framework comparisons
   with proper timeouts and resource constraints
   ([#65](https://github.com/ExSidius/barca/issues/65))
-- **Cron scheduling enforcement** — `Schedule("0 5 * * *")` actually runs on
-  schedule, for both assets and tasks
-  ([#54](https://github.com/ExSidius/barca/issues/54))
 - **Remote storage for @sink** — S3, R2, GCS, ADLS via pluggable backends
   ([#55](https://github.com/ExSidius/barca/issues/55))
 - **Backend abstraction** — pluggable DB + storage, enabling Docker and shared

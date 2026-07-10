@@ -31,6 +31,8 @@ fn fixture_config(dir: &std::path::Path) -> ServeConfig {
         host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         port: 0,
         watch: false,
+        schedule: false,
+        timezone: "local".to_string(),
         python: barca_core::commands::find_python(),
     }
 }
@@ -59,6 +61,27 @@ async fn health_reports_ok_and_version() {
     let json = body_json(resp).await;
     assert_eq!(json["status"], "ok");
     assert!(json["version"].is_string());
+}
+
+#[tokio::test]
+async fn schedule_endpoint_returns_json_array() {
+    // `app()` does not spawn the scheduler, so the registry is empty — this
+    // asserts the route is wired and returns a well-formed (empty) array.
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(fixture_config(dir.path()));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .uri("/schedule")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    assert!(json.is_array());
+    assert_eq!(json.as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

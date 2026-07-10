@@ -89,8 +89,16 @@ enum Cli {
         /// Dev mode: re-parse the DAG when source files change
         #[arg(long)]
         watch: bool,
+        /// Disable the cron scheduler (Schedule(...) assets will not auto-fire)
+        #[arg(long)]
+        no_schedule: bool,
+        /// Timezone for cron evaluation: local (default), utc, or an IANA name
+        #[arg(long, default_value = "local")]
+        timezone: String,
     },
     /// List all discovered definitions (assets, tasks, sensors) with their deps
+    ///
+    /// Scheduled definitions also show their next fire time in local time.
     List {
         /// Python source files containing definitions
         #[arg(required = true)]
@@ -177,7 +185,13 @@ fn main() {
         Cli::History { limit } => history_cmd(limit),
         Cli::Stats { target, files } => stats_cmd(target, files, &python),
         Cli::List { files } => list_cmd(files, &python),
-        Cli::Serve { files, port, watch } => serve_cmd(files, port, watch, &python),
+        Cli::Serve {
+            files,
+            port,
+            watch,
+            no_schedule,
+            timezone,
+        } => serve_cmd(files, port, watch, !no_schedule, timezone, &python),
         Cli::Version => {
             println!("barca {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -307,49 +321,109 @@ fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::Bar
         println!("No definitions found.");
         return Ok(());
     }
+
+    // Next fire times for scheduled definitions (empty when nothing is scheduled,
+    // so the NEXT FIRE column only appears when it carries information).
+    let next_fires: std::collections::HashMap<String, String> =
+        barca_server::describe_schedule(&file_args, python)
+            .into_iter()
+            .filter_map(|j| j.next_fire_local.map(|t| (j.id, t)))
+            .collect();
+    let has_schedule = !next_fires.is_empty();
+
+    // Render each row's cells up front so column widths fit the actual content.
+    let rows: Vec<(&str, String, String, &str, String)> = assets
+        .iter()
+        .map(|a| {
+            let kind = serde_json::to_value(&a.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", a.kind).to_lowercase());
+            let freshness = serde_json::to_value(&a.freshness)
+                .ok()
+                .and_then(|v| {
+                    let ty = v.get("type")?.as_str()?;
+                    if ty == "Schedule" {
+                        let cron = v.get("value").and_then(|c| c.as_str()).unwrap_or("?");
+                        Some(format!("cron: {cron}"))
+                    } else {
+                        Some(ty.to_lowercase())
+                    }
+                })
+                .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
+            let next = next_fires.get(&a.id).map(String::as_str).unwrap_or("-");
+            let deps = if a.inputs.is_empty() {
+                "-".to_string()
+            } else {
+                a.inputs.join(", ")
+            };
+            (a.id.as_str(), kind, freshness, next, deps)
+        })
+        .collect();
+
     let max_name = assets.iter().map(|a| a.id.len()).max().unwrap_or(4).max(4);
-    let max_kind = 6; // "sensor" is the longest
-    println!(
-        "{:<wn$}  {:<wk$}  {:<10}  {}",
-        "NAME",
-        "KIND",
-        "FRESHNESS",
-        "DEPS",
-        wn = max_name,
-        wk = max_kind,
-    );
-    println!("{}", "-".repeat(max_name + max_kind + 20));
-    for a in &assets {
-        let kind = serde_json::to_value(&a.kind)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{:?}", a.kind).to_lowercase());
-        let freshness = serde_json::to_value(&a.freshness)
-            .ok()
-            .and_then(|v| {
-                let ty = v.get("type")?.as_str()?;
-                if ty == "Schedule" {
-                    let cron = v.get("value").and_then(|c| c.as_str()).unwrap_or("?");
-                    Some(format!("cron: {cron}"))
-                } else {
-                    Some(ty.to_lowercase())
-                }
-            })
-            .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
-        let deps = if a.inputs.is_empty() {
-            "-".to_string()
-        } else {
-            a.inputs.join(", ")
-        };
+    let max_kind = rows.iter().map(|r| r.1.len()).max().unwrap_or(4).max(4);
+    let max_fresh = rows.iter().map(|r| r.2.len()).max().unwrap_or(9).max(9); // "FRESHNESS"
+    let max_next = rows.iter().map(|r| r.3.len()).max().unwrap_or(9).max(9); // "NEXT FIRE"
+
+    if has_schedule {
         println!(
-            "{:<wn$}  {:<wk$}  {:<10}  {}",
-            a.id,
-            kind,
-            freshness,
-            deps,
+            "{:<wn$}  {:<wk$}  {:<ws$}  {:<wf$}  {}",
+            "NAME",
+            "KIND",
+            "FRESHNESS",
+            "NEXT FIRE",
+            "DEPS",
             wn = max_name,
             wk = max_kind,
+            ws = max_fresh,
+            wf = max_next,
         );
+        println!(
+            "{}",
+            "-".repeat(max_name + max_kind + max_fresh + max_next + 12)
+        );
+    } else {
+        println!(
+            "{:<wn$}  {:<wk$}  {:<ws$}  {}",
+            "NAME",
+            "KIND",
+            "FRESHNESS",
+            "DEPS",
+            wn = max_name,
+            wk = max_kind,
+            ws = max_fresh,
+        );
+        println!("{}", "-".repeat(max_name + max_kind + max_fresh + 10));
+    }
+
+    for row in &rows {
+        let (id, kind, freshness, next, deps) = row;
+        if has_schedule {
+            println!(
+                "{:<wn$}  {:<wk$}  {:<ws$}  {:<wf$}  {}",
+                id,
+                kind,
+                freshness,
+                next,
+                deps,
+                wn = max_name,
+                wk = max_kind,
+                ws = max_fresh,
+                wf = max_next,
+            );
+        } else {
+            println!(
+                "{:<wn$}  {:<wk$}  {:<ws$}  {}",
+                id,
+                kind,
+                freshness,
+                deps,
+                wn = max_name,
+                wk = max_kind,
+                ws = max_fresh,
+            );
+        }
     }
     Ok(())
 }
@@ -433,6 +507,8 @@ fn serve_cmd(
     files: Vec<PathBuf>,
     port: u16,
     watch: bool,
+    schedule: bool,
+    timezone: String,
     python: &std::path::Path,
 ) -> Result<(), barca_core::BarcaError> {
     let config = barca_server::ServeConfig {
@@ -440,6 +516,8 @@ fn serve_cmd(
         host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         port,
         watch,
+        schedule,
+        timezone,
         python: python.to_path_buf(),
     };
     barca_server::serve(config).map_err(|e| barca_core::BarcaError::Other(e.to_string()))

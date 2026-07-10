@@ -1,0 +1,816 @@
+//! Cron scheduler — the background task that gives `Freshness::Schedule(...)` teeth.
+//!
+//! `barca serve` parses `@asset(freshness=Schedule("0 5 * * *"))` into
+//! `Freshness::Schedule(CronExpr)`, but nothing in the executor ever acts on it.
+//! This module closes that gap: at startup it enumerates every scheduled node, and
+//! then on each live cron match it triggers a run through the exact same
+//! [`crate::handlers::start_run`] path the HTTP `/run` endpoint uses — so scheduled
+//! runs go through the same bounded run pool and land in the `runs`
+//! history table for free.
+//!
+//! Semantics: cron is evaluated in the configured timezone (`--timezone`, local
+//! by default). On startup a job fires once if a tick elapsed while the daemon
+//! was down (catch-up), then fires on each live cron match. Last-fired times are
+//! persisted so catch-up survives restarts; runs execute through the bounded run
+//! pool and are visible via `GET /schedule`.
+
+use crate::handlers;
+use crate::state::{AppState, JobStatus, RunStatus};
+use barca_core::commands::{self, AssetSummary};
+use barca_core::{Freshness, NodeKind, db};
+use chrono::{DateTime, FixedOffset, Local, TimeZone, Timelike, Utc};
+use croner::Cron;
+use serde::Serialize;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+/// Static description of one scheduled job, for `barca schedule` (no server).
+#[derive(Debug, Clone, Serialize)]
+pub struct ScheduleInfo {
+    pub id: String,
+    pub cron: String,
+    pub kind: NodeKind,
+    /// Next fire time as unix epoch seconds (for programmatic use).
+    pub next_fire: Option<i64>,
+    /// Next fire time formatted in local time (for display).
+    pub next_fire_local: Option<String>,
+}
+
+/// Enumerate scheduled jobs from source and compute each one's next fire time.
+/// Pure static analysis — used by the `barca schedule` CLI, no running server.
+pub fn describe_schedule(files: &[String], python: &PathBuf) -> Vec<ScheduleInfo> {
+    let now = Local::now();
+    collect_jobs(files, python)
+        .iter()
+        .map(|j| {
+            let next = j.cron.find_next_occurrence(&now, false).ok();
+            ScheduleInfo {
+                id: j.id.clone(),
+                cron: j.cron_str.clone(),
+                kind: j.kind,
+                next_fire: next.map(|t| t.timestamp()),
+                next_fire_local: next.map(|t| t.format("%Y-%m-%d %H:%M").to_string()),
+            }
+        })
+        .collect()
+}
+
+/// A parsed cron job discovered from the DAG at startup.
+struct ScheduledJob {
+    /// Full node id (e.g. `pipeline.py:daily_report`), used verbatim as the run target.
+    id: String,
+    /// Node kind decides the trigger path: asset/sensor → `get`, task → `run`.
+    kind: NodeKind,
+    /// The original cron string, kept for logging.
+    cron_str: String,
+    /// Parsed 5-field cron expression, evaluated in local time.
+    cron: Cron,
+}
+
+/// Enumerate every node whose freshness is `Schedule(cron)` and parse each cron.
+/// A DAG-analysis failure disables the scheduler (returns empty); individual
+/// invalid/empty cron strings are logged and skipped rather than aborting.
+fn collect_jobs(files: &[String], python: &PathBuf) -> Vec<ScheduledJob> {
+    match commands::list_assets(files, python) {
+        Ok(summaries) => jobs_from_summaries(summaries),
+        Err(e) => {
+            eprintln!("[barca] scheduler disabled: failed to analyze DAG: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Pure summary → job mapping (split out from [`collect_jobs`] so it is testable
+/// without a Python interpreter). Drops entries whose cron fails to parse.
+fn jobs_from_summaries(summaries: Vec<AssetSummary>) -> Vec<ScheduledJob> {
+    let mut jobs = Vec::new();
+    for s in summaries {
+        let Freshness::Schedule(expr) = &s.freshness else {
+            continue;
+        };
+        match Cron::from_str(&expr.0) {
+            Ok(cron) => jobs.push(ScheduledJob {
+                id: s.id,
+                kind: s.kind,
+                cron_str: expr.0.clone(),
+                cron,
+            }),
+            Err(e) => eprintln!(
+                "[barca] skipping '{}': invalid cron {:?}: {e}",
+                s.id, expr.0
+            ),
+        }
+    }
+    jobs
+}
+
+/// Pure eligibility check: which jobs fire at `now`? Split out so it can be
+/// unit-tested against fixed timestamps without a running server or wall clock.
+///
+/// `now` is truncated to the start of its minute before matching, because a
+/// 5-field cron implicitly pins seconds to `0`; the tick loop wakes a few
+/// milliseconds *after* the minute boundary, so we normalize here.
+fn due_jobs<'a, Tz: TimeZone>(
+    now: &DateTime<Tz>,
+    jobs: &'a [ScheduledJob],
+) -> Vec<&'a ScheduledJob> {
+    let minute = now
+        .with_second(0)
+        .and_then(|t| t.with_nanosecond(0))
+        .unwrap_or_else(|| now.clone());
+    jobs.iter()
+        .filter(|j| j.cron.is_time_matching(&minute).unwrap_or(false))
+        .collect()
+}
+
+/// Milliseconds from `now` until just after the next minute boundary. A small
+/// cushion guarantees the tick wakes with the second component at `0`. Pure so
+/// the boundary arithmetic can be unit-tested without sleeping.
+fn millis_to_next_minute<Tz: TimeZone>(now: &DateTime<Tz>) -> u64 {
+    let elapsed_ms = now.second() as u64 * 1_000 + now.nanosecond() as u64 / 1_000_000;
+    60_000u64.saturating_sub(elapsed_ms) + 5
+}
+
+/// Sleep until just after the next minute boundary in the scheduler's timezone.
+async fn sleep_to_next_minute(zone: &Zone) {
+    tokio::time::sleep(Duration::from_millis(millis_to_next_minute(&zone.now()))).await;
+}
+
+/// Resolved timezone that cron expressions are evaluated in.
+enum Zone {
+    Local,
+    Utc,
+    Named(chrono_tz::Tz),
+}
+
+impl Zone {
+    /// Parse a `--timezone` value: `local` (default), `utc`, or an IANA name
+    /// like `America/New_York`. Unknown names fall back to local with a warning.
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "local" => Zone::Local,
+            "utc" => Zone::Utc,
+            _ => match s.trim().parse::<chrono_tz::Tz>() {
+                Ok(tz) => Zone::Named(tz),
+                Err(_) => {
+                    eprintln!("[barca] unknown timezone {s:?}, using local time");
+                    Zone::Local
+                }
+            },
+        }
+    }
+
+    /// The current instant in this zone as a fixed-offset datetime.
+    fn now(&self) -> DateTime<FixedOffset> {
+        match self {
+            Zone::Local => Local::now().fixed_offset(),
+            Zone::Utc => Utc::now().fixed_offset(),
+            Zone::Named(tz) => Utc::now().with_timezone(tz).fixed_offset(),
+        }
+    }
+
+    /// An epoch-seconds timestamp interpreted in this zone.
+    fn timestamp(&self, secs: i64) -> DateTime<FixedOffset> {
+        let dt = match self {
+            Zone::Local => Local
+                .timestamp_opt(secs, 0)
+                .single()
+                .map(|t| t.fixed_offset()),
+            Zone::Utc => Utc
+                .timestamp_opt(secs, 0)
+                .single()
+                .map(|t| t.fixed_offset()),
+            Zone::Named(tz) => tz.timestamp_opt(secs, 0).single().map(|t| t.fixed_offset()),
+        };
+        dt.unwrap_or_else(|| self.now())
+    }
+}
+
+/// What the scheduler decided to do with a due job on a given tick.
+enum TickAction<'a> {
+    /// Trigger a run of this job.
+    Fire(&'a ScheduledJob),
+    /// Skip because this job's previous run (`handle`) is still in flight.
+    Skip {
+        job: &'a ScheduledJob,
+        handle: String,
+    },
+}
+
+/// Decide, for a tick at `now`, which due jobs to fire and which to skip. Pure:
+/// takes the last handle issued per job and a predicate reporting whether a
+/// handle is still running, so the overlap-skip logic is testable without a
+/// live server or wall clock.
+fn plan_tick<'a, Tz: TimeZone>(
+    now: &DateTime<Tz>,
+    jobs: &'a [ScheduledJob],
+    last_handle: &HashMap<String, String>,
+    in_flight: impl Fn(&str) -> bool,
+) -> Vec<TickAction<'a>> {
+    due_jobs(now, jobs)
+        .into_iter()
+        .map(|job| match last_handle.get(&job.id) {
+            Some(h) if in_flight(h) => TickAction::Skip {
+                job,
+                handle: h.clone(),
+            },
+            _ => TickAction::Fire(job),
+        })
+        .collect()
+}
+
+/// Whether a previously-issued run handle is still pending or running.
+fn is_in_flight(state: &AppState, handle: &str) -> bool {
+    state
+        .runs
+        .get(handle)
+        .is_some_and(|r| matches!(r.status, RunStatus::Pending | RunStatus::Running))
+}
+
+/// Trigger a run for a due job, routed by node kind: assets and sensors go
+/// through the `get` path, tasks through the `run` path. Returns the handle.
+fn trigger(state: &AppState, job: &ScheduledJob) -> String {
+    match job.kind {
+        NodeKind::Task => handlers::start_run_task(state.clone(), job.id.clone()),
+        NodeKind::Asset | NodeKind::Sensor => {
+            handlers::start_run(state.clone(), Some(job.id.clone()))
+        }
+    }
+}
+
+/// Whether a scheduled tick elapsed between `last_fired` and `now` — i.e. the
+/// next cron occurrence strictly after `last_fired` is already in the past. This
+/// drives the single catch-up run after the daemon was down. Pure and generic
+/// over timezone so it is testable and reusable once a `--timezone` is honored.
+fn needs_catchup<Tz: TimeZone>(cron: &Cron, last_fired: &DateTime<Tz>, now: &DateTime<Tz>) -> bool {
+    match cron.find_next_occurrence(last_fired, false) {
+        Ok(next) => next <= *now,
+        Err(_) => false,
+    }
+}
+
+/// Record that `node_id` fired at `epoch` seconds. Best-effort durability: the DB
+/// helpers build their own runtime, so they must run on the blocking pool.
+async fn persist_fired(db_path: &str, node_id: &str, epoch: i64) {
+    let d = db_path.to_string();
+    let n = node_id.to_string();
+    match tokio::task::spawn_blocking(move || db::upsert_schedule_state_sync(&d, &n, epoch)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[barca] schedule_state write failed for {node_id}: {e}"),
+        Err(e) => eprintln!("[barca] schedule_state task failed for {node_id}: {e}"),
+    }
+}
+
+/// Publish the current job set + last-fired/last-handle bookkeeping into shared
+/// state for `GET /schedule` to read.
+fn publish_registry(
+    state: &AppState,
+    jobs: &[ScheduledJob],
+    last_handle: &HashMap<String, String>,
+    last_fired: &HashMap<String, i64>,
+) {
+    let snapshot: Vec<JobStatus> = jobs
+        .iter()
+        .map(|j| JobStatus {
+            id: j.id.clone(),
+            cron: j.cron_str.clone(),
+            kind: j.kind,
+            last_fired: last_fired.get(&j.id).copied(),
+            last_handle: last_handle.get(&j.id).cloned(),
+        })
+        .collect();
+    if let Ok(mut w) = state.schedule.write() {
+        *w = snapshot;
+    }
+}
+
+/// Re-run static analysis to enumerate scheduled jobs (blocking, off the async
+/// runtime). Returns `None` only if the analysis task itself panicked.
+async fn reload_jobs(state: &AppState) -> Option<Vec<ScheduledJob>> {
+    let files = state.config.files.clone();
+    let python = state.config.python.clone();
+    match tokio::task::spawn_blocking(move || collect_jobs(&files, &python)).await {
+        Ok(jobs) => Some(jobs),
+        Err(e) => {
+            eprintln!("[barca] scheduler: analysis task failed: {e}");
+            None
+        }
+    }
+}
+
+/// Log the current schedule and each job's next fire time.
+fn log_schedule(jobs: &[ScheduledJob], zone: &Zone) {
+    if jobs.is_empty() {
+        eprintln!("[barca] no scheduled assets yet (watching for changes)");
+        return;
+    }
+    eprintln!(
+        "[barca] scheduling {} asset{}:",
+        jobs.len(),
+        if jobs.len() == 1 { "" } else { "s" }
+    );
+    let now = zone.now();
+    for job in jobs {
+        let next = job
+            .cron
+            .find_next_occurrence(&now, false)
+            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        eprintln!("  {} — {} (next {})", job.id, job.cron_str, next);
+    }
+}
+
+/// The scheduler background task. Spawned from `serve_async` when scheduling is
+/// enabled; runs for the lifetime of the server.
+pub async fn run_scheduler(state: AppState) {
+    let zone = Zone::parse(&state.config.timezone);
+
+    let mut jobs = match reload_jobs(&state).await {
+        Some(jobs) => jobs,
+        None => return, // analysis task panicked
+    };
+
+    if jobs.is_empty() && !state.config.watch {
+        eprintln!("[barca] no scheduled assets — scheduler idle");
+        return;
+    }
+    log_schedule(&jobs, &zone);
+
+    // Resolve the metadata DB path (same `.barca` a CLI run uses) and ensure the
+    // schedule_state table exists. `None` → durability disabled, live-match only.
+    let db_path = match tokio::task::spawn_blocking(db::ensure_db_dir).await {
+        Ok(Ok(path)) => {
+            let p = path.clone();
+            let _ = tokio::task::spawn_blocking(move || db::init_db_sync(&p)).await;
+            Some(path)
+        }
+        _ => {
+            eprintln!("[barca] scheduler: durability disabled (no metadata db)");
+            None
+        }
+    };
+
+    // Handle issued and last-fired epoch per job. `last_handle` powers the
+    // overlap skip ("passes do not overlap"); `last_fired` powers durability and
+    // the `/schedule` view. Entries for jobs removed on reload are harmless.
+    let mut last_handle: HashMap<String, String> = HashMap::new();
+    let mut last_fired: HashMap<String, i64> = HashMap::new();
+
+    // Catch-up: fire once per job whose scheduled tick elapsed while the daemon
+    // was down. Jobs with no prior record are anchored to now (no first-launch
+    // stampede). Requires durability; skipped entirely if the DB is unavailable.
+    if let Some(dbp) = &db_path {
+        let d = dbp.clone();
+        let saved = tokio::task::spawn_blocking(move || db::get_schedule_state_sync(&d))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        last_fired = saved.clone();
+        let now = zone.now();
+        for job in &jobs {
+            match saved.get(&job.id) {
+                Some(&last_epoch) => {
+                    let last = zone.timestamp(last_epoch);
+                    if needs_catchup(&job.cron, &last, &now) {
+                        let handle = trigger(&state, job);
+                        eprintln!("[barca] catch-up run {} → {handle}", job.id);
+                        last_handle.insert(job.id.clone(), handle);
+                        last_fired.insert(job.id.clone(), now.timestamp());
+                        persist_fired(dbp, &job.id, now.timestamp()).await;
+                    }
+                }
+                None => {
+                    last_fired.insert(job.id.clone(), now.timestamp());
+                    persist_fired(dbp, &job.id, now.timestamp()).await;
+                }
+            }
+        }
+    }
+    publish_registry(&state, &jobs, &last_handle, &last_fired);
+
+    let mut seen_gen = state.dag_generation.load(Ordering::Relaxed);
+
+    loop {
+        sleep_to_next_minute(&zone).await;
+
+        // `--watch`: re-read the job set when a source file changed.
+        let current_gen = state.dag_generation.load(Ordering::Relaxed);
+        if current_gen != seen_gen {
+            seen_gen = current_gen;
+            if let Some(fresh) = reload_jobs(&state).await {
+                eprintln!("[barca] schedule reloaded: {} job(s)", fresh.len());
+                jobs = fresh;
+                log_schedule(&jobs, &zone);
+                publish_registry(&state, &jobs, &last_handle, &last_fired);
+            }
+        }
+
+        let now = zone.now();
+        let mut fired_any = false;
+        for action in plan_tick(&now, &jobs, &last_handle, |h| is_in_flight(&state, h)) {
+            match action {
+                TickAction::Skip { job, handle } => eprintln!(
+                    "[barca] scheduled run {} skipped — previous run {handle} still in flight",
+                    job.id
+                ),
+                TickAction::Fire(job) => {
+                    let handle = trigger(&state, job);
+                    eprintln!("[barca] scheduled run {} → {handle}", job.id);
+                    last_handle.insert(job.id.clone(), handle);
+                    last_fired.insert(job.id.clone(), now.timestamp());
+                    if let Some(dbp) = &db_path {
+                        persist_fired(dbp, &job.id, now.timestamp()).await;
+                    }
+                    fired_any = true;
+                }
+            }
+        }
+        if fired_any {
+            publish_registry(&state, &jobs, &last_handle, &last_fired);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{RunState, ServeConfig};
+    use barca_core::{CronExpr, Freshness, NodeKind};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn summary(id: &str, kind: NodeKind, cron: &str) -> AssetSummary {
+        AssetSummary {
+            id: id.to_string(),
+            kind,
+            freshness: Freshness::Schedule(CronExpr(cron.to_string())),
+            inputs: vec![],
+        }
+    }
+
+    /// Build a single `ScheduledJob` through the real parse path.
+    fn job(id: &str, kind: NodeKind, cron: &str) -> ScheduledJob {
+        jobs_from_summaries(vec![summary(id, kind, cron)])
+            .pop()
+            .expect("valid cron")
+    }
+
+    fn at(hour: u32, minute: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 7, 2, hour, minute, 0)
+            .single()
+            .unwrap()
+    }
+
+    /// A minimal `AppState`. `files` points at a nonexistent path so any run this
+    /// triggers fails fast in the background (DAG read error) with no side effects.
+    fn app_state() -> AppState {
+        AppState::new(ServeConfig {
+            files: vec!["/nonexistent-barca-test-file.py".to_string()],
+            host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port: 0,
+            watch: false,
+            schedule: true,
+            timezone: "local".to_string(),
+            python: PathBuf::from("python3"),
+        })
+    }
+
+    fn insert_run(state: &AppState, handle: &str, status: RunStatus) {
+        state.runs.insert(
+            handle.to_string(),
+            RunState {
+                handle: handle.to_string(),
+                status,
+                result: None,
+                error: None,
+                started_at: 0.0,
+                finished_at: None,
+            },
+        );
+    }
+
+    #[test]
+    fn invalid_and_empty_crons_are_dropped() {
+        let summaries = vec![
+            summary("f.py:good", NodeKind::Asset, "0 5 * * *"),
+            summary("f.py:empty", NodeKind::Asset, ""),
+            summary("f.py:garbage", NodeKind::Asset, "not a cron"),
+        ];
+        let jobs = jobs_from_summaries(summaries);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "f.py:good");
+        assert_eq!(jobs[0].kind, NodeKind::Asset);
+    }
+
+    #[test]
+    fn non_scheduled_freshness_is_ignored() {
+        let summaries = vec![AssetSummary {
+            id: "f.py:always".into(),
+            kind: NodeKind::Asset,
+            freshness: Freshness::Always,
+            inputs: vec![],
+        }];
+        assert!(jobs_from_summaries(summaries).is_empty());
+    }
+
+    #[test]
+    fn daily_cron_fires_only_at_its_minute() {
+        let jobs = jobs_from_summaries(vec![summary("f.py:daily", NodeKind::Asset, "0 5 * * *")]);
+        assert_eq!(due_jobs(&at(5, 0), &jobs).len(), 1, "05:00 should fire");
+        assert!(
+            due_jobs(&at(5, 1), &jobs).is_empty(),
+            "05:01 should not fire"
+        );
+        assert!(
+            due_jobs(&at(6, 0), &jobs).is_empty(),
+            "06:00 should not fire"
+        );
+    }
+
+    #[test]
+    fn step_cron_fires_on_multiples() {
+        let jobs = jobs_from_summaries(vec![summary("f.py:poll", NodeKind::Sensor, "*/5 * * * *")]);
+        assert_eq!(due_jobs(&at(5, 0), &jobs).len(), 1);
+        assert_eq!(due_jobs(&at(5, 5), &jobs).len(), 1);
+        assert!(due_jobs(&at(5, 3), &jobs).is_empty());
+    }
+
+    #[test]
+    fn matching_ignores_sub_minute_component() {
+        // A time a few seconds into the minute must still match (loop wakes late).
+        let jobs = jobs_from_summaries(vec![summary("f.py:daily", NodeKind::Asset, "0 5 * * *")]);
+        let late = Local
+            .with_ymd_and_hms(2026, 7, 2, 5, 0, 42)
+            .single()
+            .unwrap();
+        assert_eq!(due_jobs(&late, &jobs).len(), 1);
+    }
+
+    // ─── catch-up detection ────────────────────────────────────────────────
+
+    #[test]
+    fn needs_catchup_true_when_a_tick_was_missed() {
+        let j = job("f.py:daily", NodeKind::Asset, "0 5 * * *");
+        // Last fired yesterday 05:00; now is today 06:00 → today's 05:00 was missed.
+        let last = at(5, 0) - chrono::Duration::days(1);
+        assert!(needs_catchup(&j.cron, &last, &at(6, 0)));
+    }
+
+    #[test]
+    fn needs_catchup_false_when_no_tick_elapsed() {
+        let j = job("f.py:daily", NodeKind::Asset, "0 5 * * *");
+        // Fired at today 05:00; now 05:30 — next occurrence is tomorrow, not past.
+        let last = at(5, 0);
+        let now = Local
+            .with_ymd_and_hms(2026, 7, 2, 5, 30, 0)
+            .single()
+            .unwrap();
+        assert!(!needs_catchup(&j.cron, &last, &now));
+    }
+
+    #[test]
+    fn needs_catchup_true_after_long_downtime() {
+        // A */5 job down for an hour: a tick is certainly in the past → catch up once.
+        let j = job("f.py:poll", NodeKind::Sensor, "*/5 * * * *");
+        let last = at(5, 0);
+        assert!(needs_catchup(&j.cron, &last, &at(6, 0)));
+    }
+
+    // ─── timezone handling ─────────────────────────────────────────────────
+
+    #[test]
+    fn zone_parse_handles_local_utc_named_and_unknown() {
+        assert!(matches!(Zone::parse("local"), Zone::Local));
+        assert!(matches!(Zone::parse(""), Zone::Local));
+        assert!(matches!(Zone::parse("UTC"), Zone::Utc));
+        assert!(matches!(Zone::parse("America/New_York"), Zone::Named(_)));
+        // Unknown names fall back to local rather than erroring.
+        assert!(matches!(Zone::parse("Not/AZone"), Zone::Local));
+    }
+
+    #[test]
+    fn zone_timestamp_round_trips_epoch() {
+        assert_eq!(Zone::Utc.timestamp(0).timestamp(), 0);
+        assert_eq!(Zone::Local.timestamp(1_000).timestamp(), 1_000);
+    }
+
+    #[test]
+    fn due_jobs_works_in_a_fixed_offset_zone() {
+        use chrono::FixedOffset;
+        // Matching must work for the DateTime<FixedOffset> the scheduler actually
+        // uses in production (not just the Local type the other tests exercise).
+        let jobs = jobs_from_summaries(vec![summary("f.py:daily", NodeKind::Asset, "0 5 * * *")]);
+        let tz = FixedOffset::east_opt(5 * 3600).unwrap();
+        let at_five = tz.with_ymd_and_hms(2026, 7, 2, 5, 0, 0).single().unwrap();
+        assert_eq!(due_jobs(&at_five, &jobs).len(), 1);
+        let at_six = tz.with_ymd_and_hms(2026, 7, 2, 6, 0, 0).single().unwrap();
+        assert!(due_jobs(&at_six, &jobs).is_empty());
+    }
+
+    #[test]
+    fn scheduled_task_keeps_task_kind() {
+        // Discovery must preserve kind so `trigger` can route tasks to the run path.
+        let jobs = jobs_from_summaries(vec![summary(
+            "f.py:cleanup",
+            NodeKind::Task,
+            "*/10 * * * *",
+        )]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, NodeKind::Task);
+    }
+
+    // ─── minute-boundary arithmetic ────────────────────────────────────────
+
+    #[test]
+    fn millis_to_next_minute_from_boundary_and_mid() {
+        let at_s = |sec: u32| {
+            Local
+                .with_ymd_and_hms(2026, 7, 2, 5, 0, sec)
+                .single()
+                .unwrap()
+        };
+        assert_eq!(millis_to_next_minute(&at_s(0)), 60_005);
+        assert_eq!(millis_to_next_minute(&at_s(30)), 30_005);
+        let almost = at_s(59).with_nanosecond(500_000_000).unwrap();
+        assert_eq!(millis_to_next_minute(&almost), 505);
+    }
+
+    // ─── in-flight detection ───────────────────────────────────────────────
+
+    #[test]
+    fn is_in_flight_only_for_pending_or_running() {
+        let st = app_state();
+        insert_run(&st, "pending", RunStatus::Pending);
+        insert_run(&st, "running", RunStatus::Running);
+        insert_run(&st, "complete", RunStatus::Complete);
+        insert_run(&st, "failed", RunStatus::Failed);
+        assert!(is_in_flight(&st, "pending"));
+        assert!(is_in_flight(&st, "running"));
+        assert!(!is_in_flight(&st, "complete"));
+        assert!(!is_in_flight(&st, "failed"));
+        assert!(
+            !is_in_flight(&st, "missing"),
+            "unknown handle is not in flight"
+        );
+    }
+
+    // ─── per-tick planning (the overlap-skip guard) ────────────────────────
+
+    fn fired_ids(plan: &[TickAction]) -> Vec<String> {
+        plan.iter()
+            .filter_map(|a| match a {
+                TickAction::Fire(j) => Some(j.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn skipped_ids(plan: &[TickAction]) -> Vec<String> {
+        plan.iter()
+            .filter_map(|a| match a {
+                TickAction::Skip { job, .. } => Some(job.id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn plan_tick_fires_when_no_prior_run() {
+        let jobs = vec![job("f.py:daily", NodeKind::Asset, "0 5 * * *")];
+        let plan = plan_tick(&at(5, 0), &jobs, &HashMap::new(), |_| false);
+        assert_eq!(fired_ids(&plan), vec!["f.py:daily"]);
+    }
+
+    #[test]
+    fn plan_tick_skips_when_prior_run_in_flight() {
+        let jobs = vec![job("f.py:daily", NodeKind::Asset, "0 5 * * *")];
+        let last = HashMap::from([("f.py:daily".to_string(), "h1".to_string())]);
+        let plan = plan_tick(&at(5, 0), &jobs, &last, |h| h == "h1");
+        assert!(fired_ids(&plan).is_empty());
+        assert_eq!(skipped_ids(&plan), vec!["f.py:daily"]);
+        // The skip carries the offending handle for the log line.
+        match &plan[0] {
+            TickAction::Skip { handle, .. } => assert_eq!(handle, "h1"),
+            _ => panic!("expected skip"),
+        }
+    }
+
+    #[test]
+    fn plan_tick_fires_again_once_prior_run_finished() {
+        let jobs = vec![job("f.py:daily", NodeKind::Asset, "0 5 * * *")];
+        let last = HashMap::from([("f.py:daily".to_string(), "h1".to_string())]);
+        // Same handle recorded, but it is no longer in flight (completed/evicted).
+        let plan = plan_tick(&at(5, 0), &jobs, &last, |_| false);
+        assert_eq!(fired_ids(&plan), vec!["f.py:daily"]);
+    }
+
+    #[test]
+    fn plan_tick_ignores_jobs_not_due_this_minute() {
+        let jobs = vec![job("f.py:daily", NodeKind::Asset, "0 5 * * *")];
+        let plan = plan_tick(&at(6, 0), &jobs, &HashMap::new(), |_| false);
+        assert!(plan.is_empty(), "06:00 is not the job's minute");
+    }
+
+    #[test]
+    fn plan_tick_mixes_fire_and_skip_across_jobs() {
+        let jobs = vec![
+            job("f.py:a", NodeKind::Asset, "0 5 * * *"),
+            job("f.py:b", NodeKind::Task, "0 5 * * *"),
+        ];
+        // `a` has a run still going; `b` has never run.
+        let last = HashMap::from([("f.py:a".to_string(), "ha".to_string())]);
+        let plan = plan_tick(&at(5, 0), &jobs, &last, |h| h == "ha");
+        assert_eq!(skipped_ids(&plan), vec!["f.py:a"]);
+        assert_eq!(fired_ids(&plan), vec!["f.py:b"]);
+    }
+
+    // ─── kind-based dispatch ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn trigger_registers_a_tracked_run_for_asset_and_task() {
+        let st = app_state();
+        let asset = job("f.py:a", NodeKind::Asset, "* * * * *");
+        let task = job("f.py:t", NodeKind::Task, "* * * * *");
+        // Both kinds must produce a handle that is registered in the runs map,
+        // proving each routes into a real run-trigger path (get vs run).
+        let ha = trigger(&st, &asset);
+        let ht = trigger(&st, &task);
+        assert!(st.runs.contains_key(&ha));
+        assert!(st.runs.contains_key(&ht));
+        assert_ne!(ha, ht);
+    }
+
+    // ─── real-parser enumeration seam ──────────────────────────────────────
+
+    #[test]
+    fn collect_jobs_discovers_scheduled_nodes_from_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline.py");
+        std::fs::write(
+            &path,
+            concat!(
+                "from barca import asset, sensor, Schedule, Always\n\n",
+                "@asset(freshness=Schedule(\"0 6 * * *\"))\n",
+                "def daily_report() -> dict:\n    return {}\n\n",
+                "@sensor(freshness=Schedule(\"*/5 * * * *\"))\n",
+                "def inbox() -> tuple:\n    return (True, [])\n\n",
+                "@asset(freshness=Always)\n",
+                "def raw() -> dict:\n    return {}\n",
+            ),
+        )
+        .unwrap();
+
+        let jobs = collect_jobs(
+            &[path.display().to_string()],
+            &barca_core::commands::find_python(),
+        );
+
+        assert_eq!(
+            jobs.len(),
+            2,
+            "only the two Schedule nodes, not the Always asset"
+        );
+        assert!(
+            jobs.iter().any(|j| j.id.ends_with(":daily_report")
+                && j.kind == NodeKind::Asset
+                && j.cron_str == "0 6 * * *"),
+            "scheduled asset discovered with round-tripped cron",
+        );
+        assert!(
+            jobs.iter().any(|j| j.id.ends_with(":inbox")
+                && j.kind == NodeKind::Sensor
+                && j.cron_str == "*/5 * * * *"),
+            "scheduled sensor discovered with round-tripped cron",
+        );
+    }
+
+    #[test]
+    fn describe_schedule_reports_next_fire() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pipeline.py");
+        std::fs::write(
+            &path,
+            concat!(
+                "from barca import asset, Schedule\n\n",
+                "@asset(freshness=Schedule(\"*/5 * * * *\"))\n",
+                "def poll() -> dict:\n    return {}\n",
+            ),
+        )
+        .unwrap();
+
+        let infos = describe_schedule(
+            &[path.display().to_string()],
+            &barca_core::commands::find_python(),
+        );
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].cron, "*/5 * * * *");
+        assert_eq!(infos[0].kind, NodeKind::Asset);
+        // A `*/5` cron always has an upcoming occurrence.
+        assert!(infos[0].next_fire.is_some());
+        assert!(infos[0].next_fire_local.is_some());
+    }
+}
