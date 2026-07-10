@@ -21,7 +21,7 @@ Shipped:
 - Retries with backoff (`retries=`, `retry_backoff=`)
 - Benchmarks: 13-97x faster than Dagster/Prefect across all workloads
 
-## 0.2.0 (current)
+## 0.2.0 (shipped)
 
 The execution engine rewrite. Replaced the old per-thread dispatch system with
 a stateless worker pool coordinated via Unix domain sockets.
@@ -42,7 +42,7 @@ Shipped:
 Issues closed: [#70](https://github.com/ExSidius/barca/issues/70) (UDS communication),
 [#58](https://github.com/ExSidius/barca/issues/58) (asset vs task model)
 
-## 0.3.0 (planned)
+## 0.3.0 (current)
 
 Goal: scheduling, remote I/O, observability.
 
