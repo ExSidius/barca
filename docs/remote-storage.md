@@ -2,8 +2,9 @@
 
 Barca can store artifacts — the serialized outputs of every asset — in a
 remote object store instead of the local `.barca/artifacts/` directory, and
-`@sink` destinations can point at remote URIs directly. Azure ADLS Gen2 is
-the first-class backend; S3 and GCS plug in through the same mechanism.
+`@sink` destinations can point at remote URIs directly. Amazon S3, Google
+Cloud Storage, and Azure ADLS Gen2 are all first-class; Cloudflare R2 rides
+on the S3 backend (it speaks the S3 API).
 
 ## Install the backend
 
@@ -11,14 +12,21 @@ Remote backends are optional extras — the core install stays dependency-free:
 
 | Extra | Backend | URI schemes |
 |---|---|---|
-| `barca[azure]` | Azure ADLS Gen2 / Blob (adlfs) | `abfs://`, `abfss://` |
 | `barca[s3]` | Amazon S3 (s3fs) | `s3://`, `s3a://` |
-| `barca[gcs]` | Google Cloud Storage (gcsfs) | `gs://`, `gcs://` |
+| `barca[r2]` | Cloudflare R2 (s3fs) — S3-compatible | `s3://` + R2 endpoint |
+| `barca[gcs]` | Google Cloud Storage (gcsfs + google-cloud-storage) | `gs://`, `gcs://` |
+| `barca[azure]` | Azure ADLS Gen2 / Blob (adlfs) | `abfs://`, `abfss://` |
 | `barca[remote]` | all of the above | |
 
 ```bash
-uv add 'barca[azure]'
+uv add 'barca[s3]'
 ```
+
+Every backend is held to the **same shared-state contract** — conditional
+create, cross-machine cache hit, concurrent-writer conflict → replay — by a
+backend conformance suite that runs on every PR against local emulators
+(MinIO for S3/R2, fake-gcs-server for GCS, Azurite for Azure). See
+[Releases](releases.md) for the guarantees each backend makes.
 
 ## Remote mode: shared state + artifacts
 
@@ -108,21 +116,50 @@ deserialized, and the temp file removed.
 
 Barca passes no credentials — each backend uses its native default chain:
 
+- **S3 (s3fs)**: the standard boto chain — `AWS_ACCESS_KEY_ID`, profiles,
+  instance metadata.
+- **GCS**: `google.auth` application default credentials. Artifact I/O uses
+  gcsfs; the shared-state path uses the `google-cloud-storage` SDK directly
+  (gcsfs cannot express a generation precondition on overwrite) — both read
+  the same ADC chain.
 - **Azure (adlfs)**: `DefaultAzureCredential` — env vars
   (`AZURE_CLIENT_ID`/`AZURE_CLIENT_SECRET`/`AZURE_TENANT_ID`), managed
   identity, Azure CLI login, etc. `AZURE_STORAGE_ACCOUNT_NAME` /
   `AZURE_STORAGE_ACCOUNT_KEY` and connection strings also work.
-- **S3 (s3fs)**: the standard boto chain — `AWS_ACCESS_KEY_ID`, profiles,
-  instance metadata.
-- **GCS (gcsfs)**: `google.auth` application default credentials.
 
 For anything the default chains can't express, `BARCA_STORAGE_OPTIONS`
 takes a JSON object keyed by fsspec protocol, splatted into the filesystem
-constructor:
+constructor (equivalently, `[remote.storage_options.<protocol>]` in
+`barca.toml`):
 
 ```bash
 export BARCA_STORAGE_OPTIONS='{"abfs": {"account_name": "myaccount", "anon": false}}'
 ```
+
+### Cloudflare R2
+
+R2 is S3-compatible, so it uses the `s3://` schemes with the S3 backend
+(`barca[r2]` or `barca[s3]`) pointed at your account's R2 endpoint. Set the
+endpoint in `storage_options` under the `s3` protocol; credentials are your
+R2 access key / secret via the usual boto env vars:
+
+```toml
+# barca.toml
+[remote]
+uri = "s3://my-bucket/barca/my-project"
+
+[remote.storage_options.s3]
+client_kwargs = { endpoint_url = "https://<account-id>.r2.cloudflarestorage.com" }
+```
+
+```bash
+export AWS_ACCESS_KEY_ID=<r2-access-key-id>
+export AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
+```
+
+R2 supports the same `If-Match` conditional writes barca's shared state relies
+on. As with S3, the state blob must stay under the 48 MiB single-request limit
+(the coordinator errors clearly if it grows past that).
 
 ## v1 limitations
 
