@@ -44,6 +44,9 @@ pub struct ItemSpec {
     pub serializer: Option<String>,
     /// Sink outputs from stacked `@sink(...)` decorators.
     pub sinks: Vec<crate::model::SinkDecl>,
+    /// Content-addressing run hash for this item's artifact (None → legacy
+    /// node-id-keyed layout, e.g. parallel() children).
+    pub run_hash: Option<String>,
     /// Original step.inputs mapping: param_name → upstream_node_id.
     /// Used at dispatch time to resolve in-phase upstream artifacts.
     pub upstream_inputs: HashMap<String, String>,
@@ -65,6 +68,7 @@ impl ItemSpec {
             retry_backoff_seconds: step.retry_backoff_seconds,
             serializer: step.serializer.as_ref().map(|s| s.to_string()),
             sinks: step.sinks.clone(),
+            run_hash: step.run_hashes.get(&step.step_id.display()).cloned(),
             upstream_inputs: step.inputs.clone(),
             kind: format!("{:?}", step.kind).to_lowercase(),
             is_dynamic: false,
@@ -445,6 +449,7 @@ impl Coordinator {
                         }
 
                         let mut spec = ItemSpec::from_step(step);
+                        spec.run_hash = step.run_hashes.get(&partition_display).cloned();
                         // Add partition values as direct_kwargs so they're
                         // injected into the function call.
                         for (k, v) in &pk.0 {
@@ -660,6 +665,7 @@ mod tests {
             retry_backoff_seconds: 0.0,
             serializer: None,
             sinks: Vec::new(),
+            run_hash: None,
             upstream_inputs: HashMap::new(),
             kind: "asset".to_string(),
             is_dynamic: false,
@@ -1025,5 +1031,67 @@ mod tests {
             }
         }
         assert_eq!(count, 10_000);
+    }
+
+    #[test]
+    fn load_phase_assigns_run_hashes_per_item_and_partition() {
+        use crate::planner::{Phase, PhaseReason, StreamStep, WorkerStream};
+        use crate::{PartitionKey, StepId};
+
+        let pk_a = PartitionKey::from(HashMap::from([("t".to_string(), "A".to_string())]));
+        let pk_b = PartitionKey::from(HashMap::from([("t".to_string(), "B".to_string())]));
+
+        let mut plain_hashes = HashMap::new();
+        plain_hashes.insert("f:plain".to_string(), "hash-plain".to_string());
+        let mut part_hashes = HashMap::new();
+        part_hashes.insert("f:part[t=A]".to_string(), "hash-a".to_string());
+        part_hashes.insert("f:part[t=B]".to_string(), "hash-b".to_string());
+
+        let mk = |name: &str, hashes: HashMap<String, String>, pks: Vec<PartitionKey>| StreamStep {
+            step_id: StepId::unpartitioned(name),
+            kind: crate::NodeKind::Asset,
+            function_name: std::sync::Arc::from(name.rsplit(':').next().unwrap()),
+            source_file: std::sync::Arc::from("f"),
+            inputs: HashMap::new(),
+            pending_partitions: HashMap::new(),
+            serializer: None,
+            sinks: vec![],
+            run_hashes: hashes,
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            partition_keys: pks,
+        };
+
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![
+                    mk("f:plain", plain_hashes, vec![]),
+                    mk("f:part", part_hashes, vec![pk_a, pk_b]),
+                ],
+            }],
+        };
+
+        let mut c = Coordinator::new();
+        let loaded = c.load_phase(&phase, &HashMap::new());
+        assert_eq!(loaded, 3);
+
+        let mut seen: Vec<(String, Option<String>)> = Vec::new();
+        while let Some(id) = c.next_ready() {
+            let item = c.item(id);
+            seen.push((item.step_id.display(), item.spec.run_hash.clone()));
+            c.on_item_completed(id);
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("f:part[t=A]".to_string(), Some("hash-a".to_string())),
+                ("f:part[t=B]".to_string(), Some("hash-b".to_string())),
+                ("f:plain".to_string(), Some("hash-plain".to_string())),
+            ]
+        );
     }
 }

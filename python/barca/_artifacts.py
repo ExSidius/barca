@@ -254,11 +254,21 @@ def safe_node_id(node_id: str) -> str:
     return s
 
 
-def artifact_path(artifact_dir: "Path | str", node_id: str, fmt: str) -> "Path | str":
+def artifact_path(
+    artifact_dir: "Path | str", node_id: str, fmt: str, run_hash: "str | None" = None
+) -> "Path | str":
     """Compute the deterministic artifact path for a node + format.
+
+    With a run_hash the artifact is content-addressed —
+    ``{dir}/{safe_node_id}/{run_hash}{ext}`` — so objects are immutable and
+    cache hits transfer across machines. Without one (older coordinators,
+    parallel() children, batch mode) the legacy node-id-keyed layout is used.
 
     Returns a Path for a local artifact_dir, or a URI string when
     artifact_dir is a remote prefix (e.g. BARCA_ARTIFACT_URI).
     """
     ext = _FORMAT_EXTENSIONS.get(fmt, f".{fmt}")
+    if run_hash:
+        subdir = _storage.join(artifact_dir, safe_node_id(node_id))
+        return _storage.join(subdir, f"{run_hash}{ext}")
     return _storage.join(artifact_dir, f"{safe_node_id(node_id)}{ext}")

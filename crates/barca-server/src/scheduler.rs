@@ -341,7 +341,13 @@ pub async fn run_scheduler(state: AppState) {
 
     // Resolve the metadata DB path (same `.barca` a CLI run uses) and ensure the
     // schedule_state table exists. `None` → durability disabled, live-match only.
-    let db_path = match tokio::task::spawn_blocking(db::ensure_db_dir).await {
+    let sched_env = state.config.resolved.env.clone();
+    let sched_db = state.config.resolved.db_path.clone();
+    let db_path = match tokio::task::spawn_blocking(move || {
+        db::ensure_env_dirs(&sched_env).map(|_| sched_db)
+    })
+    .await
+    {
         Ok(Ok(path)) => {
             let p = path.clone();
             let _ = tokio::task::spawn_blocking(move || db::init_db_sync(&p)).await;
@@ -476,6 +482,8 @@ mod tests {
             schedule: true,
             timezone: "local".to_string(),
             python: PathBuf::from("python3"),
+            resolved: barca_core::config::resolve_in(None, std::path::Path::new("/nonexistent"))
+                .unwrap(),
         })
     }
 

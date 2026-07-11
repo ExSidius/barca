@@ -228,7 +228,12 @@ def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=Fa
     """Serialize a result to its artifact and emit a `result` protocol message."""
     explicit_fmt = step.get("serializer")
     fmt = resolve_format(result, detect_format(result, explicit=explicit_fmt))
-    path = artifact_path(art_dir, node_id, fmt)
+    # Content-addressed layout when the coordinator supplies a run hash.
+    # Batch mode's legacy partitioned loop reuses the step-level hash only for
+    # unpartitioned steps (a per-step hash is wrong per-partition; the daemon
+    # path gets a per-item hash from Rust and batch mode is test-only).
+    run_hash = step.get("run_hash") if node_id == step.get("node_id") else None
+    path = artifact_path(art_dir, node_id, fmt, run_hash)
     size = serialize(result, path, fmt)
     artifact = {"path": str(path), "format": fmt, "size_bytes": size}
     if elapsed_in_artifact:

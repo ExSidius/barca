@@ -34,6 +34,7 @@ fn fixture_config(dir: &std::path::Path) -> ServeConfig {
         schedule: false,
         timezone: "local".to_string(),
         python: barca_core::commands::find_python(),
+        resolved: barca_core::config::resolve_in(None, dir).unwrap(),
     }
 }
 
