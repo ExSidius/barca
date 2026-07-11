@@ -42,3 +42,55 @@ jobs:
           bash tests/integration/test_cli.sh
           bash tests/integration/test_cache.sh
           bash tests/integration/test_cache_gaps.sh
+          bash tests/integration/test_env.sh
+          bash tests/integration/test_remote_state.sh
+
+  backends:
+    # Python unit tests + the state-backend conformance suite run against local
+    # object-store emulators (no cloud credentials). MinIO covers the S3 API —
+    # and therefore Cloudflare R2's code path — fake-gcs-server covers GCS
+    # generation-match, Azurite covers Azure ETag If-Match.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build barca and install test extras
+        run: |
+          pip install maturin
+          rm -rf target/wheels
+          maturin build --release
+          WHEEL=$(ls target/wheels/*.whl)
+          pip install "${WHEEL}[test]"
+
+      - name: Start object-store emulators
+        run: |
+          docker run -d --name minio -p 9100:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          docker run -d --name fake-gcs -p 9200:4443 \
+            fsouza/fake-gcs-server -scheme http -port 4443 \
+            -public-host localhost:9200 -external-url http://localhost:9200
+          docker run -d --name azurite -p 9210:10000 \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+
+      - name: Wait for emulators
+        run: |
+          for i in $(seq 1 60); do curl -sf http://localhost:9100/minio/health/live && break; sleep 1; done
+          for i in $(seq 1 60); do curl -sf http://localhost:9200/storage/v1/b >/dev/null && break; sleep 1; done
+          for i in $(seq 1 60); do curl -s http://localhost:9210/devstoreaccount1 >/dev/null && break; sleep 1; done
+
+      - name: Run Python suite (unit + backend conformance)
+        env:
+          BARCA_TEST_S3_ENDPOINT: http://localhost:9100
+          BARCA_TEST_GCS_ENDPOINT: http://localhost:9200
+          BARCA_TEST_AZURITE_HOST: 127.0.0.1:9210
+        run: pytest python/tests -q

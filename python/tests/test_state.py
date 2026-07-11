@@ -158,9 +158,36 @@ class TestRemoteToken:
         self._with_info(monkeypatch, {"ETag": '"abc123"', "size": 10})
         assert _remote_token("s3://b/x") == '"abc123"'
 
-    def test_gcsfs_generation(self, monkeypatch):
-        self._with_info(monkeypatch, {"generation": 1712345, "size": 10})
+    def _with_gcs_blob(self, monkeypatch, generation):
+        """Stub the GCS SDK: bucket.get_blob(name) -> object with .generation,
+        or None when generation is None (absent object)."""
+
+        class FakeFetched:
+            pass
+
+        class FakeBucket:
+            def get_blob(self, name):
+                if generation is None:
+                    return None
+                f = FakeFetched()
+                f.generation = generation
+                return f
+
+        class FakeBlob:
+            name = "x"
+            bucket = FakeBucket()
+
+        monkeypatch.setattr("barca._state._gcs_blob", lambda uri: FakeBlob())
+
+    def test_gcs_token_is_sdk_generation(self, monkeypatch):
+        """GCS conditions on the numeric generation, read via the SDK — never
+        the base64 etag, which int(if_generation_match) could not parse."""
+        self._with_gcs_blob(monkeypatch, 1712345)
         assert _remote_token("gs://b/x") == "1712345"
+
+    def test_gcs_token_absent(self, monkeypatch):
+        self._with_gcs_blob(monkeypatch, None)
+        assert _remote_token("gs://b/x") is None
 
     def test_absent_object(self, monkeypatch):
         self._with_info(monkeypatch, None)
@@ -168,7 +195,7 @@ class TestRemoteToken:
 
     def test_missing_token_key_raises(self, monkeypatch):
         self._with_info(monkeypatch, {"size": 10})
-        with pytest.raises(RuntimeError, match="no etag/generation"):
+        with pytest.raises(RuntimeError, match="no etag in object info"):
             _remote_token("s3://b/x")
 
 
@@ -202,3 +229,9 @@ class TestConflictClassification:
         assert _is_conflict(Exception("An error occurred (PreconditionFailed)"))
         assert _is_conflict(Exception("HTTP 412: precondition"))
         assert not _is_conflict(Exception("connection refused"))
+
+    def test_file_exists_error_is_conflict(self):
+        """adlfs raises FileExistsError for mode='create' against an existing
+        blob — a concurrent first-push race, which must classify as a conflict
+        so the coordinator re-pulls and replays instead of hard-failing."""
+        assert _is_conflict(FileExistsError("barca-state/metadata.db"))
