@@ -37,6 +37,8 @@ pub struct ServeConfig {
     pub timezone: String,
     /// Python interpreter used for execution (and dynamic-partition resolution).
     pub python: PathBuf,
+    /// Resolved barca configuration (environment, DB path, artifact root, state).
+    pub resolved: barca_core::config::ResolvedConfig,
 }
 
 /// Lifecycle of an async run tracked by the server.

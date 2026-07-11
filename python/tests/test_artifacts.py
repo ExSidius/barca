@@ -513,3 +513,29 @@ class TestRemoteRoundTrip:
         serialize([1, 2], "memory://arts/x.json", "json")
         assert deserialize("memory://arts/x.json", "json") == [1, 2]
         assert list((tmp_path / ".barca" / "staging").glob("*.tmp")) == []
+
+
+# ─── Content-addressed layout ────────────────────────────────────────────────
+
+
+class TestContentAddressedPaths:
+    def test_run_hash_layout_local(self, tmp_path):
+        p = artifact_path(tmp_path, "f.py:node", "parquet", run_hash="3fa9c2e1")
+        assert p == tmp_path / "f.py--node" / "3fa9c2e1.parquet"
+
+    def test_run_hash_layout_remote(self):
+        p = artifact_path("memory://arts", "f.py:node[t=A]", "json", run_hash="beef")
+        assert p == "memory://arts/f.py--node_t_A/beef.json"
+
+    def test_no_run_hash_is_legacy_layout(self, tmp_path):
+        p = artifact_path(tmp_path, "f.py:node", "json")
+        assert p == tmp_path / "f.py--node.json"
+
+    def test_none_run_hash_is_legacy_layout(self, tmp_path):
+        p = artifact_path(tmp_path, "f.py:node", "json", run_hash=None)
+        assert p == tmp_path / "f.py--node.json"
+
+    def test_serialize_creates_subdir(self, tmp_path):
+        p = artifact_path(tmp_path, "f.py:node", "json", run_hash="cafe01")
+        serialize({"x": 1}, p, "json")
+        assert deserialize(p, "json") == {"x": 1}

@@ -8,6 +8,7 @@ use crate::dispatch;
 use crate::dispatch::OutputRef;
 use crate::parse::extract_nodes;
 use crate::planner::{self, ExecutionPlan, Phase, ResourceConfig};
+use crate::state_sync;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -118,6 +119,7 @@ pub enum CachePolicy {
 
 /// `barca get` — cache-aware execution of an asset (or all assets).
 pub fn get(
+    cfg: &crate::config::ResolvedConfig,
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
@@ -125,6 +127,7 @@ pub fn get(
     agent_mode: bool,
 ) -> Result<GetResult, BarcaError> {
     execute(
+        cfg,
         target_name,
         file_args,
         python,
@@ -138,6 +141,7 @@ pub fn get(
 /// `barca run` — execute a task (and its cone), bursting upstream asset caches.
 /// `burst == None` bursts all upstream assets; `Some(names)` bursts only those.
 pub fn run(
+    cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
@@ -149,6 +153,7 @@ pub fn run(
         Some(names) => CachePolicy::BurstSelective(names),
     };
     execute(
+        cfg,
         Some(target_name),
         file_args,
         python,
@@ -161,6 +166,7 @@ pub fn run(
 
 #[allow(clippy::too_many_arguments)]
 fn execute(
+    cfg: &crate::config::ResolvedConfig,
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
@@ -219,7 +225,20 @@ fn execute(
         full_plan
     };
 
-    let db_path = db::ensure_db_dir()?;
+    db::ensure_env_dirs(&cfg.env)?;
+    let db_path = cfg.db_path.clone();
+
+    // Shared remote state: pull the metadata DB before opening it, so cache
+    // checks below see every machine's materializations. Pull failure is a
+    // hard error — silently diverging local runs are worse than stopping.
+    let state_sync_on =
+        cfg.state == crate::config::StateMode::Optimistic && cfg.state_uri.is_some();
+    let mut state_token = if state_sync_on {
+        Some(state_sync::pull_state(python, cfg)?)
+    } else {
+        None
+    };
+
     db::init_db_sync(&db_path)?;
 
     db::create_run_sync(
@@ -250,7 +269,7 @@ fn execute(
         .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
 
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
+    let mut run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     // Sink outcomes (JSON) per node, accumulated across phases for the DB.
@@ -338,6 +357,43 @@ fn execute(
                 let base_id = step.step_id.base_id();
                 let display_id = step.step_id.display();
                 let base_node = dag.get_node(base_id);
+                let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
+
+                // Compute run hashes for EVERY step (including sensors, tasks,
+                // bursted and partitioned steps that never cache-check): they
+                // content-address the artifacts and key persistence. Steps are
+                // visited in stream order, so in-phase upstream hashes are
+                // already present when a consumer is hashed — check-time and
+                // persist-time hashes are therefore identical.
+                let mut step = step.clone();
+                if step.partition_keys.is_empty() {
+                    let partition_key = if step.step_id.partition.is_empty() {
+                        None
+                    } else {
+                        Some(step.step_id.partition.suffix())
+                    };
+                    let run_h = cache::compute_run_hash(
+                        def_hash,
+                        partition_key.as_deref(),
+                        step.inputs.values(),
+                        &run_hashes,
+                    );
+                    run_hashes.insert(display_id.clone(), run_h.clone());
+                    step.run_hashes.insert(display_id.clone(), run_h);
+                } else {
+                    for pk in &step.partition_keys {
+                        let pdisplay = pk.display_id(&step.step_id.base);
+                        let run_h = cache::compute_run_hash(
+                            def_hash,
+                            Some(&pk.suffix()),
+                            step.inputs.values(),
+                            &run_hashes,
+                        );
+                        run_hashes.insert(pdisplay.clone(), run_h.clone());
+                        step.run_hashes.insert(pdisplay, run_h);
+                    }
+                }
+                let step = &step;
 
                 // Sensors and tasks always re-run — never cached.
                 if base_node.is_some_and(|n| {
@@ -379,19 +435,11 @@ fn execute(
                     continue;
                 }
 
-                let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
-                let partition_key = if step.step_id.partition.is_empty() {
-                    None
-                } else {
-                    Some(step.step_id.partition.suffix())
-                };
-
-                let run_h = cache::compute_run_hash(
-                    def_hash,
-                    partition_key.as_deref(),
-                    step.inputs.values(),
-                    &cached_run_hashes,
-                );
+                let run_h = step
+                    .run_hashes
+                    .get(&display_id)
+                    .cloned()
+                    .expect("unpartitioned step has a precomputed run hash");
 
                 let cached = {
                     let _g = db::db_guard();
@@ -416,8 +464,7 @@ fn execute(
 
                 if let Some(oref) = cached {
                     all_outputs.insert(display_id.clone(), oref);
-                    cached_node_ids.insert(display_id.clone());
-                    cached_run_hashes.insert(display_id, run_h);
+                    cached_node_ids.insert(display_id);
                 } else {
                     uncached_steps.push(step.clone());
                 }
@@ -534,6 +581,8 @@ fn execute(
             python: python.clone(),
             pool_size,
             run_id: run_id.clone(),
+            artifact_root: cfg.artifact_root.clone(),
+            storage_options_json: cfg.storage_options_json.clone(),
         };
 
         // Use a multi-thread runtime for io_loop — the current_thread runtime (used
@@ -626,44 +675,14 @@ fn execute(
             }
         }
 
-        let step_order: Vec<String> = filtered_phase
-            .streams
-            .iter()
-            .flat_map(|s| s.steps.iter().map(|st| st.step_id.display()))
-            .collect();
-        for node_id in step_order {
-            let Some(oref) = phase_outputs.get(&node_id).cloned() else {
-                continue;
-            };
-            let sid = crate::StepId::parse(&node_id);
-            let def_hash = dag
-                .get_node(sid.base_id())
-                .map(|n| n.definition_hash.as_str())
-                .unwrap_or("");
-            let partition_key = if sid.partition.is_empty() {
-                None
-            } else {
-                Some(sid.partition.suffix())
-            };
-
-            let upstream_ids: Vec<String> = dag
-                .get_node(sid.base_id())
-                .map(|n| {
-                    n.resolved_inputs
-                        .values()
-                        .chain(n.resolved_collected.values())
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let run_h = cache::compute_run_hash(
-                def_hash,
-                partition_key.as_deref(),
-                upstream_ids.iter(),
-                &cached_run_hashes,
-            );
-            cached_run_hashes.insert(node_id.clone(), run_h);
-            all_outputs.insert(node_id, oref);
+        // Run hashes were computed pre-dispatch for every plan step (including
+        // per-partition ids), so collection is a filter: coordinator outputs
+        // with a known hash are plan steps; the rest are parallel() children,
+        // which are never persisted.
+        for (node_id, oref) in &phase_outputs {
+            if run_hashes.contains_key(node_id) {
+                all_outputs.insert(node_id.clone(), oref.clone());
+            }
         }
 
         // If this phase had a worker failure, stop after collecting partial results.
@@ -690,114 +709,69 @@ fn execute(
         );
     }
 
-    // Persist all executed outputs (including partial results on failure).
-    {
-        let _g = db::db_guard();
-        rt.block_on(async {
-        for (node_id, oref) in &all_outputs {
-            if cached_node_ids.contains(node_id) {
-                continue;
-            }
-            let Some(run_h) = cached_run_hashes.get(node_id) else {
-                continue;
-            };
-            let elapsed_str = oref
-                .elapsed_seconds
-                .map(|e| e.to_string())
-                .unwrap_or_default();
-            let base = crate::StepId::parse(node_id).base_id().to_string();
-            let attempts = all_attempts.get(&base).copied().unwrap_or(1);
-            conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''))",
-                [
-                    node_id.clone(),
-                    run_h.clone(),
-                    oref.path.clone(),
-                    oref.format.clone(),
-                    oref.size_bytes.to_string(),
-                    elapsed_str,
-                    attempts.to_string(),
-                    all_sinks.get(node_id).cloned().unwrap_or_default(),
-                ],
-            )
-            .await
-            .ok();
-        }
-
-        // Persist permanently-failed steps as `status='failed'` rows (artifact
-        // columns NULL). Failed rows are never served as cache hits.
-        // Use all_attempts (exec_attempts) for parity with success rows —
-        // scheduler dispatch counts can overstate for blocked descendants.
-        for failure in &all_failures {
-            let node_id = &failure.node_id;
-            let sid = crate::StepId::parse(node_id);
-            let base = sid.base_id().to_string();
-            let def_hash = dag
-                .get_node(sid.base_id())
-                .map(|n| n.definition_hash.as_str())
-                .unwrap_or("");
-            let partition_key = if sid.partition.is_empty() {
-                None
-            } else {
-                Some(sid.partition.suffix())
-            };
-            let upstream_ids: Vec<String> = dag
-                .get_node(sid.base_id())
-                .map(|n| {
-                    n.resolved_inputs
-                        .values()
-                        .chain(n.resolved_collected.values())
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let run_h = cache::compute_run_hash(
-                def_hash,
-                partition_key.as_deref(),
-                upstream_ids.iter(),
-                &cached_run_hashes,
-            );
-            let attempts = all_attempts.get(&base).copied().unwrap_or(failure.error.attempts);
-            conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
-                [
-                    node_id.clone(),
-                    run_h,
-                    failure.error.message.clone(),
-                    failure.error.traceback.clone(),
-                    attempts.to_string(),
-                ],
-            )
-            .await
-            .ok();
-        }
-        });
-    }
-
     let steps_cached = cached_node_ids.len();
     let elapsed = t0.elapsed().as_secs_f64();
 
-    // Propagate worker error after persisting partial results.
-    if let Some(error) = phase_error {
-        db::finish_run_sync(
-            &db_path,
-            &run_id,
-            "failed",
-            steps_executed,
-            steps_cached,
-            elapsed,
-        )?;
-        return Err(BarcaError::WorkerFailed(error));
-    }
+    // Drop the run-long cache connection before persistence: the state push
+    // checkpoints the WAL, which requires no other open handles on the file.
+    drop(conn);
+    drop(db);
+    drop(rt);
 
-    db::finish_run_sync(
-        &db_path,
-        &run_id,
-        "success",
+    // Persist all executed outputs (including partial results on failure) —
+    // held in a ledger so a state-push conflict can replay this run's rows
+    // onto a freshly pulled database.
+    let ledger = RunLedger {
+        run_id: &run_id,
+        status: if phase_error.is_some() {
+            "failed"
+        } else {
+            "success"
+        },
+        command: command_label,
+        files: file_args.join(" "),
+        target: target_name,
+        steps_total: exec_plan.total_steps,
         steps_executed,
         steps_cached,
         elapsed,
-    )?;
+        all_outputs: &all_outputs,
+        all_failures: &all_failures,
+        all_sinks: &all_sinks,
+        all_attempts: &all_attempts,
+        cached_node_ids: &cached_node_ids,
+        run_hashes: &run_hashes,
+    };
+    persist_run(&db_path, &ledger)?;
+
+    // Shared remote state: fold the WAL into the main file and conditionally
+    // upload it. On conflict (another machine pushed first): pull the fresh
+    // database, replay this run's ledger onto it, retry.
+    if state_sync_on {
+        let mut attempt = 0u32;
+        loop {
+            state_sync::checkpoint_truncate(&db_path)?;
+            match state_sync::push_state(python, cfg, state_token.as_ref().unwrap())? {
+                state_sync::PushOutcome::Pushed(_) => break,
+                state_sync::PushOutcome::Conflict => {
+                    if attempt >= cfg.push_retries {
+                        return Err(BarcaError::Other(format!(
+                            "shared state push conflicted {attempt} times — results were                              computed but the shared state was not updated; re-run to retry"
+                        )));
+                    }
+                    attempt += 1;
+                    state_token = Some(state_sync::pull_state(python, cfg)?);
+                    db::init_db_sync(&db_path)?;
+                    persist_run(&db_path, &ledger)?;
+                }
+            }
+        }
+    }
+
+    // Propagate worker error after persisting partial results.
+    if let Some(error) = phase_error {
+        return Err(BarcaError::WorkerFailed(error));
+    }
 
     // Determine final_output: use target if specified, otherwise last planned step.
     let final_output = if let Some(ref tid) = target_id {
@@ -839,6 +813,130 @@ fn execute(
     })
 }
 
+// ─── run persistence ──────────────────────────────────────────────────────────
+
+/// Everything one run wants written to the metadata DB, held in memory so a
+/// state-push conflict can replay it onto a freshly pulled database.
+struct RunLedger<'a> {
+    run_id: &'a str,
+    status: &'a str,
+    command: &'a str,
+    files: String,
+    target: Option<&'a str>,
+    steps_total: usize,
+    steps_executed: usize,
+    steps_cached: usize,
+    elapsed: f64,
+    all_outputs: &'a HashMap<String, dispatch::OutputRef>,
+    all_failures: &'a [dispatch::StepFailure],
+    all_sinks: &'a HashMap<String, String>,
+    all_attempts: &'a HashMap<String, u32>,
+    cached_node_ids: &'a std::collections::HashSet<String>,
+    run_hashes: &'a HashMap<String, String>,
+}
+
+/// Write a run's ledger with a short-lived connection. Idempotent for the run
+/// row (INSERT OR IGNORE + terminal UPDATE) so replays don't duplicate it;
+/// materialization rows are append-only history and re-appended on replay
+/// only against a database that doesn't already contain them.
+fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
+    let _g = db::db_guard();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+
+        conn.execute(
+            "INSERT OR IGNORE INTO runs (run_id, command, files, target, status, steps_total) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+            [
+                l.run_id.to_string(),
+                l.command.to_string(),
+                l.files.clone(),
+                l.target.unwrap_or("").to_string(),
+                l.steps_total.to_string(),
+            ],
+        )
+        .await
+        .ok();
+        conn.execute(
+            "UPDATE runs SET status = ?1, steps_executed = ?2, steps_cached = ?3, elapsed_seconds = ?4, finished_at = datetime('now') WHERE run_id = ?5",
+            [
+                l.status.to_string(),
+                l.steps_executed.to_string(),
+                l.steps_cached.to_string(),
+                l.elapsed.to_string(),
+                l.run_id.to_string(),
+            ],
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to finish run: {e}")))?;
+
+        for (node_id, oref) in l.all_outputs {
+            if l.cached_node_ids.contains(node_id) {
+                continue;
+            }
+            let Some(run_h) = l.run_hashes.get(node_id) else {
+                continue;
+            };
+            let elapsed_str = oref
+                .elapsed_seconds
+                .map(|e| e.to_string())
+                .unwrap_or_default();
+            let base = crate::StepId::parse(node_id).base_id().to_string();
+            let attempts = l.all_attempts.get(&base).copied().unwrap_or(1);
+            conn.execute(
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''))",
+                [
+                    node_id.clone(),
+                    run_h.clone(),
+                    oref.path.clone(),
+                    oref.format.clone(),
+                    oref.size_bytes.to_string(),
+                    elapsed_str,
+                    attempts.to_string(),
+                    l.all_sinks.get(node_id).cloned().unwrap_or_default(),
+                ],
+            )
+            .await
+            .ok();
+        }
+
+        // Persist permanently-failed steps as `status='failed'` rows (artifact
+        // columns NULL). Failed rows are never served as cache hits.
+        for failure in l.all_failures {
+            let node_id = &failure.node_id;
+            let base = crate::StepId::parse(node_id).base_id().to_string();
+            let run_h = l.run_hashes.get(node_id).cloned().unwrap_or_default();
+            let attempts = l
+                .all_attempts
+                .get(&base)
+                .copied()
+                .unwrap_or(failure.error.attempts);
+            conn.execute(
+                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
+                [
+                    node_id.clone(),
+                    run_h,
+                    failure.error.message.clone(),
+                    failure.error.traceback.clone(),
+                    attempts.to_string(),
+                ],
+            )
+            .await
+            .ok();
+        }
+        Ok::<(), BarcaError>(())
+    })
+}
+
 // ─── plan ────────────────────────────────────────────────────────────────────
 
 pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaError> {
@@ -871,15 +969,19 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaE
 
 // ─── history ──────────────────────────────────────────────────────────────────
 
-pub fn history(limit: usize) -> Result<Vec<db::RunRecord>, BarcaError> {
-    let db_path = db::ensure_db_dir()?;
-    db::init_db_sync(&db_path)?;
-    db::get_recent_runs_sync(&db_path, limit)
+pub fn history(
+    cfg: &crate::config::ResolvedConfig,
+    limit: usize,
+) -> Result<Vec<db::RunRecord>, BarcaError> {
+    db::ensure_env_dirs(&cfg.env)?;
+    db::init_db_sync(&cfg.db_path)?;
+    db::get_recent_runs_sync(&cfg.db_path, limit)
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────
 
 pub fn stats(
+    cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
@@ -900,9 +1002,9 @@ pub fn stats(
             BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
         })?;
 
-    let db_path = db::ensure_db_dir()?;
-    db::init_db_sync(&db_path)?;
-    db::get_asset_stats_sync(&db_path, &target_id)
+    db::ensure_env_dirs(&cfg.env)?;
+    db::init_db_sync(&cfg.db_path)?;
+    db::get_asset_stats_sync(&cfg.db_path, &target_id)
 }
 
 // ─── list_assets ──────────────────────────────────────────────────────────────

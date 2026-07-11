@@ -925,3 +925,44 @@ class TestErrorEmission:
         assert msgs[0]["type"] == "error"
         assert msgs[0]["error_type"] == "TimeoutError"
         assert "timeout" in msgs[0]["message"].lower()
+
+
+# ─── Content-addressed artifacts (run_hash in the step) ──────────────────────
+
+
+class TestContentAddressedArtifacts:
+    def test_step_with_run_hash_lands_content_addressed(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        step = _make_step("mod.py:my_func", "my_func", src)
+        step["run_hash"] = "deadbeef01"
+        batch = _make_batch([step], artifact_dir=artifact_dir)
+        msgs, _ = _run_batch_capture_protocol(batch)
+
+        path = msgs[0]["artifact"]["path"]
+        assert path.endswith("mod.py--my_func/deadbeef01.json")
+        assert deserialize(Path(path), "json") == {"x": 1}
+
+    def test_step_without_run_hash_uses_legacy_layout(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        batch = _make_batch(
+            [_make_step("mod.py:my_func", "my_func", src)],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["artifact"]["path"].endswith("mod.py--my_func.json")

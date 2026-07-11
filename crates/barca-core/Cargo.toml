@@ -20,3 +20,4 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "
 futures = "0.3"
 indicatif = "0.18.4"
 libc = "0.2"
+toml = { workspace = true }
