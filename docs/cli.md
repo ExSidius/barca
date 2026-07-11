@@ -96,3 +96,10 @@ a fixed set of files and does not need it.
 ```bash
 barca version
 ```
+
+## --env
+
+`get`, `run`, `plan`, `serve`, `history`, and `stats` accept `--env <name>`
+(default: `BARCA_ENV`, then `default_env` in barca.toml, then `default`).
+Environments fully separate cache, artifacts, and shared remote state — see
+[Configuration](config.md).

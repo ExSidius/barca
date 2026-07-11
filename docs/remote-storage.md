@@ -20,18 +20,51 @@ Remote backends are optional extras — the core install stays dependency-free:
 uv add 'barca[azure]'
 ```
 
-## Remote artifact store
+## Remote mode: shared state + artifacts
+
+Point `[remote].uri` in `barca.toml` (or `BARCA_REMOTE_URI`) at an object
+store prefix and barca shares **both** artifacts and materialization state
+across machines:
+
+```toml
+# barca.toml
+[remote]
+uri = "abfss://pipelines@myaccount.dfs.core.windows.net/barca/my-project"
+```
+
+- Artifacts are written **content-addressed** to
+  `{uri}/{env}/artifacts/{node}/{run_hash}{ext}` — immutable objects, so a
+  cache hit on one machine is valid on every machine.
+- The metadata DB (the turso/SQLite file that records materializations and
+  run history) lives as a single blob at `{uri}/{env}/state/metadata.db`.
+  Each run **pulls** it first — so cache checks see every machine's
+  materializations — and **pushes** it back at the end with an
+  etag/generation-conditional upload. If another machine pushed first, barca
+  re-pulls and replays this run's rows, so nothing is lost (bounded by
+  `push_retries`).
+- Before upload the WAL is checkpointed into the main file, so the blob is
+  always a complete standalone SQLite database — you can download it and
+  open it with stock `sqlite3`.
+- A run that pulls successfully but crashes mid-way uploads nothing; its
+  local rows are discarded by the next pull and those steps recompute.
+
+The result: a run on VM-B hits artifacts materialized by VM-A with zero
+re-execution. See [Configuration](config.md) for the full schema,
+environment separation (`--env`), and env-var overrides.
+
+`barca serve` does not support shared state yet — set `state = "off"` for
+served projects.
+
+### Artifacts-only mode (0.4.0 behavior)
 
 Set `BARCA_ARTIFACT_URI` to a URI prefix and every materialized asset is
-written there instead of `.barca/artifacts/`:
+written there instead of `.barca/artifacts/`, while metadata stays local:
 
 ```bash
 export BARCA_ARTIFACT_URI=abfss://artifacts@myaccount.dfs.core.windows.net/prod
 barca get pipeline.py
 ```
 
-Artifact paths recorded in the metadata DB and passed between workers are
-then full URIs (e.g. `abfss://.../prod/pipeline.py--load_data.parquet`).
 Downstream steps download their inputs to a local staging file on demand.
 
 ## Remote sinks
