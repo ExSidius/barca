@@ -27,6 +27,10 @@ Repository = "https://github.com/ExSidius/barca"
 [project.optional-dependencies]
 parquet = ["pyarrow", "pandas"]
 fast = ["orjson"]
+azure = ["fsspec", "adlfs"]
+s3 = ["fsspec", "s3fs"]
+gcs = ["fsspec", "gcsfs"]
+remote = ["fsspec", "adlfs", "s3fs", "gcsfs"]
 
 [tool.maturin]
 bindings = "bin"

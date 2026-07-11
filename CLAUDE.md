@@ -51,7 +51,7 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
 ### Dependencies
 
 - **Rust**: ruff_python_parser (AST), petgraph (DAG), turso (DB), serde/serde_json, sha2
-- **Python**: no runtime dependencies (stdlib only; pyarrow optional for parquet)
+- **Python**: no runtime dependencies (stdlib only; pyarrow optional for parquet; fsspec + adlfs/s3fs/gcsfs optional for remote artifact storage via the `azure`/`s3`/`gcs`/`remote` extras)
 - **Build**: maturin (packages Rust binary + Python stubs into one wheel)
 
 ## Commands

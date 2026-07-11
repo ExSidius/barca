@@ -253,9 +253,11 @@ fn execute(
     let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
+    // Sink outcomes (JSON) per node, accumulated across phases for the DB.
+    let mut all_sinks: HashMap<String, String> = HashMap::new();
     // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
     let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
-    let all_attempts: HashMap<String, u32> = HashMap::new();
+    let mut all_attempts: HashMap<String, u32> = HashMap::new();
     let mut steps_executed = 0;
 
     // Progress bar setup.
@@ -474,6 +476,26 @@ fn execute(
         // Progress callback — update bar as each step completes.
         let on_step_cb: crate::io_loop::StepCallback<'_> =
             Box::new(|node_id: &str, artifact: &serde_json::Value| {
+                // Sink failures never fail the asset — surface them prominently.
+                if let Some(sinks) = artifact.get("sinks").and_then(|v| v.as_array()) {
+                    for s in sinks {
+                        if s.get("status").and_then(|v| v.as_str()) == Some("error") {
+                            let msg = format!(
+                                "[barca] SINK FAILED: {} -> {}: {}",
+                                node_id,
+                                s.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+                                s.get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown error"),
+                            );
+                            if let Some(ref bar) = pb {
+                                bar.println(&msg);
+                            } else {
+                                eprintln!("{msg}");
+                            }
+                        }
+                    }
+                }
                 let elapsed_s = artifact.get("elapsed_seconds").and_then(|v| v.as_f64());
                 if let Some(e) = elapsed_s {
                     elapsed_so_far += e;
@@ -536,7 +558,14 @@ fn execute(
         // Collect results from coordinator
         let mut phase_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
         for (&item_id, artifact_val) in coord.outputs() {
-            let node_id = coord.item(item_id).step_id.display();
+            let item = coord.item(item_id);
+            let node_id = item.step_id.display();
+            // Attempts made for this item (dispatch count), keyed by base node
+            // id — how the success-row INSERT looks it up.
+            all_attempts.insert(
+                crate::StepId::parse(&node_id).base_id().to_string(),
+                item.attempts,
+            );
             let oref = dispatch::OutputRef {
                 path: artifact_val
                     .get("path")
@@ -554,6 +583,14 @@ fn execute(
                     .unwrap_or(0),
                 elapsed_seconds: artifact_val.get("elapsed_seconds").and_then(|v| v.as_f64()),
             };
+            if let Some(sinks) = artifact_val.get("sinks").and_then(|v| v.as_array())
+                && !sinks.is_empty()
+            {
+                all_sinks.insert(
+                    node_id.clone(),
+                    serde_json::Value::from(sinks.clone()).to_string(),
+                );
+            }
             phase_outputs.insert(node_id, oref);
         }
 
@@ -671,7 +708,7 @@ fn execute(
             let base = crate::StepId::parse(node_id).base_id().to_string();
             let attempts = all_attempts.get(&base).copied().unwrap_or(1);
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7)",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''))",
                 [
                     node_id.clone(),
                     run_h.clone(),
@@ -680,6 +717,7 @@ fn execute(
                     oref.size_bytes.to_string(),
                     elapsed_str,
                     attempts.to_string(),
+                    all_sinks.get(node_id).cloned().unwrap_or_default(),
                 ],
             )
             .await

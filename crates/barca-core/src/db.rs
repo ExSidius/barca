@@ -107,6 +107,7 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
                 error_message TEXT,
                 error_traceback TEXT,
                 attempts INTEGER DEFAULT 1,
+                sinks_json TEXT,
                 created_at TEXT DEFAULT (datetime('now'))
             )",
             (),
@@ -130,6 +131,7 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
             "ALTER TABLE materializations ADD COLUMN error_message TEXT",
             "ALTER TABLE materializations ADD COLUMN error_traceback TEXT",
             "ALTER TABLE materializations ADD COLUMN attempts INTEGER DEFAULT 1",
+            "ALTER TABLE materializations ADD COLUMN sinks_json TEXT",
         ] {
             conn.execute(col, ()).await.ok();
         }
