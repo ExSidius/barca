@@ -61,7 +61,7 @@ Delivered:
 - **Python server client** — `barca.Client` (stdlib-only) to trigger runs, poll
   status, and inspect schedules over the HTTP API.
 
-## 0.4.0 (current)
+## 0.4.0 (shipped)
 
 Goal: remote artifact storage and execution reliability.
 
@@ -106,6 +106,25 @@ Planned (carried forward):
   ([#59](https://github.com/ExSidius/barca/issues/59))
 - **Alerting hooks** — Slack webhooks, email notifications
   ([#52](https://github.com/ExSidius/barca/issues/52))
+
+## 0.5.0 (current)
+
+Goal: shared state across machines.
+
+- **Shared remote materialization state** — the metadata DB lives as a blob
+  (`{uri}/{env}/state/metadata.db`), pulled at run start and pushed with an
+  etag/generation-conditional upload at run end (conflict → pull + replay).
+  A run on one machine hits artifacts materialized by another.
+- **Content-addressed artifacts** — `{artifacts}/{node}/{run_hash}{ext}` in
+  every mode (local included): immutable objects, cross-machine cache hits.
+- **barca.toml** — first config file (`[remote]` section, `default_env`),
+  env vars override; see docs/config.md.
+- **`--env` environments** — dev/staging/prod fully separated state, local
+  and remote.
+
+Planned follow-ups: `barca serve` with shared state (currently gated to
+`state = "off"`), `barca gc` for content-addressed artifact garbage
+collection, partitioned cache checks.
 
 ## Future (unscoped)
 

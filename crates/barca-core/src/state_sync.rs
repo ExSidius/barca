@@ -1,0 +1,242 @@
+//! Shared remote state — pull/checkpoint/push of the metadata DB blob.
+//!
+//! The metadata DB is a turso-managed SQLite file. To share it across
+//! machines it is stored as a single blob object: pulled at run start,
+//! conditionally uploaded (etag/generation match) at run end. Blob transfer
+//! is delegated to `python -m barca._state` so the fsspec extras and their
+//! credential chains are the only cloud-auth surface; Python never opens
+//! the database.
+//!
+//! Critical invariant: turso is WAL-only and barca's normal operation
+//! leaves most data in `metadata.db-wal`. Before any upload the WAL must
+//! be checkpointed into the main file (`PRAGMA wal_checkpoint(TRUNCATE)`)
+//! — uploading the main file alone without this would upload an empty
+//! database.
+
+use crate::BarcaError;
+use crate::config::ResolvedConfig;
+use std::path::Path;
+use std::process::Command;
+use turso::Builder;
+
+/// Opaque concurrency token for the remote state blob (etag / generation /
+/// sha256, depending on backend). `None` means the remote object is absent.
+#[derive(Debug, Clone)]
+pub struct StateToken(pub Option<String>);
+
+#[derive(Debug)]
+pub enum PushOutcome {
+    /// Uploaded; carries the new token.
+    Pushed(String),
+    /// The remote changed since our token was read — re-pull and replay.
+    Conflict,
+}
+
+const EXIT_CONFLICT: i32 = 3;
+
+fn state_cmd(python: &Path, cfg: &ResolvedConfig) -> Command {
+    let mut cmd = Command::new(python);
+    cmd.arg("-m").arg("barca._state");
+    if let Some(ref opts) = cfg.storage_options_json {
+        cmd.env("BARCA_STORAGE_OPTIONS", opts);
+    }
+    cmd
+}
+
+/// Download the shared state blob over `cfg.db_path`. Returns its token, or
+/// `StateToken(None)` when the remote object doesn't exist yet (the local
+/// file is left untouched for bootstrap).
+pub fn pull_state(python: &Path, cfg: &ResolvedConfig) -> Result<StateToken, BarcaError> {
+    let uri = cfg
+        .state_uri
+        .as_deref()
+        .ok_or_else(|| BarcaError::Other("pull_state called without a state uri".into()))?;
+    let _g = crate::db::db_guard();
+    let out = state_cmd(python, cfg)
+        .arg("pull")
+        .arg(uri)
+        .arg(&cfg.db_path)
+        .output()
+        .map_err(|e| BarcaError::Other(format!("failed to spawn state helper: {e}")))?;
+    if !out.status.success() {
+        return Err(BarcaError::Other(format!(
+            "shared state pull from {uri} failed: {} — fix connectivity/credentials \
+             or set BARCA_STATE=off to run local-only",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| BarcaError::Other(format!("state pull: bad helper output: {e}")))?;
+    let token = parsed
+        .get("token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    Ok(StateToken(token))
+}
+
+/// Conditionally upload `cfg.db_path` over the shared state blob.
+/// Call `checkpoint_truncate` first — the WAL must be folded in.
+pub fn push_state(
+    python: &Path,
+    cfg: &ResolvedConfig,
+    token: &StateToken,
+) -> Result<PushOutcome, BarcaError> {
+    let uri = cfg
+        .state_uri
+        .as_deref()
+        .ok_or_else(|| BarcaError::Other("push_state called without a state uri".into()))?;
+    let _g = crate::db::db_guard();
+    let mut cmd = state_cmd(python, cfg);
+    cmd.arg("push").arg(uri).arg(&cfg.db_path);
+    if let Some(ref t) = token.0 {
+        cmd.arg("--token").arg(t);
+    }
+    let out = cmd
+        .output()
+        .map_err(|e| BarcaError::Other(format!("failed to spawn state helper: {e}")))?;
+    if out.status.code() == Some(EXIT_CONFLICT) {
+        return Ok(PushOutcome::Conflict);
+    }
+    if !out.status.success() {
+        return Err(BarcaError::Other(format!(
+            "shared state push to {uri} failed: {} — results were computed but the \
+             shared state was not updated; re-run, or set BARCA_STATE=off",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    let parsed: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .map_err(|e| BarcaError::Other(format!("state push: bad helper output: {e}")))?;
+    let new_token = parsed
+        .get("token")
+        .and_then(|t| t.as_str())
+        .ok_or_else(|| BarcaError::Other("state push: helper returned no token".into()))?;
+    Ok(PushOutcome::Pushed(new_token.to_string()))
+}
+
+/// Checkpoint the WAL into the main database file and verify nothing is
+/// left behind. Must be called with no other connections open on the file
+/// (the caller drops all handles first) and before any upload.
+pub fn checkpoint_truncate(db_path: &str) -> Result<(), BarcaError> {
+    let _g = crate::db::db_guard();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("checkpoint: failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("checkpoint: failed to connect: {e}")))?;
+        // The pragma returns a (busy, log_pages, checkpointed_pages) row — use
+        // query and drain it.
+        let mut rows = conn
+            .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+            .await
+            .map_err(|e| BarcaError::Db(format!("wal_checkpoint(TRUNCATE) failed: {e}")))?;
+        while let Some(_row) = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("wal_checkpoint(TRUNCATE) failed: {e}")))?
+        {}
+        Ok::<(), BarcaError>(())
+    })?;
+
+    // Backstop: an upload of the main file is only valid if the WAL is gone.
+    let wal = format!("{db_path}-wal");
+    if let Ok(meta) = std::fs::metadata(&wal) {
+        if meta.len() > 0 {
+            return Err(BarcaError::Db(format!(
+                "WAL not empty after checkpoint ({} bytes remain in {wal}) — \
+                 refusing to upload a torn database",
+                meta.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// True when the sidecar WAL file is absent or empty.
+pub fn wal_is_clean(db_path: &str) -> bool {
+    match std::fs::metadata(format!("{db_path}-wal")) {
+        Err(_) => true,
+        Ok(m) => m.len() == 0,
+    }
+}
+
+#[allow(dead_code)]
+fn _path_exists(p: &str) -> bool {
+    Path::new(p).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_and_count(db_path: &str, table: &str) -> u64 {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Builder::new_local(db_path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            let mut rows = conn
+                .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            row.get_value(0).unwrap().as_integer().copied().unwrap() as u64
+        })
+    }
+
+    /// The load-bearing spike for shared remote state: after
+    /// wal_checkpoint(TRUNCATE), the -wal sidecar must be empty/absent and
+    /// all rows must be readable from the main file alone.
+    #[test]
+    fn checkpoint_truncate_collapses_wal_into_main_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("metadata.db").to_string_lossy().to_string();
+
+        // Create a table and write enough rows that data definitely lives in the WAL.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let db = Builder::new_local(&db_path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            conn.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)",
+                (),
+            )
+            .await
+            .unwrap();
+            for i in 0..200 {
+                conn.execute("INSERT INTO t (v) VALUES (?1)", [format!("value-{i}")])
+                    .await
+                    .unwrap();
+            }
+        });
+
+        // Sanity: without a checkpoint the WAL holds the data.
+        let wal = format!("{db_path}-wal");
+        let wal_size_before = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+        assert!(
+            wal_size_before > 0,
+            "expected data in the WAL before checkpoint (got {wal_size_before} bytes) — \
+             if this fails, turso started auto-checkpointing and the sync design should be revisited"
+        );
+
+        checkpoint_truncate(&db_path).unwrap();
+        assert!(wal_is_clean(&db_path), "WAL must be empty after checkpoint");
+
+        // The main file alone (simulate the uploaded blob: copy it without the WAL)
+        // must contain every row.
+        let copy = dir.path().join("uploaded.db").to_string_lossy().to_string();
+        std::fs::copy(&db_path, &copy).unwrap();
+        assert_eq!(open_and_count(&copy, "t"), 200);
+    }
+}

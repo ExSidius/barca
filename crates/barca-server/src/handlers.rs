@@ -86,9 +86,11 @@ pub async fn asset_detail(
 
     let files = state.config.files.clone();
     let python = state.config.python.clone();
+    let cfg = state.config.resolved.clone();
     let resolved_id = summary.id.clone();
-    let stats = tokio::task::spawn_blocking(move || commands::stats(&resolved_id, &files, &python))
-        .await??;
+    let stats =
+        tokio::task::spawn_blocking(move || commands::stats(&cfg, &resolved_id, &files, &python))
+            .await??;
 
     Ok(Json(json!({
         "asset": summary,
@@ -190,6 +192,7 @@ pub(crate) fn start_run(state: AppState, target: Option<String>) -> String {
 
         let files = st.config.files.clone();
         let python = st.config.python.clone();
+        let cfg = st.config.resolved.clone();
         let tgt = target.clone();
 
         // NOTE: spawn_blocking tasks cannot be aborted — they run on OS threads
@@ -197,7 +200,7 @@ pub(crate) fn start_run(state: AppState, target: Option<String>) -> String {
         // continues in the background until it finishes naturally; the DB lock in
         // barca-core still guards its writes against any concurrent run.
         let join_handle = tokio::task::spawn_blocking(move || {
-            commands::get(tgt.as_deref(), &files, &python, false, true)
+            commands::get(&cfg, tgt.as_deref(), &files, &python, false, true)
         });
         let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
 
@@ -262,12 +265,14 @@ pub(crate) fn start_run_task(state: AppState, target: String) -> String {
 
         let files = st.config.files.clone();
         let python = st.config.python.clone();
+        let cfg = st.config.resolved.clone();
         let tgt = target.clone();
 
         // NOTE: Same spawn_blocking caveat as start_run — see comment above.
         // barca-core's DB lock guards writes even if this task outlives the timeout.
-        let join_handle =
-            tokio::task::spawn_blocking(move || commands::run(&tgt, &files, &python, None, true));
+        let join_handle = tokio::task::spawn_blocking(move || {
+            commands::run(&cfg, &tgt, &files, &python, None, true)
+        });
         let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
 
         let outcome = match res {

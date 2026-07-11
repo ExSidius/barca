@@ -24,6 +24,12 @@ pub struct IoConfig {
     pub python: PathBuf,
     pub pool_size: usize,
     pub run_id: String,
+    /// Artifact store root for this run — a local directory or a remote URI.
+    /// Set explicitly on every worker so env-separated and remote layouts work
+    /// regardless of the coordinator's own environment.
+    pub artifact_root: String,
+    /// Merged fsspec storage options (JSON), forwarded to workers.
+    pub storage_options_json: Option<String>,
 }
 
 /// Callback invoked on each step completion with (node_id, artifact_json).
@@ -139,7 +145,7 @@ pub async fn run(
     for _ in 0..initial_count {
         let wid = next_worker_id;
         next_worker_id += 1;
-        match spawn_worker(&config.python, &socket_path, wid, &listener, &event_tx).await {
+        match spawn_worker(config, &socket_path, wid, &listener, &event_tx).await {
             Ok(handle) => {
                 workers.insert(wid, handle);
             }
@@ -154,7 +160,7 @@ pub async fn run(
     assign_ready(
         &mut workers,
         coord,
-        &config.python,
+        config,
         &socket_path,
         &listener,
         &event_tx,
@@ -205,7 +211,7 @@ pub async fn run(
                         assign_ready(
                             &mut workers,
                             coord,
-                            &config.python,
+                            config,
                             &socket_path,
                             &listener,
                             &event_tx,
@@ -251,7 +257,7 @@ pub async fn run(
                         assign_ready(
                             &mut workers,
                             coord,
-                            &config.python,
+                            config,
                             &socket_path,
                             &listener,
                             &event_tx,
@@ -279,7 +285,7 @@ pub async fn run(
                         assign_ready(
                             &mut workers,
                             coord,
-                            &config.python,
+                            config,
                             &socket_path,
                             &listener,
                             &event_tx,
@@ -313,6 +319,7 @@ pub async fn run(
                                     retry_backoff_seconds: 0.0,
                                     serializer: None,
                                     sinks: Vec::new(),
+                                    run_hash: None,
                                     upstream_inputs: HashMap::new(),
                                     kind: "task".to_string(),
                                     is_dynamic: false,
@@ -336,7 +343,7 @@ pub async fn run(
                         let replacement_id = next_worker_id;
                         next_worker_id += 1;
                         match spawn_worker(
-                            &config.python,
+                            config,
                             &socket_path,
                             replacement_id,
                             &listener,
@@ -364,7 +371,7 @@ pub async fn run(
                         assign_ready(
                             &mut workers,
                             coord,
-                            &config.python,
+                            config,
                             &socket_path,
                             &listener,
                             &event_tx,
@@ -390,16 +397,14 @@ pub async fn run(
                 // Spawn replacement
                 let wid = next_worker_id;
                 next_worker_id += 1;
-                if let Ok(h) =
-                    spawn_worker(&config.python, &socket_path, wid, &listener, &event_tx).await
-                {
+                if let Ok(h) = spawn_worker(config, &socket_path, wid, &listener, &event_tx).await {
                     workers.insert(wid, h);
                 }
                 resume_frozen(&mut frozen, &mut workers, coord).await;
                 assign_ready(
                     &mut workers,
                     coord,
-                    &config.python,
+                    config,
                     &socket_path,
                     &listener,
                     &event_tx,
@@ -412,7 +417,7 @@ pub async fn run(
                 assign_ready(
                     &mut workers,
                     coord,
-                    &config.python,
+                    config,
                     &socket_path,
                     &listener,
                     &event_tx,
@@ -446,7 +451,7 @@ pub async fn run(
 async fn assign_ready(
     workers: &mut HashMap<usize, WorkerHandle>,
     coord: &mut Coordinator,
-    python: &Path,
+    config: &IoConfig,
     socket_path: &Path,
     listener: &UnixListener,
     event_tx: &mpsc::Sender<IoEvent>,
@@ -480,7 +485,7 @@ async fn assign_ready(
         }
         let wid = *next_worker_id;
         *next_worker_id += 1;
-        match spawn_worker(python, socket_path, wid, listener, event_tx).await {
+        match spawn_worker(config, socket_path, wid, listener, event_tx).await {
             Ok(mut handle) => {
                 if let Some(item_id) = coord.next_ready() {
                     let item = coord.item(item_id);
@@ -630,22 +635,25 @@ async fn write_message(
 // ─── Worker spawning ─────────────────────────────────────────────────────────
 
 async fn spawn_worker(
-    python: &Path,
+    config: &IoConfig,
     socket_path: &Path,
     worker_id: usize,
     listener: &UnixListener,
     event_tx: &mpsc::Sender<IoEvent>,
 ) -> Result<WorkerHandle, String> {
-    let child = Command::new(python)
-        .args(["-m", "barca._worker", "--daemon"])
+    let mut cmd = Command::new(&config.python);
+    cmd.args(["-m", "barca._worker", "--daemon"])
         .env("BARCA_SOCKET", socket_path.to_str().unwrap_or(""))
         .env("BARCA_WORKER", "1")
         .env("BARCA_WORKER_ID", worker_id.to_string())
+        .env("BARCA_ARTIFACT_URI", &config.artifact_root)
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .stdin(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("spawn: {e}"))?;
+        .stdin(Stdio::null());
+    if let Some(ref opts) = config.storage_options_json {
+        cmd.env("BARCA_STORAGE_OPTIONS", opts);
+    }
+    let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
 
     let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
         .await
@@ -727,6 +735,7 @@ fn build_step_json(item: &crate::coordinator::Item, coord: &Coordinator) -> serd
         "direct_kwargs": item.spec.direct_kwargs,
         "serializer": item.spec.serializer.as_deref(),
         "sinks": item.spec.sinks,
+        "run_hash": item.spec.run_hash,
     })
 }
 
@@ -752,6 +761,7 @@ mod tests {
             retries: 1,
             retry_backoff_seconds: 0.0,
             serializer: Some("parquet".to_string()),
+            run_hash: Some("abc123".to_string()),
             sinks: vec![
                 crate::model::SinkDecl {
                     path: "abfss://cont@acct.dfs.core.windows.net/exports/a.parquet".to_string(),
@@ -794,6 +804,7 @@ mod tests {
             retry_backoff_seconds: 0.0,
             serializer: None,
             sinks: Vec::new(),
+            run_hash: None,
             upstream_inputs: HashMap::new(),
             kind: "asset".to_string(),
             is_dynamic: false,
@@ -801,5 +812,6 @@ mod tests {
         let id = coord.add_item(crate::StepId::unpartitioned("f.py:a"), spec, Vec::new());
         let step = build_step_json(coord.item(id), &coord);
         assert_eq!(step["sinks"], serde_json::json!([]));
+        assert_eq!(step["run_hash"], serde_json::Value::Null);
     }
 }

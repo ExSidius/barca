@@ -1,6 +1,7 @@
 pub mod cache;
 pub mod commands;
 pub mod cone;
+pub mod config;
 pub mod coordinator;
 pub mod dag;
 pub mod db;
@@ -11,6 +12,7 @@ pub mod model;
 pub mod parse;
 pub mod planner;
 pub mod protocol;
+pub mod state_sync;
 
 pub use dag::Dag;
 pub use model::*;

@@ -69,6 +69,10 @@ pub struct StreamStep {
     pub serializer: Option<Arc<str>>,
     /// Sink outputs from stacked `@sink(...)` decorators.
     pub sinks: Vec<crate::model::SinkDecl>,
+    /// Pre-dispatch run hashes: display node id → run_hash (one entry for
+    /// unpartitioned steps, one per partition otherwise). Populated by the
+    /// executor's cache pass; empty in freshly planned steps.
+    pub run_hashes: HashMap<String, String>,
     /// Timeout in seconds for this step's execution.
     pub timeout_seconds: u32,
     /// Total number of attempts on failure (1 = no retry). Rust-side only.
@@ -331,6 +335,7 @@ fn build_phases(
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
                                     sinks: step.sinks.clone(),
+                                    run_hashes: step.run_hashes.clone(),
                                     timeout_seconds: step.timeout_seconds,
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
@@ -369,6 +374,7 @@ fn build_phases(
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
                                     sinks: step.sinks.clone(),
+                                    run_hashes: step.run_hashes.clone(),
                                     timeout_seconds: step.timeout_seconds,
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
@@ -434,6 +440,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 pending_partitions: HashMap::new(),
                 serializer,
                 sinks,
+                run_hashes: HashMap::new(),
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
@@ -449,6 +456,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 pending_partitions: derived_partitions,
                 serializer: serializer.clone(),
                 sinks,
+                run_hashes: HashMap::new(),
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
@@ -464,6 +472,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 pending_partitions: HashMap::new(),
                 serializer,
                 sinks,
+                run_hashes: HashMap::new(),
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,

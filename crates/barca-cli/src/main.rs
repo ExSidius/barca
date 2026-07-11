@@ -35,6 +35,9 @@ enum Cli {
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Run a task (and its cone) — always re-runs, bursting upstream asset caches
     ///
@@ -54,18 +57,27 @@ enum Cli {
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Parse source files and emit the execution plan as JSON
     Plan {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Environment name (accepted for symmetry; planning uses no state)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Show recent run history
     History {
         /// Number of recent runs to show
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Show execution statistics for an asset
     Stats {
@@ -74,6 +86,9 @@ enum Cli {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Run a long-running HTTP server exposing the orchestrator as a JSON API
     ///
@@ -95,6 +110,9 @@ enum Cli {
         /// Timezone for cron evaluation: local (default), utc, or an IANA name
         #[arg(long, default_value = "local")]
         timezone: String,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// List all discovered definitions (assets, tasks, sensors) with their deps
     ///
@@ -148,6 +166,7 @@ fn main() {
             output,
             no_cache,
             agent,
+            env,
         } => {
             let (target, files) = split_target_files(args);
             if files.is_empty() && target.is_none() {
@@ -158,13 +177,22 @@ fn main() {
                 eprintln!("error: no .py files provided\n\nUsage: barca get [TARGET] <FILES>...");
                 std::process::exit(1);
             }
-            get_cmd(target, files, &python, output, no_cache, agent)
+            get_cmd(
+                env.as_deref(),
+                target,
+                files,
+                &python,
+                output,
+                no_cache,
+                agent,
+            )
         }
         Cli::Run {
             args,
             burst,
             output,
             agent,
+            env,
         } => {
             let (target, files) = split_target_files(args);
             let Some(target) = target else {
@@ -179,11 +207,11 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            run_cmd(target, files, &python, burst, output, agent)
+            run_cmd(env.as_deref(), target, files, &python, burst, output, agent)
         }
-        Cli::Plan { files } => plan_cmd(files, &python),
-        Cli::History { limit } => history_cmd(limit),
-        Cli::Stats { target, files } => stats_cmd(target, files, &python),
+        Cli::Plan { files, env: _ } => plan_cmd(files, &python),
+        Cli::History { limit, env } => history_cmd(env.as_deref(), limit),
+        Cli::Stats { target, files, env } => stats_cmd(env.as_deref(), target, files, &python),
         Cli::List { files } => list_cmd(files, &python),
         Cli::Serve {
             files,
@@ -191,7 +219,16 @@ fn main() {
             watch,
             no_schedule,
             timezone,
-        } => serve_cmd(files, port, watch, !no_schedule, timezone, &python),
+            env,
+        } => serve_cmd(
+            env.as_deref(),
+            files,
+            port,
+            watch,
+            !no_schedule,
+            timezone,
+            &python,
+        ),
         Cli::Version => {
             println!("barca {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -206,6 +243,7 @@ fn main() {
 
 #[allow(clippy::too_many_arguments)]
 fn get_cmd(
+    env: Option<&str>,
     target: Option<String>,
     files: Vec<PathBuf>,
     python: &PathBuf,
@@ -213,8 +251,10 @@ fn get_cmd(
     no_cache: bool,
     agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::get(target.as_deref(), &file_args, python, no_cache, agent)?;
+    let result =
+        barca_core::commands::get(&cfg, target.as_deref(), &file_args, python, no_cache, agent)?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -258,7 +298,9 @@ fn get_cmd(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cmd(
+    env: Option<&str>,
     target: String,
     files: Vec<PathBuf>,
     python: &PathBuf,
@@ -266,8 +308,9 @@ fn run_cmd(
     mode: OutputMode,
     agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::run(&target, &file_args, python, burst, agent)?;
+    let result = barca_core::commands::run(&cfg, &target, &file_args, python, burst, agent)?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -428,8 +471,9 @@ fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::Bar
     Ok(())
 }
 
-fn history_cmd(limit: usize) -> Result<(), barca_core::BarcaError> {
-    let runs = barca_core::commands::history(limit)?;
+fn history_cmd(env: Option<&str>, limit: usize) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
+    let runs = barca_core::commands::history(&cfg, limit)?;
     if runs.is_empty() {
         println!("No run history found.");
         return Ok(());
@@ -460,12 +504,14 @@ fn history_cmd(limit: usize) -> Result<(), barca_core::BarcaError> {
 }
 
 fn stats_cmd(
+    env: Option<&str>,
     target: String,
     files: Vec<PathBuf>,
     python: &PathBuf,
 ) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let stats = barca_core::commands::stats(&target, &file_args, python)?;
+    let stats = barca_core::commands::stats(&cfg, &target, &file_args, python)?;
     let fmt = |v: Option<f64>| v.map(|e| format!("{:.3}s", e)).unwrap_or("-".to_string());
     println!("Asset: {}", stats.node_id);
     println!("Total materializations: {}", stats.total_runs);
@@ -503,7 +549,9 @@ fn stats_cmd(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_cmd(
+    env: Option<&str>,
     files: Vec<PathBuf>,
     port: u16,
     watch: bool,
@@ -511,6 +559,14 @@ fn serve_cmd(
     timezone: String,
     python: &std::path::Path,
 ) -> Result<(), barca_core::BarcaError> {
+    let resolved = barca_core::config::resolve(env)?;
+    if resolved.state == barca_core::config::StateMode::Optimistic && resolved.state_uri.is_some() {
+        return Err(barca_core::BarcaError::Other(
+            "barca serve does not support shared remote state yet — set state = \"off\" \
+             in barca.toml (or BARCA_STATE=off) to serve with a local metadata DB"
+                .to_string(),
+        ));
+    }
     let config = barca_server::ServeConfig {
         files: files.iter().map(|p| p.display().to_string()).collect(),
         host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -519,6 +575,7 @@ fn serve_cmd(
         schedule,
         timezone,
         python: python.to_path_buf(),
+        resolved,
     };
     barca_server::serve(config).map_err(|e| barca_core::BarcaError::Other(e.to_string()))
 }
