@@ -61,7 +61,7 @@ Delivered:
 - **Python server client** — `barca.Client` (stdlib-only) to trigger runs, poll
   status, and inspect schedules over the HTTP API.
 
-## 0.4.0 (current)
+## 0.4.0 (shipped)
 
 Goal: remote artifact storage and execution reliability.
 
@@ -107,7 +107,7 @@ Planned (carried forward):
 - **Alerting hooks** — Slack webhooks, email notifications
   ([#52](https://github.com/ExSidius/barca/issues/52))
 
-## 0.5.0 (in progress)
+## 0.5.0 (current)
 
 Goal: shared state across machines.
 
