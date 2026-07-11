@@ -4,11 +4,14 @@ import datetime
 
 import pandas as pd
 import polars as pl
+import pytest
 
+from barca import _storage
 from barca._artifacts import (
     artifact_path,
     deserialize,
     detect_format,
+    resolve_format,
     safe_node_id,
     serialize,
 )
@@ -279,9 +282,7 @@ class TestRoundTripParquet:
         assert result is not None
 
     def test_empty_pandas_dataframe(self, tmp_path):
-        df = pd.DataFrame(
-            {"a": pd.Series([], dtype="int64"), "b": pd.Series([], dtype="str")}
-        )
+        df = pd.DataFrame({"a": pd.Series([], dtype="int64"), "b": pd.Series([], dtype="str")})
         path = tmp_path / "out.parquet"
         serialize(df, path, "parquet")
         result = deserialize(path, "parquet")
@@ -396,3 +397,119 @@ class TestEndToEnd:
         result, fmt = self._round_trip(value, tmp_path, explicit="pickle")
         assert fmt == "pickle"
         assert result == value
+
+
+# ─── resolve_format (parquet → pickle downgrade) ─────────────────────────────
+
+
+class TestResolveFormat:
+    def test_dataframe_stays_parquet(self):
+        assert resolve_format(pd.DataFrame({"x": [1]}), "parquet") == "parquet"
+
+    def test_polars_stays_parquet(self):
+        assert resolve_format(pl.DataFrame({"x": [1]}), "parquet") == "parquet"
+
+    def test_non_dataframe_downgrades_to_pickle(self, capsys):
+        assert resolve_format({"not": "a df"}, "parquet") == "pickle"
+        assert "falling back to pickle" in capsys.readouterr().err
+
+    def test_non_parquet_untouched(self):
+        assert resolve_format({"x": 1}, "json") == "json"
+        assert resolve_format({1, 2}, "pickle") == "pickle"
+
+    def test_downgrade_path_and_bytes_agree(self, tmp_path):
+        """Regression: the old fallback wrote .pkl bytes at a .parquet receipt path."""
+        value = {"not": "a df"}
+        fmt = resolve_format(value, "parquet")
+        path = artifact_path(tmp_path, "f.py:node", fmt)
+        serialize(value, path, fmt)
+        assert str(path).endswith(".pkl")
+        assert path.exists()
+        assert deserialize(path, fmt) == value
+
+    def test_serialize_parquet_of_non_dataframe_raises(self, tmp_path):
+        with pytest.raises(TypeError, match="parquet format requires a DataFrame"):
+            serialize({"not": "a df"}, tmp_path / "out.parquet", "parquet")
+        assert not (tmp_path / "out.parquet").exists()
+        assert not list(tmp_path.glob("*.tmp"))
+
+
+# ─── Staged writes ───────────────────────────────────────────────────────────
+
+
+class _ExplodesOnPickle:
+    def __getstate__(self):
+        raise RuntimeError("boom mid-serialize")
+
+
+@pytest.fixture
+def _memory_fs():
+    """Clean fsspec memory filesystem around each test."""
+    yield
+    fs = _storage._fs_cache.get("memory")
+    if fs is not None:
+        fs.store.clear()
+
+
+class TestStagedWrites:
+    def test_local_failure_leaves_no_dest_and_no_temp(self, tmp_path):
+        dest = tmp_path / "out.pkl"
+        with pytest.raises(RuntimeError, match="boom"):
+            serialize(_ExplodesOnPickle(), dest, "pickle")
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []
+
+    def test_local_failure_does_not_clobber_previous_artifact(self, tmp_path):
+        dest = tmp_path / "out.pkl"
+        serialize({1, 2}, dest, "pickle")
+        with pytest.raises(RuntimeError):
+            serialize(_ExplodesOnPickle(), dest, "pickle")
+        assert deserialize(dest, "pickle") == {1, 2}
+
+    def test_remote_failure_leaves_no_object(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        dest = "memory://arts/out.pkl"
+        with pytest.raises(RuntimeError, match="boom"):
+            serialize(_ExplodesOnPickle(), dest, "pickle")
+        assert _storage.exists(dest) is False
+        staging = tmp_path / ".barca" / "staging"
+        assert not staging.exists() or list(staging.glob("*.tmp")) == []
+
+    def test_remote_write_cleans_staging(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        size = serialize({"a": 1}, "memory://arts/out.json", "json")
+        assert size > 0
+        assert list((tmp_path / ".barca" / "staging").glob("*.tmp")) == []
+
+
+class TestRemoteRoundTrip:
+    def test_json_via_memory(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        value = {"users": [1, 2, 3]}
+        serialize(value, "memory://arts/x.json", "json")
+        assert deserialize("memory://arts/x.json", "json") == value
+
+    def test_pickle_via_memory(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        value = {1, 2, 3}
+        serialize(value, "memory://arts/x.pkl", "pickle")
+        assert deserialize("memory://arts/x.pkl", "pickle") == value
+
+    def test_parquet_via_memory(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        df = pd.DataFrame({"a": [1, 2], "b": ["x", "y"]})
+        size = serialize(df, "memory://arts/x.parquet", "parquet")
+        assert size == _storage.size("memory://arts/x.parquet")
+        result = deserialize("memory://arts/x.parquet", "parquet")
+        pd.testing.assert_frame_equal(result, df)
+
+    def test_artifact_path_remote_is_uri(self):
+        p = artifact_path("memory://arts", "f.py:node", "parquet")
+        assert isinstance(p, str)
+        assert p == "memory://arts/f.py--node.parquet"
+
+    def test_deserialize_cleans_staging(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        serialize([1, 2], "memory://arts/x.json", "json")
+        assert deserialize("memory://arts/x.json", "json") == [1, 2]
+        assert list((tmp_path / ".barca" / "staging").glob("*.tmp")) == []

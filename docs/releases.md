@@ -42,7 +42,7 @@ Shipped:
 Issues closed: [#70](https://github.com/ExSidius/barca/issues/70) (UDS communication),
 [#58](https://github.com/ExSidius/barca/issues/58) (asset vs task model)
 
-## 0.3.0 (current)
+## 0.3.0 (shipped)
 
 Goal: scheduling, remote I/O, observability.
 
@@ -61,13 +61,45 @@ Delivered:
 - **Python server client** — `barca.Client` (stdlib-only) to trigger runs, poll
   status, and inspect schedules over the HTTP API.
 
-Planned:
+## 0.4.0 (current)
+
+Goal: remote artifact storage and execution reliability.
+
+Delivered:
+
+- **Remote artifact backends** — the artifact store and `@sink` destinations
+  accept object-store URIs via fsspec scheme dispatch: Azure ADLS Gen2
+  (`abfs://`/`abfss://`) first-class, S3 and GCS pluggable
+  ([#55](https://github.com/ExSidius/barca/issues/55)). Includes:
+  - **Optional extras** — `barca[azure]`, `barca[s3]`, `barca[gcs]`,
+    `barca[remote]`; the core install stays zero-dependency.
+  - **`BARCA_ARTIFACT_URI`** — points the primary artifact store at a remote
+    prefix; `BARCA_STORAGE_OPTIONS` passes per-protocol fsspec options.
+    Credentials use each backend's native default chain.
+  - **Staged writes** — serializer → local temp file → atomic rename (local)
+    or chunked upload (remote); large payloads are never buffered in memory
+    and a crash never leaves a partial artifact.
+  - v1 limitations (explicit errors): `partitions_from` and `parallel()`
+    result values require a local artifact store.
+- **`@sink` execution** — previously parsed but inert; sinks now write after
+  the parent asset materializes, with `serializer=` override, format
+  precedence (kwarg → extension → primary format), per-partition filename
+  suffixing, and error isolation (a sink failure never fails the asset;
+  outcomes are logged and persisted). Sinks and `@asset(serializer=)` now
+  participate in the definition hash — a one-time global cache invalidation
+  on upgrade.
+- **Error surfacing** — worker failures carry the exception type and a
+  barca-frame-filtered traceback all the way to `BarcaError` and the DB.
+- **Real retries** — backoff is actually applied (`retry_backoff * attempt`,
+  non-blocking), every attempt runs in a fresh worker process, and attempt
+  counts are recorded accurately; timeouts are reported as `TimeoutError`
+  instead of a worker disconnect.
+
+Planned (carried forward):
 
 - **Reproducible Docker benchmarks** — containerized cross-framework comparisons
   with proper timeouts and resource constraints
   ([#65](https://github.com/ExSidius/barca/issues/65))
-- **Remote storage for @sink** — S3, R2, GCS, ADLS via pluggable backends
-  ([#55](https://github.com/ExSidius/barca/issues/55))
 - **Backend abstraction** — pluggable DB + storage, enabling Docker and shared
   deployments ([#56](https://github.com/ExSidius/barca/issues/56))
 - **APM integration** — Datadog + Sentry for observability

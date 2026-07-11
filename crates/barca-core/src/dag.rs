@@ -78,10 +78,15 @@ impl Dag {
             }
 
             // Compute definition_hash from source text + dependency cone + metadata.
+            // Sinks and serializer are included so that changing a @sink or
+            // @asset(serializer=) re-materializes the node — cached steps never
+            // reach a worker, so their sinks would otherwise silently not run.
             let metadata = serde_json::json!({
                 "kind": node.kind,
                 "freshness": node.freshness,
                 "inputs": node.inputs.iter().map(|i| &i.param_name).collect::<Vec<_>>(),
+                "sinks": node.sinks,
+                "serializer": node.artifact_serializer,
             })
             .to_string();
             let def_hash = hash::definition_hash(&node.source_text, &node.cone_hash, &metadata);
@@ -281,5 +286,89 @@ impl Dag {
     /// Edge count.
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
+    }
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{SerializerKind, SinkDecl};
+
+    fn node(name: &str) -> ExtractedNode {
+        ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: name.to_string(),
+            explicit_name: None,
+            freshness: crate::model::Freshness::Always,
+            inputs: smallvec::SmallVec::new(),
+            partitions: HashMap::new(),
+            sinks: smallvec::SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: "def a(): return 1".to_string(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            parallel_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn definition_hash_changes_when_sink_added() {
+        let plain = node("a");
+        let mut sinked = node("a");
+        sinked.sinks.push(SinkDecl {
+            path: "exports/a.parquet".to_string(),
+            serializer: None,
+        });
+
+        let dag_plain = Dag::build(std::slice::from_ref(&plain)).unwrap();
+        let dag_sinked = Dag::build(std::slice::from_ref(&sinked)).unwrap();
+        assert_ne!(
+            dag_plain.get_node("test.py:a").unwrap().definition_hash,
+            dag_sinked.get_node("test.py:a").unwrap().definition_hash,
+        );
+    }
+
+    #[test]
+    fn definition_hash_changes_when_sink_edited() {
+        let mut s1 = node("a");
+        s1.sinks.push(SinkDecl {
+            path: "exports/a.parquet".to_string(),
+            serializer: None,
+        });
+        let mut s2 = node("a");
+        s2.sinks.push(SinkDecl {
+            path: "exports/a.parquet".to_string(),
+            serializer: Some(SerializerKind::Pickle),
+        });
+
+        let d1 = Dag::build(std::slice::from_ref(&s1)).unwrap();
+        let d2 = Dag::build(std::slice::from_ref(&s2)).unwrap();
+        assert_ne!(
+            d1.get_node("test.py:a").unwrap().definition_hash,
+            d2.get_node("test.py:a").unwrap().definition_hash,
+        );
+    }
+
+    #[test]
+    fn definition_hash_changes_when_serializer_changed() {
+        let plain = node("a");
+        let mut with_ser = node("a");
+        with_ser.artifact_serializer = Some(SerializerKind::Parquet);
+
+        let d1 = Dag::build(std::slice::from_ref(&plain)).unwrap();
+        let d2 = Dag::build(std::slice::from_ref(&with_ser)).unwrap();
+        assert_ne!(
+            d1.get_node("test.py:a").unwrap().definition_hash,
+            d2.get_node("test.py:a").unwrap().definition_hash,
+        );
     }
 }

@@ -59,6 +59,22 @@ pub struct ArtifactRef {
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<f64>,
+    /// Outcomes of `@sink` writes performed alongside this artifact.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sinks: Vec<SinkOutcome>,
+}
+
+/// Outcome of a single `@sink` write. Sink failures never fail the parent
+/// asset — they are reported here and surfaced in logs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SinkOutcome {
+    pub path: String,
+    /// "ok" | "error"
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ─── Coordinator → Worker ────────────────────────────────────────────────────
@@ -154,6 +170,7 @@ mod tests {
                 format: "json".to_string(),
                 size_bytes: 1024,
                 elapsed_seconds: Some(0.42),
+                sinks: Vec::new(),
             },
         };
 
@@ -209,6 +226,61 @@ mod tests {
                 }
             }
             _ => panic!("expected ParallelResponse"),
+        }
+    }
+
+    #[test]
+    fn test_artifact_ref_with_sinks_round_trips() {
+        let msg = WorkerMessage::StepCompleted {
+            node_id: "n".to_string(),
+            artifact: ArtifactRef {
+                path: "abfss://cont@acct.dfs.core.windows.net/arts/n.parquet".to_string(),
+                format: "parquet".to_string(),
+                size_bytes: 42,
+                elapsed_seconds: None,
+                sinks: vec![
+                    SinkOutcome {
+                        path: "exports/out.parquet".to_string(),
+                        status: "ok".to_string(),
+                        size_bytes: Some(42),
+                        error: None,
+                    },
+                    SinkOutcome {
+                        path: "s3://b/x.pkl".to_string(),
+                        status: "error".to_string(),
+                        size_bytes: None,
+                        error: Some("ImportError: s3fs".to_string()),
+                    },
+                ],
+            },
+        };
+        let frame = encode_message(&msg).unwrap();
+        let mut cursor = Cursor::new(frame);
+        let decoded: WorkerMessage = read_message(&mut cursor).unwrap().unwrap();
+        match decoded {
+            WorkerMessage::StepCompleted { artifact, .. } => {
+                assert_eq!(artifact.sinks.len(), 2);
+                assert_eq!(artifact.sinks[0].status, "ok");
+                assert_eq!(
+                    artifact.sinks[1].error.as_deref(),
+                    Some("ImportError: s3fs")
+                );
+            }
+            _ => panic!("expected StepCompleted"),
+        }
+    }
+
+    #[test]
+    fn test_artifact_ref_without_sinks_still_decodes() {
+        // Legacy workers don't send a `sinks` key — it must default to empty.
+        let legacy = r#"{"type":"step_completed","node_id":"n","artifact":{"path":"/a/n.json","format":"json","size_bytes":7}}"#;
+        let decoded: WorkerMessage = serde_json::from_str(legacy).unwrap();
+        match decoded {
+            WorkerMessage::StepCompleted { artifact, .. } => {
+                assert!(artifact.sinks.is_empty());
+                assert_eq!(artifact.size_bytes, 7);
+            }
+            _ => panic!("expected StepCompleted"),
         }
     }
 
@@ -320,6 +392,7 @@ mod tests {
                     format: "json".to_string(),
                     size_bytes: 512,
                     elapsed_seconds: None,
+                    sinks: Vec::new(),
                 },
             },
             WorkerMessage::Blocked {

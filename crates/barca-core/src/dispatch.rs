@@ -78,6 +78,15 @@ pub fn expand_pending_partitions(
                         );
                         continue;
                     }
+                    if oref.path.contains("://") {
+                        eprintln!(
+                            "[barca] Error: dynamic partitions (partitions_from) require a \
+                             local artifact store in v1 — partition source '{}' lives at \
+                             '{}'. Unset BARCA_ARTIFACT_URI to use these.",
+                            source_name, oref.path
+                        );
+                        continue;
+                    }
                     // Read the JSON artifact file from disk.
                     let json_str = match std::fs::read_to_string(&oref.path) {
                         Ok(s) => s,
@@ -133,6 +142,7 @@ pub fn expand_pending_partitions(
                 inputs: step.inputs.clone(),
                 pending_partitions: HashMap::new(),
                 serializer: step.serializer.clone(),
+                sinks: step.sinks.clone(),
                 timeout_seconds: step.timeout_seconds,
                 retries: step.retries,
                 retry_backoff_seconds: step.retry_backoff_seconds,
@@ -162,6 +172,7 @@ pub fn expand_pending_partitions(
                     inputs: step.inputs.clone(),
                     pending_partitions: step.pending_partitions.clone(),
                     serializer: step.serializer.clone(),
+                    sinks: step.sinks.clone(),
                     timeout_seconds: step.timeout_seconds,
                     retries: step.retries,
                     retry_backoff_seconds: step.retry_backoff_seconds,
@@ -327,6 +338,7 @@ mod tests {
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    sinks: vec![],
                     timeout_seconds: 300,
                     retries: 1,
                     retry_backoff_seconds: 0.0,
@@ -359,6 +371,7 @@ mod tests {
                     inputs: HashMap::from([("a_val".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    sinks: vec![],
                     timeout_seconds: 300,
                     retries: 1,
                     retry_backoff_seconds: 0.0,
@@ -393,6 +406,7 @@ mod tests {
                     inputs: HashMap::new(),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    sinks: vec![],
                     timeout_seconds: 300,
                     retries: 1,
                     retry_backoff_seconds: 0.0,
@@ -427,6 +441,7 @@ mod tests {
                         "get_regions".to_string(),
                     )]),
                     serializer: None,
+                    sinks: vec![],
                     timeout_seconds: 300,
                     retries: 1,
                     retry_backoff_seconds: 0.0,
@@ -463,6 +478,103 @@ mod tests {
     }
 
     #[test]
+    fn expand_pending_partitions_carries_sinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact_path = dir.path().join("regions.json");
+        std::fs::write(&artifact_path, r#"["us","eu"]"#).unwrap();
+
+        let sink = crate::model::SinkDecl {
+            path: "exports/out.parquet".to_string(),
+            serializer: Some(crate::model::SerializerKind::Parquet),
+        };
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![StreamStep {
+                    step_id: StepId::unpartitioned("f:transform"),
+                    kind: NodeKind::Asset,
+                    function_name: Arc::from("transform"),
+                    source_file: Arc::from("f"),
+                    inputs: HashMap::new(),
+                    pending_partitions: HashMap::from([(
+                        "region".to_string(),
+                        "get_regions".to_string(),
+                    )]),
+                    serializer: None,
+                    sinks: vec![sink.clone()],
+                    timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
+                    partition_keys: vec![],
+                }],
+            }],
+        };
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "f:get_regions".to_string(),
+            test_output_ref(&artifact_path.to_string_lossy(), "json"),
+        );
+
+        let expanded = expand_pending_partitions(&phase, &outputs, 4).unwrap();
+        let expanded_steps: Vec<&StreamStep> = expanded
+            .streams
+            .iter()
+            .flat_map(|s| &s.steps)
+            .filter(|st| !st.partition_keys.is_empty())
+            .collect();
+        assert!(!expanded_steps.is_empty());
+        for st in expanded_steps {
+            assert_eq!(st.sinks, vec![sink.clone()]);
+        }
+    }
+
+    #[test]
+    fn expand_pending_partitions_rejects_remote_partition_source() {
+        // Remote artifact store: the partition source can't be read from disk.
+        // The step must fall through as passthrough (no expansion, loud error).
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![StreamStep {
+                    step_id: StepId::unpartitioned("f:transform"),
+                    kind: NodeKind::Asset,
+                    function_name: Arc::from("transform"),
+                    source_file: Arc::from("f"),
+                    inputs: HashMap::new(),
+                    pending_partitions: HashMap::from([(
+                        "region".to_string(),
+                        "get_regions".to_string(),
+                    )]),
+                    serializer: None,
+                    sinks: vec![],
+                    timeout_seconds: 300,
+                    retries: 1,
+                    retry_backoff_seconds: 0.0,
+                    partition_keys: vec![],
+                }],
+            }],
+        };
+        let mut outputs = HashMap::new();
+        outputs.insert(
+            "f:get_regions".to_string(),
+            test_output_ref(
+                "abfss://cont@acct.dfs.core.windows.net/arts/regions.json",
+                "json",
+            ),
+        );
+
+        let expanded = expand_pending_partitions(&phase, &outputs, 4).unwrap();
+        for st in expanded.streams.iter().flat_map(|s| &s.steps) {
+            assert!(
+                st.partition_keys.is_empty(),
+                "remote source must not expand"
+            );
+        }
+    }
+
+    #[test]
     fn expand_pending_partitions_reads_json_artifact() {
         // Create a temporary JSON artifact file containing partition values.
         let dir = tempfile::tempdir().unwrap();
@@ -484,6 +596,7 @@ mod tests {
                         "get_regions".to_string(),
                     )]),
                     serializer: None,
+                    sinks: vec![],
                     timeout_seconds: 300,
                     retries: 1,
                     retry_backoff_seconds: 0.0,
@@ -535,6 +648,7 @@ mod tests {
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    sinks: vec![],
                     timeout_seconds: 300,
                     retries: 1,
                     retry_backoff_seconds: 0.0,
@@ -575,6 +689,7 @@ mod tests {
                     inputs: HashMap::from([("data".to_string(), "f:a".to_string())]),
                     pending_partitions: HashMap::new(),
                     serializer: None,
+                    sinks: vec![],
                     timeout_seconds: 300,
                     retries: 1,
                     retry_backoff_seconds: 0.0,

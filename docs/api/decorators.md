@@ -50,22 +50,27 @@ def daily_report() -> dict:
 ```python
 @sink(
     path: str,
+    serializer: str | None = None,
 )
 ```
 
-Stacked on an `@asset` to write the asset's output to a path when it materialises. Paths are fsspec-compatible (local, `s3://`, `gs://`, etc.). Multiple `@sink` decorators may be stacked on the same asset.
+Stacked on an `@asset` to write the asset's output to a path when it materialises. Paths are fsspec-compatible (local, `abfss://`, `s3://`, `gs://`, etc. — remote schemes need the matching extra, see [Remote storage](../remote-storage.md)). Multiple `@sink` decorators may be stacked on the same asset.
 
 ```python
 from barca import asset, sink, Always
 
 @asset(freshness=Always)
 @sink('./output.json')
-@sink('s3://my-bucket/output.json')
+@sink('abfss://exports@myacct.dfs.core.windows.net/output.parquet', serializer='parquet')
 def banana() -> dict:
     return {'a': 1}
 ```
 
-Sinks are leaf nodes — no other asset may list a sink as an input. A sink failure does not fail the parent asset, but is surfaced prominently in logs.
+The serialization format for each sink is chosen by precedence: the `serializer=` kwarg (`json`, `pickle`, `parquet`) → the sink path's extension (`.json`, `.pkl`, `.pickle`, `.parquet`) → the parent asset's artifact format. Writes are staged through a local temp file and uploaded/renamed atomically, so a crash never leaves a partial file at the destination.
+
+Sinks are leaf nodes — no other asset may list a sink as an input. A sink failure does not fail the parent asset, but is surfaced prominently in logs (`[barca] SINK FAILED: ...`).
+
+For partitioned assets, each partition writes its own sink file with the partition key injected before the extension: `@sink('out.parquet')` on partitions `ticker=AAPL, ticker=MSFT` produces `out_ticker_AAPL.parquet` and `out_ticker_MSFT.parquet`.
 
 ::: barca.sink
     options:

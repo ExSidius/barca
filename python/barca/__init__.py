@@ -7,7 +7,7 @@ parses these statically from source without importing.
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "asset",
@@ -106,8 +106,13 @@ def task(fn=None, *, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
     return decorator
 
 
-def sink(path: str, **kwargs):
-    """Declare a sink output (stacked on @asset)."""
+def sink(path: str, serializer: str | None = None, **kwargs):
+    """Declare a sink output (stacked on @asset).
+
+    path may be local or a remote URI (abfss://, s3://, gs://). serializer
+    overrides the format ("json", "pickle", "parquet"); it defaults to the
+    path extension, then the parent asset's artifact format.
+    """
 
     def decorator(f):
         return f
