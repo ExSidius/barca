@@ -53,7 +53,7 @@ export EXEC_LOG="$TMP/exec-a.log"
     || { cat "$TMP/machine-a/stderr-a.log"; exit 1; }
 grep -q '"steps_executed":2' "$TMP/machine-a/result-a.json" \
     || { echo "FAIL: machine A did not execute 2 steps"; cat "$TMP/machine-a/result-a.json"; exit 1; }
-[ "$(wc -l < "$EXEC_LOG")" = "2" ] || { echo "FAIL: expected 2 executions on A"; exit 1; }
+[ "$(wc -l < "$EXEC_LOG" | tr -d '[:space:]')" = "2" ] || { echo "FAIL: expected 2 executions on A"; exit 1; }
 
 STATE_BLOB="$SHARED/default/state/metadata.db"
 [ -f "$STATE_BLOB" ] || { echo "FAIL: state blob not pushed to $STATE_BLOB"; exit 1; }
