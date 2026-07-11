@@ -841,3 +841,87 @@ class TestRemoteArtifactStore:
         )
         msgs, _ = _run_batch_capture_protocol(batch)
         assert deserialize(msgs[0]["artifact"]["path"], "json") == 20
+
+
+# ─── Error emission: filtered tracebacks + timeout classification ────────────
+
+
+class TestErrorEmission:
+    def test_user_traceback_strips_barca_frames(self, tmp_path):
+        from barca._worker import _user_traceback, load_module
+
+        src = _write_module(
+            tmp_path,
+            "boom.py",
+            """
+            def outer():
+                return inner()
+
+            def inner():
+                return 1 / 0
+        """,
+        )
+        mod = load_module(src)
+        try:
+            mod.outer()
+        except ZeroDivisionError as exc:
+            tb = _user_traceback(exc)
+        assert "boom.py" in tb
+        assert "inner" in tb
+        assert "_worker.py" not in tb
+
+    def test_user_traceback_empty_when_all_frames_internal(self):
+        from barca._worker import _user_traceback
+
+        # A TypeError raised by calling the fn itself — every frame is barca's.
+        def takes_none():
+            return 1
+
+        try:
+            from barca._worker import _execute
+
+            _execute(takes_none, {"unexpected": 1}, {})
+        except TypeError as exc:
+            tb = _user_traceback(exc)
+        assert "_worker.py" not in tb
+
+    def test_batch_error_receipt_has_filtered_traceback(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def explode():
+                raise ValueError("kaboom")
+        """,
+        )
+        batch = _make_batch(
+            [_make_step("mod.py:explode", "explode", src)],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["type"] == "error"
+        assert msgs[0]["error_type"] == "ValueError"
+        assert msgs[0]["message"] == "kaboom"
+        assert "mod.py" in msgs[0]["traceback"]
+        assert "_worker.py" not in msgs[0]["traceback"]
+
+    def test_timeout_emits_timeout_error(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            import time
+
+            def hung():
+                time.sleep(5)
+        """,
+        )
+        step = _make_step("mod.py:hung", "hung", src)
+        step["timeout_seconds"] = 1
+        batch = _make_batch([step], artifact_dir=artifact_dir)
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["type"] == "error"
+        assert msgs[0]["error_type"] == "TimeoutError"
+        assert "timeout" in msgs[0]["message"].lower()

@@ -72,6 +72,21 @@ impl ItemSpec {
     }
 }
 
+// ─── Failure handling ─────────────────────────────────────────────────────────
+
+/// What `on_item_failed` decided. `RetryAfter` items are parked in
+/// `waiting_retry` — the caller owns the timer and must call `requeue()`
+/// once the backoff elapses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FailureAction {
+    /// Re-queued immediately (no backoff configured).
+    RetryNow,
+    /// Parked for backoff; schedule `requeue(item_id)` after this delay.
+    RetryAfter(std::time::Duration),
+    /// Retry budget exhausted — permanently failed, dependents cascaded.
+    Failed,
+}
+
 // ─── Item ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -113,6 +128,8 @@ pub struct Coordinator {
     failed: HashMap<ItemId, String>,
     /// Skipped items (upstream data dep failed).
     skipped: HashSet<ItemId>,
+    /// Items parked for retry backoff — not ready until requeue() is called.
+    waiting_retry: HashSet<ItemId>,
     /// Output artifacts from completed items.
     outputs: HashMap<ItemId, serde_json::Value>,
     /// Parallel groups.
@@ -135,6 +152,7 @@ impl Coordinator {
             done: HashSet::new(),
             failed: HashMap::new(),
             skipped: HashSet::new(),
+            waiting_retry: HashSet::new(),
             outputs: HashMap::new(),
             groups: HashMap::new(),
             next_item_id: 0,
@@ -200,10 +218,21 @@ impl Coordinator {
     // ─── Scheduling ────────────────────────────────────────────────────────
 
     /// Pop the next ready item. Returns None if nothing is ready.
+    /// `attempts` counts dispatches, so it is incremented here.
     pub fn next_ready(&mut self) -> Option<ItemId> {
         let id = self.ready.pop_front()?;
         self.executing.insert(id);
+        if let Some(item) = self.items.get_mut(&id) {
+            item.attempts += 1;
+        }
         Some(id)
+    }
+
+    /// Move an item parked by a `RetryAfter` decision back to the ready queue.
+    pub fn requeue(&mut self, item_id: ItemId) {
+        if self.waiting_retry.remove(&item_id) {
+            self.ready.push_back(item_id);
+        }
     }
 
     /// How many items are ready to be assigned.
@@ -229,15 +258,21 @@ impl Coordinator {
     }
 
     /// Mark an item as failed. Retries if budget remains, else cascades.
-    pub fn on_item_failed(&mut self, item_id: ItemId, error: String) {
+    /// Backoff delay grows linearly: `retry_backoff_seconds * attempts`.
+    pub fn on_item_failed(&mut self, item_id: ItemId, error: String) -> FailureAction {
         self.executing.remove(&item_id);
 
         let item = self.items.get_mut(&item_id).unwrap();
-        item.attempts += 1;
 
         if item.attempts < item.spec.retries {
-            // Retry: push back to ready queue
-            self.ready.push_back(item_id);
+            let backoff = item.spec.retry_backoff_seconds * item.attempts as f64;
+            if backoff > 0.0 {
+                self.waiting_retry.insert(item_id);
+                FailureAction::RetryAfter(std::time::Duration::from_secs_f64(backoff))
+            } else {
+                self.ready.push_back(item_id);
+                FailureAction::RetryNow
+            }
         } else {
             // Permanent failure
             self.failed.insert(item_id, error);
@@ -248,6 +283,7 @@ impl Coordinator {
             }
 
             self.cascade_failure(item_id);
+            FailureAction::Failed
         }
     }
 
@@ -812,9 +848,79 @@ mod tests {
         let mut c = Coordinator::new();
         let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]); // retries=1 → no retry
         c.next_ready();
-        c.on_item_failed(a, "boom".into());
+        assert_eq!(c.on_item_failed(a, "boom".into()), FailureAction::Failed);
         assert_eq!(c.failed_items().len(), 1);
         assert!(c.is_finished());
+    }
+
+    #[test]
+    fn attempts_count_dispatches() {
+        let mut c = Coordinator::new();
+        let mut s = spec("a");
+        s.retries = 3;
+        let a = c.add_item(dummy_step_id("a"), s, vec![]);
+
+        c.next_ready();
+        assert_eq!(c.item(a).attempts, 1);
+        assert_eq!(
+            c.on_item_failed(a, "fail 1".into()),
+            FailureAction::RetryNow
+        );
+        c.next_ready();
+        assert_eq!(c.item(a).attempts, 2);
+        assert_eq!(
+            c.on_item_failed(a, "fail 2".into()),
+            FailureAction::RetryNow
+        );
+        c.next_ready();
+        assert_eq!(c.item(a).attempts, 3);
+        // A success after two failures records 3 total attempts.
+        c.on_item_completed(a);
+        assert_eq!(c.item(a).attempts, 3);
+        assert!(c.is_finished());
+    }
+
+    #[test]
+    fn backoff_parks_item_until_requeue() {
+        let mut c = Coordinator::new();
+        let mut s = spec("a");
+        s.retries = 3;
+        s.retry_backoff_seconds = 0.2;
+        let a = c.add_item(dummy_step_id("a"), s, vec![]);
+
+        c.next_ready();
+        // delay = backoff * attempt: 0.2 * 1 after the first failure.
+        assert_eq!(
+            c.on_item_failed(a, "fail 1".into()),
+            FailureAction::RetryAfter(std::time::Duration::from_secs_f64(0.2)),
+        );
+        // Parked: not ready, not finished, until the caller requeues.
+        assert_eq!(c.ready_count(), 0);
+        assert!(!c.is_finished());
+        c.requeue(a);
+        assert_eq!(c.next_ready(), Some(a));
+
+        // Second failure: delay = 0.2 * 2.
+        assert_eq!(
+            c.on_item_failed(a, "fail 2".into()),
+            FailureAction::RetryAfter(std::time::Duration::from_secs_f64(0.4)),
+        );
+        c.requeue(a);
+        assert_eq!(c.next_ready(), Some(a));
+
+        // Third failure exhausts the budget regardless of backoff.
+        assert_eq!(c.on_item_failed(a, "fail 3".into()), FailureAction::Failed);
+        assert!(c.is_finished());
+    }
+
+    #[test]
+    fn requeue_of_unparked_item_is_noop() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        c.requeue(a); // a is in ready (never parked) — must not duplicate
+        assert_eq!(c.ready_count(), 1);
+        assert_eq!(c.next_ready(), Some(a));
+        assert_eq!(c.next_ready(), None);
     }
 
     #[test]

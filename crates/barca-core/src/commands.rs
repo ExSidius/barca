@@ -257,7 +257,7 @@ fn execute(
     let mut all_sinks: HashMap<String, String> = HashMap::new();
     // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
     let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
-    let all_attempts: HashMap<String, u32> = HashMap::new();
+    let mut all_attempts: HashMap<String, u32> = HashMap::new();
     let mut steps_executed = 0;
 
     // Progress bar setup.
@@ -558,7 +558,14 @@ fn execute(
         // Collect results from coordinator
         let mut phase_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
         for (&item_id, artifact_val) in coord.outputs() {
-            let node_id = coord.item(item_id).step_id.display();
+            let item = coord.item(item_id);
+            let node_id = item.step_id.display();
+            // Attempts made for this item (dispatch count), keyed by base node
+            // id — how the success-row INSERT looks it up.
+            all_attempts.insert(
+                crate::StepId::parse(&node_id).base_id().to_string(),
+                item.attempts,
+            );
             let oref = dispatch::OutputRef {
                 path: artifact_val
                     .get("path")

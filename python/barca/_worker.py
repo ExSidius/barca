@@ -72,6 +72,25 @@ def _emit(msg_type, **fields):
     print(f"BARCA:{_PROTOCOL_VERSION}:{payload}", file=sys.stderr, flush=True)
 
 
+def _user_traceback(exc) -> str:
+    """Format the traceback with barca-internal frames stripped.
+
+    Keeps only frames from user code so surfaced errors point at the user's
+    file/line, never at _worker.py plumbing. Returns "" when every frame is
+    internal (e.g. a TypeError raised by the fn(**kwargs) call itself) — the
+    caller always leads with "ErrorType: message", which carries the detail.
+    """
+    barca_dir = str(Path(__file__).resolve().parent)
+    frames = [
+        f
+        for f in traceback.extract_tb(exc.__traceback__)
+        if not str(Path(f.filename).resolve()).startswith(barca_dir)
+    ]
+    if not frames:
+        return ""
+    return "".join(traceback.format_list(frames)).rstrip("\n")
+
+
 def _emit_error(node_id, exc, elapsed=0.0):
     """Emit a structured failure for a single step. Rust owns the retry decision."""
     _emit(
@@ -79,7 +98,7 @@ def _emit_error(node_id, exc, elapsed=0.0):
         node_id=node_id,
         error_type=type(exc).__name__,
         message=str(exc),
-        traceback=traceback.format_exc(),
+        traceback=_user_traceback(exc),
         elapsed=elapsed,
     )
 
@@ -478,21 +497,23 @@ def run_daemon():
             # Serialize result to artifact (and write any declared sinks).
             _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=True)
 
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            # Socket was closed (e.g. replacement worker killed) — exit cleanly.
-            break
         except BaseException as exc:
+            # Any failure inside the step — including TimeoutError and OSError
+            # from user code — is a step error. (TimeoutError and the socket
+            # errors are OSError subclasses, so a socket-error catch here would
+            # swallow them; genuine socket death surfaces when the emit below
+            # fails, and that is when we exit.)
             elapsed = time.time() - t0
-            tb = traceback.format_exc()
             try:
                 _runtime.emit_step_error(
                     node_id=node_id,
                     error_type=type(exc).__name__,
                     message=str(exc),
-                    traceback=tb,
+                    traceback=_user_traceback(exc),
                     elapsed=elapsed,
                 )
             except (BrokenPipeError, ConnectionResetError, OSError):
+                # Socket was closed (e.g. replacement worker killed) — exit cleanly.
                 break
 
     _runtime.disconnect()

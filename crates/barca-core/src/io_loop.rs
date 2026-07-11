@@ -15,7 +15,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::coordinator::{Coordinator, GroupId, ItemId, ItemSpec};
+use crate::coordinator::{Coordinator, FailureAction, GroupId, ItemId, ItemSpec};
 use crate::protocol::{CoordinatorMessage, ParallelResult, WorkerMessage};
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -64,6 +64,20 @@ enum IoEvent {
     Disconnected {
         worker_id: usize,
     },
+    /// A retry-backoff timer elapsed — the item may be re-queued.
+    RetryReady {
+        item_id: ItemId,
+    },
+}
+
+/// Re-deliver an item to the ready queue after its retry backoff elapses.
+/// The sleep runs off the event loop so independent work keeps flowing.
+fn schedule_retry(event_tx: &mpsc::Sender<IoEvent>, item_id: ItemId, delay: Duration) {
+    let tx = event_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        let _ = tx.send(IoEvent::RetryReady { item_id }).await;
+    });
 }
 
 // ─── Worker I/O task ─────────────────────────────────────────────────────────
@@ -199,16 +213,38 @@ pub async fn run(
                         )
                         .await;
                     }
-                    WorkerMessage::StepError { message, .. } => {
+                    WorkerMessage::StepError {
+                        error_type,
+                        message,
+                        traceback,
+                        ..
+                    } => {
                         let item_id = workers
                             .get(&worker_id)
                             .and_then(|w| w.executing)
                             .expect("StepError but worker has no executing item");
 
-                        coord.on_item_failed(item_id, message);
+                        // Surface the full picture: exception type, message, and
+                        // the (barca-frame-filtered) traceback from the worker.
+                        let mut error = format!("{error_type}: {message}");
+                        if !traceback.trim().is_empty() {
+                            error.push('\n');
+                            error.push_str(&traceback);
+                        }
+                        if let FailureAction::RetryAfter(delay) =
+                            coord.on_item_failed(item_id, error)
+                        {
+                            schedule_retry(&event_tx, item_id, delay);
+                        }
 
-                        if let Some(w) = workers.get_mut(&worker_id) {
-                            w.executing = None;
+                        // User code failed (or hung past its timeout) in this
+                        // process — kill it so retries and remaining work get a
+                        // fresh interpreter. The 200ms SIGTERM grace runs off
+                        // the event loop.
+                        if let Some(mut handle) = workers.remove(&worker_id) {
+                            tokio::task::spawn_blocking(move || {
+                                graceful_kill(&mut handle.child);
+                            });
                         }
 
                         resume_frozen(&mut frozen, &mut workers, coord).await;
@@ -229,7 +265,11 @@ pub async fn run(
                             .and_then(|w| w.executing)
                             .expect("Blocked but worker has no executing item");
 
-                        coord.on_item_failed(item_id, format!("blocked: {reason}"));
+                        if let FailureAction::RetryAfter(delay) =
+                            coord.on_item_failed(item_id, format!("blocked: {reason}"))
+                        {
+                            schedule_retry(&event_tx, item_id, delay);
+                        }
 
                         if let Some(w) = workers.get_mut(&worker_id) {
                             w.executing = None;
@@ -339,7 +379,11 @@ pub async fn run(
                 // Worker crashed — fail its executing item
                 if let Some(handle) = workers.get(&worker_id) {
                     if let Some(item_id) = handle.executing {
-                        coord.on_item_failed(item_id, "worker disconnected".to_string());
+                        if let FailureAction::RetryAfter(delay) =
+                            coord.on_item_failed(item_id, "worker disconnected".to_string())
+                        {
+                            schedule_retry(&event_tx, item_id, delay);
+                        }
                     }
                 }
                 workers.remove(&worker_id);
@@ -352,6 +396,19 @@ pub async fn run(
                     workers.insert(wid, h);
                 }
                 resume_frozen(&mut frozen, &mut workers, coord).await;
+                assign_ready(
+                    &mut workers,
+                    coord,
+                    &config.python,
+                    &socket_path,
+                    &listener,
+                    &event_tx,
+                    &mut next_worker_id,
+                )
+                .await;
+            }
+            IoEvent::RetryReady { item_id } => {
+                coord.requeue(item_id);
                 assign_ready(
                     &mut workers,
                     coord,
