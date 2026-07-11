@@ -106,8 +106,13 @@ def task(fn=None, *, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
     return decorator
 
 
-def sink(path: str, **kwargs):
-    """Declare a sink output (stacked on @asset)."""
+def sink(path: str, serializer: str | None = None, **kwargs):
+    """Declare a sink output (stacked on @asset).
+
+    path may be local or a remote URI (abfss://, s3://, gs://). serializer
+    overrides the format ("json", "pickle", "parquet"); it defaults to the
+    path extension, then the parent asset's artifact format.
+    """
 
     def decorator(f):
         return f

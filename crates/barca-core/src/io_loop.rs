@@ -272,6 +272,7 @@ pub async fn run(
                                     retries: 1,
                                     retry_backoff_seconds: 0.0,
                                     serializer: None,
+                                    sinks: Vec::new(),
                                     upstream_inputs: HashMap::new(),
                                     kind: "task".to_string(),
                                     is_dynamic: false,
@@ -486,9 +487,19 @@ async fn resume_frozen(
                                 let path =
                                     artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
                                 if fmt == "json" && !path.is_empty() {
-                                    std::fs::read_to_string(path)
-                                        .ok()
-                                        .and_then(|s| serde_json::from_str(&s).ok())
+                                    if path.contains("://") {
+                                        eprintln!(
+                                            "[barca] Warning: parallel() result values require \
+                                             a local artifact store in v1 — artifact '{path}' \
+                                             is remote; the parent receives null. Unset \
+                                             BARCA_ARTIFACT_URI to use parallel() results."
+                                        );
+                                        None
+                                    } else {
+                                        std::fs::read_to_string(path)
+                                            .ok()
+                                            .and_then(|s| serde_json::from_str(&s).ok())
+                                    }
                                 } else {
                                     None
                                 }
@@ -658,5 +669,80 @@ fn build_step_json(item: &crate::coordinator::Item, coord: &Coordinator) -> serd
         "direct_args": item.spec.direct_args,
         "direct_kwargs": item.spec.direct_kwargs,
         "serializer": item.spec.serializer.as_deref(),
+        "sinks": item.spec.sinks,
     })
+}
+
+// ─── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::ItemSpec;
+    use std::collections::HashMap;
+
+    #[test]
+    fn build_step_json_includes_sinks() {
+        let mut coord = Coordinator::new();
+        let spec = ItemSpec {
+            fn_ref: "f.py:a".to_string(),
+            function_name: "a".to_string(),
+            source_file: "f.py".to_string(),
+            direct_args: Vec::new(),
+            direct_kwargs: HashMap::new(),
+            dag_inputs: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            serializer: Some("parquet".to_string()),
+            sinks: vec![
+                crate::model::SinkDecl {
+                    path: "abfss://cont@acct.dfs.core.windows.net/exports/a.parquet".to_string(),
+                    serializer: Some(crate::model::SerializerKind::Parquet),
+                },
+                crate::model::SinkDecl {
+                    path: "exports/a.pkl".to_string(),
+                    serializer: None,
+                },
+            ],
+            upstream_inputs: HashMap::new(),
+            kind: "asset".to_string(),
+            is_dynamic: false,
+        };
+        let id = coord.add_item(crate::StepId::unpartitioned("f.py:a"), spec, Vec::new());
+        let step = build_step_json(coord.item(id), &coord);
+
+        assert_eq!(
+            step["sinks"],
+            serde_json::json!([
+                {"path": "abfss://cont@acct.dfs.core.windows.net/exports/a.parquet", "serializer": "parquet"},
+                {"path": "exports/a.pkl", "serializer": null},
+            ])
+        );
+        assert_eq!(step["serializer"], serde_json::json!("parquet"));
+    }
+
+    #[test]
+    fn build_step_json_empty_sinks_serializes_as_empty_array() {
+        let mut coord = Coordinator::new();
+        let spec = ItemSpec {
+            fn_ref: "f.py:a".to_string(),
+            function_name: "a".to_string(),
+            source_file: "f.py".to_string(),
+            direct_args: Vec::new(),
+            direct_kwargs: HashMap::new(),
+            dag_inputs: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            serializer: None,
+            sinks: Vec::new(),
+            upstream_inputs: HashMap::new(),
+            kind: "asset".to_string(),
+            is_dynamic: false,
+        };
+        let id = coord.add_item(crate::StepId::unpartitioned("f.py:a"), spec, Vec::new());
+        let step = build_step_json(coord.item(id), &coord);
+        assert_eq!(step["sinks"], serde_json::json!([]));
+    }
 }

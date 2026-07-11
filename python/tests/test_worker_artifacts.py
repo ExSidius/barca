@@ -10,7 +10,9 @@ import textwrap
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
+from barca import _storage
 from barca._artifacts import deserialize
 
 
@@ -318,9 +320,7 @@ class TestCrossPhaseInputs:
         )
         msgs, errors = _run_batch_capture_protocol(batch)
         assert len(msgs) == 1, f"Errors: {errors}"
-        result = deserialize(
-            Path(msgs[0]["artifact"]["path"]), msgs[0]["artifact"]["format"]
-        )
+        result = deserialize(Path(msgs[0]["artifact"]["path"]), msgs[0]["artifact"]["format"])
         assert result == 11
 
     def test_parquet_artifact_as_input(self, tmp_path):
@@ -360,9 +360,7 @@ class TestCrossPhaseInputs:
         )
         msgs, errors = _run_batch_capture_protocol(batch)
         assert len(msgs) == 1, f"Errors: {errors}"
-        result = deserialize(
-            Path(msgs[0]["artifact"]["path"]), msgs[0]["artifact"]["format"]
-        )
+        result = deserialize(Path(msgs[0]["artifact"]["path"]), msgs[0]["artifact"]["format"])
         assert result == 60
 
     def test_pickle_artifact_as_input(self, tmp_path):
@@ -401,9 +399,7 @@ class TestCrossPhaseInputs:
         )
         msgs, errors = _run_batch_capture_protocol(batch)
         assert len(msgs) == 1, f"Errors: {errors}"
-        result = deserialize(
-            Path(msgs[0]["artifact"]["path"]), msgs[0]["artifact"]["format"]
-        )
+        result = deserialize(Path(msgs[0]["artifact"]["path"]), msgs[0]["artifact"]["format"])
         assert result == 3
 
 
@@ -521,3 +517,327 @@ class TestMultiStepBatch:
         msgs, _ = _run_batch_capture_protocol(batch)
         paths = [m["artifact"]["path"] for m in msgs]
         assert len(set(paths)) == 2, f"Paths should be distinct: {paths}"
+
+
+# ─── @sink execution ─────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def _memory_fs():
+    """Clean fsspec memory filesystem around each test."""
+    yield
+    fs = _storage._fs_cache.get("memory")
+    if fs is not None:
+        fs.store.clear()
+
+
+def _make_sink_step(node_id, function_name, source_file, sinks, **kwargs):
+    step = _make_step(node_id, function_name, source_file, **kwargs)
+    step["sinks"] = sinks
+    return step
+
+
+class TestSinkExecution:
+    def test_local_sink_written(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        sink_path = str(tmp_path / "exports" / "out.json")
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func", "my_func", src, [{"path": sink_path, "serializer": None}]
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+
+        assert msgs[0]["type"] == "result"
+        assert deserialize(Path(sink_path), "json") == {"x": 1}
+        outcomes = msgs[0]["artifact"]["sinks"]
+        assert outcomes == [
+            {"path": sink_path, "status": "ok", "size_bytes": Path(sink_path).stat().st_size}
+        ]
+
+    def test_stacked_sinks_both_written(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        s1 = str(tmp_path / "out.json")
+        s2 = str(tmp_path / "out.pkl")
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func",
+                    "my_func",
+                    src,
+                    [{"path": s1, "serializer": None}, {"path": s2, "serializer": None}],
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert deserialize(Path(s1), "json") == {"x": 1}
+        assert deserialize(Path(s2), "pickle") == {"x": 1}
+        assert [o["status"] for o in msgs[0]["artifact"]["sinks"]] == ["ok", "ok"]
+
+    def test_serializer_kwarg_overrides_extension(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        # .dat extension, explicit pickle serializer.
+        sink_path = str(tmp_path / "out.dat")
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func", "my_func", src, [{"path": sink_path, "serializer": "pickle"}]
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["artifact"]["sinks"][0]["status"] == "ok"
+        assert deserialize(Path(sink_path), "pickle") == {"x": 1}
+
+    def test_extension_precedence_over_primary_format(self, tmp_path):
+        """Primary artifact is json; .pkl sink extension forces pickle."""
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return [1, 2, 3]
+        """,
+        )
+        sink_path = str(tmp_path / "out.pkl")
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func", "my_func", src, [{"path": sink_path, "serializer": None}]
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["artifact"]["format"] == "json"
+        assert deserialize(Path(sink_path), "pickle") == [1, 2, 3]
+
+    def test_parquet_sink_for_dataframe(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            import pandas as pd
+
+            def my_func():
+                return pd.DataFrame({"a": [1, 2, 3]})
+        """,
+        )
+        sink_path = str(tmp_path / "exports" / "table.parquet")
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func", "my_func", src, [{"path": sink_path, "serializer": "parquet"}]
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["artifact"]["sinks"][0]["status"] == "ok"
+        result = pd.read_parquet(sink_path)
+        assert list(result["a"]) == [1, 2, 3]
+
+    def test_sink_failure_does_not_fail_asset(self, tmp_path):
+        """A sink with an unusable destination fails loudly but the asset succeeds."""
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func",
+                    "my_func",
+                    src,
+                    [{"path": "ftp://nowhere/out.json", "serializer": None}],
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, errors = _run_batch_capture_protocol(batch)
+
+        assert msgs[0]["type"] == "result"  # asset still succeeds
+        outcome = msgs[0]["artifact"]["sinks"][0]
+        assert outcome["status"] == "error"
+        assert "error" in outcome
+        assert any("SINK FAILED" in line for line in errors)
+
+    def test_unsupported_serializer_is_isolated_error(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func",
+                    "my_func",
+                    src,
+                    [{"path": str(tmp_path / "out.yaml"), "serializer": "yaml"}],
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["type"] == "result"
+        outcome = msgs[0]["artifact"]["sinks"][0]
+        assert outcome["status"] == "error"
+        assert "not supported yet" in outcome["error"]
+
+    def test_memory_uri_sink(self, tmp_path, _memory_fs):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 42}
+        """,
+        )
+        batch = _make_batch(
+            [
+                _make_sink_step(
+                    "mod.py:my_func",
+                    "my_func",
+                    src,
+                    [{"path": "memory://exports/out.json", "serializer": None}],
+                )
+            ],
+            artifact_dir=artifact_dir,
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["artifact"]["sinks"][0]["status"] == "ok"
+        assert deserialize("memory://exports/out.json", "json") == {"x": 42}
+
+    def test_partitioned_sinks_get_suffix(self, tmp_path):
+        artifact_dir = tmp_path / "artifacts"
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func(ticker):
+                return {"ticker": ticker}
+        """,
+        )
+        sink_path = str(tmp_path / "out.json")
+        step = _make_sink_step(
+            "mod.py:my_func", "my_func", src, [{"path": sink_path, "serializer": None}]
+        )
+        step["partition_keys"] = [{"ticker": "AAPL"}, {"ticker": "MSFT"}]
+        batch = _make_batch([step], artifact_dir=artifact_dir)
+        msgs, _ = _run_batch_capture_protocol(batch)
+
+        assert len(msgs) == 2
+        p_aapl = str(tmp_path / "out_ticker_AAPL.json")
+        p_msft = str(tmp_path / "out_ticker_MSFT.json")
+        assert deserialize(Path(p_aapl), "json") == {"ticker": "AAPL"}
+        assert deserialize(Path(p_msft), "json") == {"ticker": "MSFT"}
+        assert not Path(sink_path).exists()
+
+
+# ─── Remote primary artifact store ───────────────────────────────────────────
+
+
+class TestRemoteArtifactStore:
+    def test_batch_writes_to_memory_uri(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return {"x": 1}
+        """,
+        )
+        batch = _make_batch(
+            [_make_step("mod.py:my_func", "my_func", src)],
+            artifact_dir="memory://arts",
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+
+        art = msgs[0]["artifact"]
+        assert art["path"].startswith("memory://arts/")
+        assert art["format"] == "json"
+        assert _storage.exists(art["path"])
+        assert deserialize(art["path"], "json") == {"x": 1}
+
+    def test_env_var_used_when_no_artifact_dir(self, tmp_path, monkeypatch, _memory_fs):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("BARCA_ARTIFACT_URI", "memory://envstore")
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def my_func():
+                return 7
+        """,
+        )
+        batch = _make_batch([_make_step("mod.py:my_func", "my_func", src)])
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert msgs[0]["artifact"]["path"].startswith("memory://envstore/")
+        assert deserialize(msgs[0]["artifact"]["path"], "json") == 7
+
+    def test_cross_phase_input_from_memory_uri(self, tmp_path, monkeypatch, _memory_fs):
+        """A provided_inputs artifact ref with a memory:// path deserializes."""
+        monkeypatch.chdir(tmp_path)
+        from barca._artifacts import serialize
+
+        serialize({"seed": 10}, "memory://arts/upstream.json", "json")
+        src = _write_module(
+            tmp_path,
+            "mod.py",
+            """
+            def consumer(up):
+                return up["seed"] * 2
+        """,
+        )
+        batch = _make_batch(
+            [_make_step("mod.py:consumer", "consumer", src, inputs={"up": "phase0:up"})],
+            provided_inputs={
+                "phase0:up": {"path": "memory://arts/upstream.json", "format": "json"}
+            },
+            artifact_dir="memory://arts",
+        )
+        msgs, _ = _run_batch_capture_protocol(batch)
+        assert deserialize(msgs[0]["artifact"]["path"], "json") == 20

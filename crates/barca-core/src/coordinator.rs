@@ -42,6 +42,8 @@ pub struct ItemSpec {
     pub retries: u32,
     pub retry_backoff_seconds: f64,
     pub serializer: Option<String>,
+    /// Sink outputs from stacked `@sink(...)` decorators.
+    pub sinks: Vec<crate::model::SinkDecl>,
     /// Original step.inputs mapping: param_name → upstream_node_id.
     /// Used at dispatch time to resolve in-phase upstream artifacts.
     pub upstream_inputs: HashMap<String, String>,
@@ -62,6 +64,7 @@ impl ItemSpec {
             retries: step.retries,
             retry_backoff_seconds: step.retry_backoff_seconds,
             serializer: step.serializer.as_ref().map(|s| s.to_string()),
+            sinks: step.sinks.clone(),
             upstream_inputs: step.inputs.clone(),
             kind: format!("{:?}", step.kind).to_lowercase(),
             is_dynamic: false,
@@ -620,6 +623,7 @@ mod tests {
             retries: 1,
             retry_backoff_seconds: 0.0,
             serializer: None,
+            sinks: Vec::new(),
             upstream_inputs: HashMap::new(),
             kind: "asset".to_string(),
             is_dynamic: false,

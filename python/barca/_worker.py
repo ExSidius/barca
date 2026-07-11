@@ -12,12 +12,37 @@ Protocol:
 
 import importlib.util
 import json
+import os
 import sys
 import time
 import traceback
 from pathlib import Path
 
-from barca._artifacts import artifact_path, deserialize, detect_format, serialize
+from barca import _storage
+from barca._artifacts import (
+    artifact_path,
+    clean_staging,
+    deserialize,
+    detect_format,
+    resolve_format,
+    safe_node_id,
+    serialize,
+)
+
+_EXT_FORMATS = {
+    ".json": "json",
+    ".pkl": "pickle",
+    ".pickle": "pickle",
+    ".parquet": "parquet",
+}
+
+
+def _default_artifact_dir() -> str:
+    """Artifact store root: BARCA_ARTIFACT_URI if set, else local .barca/artifacts."""
+    uri = os.environ.get("BARCA_ARTIFACT_URI")
+    if uri:
+        return uri
+    return str(Path(".barca/artifacts").resolve())
 
 
 _PROTOCOL_VERSION = 2
@@ -133,18 +158,66 @@ def _execute(fn, kwargs, step):
     return result, elapsed
 
 
-def _materialize(result, node_id, art_dir, step, elapsed):
+def _sink_dest(path: str, node_id: str, base_node_id: str) -> str:
+    """Sink destination path, with a partition suffix injected before the
+    extension for partitioned assets so partitions don't clobber each other
+    (e.g. out.parquet → out_ticker_AAPL.parquet)."""
+    if node_id == base_node_id or not node_id.startswith(base_node_id):
+        return path
+    part = safe_node_id(node_id[len(base_node_id) :])
+    ext = _storage.suffix(path)
+    if ext:
+        return path[: -len(ext)] + part + ext
+    return path + part
+
+
+def _write_sinks(result, step, node_id, primary_fmt):
+    """Write each @sink declared on the step. Error-isolated: a sink failure
+    never fails the parent asset — it is logged and reported in the outcome."""
+    outcomes = []
+    base_id = step.get("node_id", node_id)
+    for sink in step.get("sinks") or []:
+        dest = sink.get("path", "")
+        try:
+            fmt = sink.get("serializer") or _EXT_FORMATS.get(_storage.suffix(dest)) or primary_fmt
+            if fmt not in ("json", "pickle", "parquet"):
+                raise ValueError(
+                    f"sink serializer '{fmt}' is not supported yet "
+                    "(supported: json, pickle, parquet)"
+                )
+            fmt = resolve_format(result, fmt)
+            dest = _sink_dest(dest, node_id, base_id)
+            size = serialize(result, dest, fmt)
+            outcomes.append({"path": str(dest), "status": "ok", "size_bytes": size})
+        except Exception as exc:
+            print(
+                f"[barca] SINK FAILED: {node_id} -> {dest}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            outcomes.append(
+                {
+                    "path": str(dest),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return outcomes
+
+
+def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=False):
     """Serialize a result to its artifact and emit a `result` protocol message."""
     explicit_fmt = step.get("serializer")
-    fmt = detect_format(result, explicit=explicit_fmt)
+    fmt = resolve_format(result, detect_format(result, explicit=explicit_fmt))
     path = artifact_path(art_dir, node_id, fmt)
     size = serialize(result, path, fmt)
-    _emit(
-        "result",
-        node_id=node_id,
-        artifact={"path": str(path), "format": fmt, "size_bytes": size},
-        elapsed=elapsed,
-    )
+    artifact = {"path": str(path), "format": fmt, "size_bytes": size}
+    if elapsed_in_artifact:
+        artifact["elapsed_seconds"] = elapsed
+    sink_outcomes = _write_sinks(result, step, node_id, fmt)
+    if sink_outcomes:
+        artifact["sinks"] = sink_outcomes
+    _emit("result", node_id=node_id, artifact=artifact, elapsed=elapsed)
 
 
 def run_batch(batch):
@@ -155,10 +228,11 @@ def run_batch(batch):
     # independent chains bundled in the same batch finish even when one fails.
     unavailable = set()
 
-    # Artifact directory for writing outputs.
-    art_dir = batch.get("artifact_dir")
-    if art_dir:
+    # Artifact directory for writing outputs (local path or remote URI).
+    art_dir = batch.get("artifact_dir") or os.environ.get("BARCA_ARTIFACT_URI")
+    if art_dir and not _storage.is_remote(art_dir):
         Path(art_dir).mkdir(parents=True, exist_ok=True)
+    clean_staging()
 
     # Pre-load provided inputs (cross-phase values injected by Rust).
     # Values may be artifact references — resolve them lazily when accessed.
@@ -320,8 +394,10 @@ def run_daemon():
     signal.signal(signal.SIGTERM, _on_sigterm)
 
     modules = {}
-    art_dir = str(Path(".barca/artifacts").resolve())
-    Path(art_dir).mkdir(parents=True, exist_ok=True)
+    art_dir = _default_artifact_dir()
+    if not _storage.is_remote(art_dir):
+        Path(art_dir).mkdir(parents=True, exist_ok=True)
+    clean_staging()
 
     while True:
         try:
@@ -359,11 +435,15 @@ def run_daemon():
                 if param.startswith("_"):
                     kwargs[param] = None
                     continue
-                if artifact_path_str and Path(artifact_path_str).exists():
-                    # Infer format from file extension
-                    ext = Path(artifact_path_str).suffix.lstrip(".")
-                    fmt = {"json": "json", "pkl": "pickle", "parquet": "parquet"}.get(ext, "json")
-                    kwargs[param] = deserialize(artifact_path_str, fmt)
+                if not artifact_path_str:
+                    continue
+                if not _storage.exists(artifact_path_str):
+                    raise FileNotFoundError(
+                        f"Input artifact for parameter '{param}' not found: {artifact_path_str}"
+                    )
+                # Infer format from file extension (URI-safe).
+                fmt = _EXT_FORMATS.get(_storage.suffix(artifact_path_str), "json")
+                kwargs[param] = deserialize(artifact_path_str, fmt)
 
             timeout = step.get("timeout_seconds", 0)
             if d_args:
@@ -395,22 +475,8 @@ def run_daemon():
 
             result = _make_serializable(result)
 
-            # Serialize result to artifact.
-            serializer = step.get("serializer")
-            fmt = serializer if serializer else detect_format(result)
-            out_path = artifact_path(art_dir, node_id, fmt)
-            serialize(result, out_path, fmt)
-            size = Path(out_path).stat().st_size
-
-            _runtime.emit_step_completed(
-                node_id,
-                {
-                    "path": str(out_path),
-                    "format": fmt,
-                    "size_bytes": size,
-                    "elapsed_seconds": elapsed,
-                },
-            )
+            # Serialize result to artifact (and write any declared sinks).
+            _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=True)
 
         except (BrokenPipeError, ConnectionResetError, OSError):
             # Socket was closed (e.g. replacement worker killed) — exit cleanly.

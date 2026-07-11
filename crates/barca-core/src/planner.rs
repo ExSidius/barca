@@ -67,6 +67,8 @@ pub struct StreamStep {
     pub pending_partitions: HashMap<String, String>,
     /// Explicit artifact serializer from `@asset(serializer="parquet")`.
     pub serializer: Option<Arc<str>>,
+    /// Sink outputs from stacked `@sink(...)` decorators.
+    pub sinks: Vec<crate::model::SinkDecl>,
     /// Timeout in seconds for this step's execution.
     pub timeout_seconds: u32,
     /// Total number of attempts on failure (1 = no retry). Rust-side only.
@@ -328,6 +330,7 @@ fn build_phases(
                                     inputs: step.inputs.clone(),
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
+                                    sinks: step.sinks.clone(),
                                     timeout_seconds: step.timeout_seconds,
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
@@ -365,6 +368,7 @@ fn build_phases(
                                     inputs: step.inputs.clone(),
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
+                                    sinks: step.sinks.clone(),
                                     timeout_seconds: step.timeout_seconds,
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
@@ -411,6 +415,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             .extracted
             .artifact_serializer
             .map(|s| Arc::from(format!("{s:?}").to_lowercase().as_str()));
+        let sinks: Vec<crate::model::SinkDecl> = node.extracted.sinks.to_vec();
         let timeout_seconds = node.extracted.timeout_seconds;
         let retries = node.extracted.retries;
         let retry_backoff_seconds = node.extracted.retry_backoff_seconds;
@@ -428,6 +433,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: HashMap::new(),
                 serializer,
+                sinks,
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
@@ -442,6 +448,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: derived_partitions,
                 serializer: serializer.clone(),
+                sinks,
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
@@ -456,6 +463,7 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: HashMap::new(),
                 serializer,
+                sinks,
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
@@ -683,6 +691,50 @@ mod tests {
     // A chain is a maximal sequence where each node has single pred + succ.
     // Chains are the unit of vertical bundling (one Python process).
     // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn chain_to_steps_carries_sinks() {
+        let mut extracted = ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: "a".to_string(),
+            explicit_name: None,
+            freshness: Freshness::Always,
+            inputs: SmallVec::new(),
+            partitions: HashMap::new(),
+            sinks: SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: String::new(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            parallel_calls: Vec::new(),
+        };
+        extracted.sinks.push(SinkDecl {
+            path: "exports/out.parquet".to_string(),
+            serializer: Some(SerializerKind::Parquet),
+        });
+        extracted.sinks.push(SinkDecl {
+            path: "s3://bucket/model.pkl".to_string(),
+            serializer: None,
+        });
+        let dag = Dag::build(std::slice::from_ref(&extracted)).unwrap();
+        let chain = Chain {
+            nodes: vec!["test.py:a".to_string()],
+        };
+        let steps = chain_to_steps(&dag, &chain);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].sinks.len(), 2);
+        assert_eq!(steps[0].sinks[0].path, "exports/out.parquet");
+        assert_eq!(steps[0].sinks[0].serializer, Some(SerializerKind::Parquet));
+        assert_eq!(steps[0].sinks[1].path, "s3://bucket/model.pkl");
+        assert_eq!(steps[0].sinks[1].serializer, None);
+    }
 
     #[test]
     fn decompose_single_node() {
