@@ -159,6 +159,12 @@ fn main() {
         }
     });
 
+    // Version needs no runtime — answer before paying for thread spawns.
+    if let Cli::Version = cli {
+        println!("barca {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
     // The one runtime for the whole process — barca-core is async-native and
     // runs on whatever runtime the caller provides.
     let rt = tokio::runtime::Builder::new_multi_thread()
