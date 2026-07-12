@@ -107,7 +107,30 @@ Planned (carried forward):
 - **Alerting hooks** — Slack webhooks, email notifications
   ([#52](https://github.com/ExSidius/barca/issues/52))
 
-## 0.5.0 (current)
+## 0.6.0 (current)
+
+Goal: object storage on equal footing across clouds, held to one contract.
+
+- **First-class S3, GCS, and Cloudflare R2** — alongside Azure, the object
+  stores are now peers, all held to the same shared-state contract
+  (conditional create, cross-machine cache hit, concurrent-writer conflict →
+  replay). R2 rides on the S3 backend (`s3://` + an R2 endpoint in
+  `storage_options`); see docs/remote-storage.md.
+- **Backend conformance suite** — the identical pull/push/conflict/stale-token
+  assertions run against every backend on every PR, using local emulators
+  (MinIO for S3/R2, fake-gcs-server for GCS, Azurite for Azure) — no cloud
+  credentials. A stale-token guard makes a too-lenient emulator fail loud
+  instead of false-passing.
+- **Fixes surfaced by that suite:**
+  - Azure concurrent first-push races (`FileExistsError` from adlfs
+    create-only) are now classified as conflicts and replayed, not hard errors.
+  - GCS conditional overwrite (previously broken — the etag was fed to
+    `int(if_generation_match)`); GCS shared state now rides entirely on the
+    google-cloud-storage SDK, conditioning on the numeric generation.
+  - `barca[gcs]`/`barca[remote]` now declare `google-cloud-storage`, which the
+    state push path imports directly (gcsfs does not pull it in).
+
+## 0.5.0 (shipped)
 
 Goal: shared state across machines.
 

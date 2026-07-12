@@ -69,17 +69,19 @@ class TestGetFs:
         assert _storage.get_fs("memory://a/x") is _storage.get_fs("memory://b/y")
 
     def test_missing_driver_names_extra(self, monkeypatch):
-        """abfss:// without adlfs installed → error names barca[azure]."""
+        """abfss:// whose driver import fails → error names barca[azure].
+
+        Patches the fsspec construction to raise ImportError directly rather
+        than depending on adlfs being uninstalled — the test extra installs
+        every backend client, so absence can't be assumed."""
+        import fsspec
+
         _storage._fs_cache.pop("abfs", None)
-        real_import = builtins.__import__
 
-        def fake_import(name, *args, **kwargs):
-            if name == "adlfs" or name.startswith("adlfs."):
-                raise ImportError("No module named 'adlfs'")
-            return real_import(name, *args, **kwargs)
+        def boom(protocol, **kwargs):
+            raise ImportError("No module named 'adlfs'")
 
-        monkeypatch.setattr(builtins, "__import__", fake_import)
-        monkeypatch.delitem(sys.modules, "adlfs", raising=False)
+        monkeypatch.setattr(fsspec, "filesystem", boom)
         with pytest.raises(ImportError, match=r"barca\[azure\]"):
             _storage.get_fs("abfss://cont@acct.dfs.core.windows.net/x.parquet")
 

@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "barca"
-version = "0.5.0"
+version = "0.6.0"
 description = "Invisible asset orchestrator"
 requires-python = ">=3.12"
 license = "MIT"
@@ -29,8 +29,29 @@ parquet = ["pyarrow", "pandas"]
 fast = ["orjson"]
 azure = ["fsspec", "adlfs"]
 s3 = ["fsspec", "s3fs"]
-gcs = ["fsspec", "gcsfs"]
-remote = ["fsspec", "adlfs", "s3fs", "gcsfs"]
+# Cloudflare R2 is S3-compatible: install the s3 extra and point
+# storage_options at the R2 endpoint (see docs/remote-storage.md).
+r2 = ["fsspec", "s3fs"]
+# gcsfs speaks the GCS API for artifact I/O, but the shared-state push path
+# uses google-cloud-storage directly (gcsfs cannot express a generation
+# precondition on overwrite), so it must be declared explicitly.
+gcs = ["fsspec", "gcsfs", "google-cloud-storage"]
+remote = ["fsspec", "adlfs", "s3fs", "gcsfs", "google-cloud-storage"]
+# Everything needed to run the full test suite, including the object-store
+# backend clients exercised against local emulators (MinIO / fake-gcs-server /
+# Azurite). Not part of a normal install.
+test = [
+    "pytest",
+    "pandas",
+    "pyarrow",
+    "polars",
+    "orjson",
+    "fsspec",
+    "adlfs",
+    "s3fs",
+    "gcsfs",
+    "google-cloud-storage",
+]
 
 [tool.maturin]
 bindings = "bin"

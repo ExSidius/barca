@@ -20,8 +20,9 @@ Every backend implements the same contract:
 Backends:
   abfs/abfss  adlfs — etag If-Match via pipe_file kwargs
   s3/s3a      s3fs — IfMatch via pipe_file kwargs (multipart guard)
-  gs/gcs      google-cloud-storage directly (gcsfs cannot express
-              generation-match on overwrite); it ships with the gcs extra
+  gs/gcs      google-cloud-storage SDK for the whole path — gcsfs can neither
+              express a generation precondition on overwrite nor stream cleanly
+              on download; ships with the gcs extra
   file:// or plain path — sha256 tokens + lock file + atomic replace.
               Used by integration tests and works on shared/NFS mounts.
 """
@@ -84,20 +85,36 @@ def _staged_download(fetch, local_path: "Path | str") -> None:
 
 
 def _remote_token(uri: str) -> "str | None":
-    """Current etag/generation of a remote object, or None when absent."""
+    """Current concurrency token of a remote object, or None when absent.
+
+    GCS rides entirely on the google-cloud-storage SDK (see the GCS helpers):
+    it conditions on the numeric *generation*, which gcsfs can neither express
+    on push nor stream cleanly on pull. Every other backend conditions on the
+    *etag*, read from the fsspec ``info()`` dict.
+    """
+    if _protocol(uri) in ("gs", "gcs"):
+        return _gcs_token(uri)
     fs = _storage.get_fs(uri)
     try:
         info = fs.info(uri)
     except FileNotFoundError:
         return None
-    for key in ("etag", "ETag", "generation"):
+    for key in ("etag", "ETag"):
         if key in info and info[key] is not None:
             return str(info[key])
-    raise RuntimeError(f"no etag/generation in object info for {uri}: keys={sorted(info)}")
+    raise RuntimeError(f"no etag in object info for {uri}: keys={sorted(info)}")
 
 
 def _is_conflict(exc: Exception) -> bool:
-    """Best-effort classification of precondition-failure errors across SDKs."""
+    """Best-effort classification of precondition-failure errors across SDKs.
+
+    Only ever called from the push except-block, where the sole operations are
+    conditional writes — so a create-only collision (``FileExistsError``, what
+    adlfs raises for ``mode="create"`` against an existing blob) is
+    unambiguously a concurrency conflict here, not an unrelated error.
+    """
+    if isinstance(exc, FileExistsError):
+        return True
     name = type(exc).__name__
     if name in ("ResourceModifiedError", "ResourceExistsError", "PreconditionFailed"):
         return True
@@ -165,6 +182,44 @@ def _file_push(target: Path, local_path: "Path | str", token: "str | None") -> s
         return _sha256(target)
 
 
+# ─── GCS backend (google-cloud-storage SDK) ──────────────────────────────────
+#
+# The entire GCS state path uses the official SDK, not gcsfs: GCS conditions on
+# an object's numeric generation, which gcsfs can neither express as a
+# precondition on overwrite nor (against some endpoints) stream cleanly on
+# download. Credentials come from google.auth defaults, same as gcsfs.
+
+
+def _gcs_blob(uri: str):
+    from google.cloud import storage as gcs_storage
+
+    bucket_name, blob_name = uri.split("://", 1)[1].split("/", 1)
+    return gcs_storage.Client().bucket(bucket_name).blob(blob_name)
+
+
+def _gcs_token(uri: str) -> "str | None":
+    """The blob's current generation as a string, or None when it is absent."""
+    blob = _gcs_blob(uri)
+    fetched = blob.bucket.get_blob(blob.name)
+    return str(fetched.generation) if fetched is not None else None
+
+
+def _gcs_pull(uri: str, local_path: "Path | str") -> "str | None":
+    blob = _gcs_blob(uri)
+    fetched = blob.bucket.get_blob(blob.name)  # token read before download
+    if fetched is None:
+        return None
+    _staged_download(fetched.download_to_filename, local_path)
+    return str(fetched.generation)
+
+
+def _gcs_push(uri: str, local_path: "Path | str", token: "str | None") -> None:
+    # if_generation_match=0 means "must not exist" (create-only).
+    _gcs_blob(uri).upload_from_filename(
+        str(local_path), if_generation_match=int(token) if token else 0
+    )
+
+
 # ─── Public API ──────────────────────────────────────────────────────────────
 
 
@@ -177,6 +232,8 @@ def pull(state_uri: str, local_path: "Path | str") -> "str | None":
     local_target = _local_path_of(state_uri)
     if local_target is not None:
         return _file_pull(local_target, local_path)
+    if _protocol(state_uri) in ("gs", "gcs"):
+        return _gcs_pull(state_uri, local_path)
 
     token = _remote_token(state_uri)
     if token is None:
@@ -226,17 +283,7 @@ def push(state_uri: str, local_path: "Path | str", token: "str | None") -> str:
             else:
                 fs.pipe_file(state_uri, data, IfMatch=token)
         elif protocol in ("gs", "gcs"):
-            # gcsfs cannot express a generation precondition on overwrite;
-            # use the official SDK (a gcsfs dependency) directly.
-            from google.cloud import storage as gcs_storage
-
-            rest = state_uri.split("://", 1)[1]
-            bucket_name, blob_name = rest.split("/", 1)
-            client = gcs_storage.Client()
-            blob = client.bucket(bucket_name).blob(blob_name)
-            blob.upload_from_filename(
-                str(local_path), if_generation_match=int(token) if token else 0
-            )
+            _gcs_push(state_uri, local_path, token)
         else:
             raise RuntimeError(f"unsupported state backend '{protocol}://'")
     except ConflictError:
