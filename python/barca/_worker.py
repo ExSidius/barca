@@ -408,12 +408,22 @@ def run_daemon():
         sys.exit(1)
     _use_socket = True
 
-    # Install SIGTERM handler so graceful_kill triggers a clean exit
-    # (flushes stdio, runs atexit) instead of the default immediate termination.
+    # Install SIGTERM handler so graceful_kill flushes buffered progress output
+    # before the process goes away. Exit via os._exit, not sys.exit(0): a
+    # SystemExit raised from the handler while the interpreter is already
+    # shutting down is uncatchable, and Python prints it as a noisy
+    # "Exception ignored in: _on_sigterm ... SystemExit: 0" on stderr — which
+    # then leaks into surfaced worker errors (reliably on Linux). os._exit
+    # cannot raise, so that noise is impossible.
     import signal
 
     def _on_sigterm(_signum, _frame):
-        sys.exit(0)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 

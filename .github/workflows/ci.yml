@@ -46,10 +46,10 @@ jobs:
           bash tests/integration/test_remote_state.sh
 
   backends:
-    # Python unit tests + the state-backend conformance suite run against local
-    # object-store emulators (no cloud credentials). MinIO covers the S3 API —
-    # and therefore Cloudflare R2's code path — fake-gcs-server covers GCS
-    # generation-match, Azurite covers Azure ETag If-Match.
+    # Full Python suite, including the state-backend conformance suite that runs
+    # against local object-store emulators (no cloud credentials). MinIO covers
+    # the S3 API — and therefore Cloudflare R2's code path — fake-gcs-server
+    # covers GCS generation-match, Azurite covers Azure ETag If-Match.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -88,12 +88,9 @@ jobs:
           for i in $(seq 1 60); do curl -sf http://localhost:9200/storage/v1/b >/dev/null && break; sleep 1; done
           for i in $(seq 1 60); do curl -s http://localhost:9210/devstoreaccount1 >/dev/null && break; sleep 1; done
 
-      - name: Run state + backend conformance tests
+      - name: Run full Python suite (incl. backend conformance)
         env:
           BARCA_TEST_S3_ENDPOINT: http://localhost:9100
           BARCA_TEST_GCS_ENDPOINT: http://localhost:9200
           BARCA_TEST_AZURITE_HOST: 127.0.0.1:9210
-        run: |
-          pytest python/tests/test_state.py \
-                 python/tests/test_storage.py \
-                 python/tests/test_state_backends.py -q
+        run: pytest python/tests -q
