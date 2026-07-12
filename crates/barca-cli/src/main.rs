@@ -273,10 +273,8 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             )
             .await
         }
-        Cli::Version => {
-            println!("barca {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
-        }
+        // Answered in main() before the runtime is built — never reaches here.
+        Cli::Version => unreachable!("version is handled before runtime construction"),
     }
 }
 

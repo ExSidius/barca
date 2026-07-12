@@ -271,7 +271,9 @@ fn spawn_run(state: AppState, kind: RunKind) -> String {
         let outcome: Result<GetResult, BarcaError> = tokio::select! {
             res = &mut fut => res,
             _ = tokio::time::sleep(RUN_TIMEOUT) => {
-                timed_out = true;
+                // An operator cancel that is still unwinding when the deadline
+                // hits stays classified as cancelled, not as a timeout.
+                timed_out = !cancel.is_cancelled();
                 cancel.cancel();
                 fut.await
             }
