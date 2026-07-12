@@ -143,6 +143,200 @@ async fn unknown_asset_returns_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+/// An asset that sleeps far longer than the test is allowed to take — the only
+/// way the test finishes quickly is if cancellation genuinely stops the run.
+const SLOW_FIXTURE: &str = r#"
+import time
+from barca import asset
+
+@asset()
+def slow_one() -> dict:
+    time.sleep(120)
+    return {"done": True}
+"#;
+
+/// Send a request to a clone of the router and return (status, parsed body).
+async fn send(app: &axum::Router, method: &str, uri: &str) -> (StatusCode, serde_json::Value) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(method)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let json = if bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&bytes).unwrap()
+    };
+    (status, json)
+}
+
+/// Count live `barca._worker` processes whose environment carries `marker`
+/// (this test's unique artifact root), so concurrent tests can't interfere.
+#[cfg(target_os = "linux")]
+fn workers_running(marker: &str) -> usize {
+    let mut n = 0;
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return 0;
+    };
+    for e in entries.flatten() {
+        let pid = e.file_name();
+        let Some(pid) = pid
+            .to_str()
+            .filter(|p| p.bytes().all(|c| c.is_ascii_digit()))
+        else {
+            continue;
+        };
+        let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap_or_default();
+        if !environ
+            .windows(marker.len())
+            .any(|w| w == marker.as_bytes())
+        {
+            continue;
+        }
+        let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let needle = b"barca._worker";
+        if cmdline.windows(needle.len()).any(|w| w == needle) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The review-critical path for #79: a run started over HTTP must be
+/// cancellable mid-flight — status transitions to `cancelled` long before the
+/// asset's sleep elapses, and the run's worker process is terminated.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn delete_cancels_in_flight_run() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let slow = dir.path().join("slow.py");
+    std::fs::write(&slow, SLOW_FIXTURE).unwrap();
+
+    // Worker children import `barca._worker`; a python wrapper injects the repo
+    // checkout's python/ tree so plain `cargo test` works without an installed
+    // wheel (CI runs unit tests before building one).
+    let py_tree = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python");
+    let wrapper = dir.path().join("python");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nPYTHONPATH=\"{}${{PYTHONPATH:+:$PYTHONPATH}}\" exec python3 \"$@\"\n",
+            py_tree.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // The run derives its local `.barca` scaffolding from the process cwd; note
+    // whether it pre-existed so this test can clean up what it caused.
+    let scaffold = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".barca");
+    let scaffold_preexisting = scaffold.exists();
+
+    let mut config = fixture_config(dir.path());
+    config.files = vec![slow.display().to_string()];
+    config.python = wrapper;
+    // Absolute tempdir paths so the run's DB and artifacts never land in the repo.
+    config.resolved.db_path = dir.path().join("metadata.db").display().to_string();
+    config.resolved.artifact_root = dir.path().join("artifacts").display().to_string();
+    let marker = config.resolved.artifact_root.clone();
+    std::fs::create_dir_all(&marker).unwrap();
+    let app = app(config);
+
+    let t0 = Instant::now();
+    let (status, body) = send(&app, "POST", "/get/slow_one").await;
+    assert_eq!(status, StatusCode::OK);
+    let handle = body["run_id"].as_str().expect("run handle").to_string();
+    let status_uri = format!("/status/{handle}");
+
+    // Wait until the run is executing (and, on Linux, its worker is alive).
+    loop {
+        let (_, s) = send(&app, "GET", &status_uri).await;
+        match s["status"].as_str() {
+            Some("running") => {
+                #[cfg(target_os = "linux")]
+                if workers_running(&marker) == 0 {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                break;
+            }
+            Some("pending") => {}
+            other => panic!("unexpected status before cancel: {other:?}"),
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "run never started executing"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let (status, body) = send(&app, "DELETE", &format!("/run/{handle}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "cancelling");
+
+    loop {
+        let (_, s) = send(&app, "GET", &status_uri).await;
+        match s["status"].as_str() {
+            Some("cancelled") => {
+                assert_eq!(s["error"], "run cancelled");
+                break;
+            }
+            Some("running" | "pending") => {}
+            other => panic!("expected cancelled, got {other:?}"),
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "run did not reach cancelled after DELETE"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // The asset sleeps 120s; reaching `cancelled` this fast proves the run was
+    // stopped mid-flight rather than left to finish in the background.
+    assert!(
+        t0.elapsed() < Duration::from_secs(60),
+        "cancellation took {:?} — run was not stopped mid-flight",
+        t0.elapsed()
+    );
+
+    // The run's worker process must be terminated, not orphaned.
+    #[cfg(target_os = "linux")]
+    {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if workers_running(&marker) == 0 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker process still alive after cancellation"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    // Cancelling a finished run is a conflict, not a repeat cancel.
+    let (status, _) = send(&app, "DELETE", &format!("/run/{handle}")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    if !scaffold_preexisting {
+        std::fs::remove_dir_all(&scaffold).ok();
+    }
+}
+
 #[tokio::test]
 async fn cancel_for_unknown_run_returns_404() {
     let dir = tempfile::tempdir().unwrap();

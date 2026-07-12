@@ -19,6 +19,11 @@ use turso::Builder;
 /// this guard for the duration of its (short) database work, so runs never race
 /// on the file without depending on WAL support. A one-shot CLI run leaves it
 /// uncontended.
+///
+/// Known limit: this serializes every DB op process-wide and each helper opens
+/// a fresh connection, which becomes the contention point under many
+/// concurrent daemon runs. The Engine extraction (#80) replaces this with a
+/// single owner holding a persistent connection.
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Acquire the process-wide DB lock. Hold the returned guard only across a
