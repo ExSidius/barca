@@ -1,13 +1,15 @@
-//! Endpoint handlers. Each handler that needs core work delegates to the
-//! synchronous `barca_core::commands::*` functions via `spawn_blocking`, because
-//! those functions build their own current-thread Tokio runtime internally.
+//! Endpoint handlers. Core commands are `async fn`s that run directly on the
+//! server's runtime — handlers simply `.await` them. Each run carries a
+//! `CancellationToken` (a child of the server-wide shutdown token) so
+//! `DELETE /run/{id}`, the run timeout, and Ctrl-C can all stop it mid-flight:
+//! workers are terminated and the run is marked cancelled/failed.
 
 use crate::error::ApiError;
 use crate::state::{AppState, RunState, RunStatus, now_ts};
 use axum::Json;
 use axum::extract::{Path, State};
-use barca_core::commands;
-use barca_core::db;
+use barca_core::commands::{self, GetResult};
+use barca_core::{BarcaError, db};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -27,9 +29,7 @@ pub async fn plan(State(state): State<AppState>) -> Result<Json<commands::PlanRe
     if let Some(cached) = state.cache.read().unwrap().plan.clone() {
         return Ok(Json(cached));
     }
-    let files = state.config.files.clone();
-    let python = state.config.python.clone();
-    let result = tokio::task::spawn_blocking(move || commands::plan(&files, &python)).await??;
+    let result = commands::plan(&state.config.files, &state.config.python).await?;
     state.cache.write().unwrap().plan = Some(result.clone());
     Ok(Json(result))
 }
@@ -41,10 +41,7 @@ pub async fn assets(
     if let Some(cached) = state.cache.read().unwrap().assets.clone() {
         return Ok(Json(cached));
     }
-    let files = state.config.files.clone();
-    let python = state.config.python.clone();
-    let result =
-        tokio::task::spawn_blocking(move || commands::list_assets(&files, &python)).await??;
+    let result = commands::list_assets(&state.config.files, &state.config.python).await?;
     state.cache.write().unwrap().assets = Some(result.clone());
     Ok(Json(result))
 }
@@ -58,10 +55,7 @@ pub async fn asset_detail(
     let summaries = if let Some(cached) = state.cache.read().unwrap().assets.clone() {
         cached
     } else {
-        let files = state.config.files.clone();
-        let python = state.config.python.clone();
-        let result =
-            tokio::task::spawn_blocking(move || commands::list_assets(&files, &python)).await??;
+        let result = commands::list_assets(&state.config.files, &state.config.python).await?;
         state.cache.write().unwrap().assets = Some(result.clone());
         result
     };
@@ -84,13 +78,13 @@ pub async fn asset_detail(
         }
     };
 
-    let files = state.config.files.clone();
-    let python = state.config.python.clone();
-    let cfg = state.config.resolved.clone();
-    let resolved_id = summary.id.clone();
-    let stats =
-        tokio::task::spawn_blocking(move || commands::stats(&cfg, &resolved_id, &files, &python))
-            .await??;
+    let stats = commands::stats(
+        &state.config.resolved,
+        &summary.id,
+        &state.config.files,
+        &state.config.python,
+    )
+    .await?;
 
     Ok(Json(json!({
         "asset": summary,
@@ -114,6 +108,29 @@ pub async fn run_target(State(state): State<AppState>, Path(target): Path<String
 pub async fn get_target(State(state): State<AppState>, Path(target): Path<String>) -> Json<Value> {
     let handle = start_run(state, Some(target));
     Json(json!({ "run_id": handle }))
+}
+
+/// `DELETE /run/{run_id}` — cancel an in-flight run. The run's workers are
+/// terminated and its status transitions to `cancelled`; poll `/status/{id}`
+/// to observe the transition. Cancelling a finished run is a no-op conflict.
+pub async fn cancel_run(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let run = state
+        .runs
+        .get(&run_id)
+        .ok_or_else(|| ApiError::NotFound(format!("run '{run_id}' not found")))?;
+    match run.status {
+        RunStatus::Pending | RunStatus::Running => {
+            run.cancel.cancel();
+            Ok(Json(json!({ "run_id": run_id, "status": "cancelling" })))
+        }
+        status => Err(ApiError::Conflict(format!(
+            "run '{run_id}' already finished ({})",
+            json!(status).as_str().unwrap_or("finished")
+        ))),
+    }
 }
 
 /// `GET /schedule` — list scheduled jobs with next fire time and last run status.
@@ -163,10 +180,31 @@ pub async fn status(
         .ok_or_else(|| ApiError::NotFound(format!("run '{run_id}' not found")))
 }
 
+/// Which core command a background run executes.
+enum RunKind {
+    /// `commands::get` with an optional target (assets).
+    Get(Option<String>),
+    /// `commands::run` for a task target.
+    Task(String),
+}
+
 /// Insert a `Pending` run, spawn the background execution task, and return the
 /// server-side handle. The real DB run id is surfaced in the completed payload.
 pub(crate) fn start_run(state: AppState, target: Option<String>) -> String {
+    spawn_run(state, RunKind::Get(target))
+}
+
+/// Insert a `Pending` run for a task, spawn the background execution via
+/// `commands::run`, and return the server-side handle.
+pub(crate) fn start_run_task(state: AppState, target: String) -> String {
+    spawn_run(state, RunKind::Task(target))
+}
+
+fn spawn_run(state: AppState, kind: RunKind) -> String {
     let handle = db::generate_run_id();
+    // Child of the server-wide shutdown token: DELETE /run/{id} cancels just
+    // this run; graceful shutdown cancels all of them.
+    let cancel = state.shutdown.child_token();
     state.runs.insert(
         handle.clone(),
         RunState {
@@ -176,6 +214,7 @@ pub(crate) fn start_run(state: AppState, target: Option<String>) -> String {
             error: None,
             started_at: now_ts(),
             finished_at: None,
+            cancel: cancel.clone(),
         },
     );
 
@@ -186,6 +225,16 @@ pub(crate) fn start_run(state: AppState, target: Option<String>) -> String {
         // shared metadata.db is kept safe by barca-core's process-wide DB lock.
         let _permit = st.run_slots.acquire().await.ok();
 
+        // Cancelled while queued — never started, nothing to clean up.
+        if cancel.is_cancelled() {
+            if let Some(mut r) = st.runs.get_mut(&h) {
+                r.status = RunStatus::Cancelled;
+                r.error = Some("run cancelled".to_string());
+                r.finished_at = Some(now_ts());
+            }
+            return;
+        }
+
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.status = RunStatus::Running;
         }
@@ -193,111 +242,59 @@ pub(crate) fn start_run(state: AppState, target: Option<String>) -> String {
         let files = st.config.files.clone();
         let python = st.config.python.clone();
         let cfg = st.config.resolved.clone();
-        let tgt = target.clone();
 
-        // NOTE: spawn_blocking tasks cannot be aborted — they run on OS threads
-        // that Tokio cannot interrupt. If the timeout fires, the blocking thread
-        // continues in the background until it finishes naturally; the DB lock in
-        // barca-core still guards its writes against any concurrent run.
-        let join_handle = tokio::task::spawn_blocking(move || {
-            commands::get(&cfg, tgt.as_deref(), &files, &python, false, true)
-        });
-        let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
-
-        // On timeout, report failure to the client immediately. The blocking task
-        // may still be running; barca-core's DB lock still guards its writes.
-        let outcome = match res {
-            Ok(inner) => Ok(inner),
-            Err(_elapsed) => Err(()),
-        };
-
-        if let Some(mut r) = st.runs.get_mut(&h) {
-            r.finished_at = Some(now_ts());
-            match outcome {
-                Ok(Ok(Ok(result))) => {
-                    r.status = RunStatus::Complete;
-                    r.result = Some(result);
+        let fut = async {
+            match &kind {
+                RunKind::Get(target) => {
+                    commands::get(
+                        &cfg,
+                        target.as_deref(),
+                        &files,
+                        &python,
+                        false,
+                        true,
+                        cancel.clone(),
+                    )
+                    .await
                 }
-                Ok(Ok(Err(e))) => {
-                    r.status = RunStatus::Failed;
-                    r.error = Some(e.to_string());
-                }
-                Ok(Err(e)) => {
-                    r.status = RunStatus::Failed;
-                    r.error = Some(format!("background task failed: {e}"));
-                }
-                Err(_) => {
-                    r.status = RunStatus::Failed;
-                    r.error = Some(format!("run timed out after {}s", RUN_TIMEOUT.as_secs()));
+                RunKind::Task(target) => {
+                    commands::run(&cfg, target, &files, &python, None, true, cancel.clone()).await
                 }
             }
-        }
-        // The run slot is released here, freeing capacity for a queued run.
-    });
+        };
+        tokio::pin!(fut);
 
-    handle
-}
-
-/// Insert a `Pending` run for a task, spawn the background execution via
-/// `commands::run`, and return the server-side handle.
-pub(crate) fn start_run_task(state: AppState, target: String) -> String {
-    let handle = db::generate_run_id();
-    state.runs.insert(
-        handle.clone(),
-        RunState {
-            handle: handle.clone(),
-            status: RunStatus::Pending,
-            result: None,
-            error: None,
-            started_at: now_ts(),
-            finished_at: None,
-        },
-    );
-
-    let st = state.clone();
-    let h = handle.clone();
-    tokio::spawn(async move {
-        let _permit = st.run_slots.acquire().await.ok();
-
-        if let Some(mut r) = st.runs.get_mut(&h) {
-            r.status = RunStatus::Running;
-        }
-
-        let files = st.config.files.clone();
-        let python = st.config.python.clone();
-        let cfg = st.config.resolved.clone();
-        let tgt = target.clone();
-
-        // NOTE: Same spawn_blocking caveat as start_run — see comment above.
-        // barca-core's DB lock guards writes even if this task outlives the timeout.
-        let join_handle = tokio::task::spawn_blocking(move || {
-            commands::run(&cfg, &tgt, &files, &python, None, true)
-        });
-        let res = tokio::time::timeout(RUN_TIMEOUT, join_handle).await;
-
-        let outcome = match res {
-            Ok(inner) => Ok(inner),
-            Err(_elapsed) => Err(()),
+        // On timeout, cancel the token and keep awaiting: the run observes the
+        // cancellation, terminates its workers, persists partial results, and
+        // returns — nothing is left running in the background.
+        let mut timed_out = false;
+        let outcome: Result<GetResult, BarcaError> = tokio::select! {
+            res = &mut fut => res,
+            _ = tokio::time::sleep(RUN_TIMEOUT) => {
+                timed_out = true;
+                cancel.cancel();
+                fut.await
+            }
         };
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.finished_at = Some(now_ts());
             match outcome {
-                Ok(Ok(Ok(result))) => {
+                Ok(result) => {
                     r.status = RunStatus::Complete;
                     r.result = Some(result);
                 }
-                Ok(Ok(Err(e))) => {
-                    r.status = RunStatus::Failed;
-                    r.error = Some(e.to_string());
-                }
-                Ok(Err(e)) => {
-                    r.status = RunStatus::Failed;
-                    r.error = Some(format!("background task failed: {e}"));
-                }
-                Err(_) => {
+                Err(BarcaError::Cancelled) if timed_out => {
                     r.status = RunStatus::Failed;
                     r.error = Some(format!("run timed out after {}s", RUN_TIMEOUT.as_secs()));
+                }
+                Err(BarcaError::Cancelled) => {
+                    r.status = RunStatus::Cancelled;
+                    r.error = Some("run cancelled".to_string());
+                }
+                Err(e) => {
+                    r.status = RunStatus::Failed;
+                    r.error = Some(e.to_string());
                 }
             }
         }
@@ -315,7 +312,7 @@ pub async fn evict_finished_runs(state: AppState, interval: Duration, max_age: D
         let cutoff = now_ts() - max_age.as_secs_f64();
         state.runs.retain(|_, run| {
             match run.status {
-                RunStatus::Complete | RunStatus::Failed => {
+                RunStatus::Complete | RunStatus::Failed | RunStatus::Cancelled => {
                     // Keep if it finished recently (or hasn't finished yet somehow).
                     run.finished_at.map_or(true, |t| t > cutoff)
                 }

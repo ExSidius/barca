@@ -144,6 +144,23 @@ async fn unknown_asset_returns_404() {
 }
 
 #[tokio::test]
+async fn cancel_for_unknown_run_returns_404() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(fixture_config(dir.path()));
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/run/deadbeef")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn status_for_unknown_run_returns_404() {
     let dir = tempfile::tempdir().unwrap();
     let app = app(fixture_config(dir.path()));

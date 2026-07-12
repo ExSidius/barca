@@ -1,5 +1,6 @@
 //! Shared server state and in-memory run tracking.
 
+use barca_core::CancellationToken;
 use barca_core::commands::{AssetSummary, GetResult, PlanResult};
 use dashmap::DashMap;
 use serde::Serialize;
@@ -53,6 +54,8 @@ pub enum RunStatus {
     Complete,
     /// Finished with an error.
     Failed,
+    /// Stopped mid-flight via `DELETE /run/{id}` or server shutdown.
+    Cancelled,
 }
 
 /// In-memory record of a single run. The server-side `handle` is the polling id
@@ -70,6 +73,11 @@ pub struct RunState {
     pub started_at: f64,
     /// Unix epoch seconds when the run finished (success or failure).
     pub finished_at: Option<f64>,
+    /// Cancels this run's execution future. `DELETE /run/{id}` triggers it;
+    /// the run task observes it, terminates workers, and marks the run
+    /// cancelled. Not part of the JSON status payload.
+    #[serde(skip)]
+    pub cancel: CancellationToken,
 }
 
 /// Cached static-analysis results, invalidated by the file watcher in `--watch`
@@ -107,6 +115,12 @@ pub struct AppState {
     /// parallel; the shared metadata.db is kept race-free by a process-wide DB
     /// lock in `barca-core`, not by serializing whole runs.
     pub run_slots: Arc<Semaphore>,
+    /// Total permits in `run_slots` — lets shutdown wait for in-flight runs by
+    /// re-acquiring every permit.
+    pub run_slot_count: usize,
+    /// Cancelled on graceful shutdown; every run token is a child of this, so
+    /// Ctrl-C stops in-flight runs (workers terminated, runs marked cancelled).
+    pub shutdown: CancellationToken,
     /// Live scheduler view, published by the scheduler and read by `GET /schedule`.
     pub schedule: Arc<RwLock<Vec<JobStatus>>>,
     /// Bumped by the `--watch` file watcher on every DAG invalidation, so the
@@ -116,11 +130,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: ServeConfig) -> Self {
+        let run_slot_count = default_run_concurrency();
         Self {
             config: Arc::new(config),
             runs: Arc::new(DashMap::new()),
             cache: Arc::new(RwLock::new(DagCache::default())),
-            run_slots: Arc::new(Semaphore::new(default_run_concurrency())),
+            run_slots: Arc::new(Semaphore::new(run_slot_count)),
+            run_slot_count,
+            shutdown: CancellationToken::new(),
             schedule: Arc::new(RwLock::new(Vec::new())),
             dag_generation: Arc::new(AtomicU64::new(0)),
         }

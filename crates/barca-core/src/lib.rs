@@ -17,6 +17,9 @@ pub mod state_sync;
 pub use dag::Dag;
 pub use model::*;
 pub use planner::{ExecutionPlan, ResourceConfig, expand_partition_combos};
+/// Re-exported so callers (CLI, server) share one token type without depending
+/// on tokio-util directly.
+pub use tokio_util::sync::CancellationToken;
 
 /// Top-level error type for barca engine operations.
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +38,9 @@ pub enum BarcaError {
 
     #[error("Worker failed: {0}")]
     WorkerFailed(String),
+
+    #[error("run cancelled")]
+    Cancelled,
 
     #[error("Database error: {0}")]
     Db(String),

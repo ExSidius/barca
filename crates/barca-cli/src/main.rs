@@ -158,9 +158,41 @@ fn main() {
             Cli::parse() // re-parse to show proper clap error
         }
     });
+
+    // The one runtime for the whole process — barca-core is async-native and
+    // runs on whatever runtime the caller provides.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("failed to create runtime: {e}");
+            std::process::exit(1);
+        });
+    let result = rt.block_on(run_cli(cli));
+
+    if let Err(e) = result {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+/// A token that cancels on Ctrl-C, so an interrupted run terminates its
+/// workers and is recorded as `cancelled` instead of lingering as `running`.
+fn cancel_on_ctrl_c() -> barca_core::CancellationToken {
+    let cancel = barca_core::CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            c.cancel();
+        }
+    });
+    cancel
+}
+
+async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
     let python = barca_core::commands::find_python();
 
-    let result = match cli {
+    match cli {
         Cli::Get {
             args,
             output,
@@ -186,6 +218,7 @@ fn main() {
                 no_cache,
                 agent,
             )
+            .await
         }
         Cli::Run {
             args,
@@ -207,12 +240,14 @@ fn main() {
                 );
                 std::process::exit(1);
             }
-            run_cmd(env.as_deref(), target, files, &python, burst, output, agent)
+            run_cmd(env.as_deref(), target, files, &python, burst, output, agent).await
         }
-        Cli::Plan { files, env: _ } => plan_cmd(files, &python),
-        Cli::History { limit, env } => history_cmd(env.as_deref(), limit),
-        Cli::Stats { target, files, env } => stats_cmd(env.as_deref(), target, files, &python),
-        Cli::List { files } => list_cmd(files, &python),
+        Cli::Plan { files, env: _ } => plan_cmd(files, &python).await,
+        Cli::History { limit, env } => history_cmd(env.as_deref(), limit).await,
+        Cli::Stats { target, files, env } => {
+            stats_cmd(env.as_deref(), target, files, &python).await
+        }
+        Cli::List { files } => list_cmd(files, &python).await,
         Cli::Serve {
             files,
             port,
@@ -220,29 +255,27 @@ fn main() {
             no_schedule,
             timezone,
             env,
-        } => serve_cmd(
-            env.as_deref(),
-            files,
-            port,
-            watch,
-            !no_schedule,
-            timezone,
-            &python,
-        ),
+        } => {
+            serve_cmd(
+                env.as_deref(),
+                files,
+                port,
+                watch,
+                !no_schedule,
+                timezone,
+                &python,
+            )
+            .await
+        }
         Cli::Version => {
             println!("barca {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-    };
-
-    if let Err(e) = result {
-        eprintln!("{e}");
-        std::process::exit(1);
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn get_cmd(
+async fn get_cmd(
     env: Option<&str>,
     target: Option<String>,
     files: Vec<PathBuf>,
@@ -253,8 +286,16 @@ fn get_cmd(
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result =
-        barca_core::commands::get(&cfg, target.as_deref(), &file_args, python, no_cache, agent)?;
+    let result = barca_core::commands::get(
+        &cfg,
+        target.as_deref(),
+        &file_args,
+        python,
+        no_cache,
+        agent,
+        cancel_on_ctrl_c(),
+    )
+    .await?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -299,7 +340,7 @@ fn get_cmd(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_cmd(
+async fn run_cmd(
     env: Option<&str>,
     target: String,
     files: Vec<PathBuf>,
@@ -310,7 +351,16 @@ fn run_cmd(
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::run(&cfg, &target, &file_args, python, burst, agent)?;
+    let result = barca_core::commands::run(
+        &cfg,
+        &target,
+        &file_args,
+        python,
+        burst,
+        agent,
+        cancel_on_ctrl_c(),
+    )
+    .await?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -350,16 +400,16 @@ fn run_cmd(
     Ok(())
 }
 
-fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
+async fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::plan(&file_args, python)?;
+    let result = barca_core::commands::plan(&file_args, python).await?;
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
     Ok(())
 }
 
-fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
+async fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let assets = barca_core::commands::list_assets(&file_args, python)?;
+    let assets = barca_core::commands::list_assets(&file_args, python).await?;
     if assets.is_empty() {
         println!("No definitions found.");
         return Ok(());
@@ -369,6 +419,7 @@ fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::Bar
     // so the NEXT FIRE column only appears when it carries information).
     let next_fires: std::collections::HashMap<String, String> =
         barca_server::describe_schedule(&file_args, python)
+            .await
             .into_iter()
             .filter_map(|j| j.next_fire_local.map(|t| (j.id, t)))
             .collect();
@@ -471,9 +522,9 @@ fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::Bar
     Ok(())
 }
 
-fn history_cmd(env: Option<&str>, limit: usize) -> Result<(), barca_core::BarcaError> {
+async fn history_cmd(env: Option<&str>, limit: usize) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
-    let runs = barca_core::commands::history(&cfg, limit)?;
+    let runs = barca_core::commands::history(&cfg, limit).await?;
     if runs.is_empty() {
         println!("No run history found.");
         return Ok(());
@@ -503,7 +554,7 @@ fn history_cmd(env: Option<&str>, limit: usize) -> Result<(), barca_core::BarcaE
     Ok(())
 }
 
-fn stats_cmd(
+async fn stats_cmd(
     env: Option<&str>,
     target: String,
     files: Vec<PathBuf>,
@@ -511,7 +562,7 @@ fn stats_cmd(
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let stats = barca_core::commands::stats(&cfg, &target, &file_args, python)?;
+    let stats = barca_core::commands::stats(&cfg, &target, &file_args, python).await?;
     let fmt = |v: Option<f64>| v.map(|e| format!("{:.3}s", e)).unwrap_or("-".to_string());
     println!("Asset: {}", stats.node_id);
     println!("Total materializations: {}", stats.total_runs);
@@ -550,7 +601,7 @@ fn stats_cmd(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_cmd(
+async fn serve_cmd(
     env: Option<&str>,
     files: Vec<PathBuf>,
     port: u16,
@@ -577,7 +628,9 @@ fn serve_cmd(
         python: python.to_path_buf(),
         resolved,
     };
-    barca_server::serve(config).map_err(|e| barca_core::BarcaError::Other(e.to_string()))
+    barca_server::serve(config)
+        .await
+        .map_err(|e| barca_core::BarcaError::Other(e.to_string()))
 }
 
 /// Read an artifact for display: inline JSON values, show metadata for binary formats.

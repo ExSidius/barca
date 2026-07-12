@@ -27,7 +27,7 @@ from barca.api import BarcaError
 DEFAULT_URL = "http://127.0.0.1:8274"
 
 # Terminal run states reported by ``GET /status``.
-_TERMINAL = {"complete", "failed"}
+_TERMINAL = {"complete", "failed", "cancelled"}
 
 
 class Run:
@@ -43,6 +43,10 @@ class Run:
     def status(self) -> dict:
         """Fetch the current status payload for this run."""
         return self.client.status(self.run_id)
+
+    def cancel(self) -> dict:
+        """Cancel this run if it is still pending/running."""
+        return self.client.cancel(self.run_id)
 
     def wait(self, timeout: float = 600.0, poll: float = 0.5) -> dict:
         """Poll until the run reaches a terminal state, returning its status.
@@ -115,6 +119,15 @@ class Client:
     def status(self, run_id: str) -> dict:
         """Status payload for a run (``GET /status/{run_id}``)."""
         return self._request("GET", f"/status/{run_id}")
+
+    def cancel(self, run_id: str) -> dict:
+        """Cancel an in-flight run (``DELETE /run/{run_id}``).
+
+        The server stops the run's workers and its status transitions to
+        ``cancelled``. Cancelling an already-finished run raises
+        :class:`BarcaError` (HTTP 409).
+        """
+        return self._request("DELETE", f"/run/{run_id}")
 
     # ── trigger endpoints ──────────────────────────────────────────────────
     #

@@ -4,9 +4,9 @@
 [axum](https://github.com/tokio-rs/axum)) that exposes the orchestrator as a JSON API.
 It is the foundation for programmatic triggering, scheduling, and a future web UI.
 
-The server reuses `barca-core` directly — no subprocess, no separate daemon. Each request
-that needs engine work runs the core command on a blocking task; runs execute in background
-tasks and are tracked in memory.
+The server reuses `barca-core` directly — no subprocess, no separate daemon. Core commands
+are async and run on the server's runtime; runs execute in background tasks, are tracked in
+memory, and can be cancelled mid-flight via `DELETE /run/{run_id}`.
 
 ## Starting the server
 
@@ -39,6 +39,7 @@ All responses are JSON.
 | `POST` | `/run` | Trigger a full run. Returns a `run_id` immediately. |
 | `POST` | `/run/{target}` | Trigger a task run. Returns a `run_id`. |
 | `POST` | `/get/{target}` | Trigger a run scoped to one target asset. Returns a `run_id`. |
+| `DELETE` | `/run/{run_id}` | Cancel an in-flight run (workers terminated, status → `cancelled`). |
 | `GET`  | `/status/{run_id}` | Poll the status and result of a run. |
 | `GET`  | `/schedule` | List scheduled jobs with next fire time and last run status. |
 
@@ -70,12 +71,25 @@ Poll `GET /status/{run_id}` until `status` is `complete` or `failed`:
 }
 ```
 
-`status` is one of `pending`, `running`, `complete`, `failed`. The `handle` is the server's
-polling id; `result.run_id` is the persisted database run id (the run is also written to
-`.barca/metadata.db`, same as a CLI run).
+`status` is one of `pending`, `running`, `complete`, `failed`, `cancelled`. The `handle` is
+the server's polling id; `result.run_id` is the persisted database run id (the run is also
+written to `.barca/metadata.db`, same as a CLI run).
 
 In-flight run state is held in memory and is not persisted across a server restart. The run
 history in the database persists regardless.
+
+### Cancelling a run
+
+```
+DELETE /run/{run_id}
+```
+
+Cancels a pending or running run: its Python workers are terminated, partial results from
+already-completed steps are persisted, and the run's status transitions to `cancelled`
+(both in `/status/{run_id}` and in the `runs` history table). The response is
+`{ "run_id": "...", "status": "cancelling" }`; poll `/status/{run_id}` to observe the
+transition. Cancelling a run that already finished returns `409`. Runs that exceed the
+server's 10-minute timeout are stopped the same way and reported as `failed`.
 
 ### Health
 
@@ -161,7 +175,7 @@ Each `ScheduleEntry` is:
 
 `next_fire`/`last_fired` are unix epoch seconds (`last_fired` is `null` until the first
 fire); `last_run` is the most recent scheduled `run_id` and `last_status` its state
-(`pending`/`running`/`complete`/`failed`, or `null` if none yet).
+(`pending`/`running`/`complete`/`failed`/`cancelled`, or `null` if none yet).
 
 ## Python client
 
@@ -180,7 +194,8 @@ for job in c.schedules():         # GET /schedule
 ```
 
 `Client` methods map to the endpoints above: `health()`, `assets()`, `asset(name)`,
-`plan()`, `schedules()`, `status(run_id)`, plus the two trigger verbs that mirror the CLI —
+`plan()`, `schedules()`, `status(run_id)`, `cancel(run_id)` (also available as
+`Run.cancel()`), plus the two trigger verbs that mirror the CLI —
 `get(target=None)` (`barca get [TARGET]`; omit the target for a full-DAG run) and
 `run(target)` (`barca run TARGET`). The trigger methods return a `Run` whose `.wait()` blocks
 until the run reaches a terminal state. This complements `barca.api` (`barca.get`/`run`/…),

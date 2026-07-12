@@ -41,9 +41,10 @@ pub struct ScheduleInfo {
 
 /// Enumerate scheduled jobs from source and compute each one's next fire time.
 /// Pure static analysis — used by the `barca schedule` CLI, no running server.
-pub fn describe_schedule(files: &[String], python: &PathBuf) -> Vec<ScheduleInfo> {
+pub async fn describe_schedule(files: &[String], python: &PathBuf) -> Vec<ScheduleInfo> {
     let now = Local::now();
     collect_jobs(files, python)
+        .await
         .iter()
         .map(|j| {
             let next = j.cron.find_next_occurrence(&now, false).ok();
@@ -73,8 +74,8 @@ struct ScheduledJob {
 /// Enumerate every node whose freshness is `Schedule(cron)` and parse each cron.
 /// A DAG-analysis failure disables the scheduler (returns empty); individual
 /// invalid/empty cron strings are logged and skipped rather than aborting.
-fn collect_jobs(files: &[String], python: &PathBuf) -> Vec<ScheduledJob> {
-    match commands::list_assets(files, python) {
+async fn collect_jobs(files: &[String], python: &PathBuf) -> Vec<ScheduledJob> {
+    match commands::list_assets(files, python).await {
         Ok(summaries) => jobs_from_summaries(summaries),
         Err(e) => {
             eprintln!("[barca] scheduler disabled: failed to analyze DAG: {e}");
@@ -252,15 +253,10 @@ fn needs_catchup<Tz: TimeZone>(cron: &Cron, last_fired: &DateTime<Tz>, now: &Dat
     }
 }
 
-/// Record that `node_id` fired at `epoch` seconds. Best-effort durability: the DB
-/// helpers build their own runtime, so they must run on the blocking pool.
+/// Record that `node_id` fired at `epoch` seconds. Best-effort durability.
 async fn persist_fired(db_path: &str, node_id: &str, epoch: i64) {
-    let d = db_path.to_string();
-    let n = node_id.to_string();
-    match tokio::task::spawn_blocking(move || db::upsert_schedule_state_sync(&d, &n, epoch)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("[barca] schedule_state write failed for {node_id}: {e}"),
-        Err(e) => eprintln!("[barca] schedule_state task failed for {node_id}: {e}"),
+    if let Err(e) = db::upsert_schedule_state(db_path, node_id, epoch).await {
+        eprintln!("[barca] schedule_state write failed for {node_id}: {e}");
     }
 }
 
@@ -287,18 +283,10 @@ fn publish_registry(
     }
 }
 
-/// Re-run static analysis to enumerate scheduled jobs (blocking, off the async
-/// runtime). Returns `None` only if the analysis task itself panicked.
-async fn reload_jobs(state: &AppState) -> Option<Vec<ScheduledJob>> {
-    let files = state.config.files.clone();
-    let python = state.config.python.clone();
-    match tokio::task::spawn_blocking(move || collect_jobs(&files, &python)).await {
-        Ok(jobs) => Some(jobs),
-        Err(e) => {
-            eprintln!("[barca] scheduler: analysis task failed: {e}");
-            None
-        }
-    }
+/// Re-run static analysis to enumerate scheduled jobs. The parse itself runs
+/// on the blocking pool inside `commands::list_assets`.
+async fn reload_jobs(state: &AppState) -> Vec<ScheduledJob> {
+    collect_jobs(&state.config.files, &state.config.python).await
 }
 
 /// Log the current schedule and each job's next fire time.
@@ -328,10 +316,7 @@ fn log_schedule(jobs: &[ScheduledJob], zone: &Zone) {
 pub async fn run_scheduler(state: AppState) {
     let zone = Zone::parse(&state.config.timezone);
 
-    let mut jobs = match reload_jobs(&state).await {
-        Some(jobs) => jobs,
-        None => return, // analysis task panicked
-    };
+    let mut jobs = reload_jobs(&state).await;
 
     if jobs.is_empty() && !state.config.watch {
         eprintln!("[barca] no scheduled assets — scheduler idle");
@@ -341,19 +326,13 @@ pub async fn run_scheduler(state: AppState) {
 
     // Resolve the metadata DB path (same `.barca` a CLI run uses) and ensure the
     // schedule_state table exists. `None` → durability disabled, live-match only.
-    let sched_env = state.config.resolved.env.clone();
-    let sched_db = state.config.resolved.db_path.clone();
-    let db_path = match tokio::task::spawn_blocking(move || {
-        db::ensure_env_dirs(&sched_env).map(|_| sched_db)
-    })
-    .await
-    {
-        Ok(Ok(path)) => {
-            let p = path.clone();
-            let _ = tokio::task::spawn_blocking(move || db::init_db_sync(&p)).await;
+    let db_path = match db::ensure_env_dirs(&state.config.resolved.env) {
+        Ok(_) => {
+            let path = state.config.resolved.db_path.clone();
+            let _ = db::init_db(&path).await;
             Some(path)
         }
-        _ => {
+        Err(_) => {
             eprintln!("[barca] scheduler: durability disabled (no metadata db)");
             None
         }
@@ -369,12 +348,7 @@ pub async fn run_scheduler(state: AppState) {
     // was down. Jobs with no prior record are anchored to now (no first-launch
     // stampede). Requires durability; skipped entirely if the DB is unavailable.
     if let Some(dbp) = &db_path {
-        let d = dbp.clone();
-        let saved = tokio::task::spawn_blocking(move || db::get_schedule_state_sync(&d))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default();
+        let saved = db::get_schedule_state(dbp).await.unwrap_or_default();
         last_fired = saved.clone();
         let now = zone.now();
         for job in &jobs {
@@ -407,12 +381,11 @@ pub async fn run_scheduler(state: AppState) {
         let current_gen = state.dag_generation.load(Ordering::Relaxed);
         if current_gen != seen_gen {
             seen_gen = current_gen;
-            if let Some(fresh) = reload_jobs(&state).await {
-                eprintln!("[barca] schedule reloaded: {} job(s)", fresh.len());
-                jobs = fresh;
-                log_schedule(&jobs, &zone);
-                publish_registry(&state, &jobs, &last_handle, &last_fired);
-            }
+            let fresh = reload_jobs(&state).await;
+            eprintln!("[barca] schedule reloaded: {} job(s)", fresh.len());
+            jobs = fresh;
+            log_schedule(&jobs, &zone);
+            publish_registry(&state, &jobs, &last_handle, &last_fired);
         }
 
         let now = zone.now();
@@ -497,6 +470,7 @@ mod tests {
                 error: None,
                 started_at: 0.0,
                 finished_at: None,
+                cancel: barca_core::CancellationToken::new(),
             },
         );
     }
@@ -754,8 +728,8 @@ mod tests {
 
     // ─── real-parser enumeration seam ──────────────────────────────────────
 
-    #[test]
-    fn collect_jobs_discovers_scheduled_nodes_from_source() {
+    #[tokio::test]
+    async fn collect_jobs_discovers_scheduled_nodes_from_source() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pipeline.py");
         std::fs::write(
@@ -775,7 +749,8 @@ mod tests {
         let jobs = collect_jobs(
             &[path.display().to_string()],
             &barca_core::commands::find_python(),
-        );
+        )
+        .await;
 
         assert_eq!(
             jobs.len(),
@@ -796,8 +771,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn describe_schedule_reports_next_fire() {
+    #[tokio::test]
+    async fn describe_schedule_reports_next_fire() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pipeline.py");
         std::fs::write(
@@ -813,7 +788,8 @@ mod tests {
         let infos = describe_schedule(
             &[path.display().to_string()],
             &barca_core::commands::find_python(),
-        );
+        )
+        .await;
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].cron, "*/5 * * * *");
         assert_eq!(infos[0].kind, NodeKind::Asset);

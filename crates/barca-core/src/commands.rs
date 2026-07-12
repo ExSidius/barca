@@ -1,4 +1,9 @@
 //! Engine commands — get, plan, history, stats. Return typed results; callers handle display.
+//!
+//! Every command is an `async fn` that runs on the caller's runtime: the CLI
+//! builds one runtime in `main()`, the server `.await`s these directly. No
+//! runtime is ever constructed in this crate; genuinely blocking work (source
+//! parsing, dynamic-partition subprocesses) runs via `spawn_blocking`.
 
 use crate::BarcaError;
 use crate::cache;
@@ -16,6 +21,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
+use tokio_util::sync::CancellationToken;
 use turso::Builder;
 
 /// Format seconds as a fixed-width time string for progress display.
@@ -118,13 +124,16 @@ pub enum CachePolicy {
 }
 
 /// `barca get` — cache-aware execution of an asset (or all assets).
-pub fn get(
+/// Cancelling `cancel` stops the run mid-flight: workers are terminated,
+/// partial results are persisted, and the run row is marked `cancelled`.
+pub async fn get(
     cfg: &crate::config::ResolvedConfig,
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
     no_cache: bool,
     agent_mode: bool,
+    cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
     execute(
         cfg,
@@ -135,18 +144,21 @@ pub fn get(
         agent_mode,
         CachePolicy::CacheAware,
         "get",
+        cancel,
     )
+    .await
 }
 
 /// `barca run` — execute a task (and its cone), bursting upstream asset caches.
 /// `burst == None` bursts all upstream assets; `Some(names)` bursts only those.
-pub fn run(
+pub async fn run(
     cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
     burst: Option<Vec<String>>,
     agent_mode: bool,
+    cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
     let policy = match burst {
         None => CachePolicy::BurstAll,
@@ -161,11 +173,13 @@ pub fn run(
         agent_mode,
         policy,
         "run",
+        cancel,
     )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute(
+async fn execute(
     cfg: &crate::config::ResolvedConfig,
     target_name: Option<&str>,
     file_args: &[String],
@@ -174,11 +188,12 @@ fn execute(
     agent_mode: bool,
     policy: CachePolicy,
     command_label: &str,
+    cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
     let run_id = db::generate_run_id();
 
-    let dag = build_dag(file_args, python)?;
+    let dag = build_dag(file_args, python).await?;
 
     // Resolve target: if Some, find it and extract subgraph; if None, use full DAG.
     let target_id: Option<String> = match target_name {
@@ -234,35 +249,29 @@ fn execute(
     let state_sync_on =
         cfg.state == crate::config::StateMode::Optimistic && cfg.state_uri.is_some();
     let mut state_token = if state_sync_on {
-        Some(state_sync::pull_state(python, cfg)?)
+        Some(state_sync::pull_state(python, cfg).await?)
     } else {
         None
     };
 
-    db::init_db_sync(&db_path)?;
+    db::init_db(&db_path).await?;
 
-    db::create_run_sync(
+    db::create_run(
         &db_path,
         &run_id,
         command_label,
         &file_args.join(" "),
         target_name,
         Some(exec_plan.total_steps),
-    )?;
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    )
+    .await?;
 
     let db = {
-        let _g = db::db_guard();
-        rt.block_on(async {
-            Builder::new_local(&db_path)
-                .build()
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
-        })
+        let _g = db::db_guard().await;
+        Builder::new_local(&db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
     }?;
     let conn = db
         .connect()
@@ -299,9 +308,9 @@ fn execute(
         .filter(|st| !st.partition_keys.is_empty())
         .map(|st| st.step_id.base_id().to_string())
         .collect();
-    let avg_times = db::get_avg_elapsed_sync(&db_path, &unpartitioned_node_ids)?;
+    let avg_times = db::get_avg_elapsed(&db_path, &unpartitioned_node_ids).await?;
     let partitioned_avg_times =
-        db::get_avg_elapsed_for_partitioned_sync(&db_path, &partitioned_base_ids)?;
+        db::get_avg_elapsed_for_partitioned(&db_path, &partitioned_base_ids).await?;
     let total_estimated: f64 = unpartitioned_node_ids
         .iter()
         .filter_map(|nid| avg_times.get(nid))
@@ -345,6 +354,15 @@ fn execute(
     };
 
     for phase in &exec_plan.phases {
+        // Stop scheduling new phases once cancelled; partial results from
+        // completed phases are persisted below.
+        if cancel.is_cancelled() {
+            if phase_error.is_none() {
+                phase_error = Some("run cancelled".to_string());
+            }
+            break;
+        }
+
         let expanded_phase = dispatch::expand_pending_partitions(phase, &all_outputs, pool_size);
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
 
@@ -442,22 +460,20 @@ fn execute(
                     .expect("unpartitioned step has a precomputed run hash");
 
                 let cached = {
-                    let _g = db::db_guard();
-                    rt.block_on(async {
-                        let mut rows = conn
-                            .query(
-                                "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
-                                [display_id.clone(), run_h.clone()],
-                            )
-                            .await
-                            .unwrap();
-                        rows.next().await.unwrap().and_then(|row| {
-                            Some(dispatch::OutputRef {
-                                path: row.get::<String>(0).ok()?,
-                                format: row.get::<String>(1).ok()?,
-                                size_bytes: row.get::<i64>(2).ok()? as u64,
-                                elapsed_seconds: None,
-                            })
+                    let _g = db::db_guard().await;
+                    let mut rows = conn
+                        .query(
+                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
+                            [display_id.clone(), run_h.clone()],
+                        )
+                        .await
+                        .unwrap();
+                    rows.next().await.unwrap().and_then(|row| {
+                        Some(dispatch::OutputRef {
+                            path: row.get::<String>(0).ok()?,
+                            format: row.get::<String>(1).ok()?,
+                            size_bytes: row.get::<i64>(2).ok()? as u64,
+                            elapsed_seconds: None,
                         })
                     })
                 };
@@ -585,19 +601,8 @@ fn execute(
             storage_options_json: cfg.storage_options_json.clone(),
         };
 
-        // Use a multi-thread runtime for io_loop — the current_thread runtime (used
-        // for Turso DB) doesn't drive spawned tasks concurrently enough for the
-        // worker I/O task pattern.
-        let io_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| BarcaError::Other(format!("failed to create io runtime: {e}")))?;
-        let phase_err = io_rt.block_on(crate::io_loop::run(
-            &mut coord,
-            &io_config,
-            Some(on_step_cb),
-        ));
-        drop(io_rt);
+        let phase_err =
+            crate::io_loop::run(&mut coord, &io_config, Some(on_step_cb), &cancel).await;
         if let Err(e) = phase_err {
             if phase_error.is_none() {
                 phase_error = Some(e);
@@ -716,14 +721,17 @@ fn execute(
     // checkpoints the WAL, which requires no other open handles on the file.
     drop(conn);
     drop(db);
-    drop(rt);
+
+    let was_cancelled = cancel.is_cancelled();
 
     // Persist all executed outputs (including partial results on failure) —
     // held in a ledger so a state-push conflict can replay this run's rows
     // onto a freshly pulled database.
     let ledger = RunLedger {
         run_id: &run_id,
-        status: if phase_error.is_some() {
+        status: if was_cancelled {
+            "cancelled"
+        } else if phase_error.is_some() {
             "failed"
         } else {
             "success"
@@ -742,7 +750,7 @@ fn execute(
         cached_node_ids: &cached_node_ids,
         run_hashes: &run_hashes,
     };
-    persist_run(&db_path, &ledger)?;
+    persist_run(&db_path, &ledger).await?;
 
     // Shared remote state: fold the WAL into the main file and conditionally
     // upload it. On conflict (another machine pushed first): pull the fresh
@@ -750,8 +758,8 @@ fn execute(
     if state_sync_on {
         let mut attempt = 0u32;
         loop {
-            state_sync::checkpoint_truncate(&db_path)?;
-            match state_sync::push_state(python, cfg, state_token.as_ref().unwrap())? {
+            state_sync::checkpoint_truncate(&db_path).await?;
+            match state_sync::push_state(python, cfg, state_token.as_ref().unwrap()).await? {
                 state_sync::PushOutcome::Pushed(_) => break,
                 state_sync::PushOutcome::Conflict => {
                     if attempt >= cfg.push_retries {
@@ -760,15 +768,18 @@ fn execute(
                         )));
                     }
                     attempt += 1;
-                    state_token = Some(state_sync::pull_state(python, cfg)?);
-                    db::init_db_sync(&db_path)?;
-                    persist_run(&db_path, &ledger)?;
+                    state_token = Some(state_sync::pull_state(python, cfg).await?);
+                    db::init_db(&db_path).await?;
+                    persist_run(&db_path, &ledger).await?;
                 }
             }
         }
     }
 
-    // Propagate worker error after persisting partial results.
+    // Propagate cancellation/worker error after persisting partial results.
+    if was_cancelled {
+        return Err(BarcaError::Cancelled);
+    }
     if let Some(error) = phase_error {
         return Err(BarcaError::WorkerFailed(error));
     }
@@ -839,22 +850,17 @@ struct RunLedger<'a> {
 /// row (INSERT OR IGNORE + terminal UPDATE) so replays don't duplicate it;
 /// materialization rows are append-only history and re-appended on replay
 /// only against a database that doesn't already contain them.
-fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
-    let _g = db::db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError> {
+    let _g = db::db_guard().await;
+    let db = Builder::new_local(db_path)
         .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+    let conn = db
+        .connect()
+        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
 
-        conn.execute(
+    conn.execute(
             "INSERT OR IGNORE INTO runs (run_id, command, files, target, status, steps_total) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
             [
                 l.run_id.to_string(),
@@ -866,7 +872,7 @@ fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
         )
         .await
         .ok();
-        conn.execute(
+    conn.execute(
             "UPDATE runs SET status = ?1, steps_executed = ?2, steps_cached = ?3, elapsed_seconds = ?4, finished_at = datetime('now') WHERE run_id = ?5",
             [
                 l.status.to_string(),
@@ -879,20 +885,20 @@ fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
         .await
         .map_err(|e| BarcaError::Db(format!("failed to finish run: {e}")))?;
 
-        for (node_id, oref) in l.all_outputs {
-            if l.cached_node_ids.contains(node_id) {
-                continue;
-            }
-            let Some(run_h) = l.run_hashes.get(node_id) else {
-                continue;
-            };
-            let elapsed_str = oref
-                .elapsed_seconds
-                .map(|e| e.to_string())
-                .unwrap_or_default();
-            let base = crate::StepId::parse(node_id).base_id().to_string();
-            let attempts = l.all_attempts.get(&base).copied().unwrap_or(1);
-            conn.execute(
+    for (node_id, oref) in l.all_outputs {
+        if l.cached_node_ids.contains(node_id) {
+            continue;
+        }
+        let Some(run_h) = l.run_hashes.get(node_id) else {
+            continue;
+        };
+        let elapsed_str = oref
+            .elapsed_seconds
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let base = crate::StepId::parse(node_id).base_id().to_string();
+        let attempts = l.all_attempts.get(&base).copied().unwrap_or(1);
+        conn.execute(
                 "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''))",
                 [
                     node_id.clone(),
@@ -907,20 +913,20 @@ fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
             )
             .await
             .ok();
-        }
+    }
 
-        // Persist permanently-failed steps as `status='failed'` rows (artifact
-        // columns NULL). Failed rows are never served as cache hits.
-        for failure in l.all_failures {
-            let node_id = &failure.node_id;
-            let base = crate::StepId::parse(node_id).base_id().to_string();
-            let run_h = l.run_hashes.get(node_id).cloned().unwrap_or_default();
-            let attempts = l
-                .all_attempts
-                .get(&base)
-                .copied()
-                .unwrap_or(failure.error.attempts);
-            conn.execute(
+    // Persist permanently-failed steps as `status='failed'` rows (artifact
+    // columns NULL). Failed rows are never served as cache hits.
+    for failure in l.all_failures {
+        let node_id = &failure.node_id;
+        let base = crate::StepId::parse(node_id).base_id().to_string();
+        let run_h = l.run_hashes.get(node_id).cloned().unwrap_or_default();
+        let attempts = l
+            .all_attempts
+            .get(&base)
+            .copied()
+            .unwrap_or(failure.error.attempts);
+        conn.execute(
                 "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
                 [
                     node_id.clone(),
@@ -932,15 +938,14 @@ fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
             )
             .await
             .ok();
-        }
-        Ok::<(), BarcaError>(())
-    })
+    }
+    Ok(())
 }
 
 // ─── plan ────────────────────────────────────────────────────────────────────
 
-pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaError> {
-    let dag = build_dag(file_args, python)?;
+pub async fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaError> {
+    let dag = build_dag(file_args, python).await?;
     let config = ResourceConfig {
         pool_size: 10,
         concurrency_groups: HashMap::new(),
@@ -969,24 +974,24 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaE
 
 // ─── history ──────────────────────────────────────────────────────────────────
 
-pub fn history(
+pub async fn history(
     cfg: &crate::config::ResolvedConfig,
     limit: usize,
 ) -> Result<Vec<db::RunRecord>, BarcaError> {
     db::ensure_env_dirs(&cfg.env)?;
-    db::init_db_sync(&cfg.db_path)?;
-    db::get_recent_runs_sync(&cfg.db_path, limit)
+    db::init_db(&cfg.db_path).await?;
+    db::get_recent_runs(&cfg.db_path, limit).await
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────
 
-pub fn stats(
+pub async fn stats(
     cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
 ) -> Result<db::AssetStats, BarcaError> {
-    let dag = build_dag(file_args, python)?;
+    let dag = build_dag(file_args, python).await?;
 
     let target_id = dag
         .topo_order()
@@ -1003,19 +1008,19 @@ pub fn stats(
         })?;
 
     db::ensure_env_dirs(&cfg.env)?;
-    db::init_db_sync(&cfg.db_path)?;
-    db::get_asset_stats_sync(&cfg.db_path, &target_id)
+    db::init_db(&cfg.db_path).await?;
+    db::get_asset_stats(&cfg.db_path, &target_id).await
 }
 
 // ─── list_assets ──────────────────────────────────────────────────────────────
 
 /// Build the DAG and return a summary of every node (id, kind, freshness, inputs).
 /// Pure static analysis — no execution, no DB. Used by the server's `/assets` route.
-pub fn list_assets(
+pub async fn list_assets(
     file_args: &[String],
     python: &PathBuf,
 ) -> Result<Vec<AssetSummary>, BarcaError> {
-    let dag = build_dag(file_args, python)?;
+    let dag = build_dag(file_args, python).await?;
     let summaries = dag
         .topo_order()
         .into_iter()
@@ -1094,7 +1099,18 @@ fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> Execut
 
 // ─── DAG construction ────────────────────────────────────────────────────────
 
-pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
+/// Build the DAG from source files. The work is genuinely blocking (file I/O,
+/// parsing, and a Python subprocess for dynamic partitions), so it runs on the
+/// blocking pool rather than an async worker thread.
+pub async fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
+    let files = file_args.to_vec();
+    let py = python.clone();
+    tokio::task::spawn_blocking(move || build_dag_blocking(&files, &py))
+        .await
+        .map_err(|e| BarcaError::Other(format!("DAG analysis task failed: {e}")))?
+}
+
+fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
