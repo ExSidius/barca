@@ -59,6 +59,13 @@ pub struct ArtifactRef {
     pub size_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_seconds: Option<f64>,
+    /// CPU time the task consumed (`time.process_time` delta) — the truest
+    /// measure of work; feeds the coordinator's cost estimator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_seconds: Option<f64>,
+    /// Peak RSS of the worker process in bytes at task completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rss_bytes: Option<u64>,
     /// Outcomes of `@sink` writes performed alongside this artifact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sinks: Vec<SinkOutcome>,
@@ -170,6 +177,8 @@ mod tests {
                 format: "json".to_string(),
                 size_bytes: 1024,
                 elapsed_seconds: Some(0.42),
+                cpu_seconds: None,
+                max_rss_bytes: None,
                 sinks: Vec::new(),
             },
         };
@@ -238,6 +247,8 @@ mod tests {
                 format: "parquet".to_string(),
                 size_bytes: 42,
                 elapsed_seconds: None,
+                cpu_seconds: None,
+                max_rss_bytes: None,
                 sinks: vec![
                     SinkOutcome {
                         path: "exports/out.parquet".to_string(),
@@ -392,6 +403,8 @@ mod tests {
                     format: "json".to_string(),
                     size_bytes: 512,
                     elapsed_seconds: None,
+                    cpu_seconds: None,
+                    max_rss_bytes: None,
                     sinks: Vec::new(),
                 },
             },

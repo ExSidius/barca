@@ -3,6 +3,7 @@ pub mod commands;
 pub mod cone;
 pub mod config;
 pub mod coordinator;
+pub mod cost;
 pub mod dag;
 pub mod db;
 pub mod dispatch;

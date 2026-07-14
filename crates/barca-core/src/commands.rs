@@ -250,6 +250,12 @@ fn execute(
         Some(exec_plan.total_steps),
     )?;
 
+    // Measured-cost model: seed from persisted estimates so batch sizing is
+    // pre-warmed — the cold-start probe is paid once ever per stable node,
+    // not once per run.
+    let mut cost_model = crate::cost::CostModel::new();
+    cost_model.seed(db::load_cost_estimates_sync(&db_path)?);
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -274,6 +280,8 @@ fn execute(
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     // Sink outcomes (JSON) per node, accumulated across phases for the DB.
     let mut all_sinks: HashMap<String, String> = HashMap::new();
+    // Per-node self-timing (cpu_seconds, max_rss_bytes) reported by workers.
+    let mut all_timings: HashMap<String, (Option<f64>, Option<u64>)> = HashMap::new();
     // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
     let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
     let mut all_attempts: HashMap<String, u32> = HashMap::new();
@@ -343,6 +351,26 @@ fn execute(
     } else {
         None
     };
+
+    // Persistent worker pool: one pool for the whole run, shared across
+    // phases so workers keep their interpreter (and imported user modules)
+    // warm between phases. Uses a multi-thread runtime — the current_thread
+    // runtime (used for Turso DB) doesn't drive spawned tasks concurrently
+    // enough for the worker I/O task pattern.
+    let io_rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Other(format!("failed to create io runtime: {e}")))?;
+    let io_config = crate::io_loop::IoConfig {
+        python: python.clone(),
+        pool_size,
+        run_id: run_id.clone(),
+        artifact_root: cfg.artifact_root.clone(),
+        storage_options_json: cfg.storage_options_json.clone(),
+    };
+    let mut pool = io_rt
+        .block_on(async { crate::io_loop::WorkerPool::start(io_config) })
+        .map_err(BarcaError::Other)?;
 
     for phase in &exec_plan.phases {
         let expanded_phase = dispatch::expand_pending_partitions(phase, &all_outputs, pool_size);
@@ -576,28 +604,10 @@ fn execute(
                 }
             });
 
-        // Run the coordinator via io_loop
-        let io_config = crate::io_loop::IoConfig {
-            python: python.clone(),
-            pool_size,
-            run_id: run_id.clone(),
-            artifact_root: cfg.artifact_root.clone(),
-            storage_options_json: cfg.storage_options_json.clone(),
-        };
-
-        // Use a multi-thread runtime for io_loop — the current_thread runtime (used
-        // for Turso DB) doesn't drive spawned tasks concurrently enough for the
-        // worker I/O task pattern.
-        let io_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| BarcaError::Other(format!("failed to create io runtime: {e}")))?;
-        let phase_err = io_rt.block_on(crate::io_loop::run(
-            &mut coord,
-            &io_config,
-            Some(on_step_cb),
-        ));
-        drop(io_rt);
+        // Drive this phase against the persistent pool. The cost model both
+        // sizes the batch pulls and absorbs the timings coming back.
+        let phase_err =
+            io_rt.block_on(pool.run_phase(&mut coord, &mut cost_model, Some(on_step_cb)));
         if let Err(e) = phase_err {
             if phase_error.is_none() {
                 phase_error = Some(e);
@@ -639,6 +649,11 @@ fn execute(
                     node_id.clone(),
                     serde_json::Value::from(sinks.clone()).to_string(),
                 );
+            }
+            let cpu = artifact_val.get("cpu_seconds").and_then(|v| v.as_f64());
+            let rss = artifact_val.get("max_rss_bytes").and_then(|v| v.as_u64());
+            if cpu.is_some() || rss.is_some() {
+                all_timings.insert(node_id.clone(), (cpu, rss));
             }
             phase_outputs.insert(node_id, oref);
         }
@@ -691,6 +706,10 @@ fn execute(
         }
     }
 
+    // All phases done (or aborted) — release the worker pool before persisting.
+    pool.shutdown();
+    drop(io_rt);
+
     // Finish progress bar.
     if let Some(ref bar) = pb {
         if steps_executed > 0 {
@@ -721,6 +740,10 @@ fn execute(
     // Persist all executed outputs (including partial results on failure) —
     // held in a ledger so a state-push conflict can replay this run's rows
     // onto a freshly pulled database.
+    let cost_snapshot: Vec<(String, crate::cost::NodeEstimate)> = cost_model
+        .snapshot()
+        .map(|(node_id, est)| (node_id.clone(), *est))
+        .collect();
     let ledger = RunLedger {
         run_id: &run_id,
         status: if phase_error.is_some() {
@@ -739,8 +762,10 @@ fn execute(
         all_failures: &all_failures,
         all_sinks: &all_sinks,
         all_attempts: &all_attempts,
+        all_timings: &all_timings,
         cached_node_ids: &cached_node_ids,
         run_hashes: &run_hashes,
+        cost_snapshot: &cost_snapshot,
     };
     persist_run(&db_path, &ledger)?;
 
@@ -831,8 +856,12 @@ struct RunLedger<'a> {
     all_failures: &'a [dispatch::StepFailure],
     all_sinks: &'a HashMap<String, String>,
     all_attempts: &'a HashMap<String, u32>,
+    /// Per-node worker self-timing: (cpu_seconds, max_rss_bytes).
+    all_timings: &'a HashMap<String, (Option<f64>, Option<u64>)>,
     cached_node_ids: &'a std::collections::HashSet<String>,
     run_hashes: &'a HashMap<String, String>,
+    /// Run-end snapshot of the measured-cost EWMA, seeding the next run.
+    cost_snapshot: &'a [(String, crate::cost::NodeEstimate)],
 }
 
 /// Write a run's ledger with a short-lived connection. Idempotent for the run
@@ -892,8 +921,9 @@ fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
                 .unwrap_or_default();
             let base = crate::StepId::parse(node_id).base_id().to_string();
             let attempts = l.all_attempts.get(&base).copied().unwrap_or(1);
+            let (cpu, rss) = l.all_timings.get(node_id).copied().unwrap_or((None, None));
             conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''))",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json, cpu_seconds, max_rss_bytes) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''), NULLIF(?9, ''), NULLIF(?10, ''))",
                 [
                     node_id.clone(),
                     run_h.clone(),
@@ -903,6 +933,32 @@ fn persist_run(db_path: &str, l: &RunLedger) -> Result<(), BarcaError> {
                     elapsed_str,
                     attempts.to_string(),
                     l.all_sinks.get(node_id).cloned().unwrap_or_default(),
+                    cpu.map(|c| c.to_string()).unwrap_or_default(),
+                    rss.map(|r| r.to_string()).unwrap_or_default(),
+                ],
+            )
+            .await
+            .ok();
+        }
+
+        // Persist the measured-cost EWMA so the next run starts pre-warmed and
+        // skips the cold-start probe entirely. (Inline — this fn already holds
+        // the process-wide DB guard.)
+        for (node_id, est) in l.cost_snapshot {
+            let base = crate::StepId::parse(node_id).base_id().to_string();
+            conn.execute(
+                "INSERT INTO cost_estimates (node_id, base_id, estimate_seconds, cpu_seconds, max_rss_bytes, samples, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+                 ON CONFLICT(node_id) DO UPDATE SET
+                     estimate_seconds = ?3, cpu_seconds = ?4, max_rss_bytes = ?5,
+                     samples = ?6, updated_at = datetime('now')",
+                [
+                    node_id.clone(),
+                    base,
+                    est.estimate_seconds.to_string(),
+                    est.cpu_seconds.to_string(),
+                    est.max_rss_bytes.to_string(),
+                    est.samples.to_string(),
                 ],
             )
             .await

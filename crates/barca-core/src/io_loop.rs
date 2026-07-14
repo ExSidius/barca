@@ -1,11 +1,24 @@
-//! Async I/O layer — stateless workers receiving tasks from a global ready queue.
+//! Async I/O layer — a persistent pool of stateless workers pulling leased
+//! batches from the coordinator's global ready queue.
 //!
-//! Workers are ephemeral executors. After each task, they report back and Rust
-//! assigns the next ready item. On parallel(), the requesting worker is SIGSTOP'd,
-//! a temp replacement is spawned, and children enter the ready queue. When all
-//! children complete, the temp is killed and the original is SIGCONT'd.
+//! Workers are long-lived across phases of a run (amortizing interpreter
+//! startup and user-module imports) and stateless between tasks. Each pull
+//! leases `K` tasks, where `K` comes from the measured-cost model
+//! ([`crate::cost::CostModel`]): heavy tasks pull one-at-a-time (fully
+//! parallel), light tasks batch enough to amortize the per-pull coordination
+//! cost. The completion message closes the lease, carries the output ref, and
+//! feeds the cost estimator.
+//!
+//! Lease state machine (at-least-once):
+//! `queued → leased → done`, with `failed / worker-died → requeued`. When a
+//! worker dies mid-batch only its in-flight task consumes retry budget — the
+//! unstarted remainder returns to the queue front untouched.
+//!
+//! On parallel(), the requesting worker is SIGSTOP'd, a temp replacement is
+//! spawned, and children enter the ready queue. When all children complete,
+//! the temp is killed and the original is SIGCONT'd.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -16,6 +29,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::coordinator::{Coordinator, FailureAction, GroupId, ItemId, ItemSpec};
+use crate::cost::CostModel;
 use crate::protocol::{CoordinatorMessage, ParallelResult, WorkerMessage};
 
 // ─── Configuration ───────────────────────────────────────────────────────────
@@ -41,8 +55,8 @@ struct WorkerHandle {
     child: Child,
     cmd_tx: mpsc::Sender<serde_json::Value>,
     _task: JoinHandle<()>,
-    /// The item this worker is currently executing.
-    executing: Option<ItemId>,
+    /// Items leased to this worker, in execution order (front = in-flight).
+    leases: VecDeque<ItemId>,
 }
 
 // ─── Frozen worker (SIGSTOP'd, waiting for parallel group) ──────────────────
@@ -124,72 +138,94 @@ async fn worker_io_task(
     }
 }
 
-// ─── Top-level entry point ───────────────────────────────────────────────────
+// ─── Worker pool ─────────────────────────────────────────────────────────────
 
-pub async fn run(
-    coord: &mut Coordinator,
-    config: &IoConfig,
-    mut on_step: Option<StepCallback<'_>>,
-) -> Result<(), String> {
-    let socket_path = crate::protocol::socket_path(&config.run_id, "main");
-    std::fs::remove_file(&socket_path).ok();
-    let listener = UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
+/// A pool of long-lived Python workers, persistent across the phases of a run.
+///
+/// Spawned lazily up to `pool_size`, supervised, and replaced on death.
+/// Workers keep their interpreter (and imported user modules) warm between
+/// phases — the dominant per-spawn cost is `importlib` + heavy imports, not
+/// the fork itself.
+pub struct WorkerPool {
+    config: IoConfig,
+    socket_path: PathBuf,
+    listener: UnixListener,
+    event_tx: mpsc::Sender<IoEvent>,
+    event_rx: mpsc::Receiver<IoEvent>,
+    workers: HashMap<usize, WorkerHandle>,
+    frozen: Vec<FrozenWorker>,
+    next_worker_id: usize,
+}
 
-    let (event_tx, mut event_rx) = mpsc::channel::<IoEvent>(config.pool_size * 8);
-
-    // Spawn initial worker pool (only as many as there are ready items, up to pool_size)
-    let initial_count = coord.ready_count().min(config.pool_size).max(1);
-    let mut workers: HashMap<usize, WorkerHandle> = HashMap::new();
-    let mut next_worker_id: usize = 0;
-
-    for _ in 0..initial_count {
-        let wid = next_worker_id;
-        next_worker_id += 1;
-        match spawn_worker(config, &socket_path, wid, &listener, &event_tx).await {
-            Ok(handle) => {
-                workers.insert(wid, handle);
-            }
-            Err(e) => eprintln!("[barca] failed to spawn worker {wid}: {e}"),
-        }
+impl WorkerPool {
+    /// Bind the coordination socket. Workers spawn on demand during phases.
+    pub fn start(config: IoConfig) -> Result<Self, String> {
+        let socket_path = crate::protocol::socket_path(&config.run_id, "main");
+        std::fs::remove_file(&socket_path).ok();
+        let listener =
+            UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
+        let (event_tx, event_rx) = mpsc::channel::<IoEvent>(config.pool_size.max(1) * 8);
+        Ok(Self {
+            config,
+            socket_path,
+            listener,
+            event_tx,
+            event_rx,
+            workers: HashMap::new(),
+            frozen: Vec::new(),
+            next_worker_id: 0,
+        })
     }
 
-    // Frozen workers (SIGSTOP'd, waiting for parallel groups)
-    let mut frozen: Vec<FrozenWorker> = Vec::new();
+    /// Drive one phase's coordinator to completion against the (persistent)
+    /// pool. `cost` supplies batch sizes and absorbs the timings coming back.
+    pub async fn run_phase(
+        &mut self,
+        coord: &mut Coordinator,
+        cost: &mut CostModel,
+        mut on_step: Option<StepCallback<'_>>,
+    ) -> Result<(), String> {
+        self.assign_ready(coord, cost).await;
 
-    // Assign initial ready items to idle workers
-    assign_ready(
-        &mut workers,
-        coord,
-        config,
-        &socket_path,
-        &listener,
-        &event_tx,
-        &mut next_worker_id,
-    )
-    .await;
+        loop {
+            if coord.is_finished() {
+                break;
+            }
+            if self.workers.is_empty() && self.frozen.is_empty() && coord.ready_count() > 0 {
+                // Ready work exists but spawning failed — nothing will ever
+                // produce a completion event.
+                return Err("no workers available and work remains".to_string());
+            }
 
-    // Main event loop
-    loop {
-        if coord.is_finished() {
-            break;
-        }
+            let event = match self.event_rx.recv().await {
+                Some(e) => e,
+                None => break,
+            };
 
-        let event = match event_rx.recv().await {
-            Some(e) => e,
-            None => break,
-        };
-
-        match event {
-            IoEvent::Message { worker_id, msg } => {
-                match msg {
+            match event {
+                IoEvent::Message { worker_id, msg } => match msg {
                     WorkerMessage::StepCompleted {
                         ref node_id,
                         ref artifact,
                     } => {
-                        let item_id = workers
-                            .get(&worker_id)
-                            .and_then(|w| w.executing)
-                            .expect("StepCompleted but worker has no executing item");
+                        let Some(item_id) = self.take_lease(worker_id, node_id, coord) else {
+                            eprintln!(
+                                "[barca] StepCompleted for '{node_id}' from worker {worker_id} \
+                                 with no matching lease — ignoring"
+                            );
+                            continue;
+                        };
+
+                        // Feed the estimator: within-run adaptation means the
+                        // very next pull sizes K from this observation.
+                        if let Some(wall) = artifact.elapsed_seconds {
+                            cost.observe(
+                                node_id,
+                                wall,
+                                artifact.cpu_seconds.unwrap_or(wall),
+                                artifact.max_rss_bytes.unwrap_or(0),
+                            );
+                        }
 
                         // Record output and fire progress callback
                         let artifact_val = serde_json::to_value(artifact).unwrap_or_default();
@@ -199,36 +235,24 @@ pub async fn run(
                         }
                         coord.on_item_completed(item_id);
 
-                        // Mark worker idle
-                        if let Some(w) = workers.get_mut(&worker_id) {
-                            w.executing = None;
-                        }
-
                         // Check if any frozen worker's group is now complete
-                        resume_frozen(&mut frozen, &mut workers, coord).await;
-
-                        // Assign next ready items
-                        assign_ready(
-                            &mut workers,
-                            coord,
-                            config,
-                            &socket_path,
-                            &listener,
-                            &event_tx,
-                            &mut next_worker_id,
-                        )
-                        .await;
+                        self.resume_frozen(coord).await;
+                        self.assign_ready(coord, cost).await;
                     }
                     WorkerMessage::StepError {
+                        ref node_id,
                         error_type,
                         message,
                         traceback,
                         ..
                     } => {
-                        let item_id = workers
-                            .get(&worker_id)
-                            .and_then(|w| w.executing)
-                            .expect("StepError but worker has no executing item");
+                        let Some(item_id) = self.take_lease(worker_id, node_id, coord) else {
+                            eprintln!(
+                                "[barca] StepError for '{node_id}' from worker {worker_id} \
+                                 with no matching lease — ignoring"
+                            );
+                            continue;
+                        };
 
                         // Surface the full picture: exception type, message, and
                         // the (barca-frame-filtered) traceback from the worker.
@@ -240,64 +264,56 @@ pub async fn run(
                         if let FailureAction::RetryAfter(delay) =
                             coord.on_item_failed(item_id, error)
                         {
-                            schedule_retry(&event_tx, item_id, delay);
+                            schedule_retry(&self.event_tx, item_id, delay);
                         }
 
                         // User code failed (or hung past its timeout) in this
                         // process — kill it so retries and remaining work get a
-                        // fresh interpreter. The 200ms SIGTERM grace runs off
-                        // the event loop.
-                        if let Some(mut handle) = workers.remove(&worker_id) {
+                        // fresh interpreter. Unstarted leases go back to the
+                        // queue front; the 200ms SIGTERM grace runs off the
+                        // event loop.
+                        if let Some(mut handle) = self.workers.remove(&worker_id) {
+                            Self::return_leases(&mut handle, coord);
                             tokio::task::spawn_blocking(move || {
                                 graceful_kill(&mut handle.child);
                             });
                         }
 
-                        resume_frozen(&mut frozen, &mut workers, coord).await;
-                        assign_ready(
-                            &mut workers,
-                            coord,
-                            config,
-                            &socket_path,
-                            &listener,
-                            &event_tx,
-                            &mut next_worker_id,
-                        )
-                        .await;
+                        self.resume_frozen(coord).await;
+                        self.assign_ready(coord, cost).await;
                     }
-                    WorkerMessage::Blocked { reason, .. } => {
-                        let item_id = workers
-                            .get(&worker_id)
-                            .and_then(|w| w.executing)
-                            .expect("Blocked but worker has no executing item");
+                    WorkerMessage::Blocked {
+                        ref node_id,
+                        reason,
+                    } => {
+                        let Some(item_id) = self.take_lease(worker_id, node_id, coord) else {
+                            eprintln!(
+                                "[barca] Blocked for '{node_id}' from worker {worker_id} \
+                                 with no matching lease — ignoring"
+                            );
+                            continue;
+                        };
 
                         if let FailureAction::RetryAfter(delay) =
                             coord.on_item_failed(item_id, format!("blocked: {reason}"))
                         {
-                            schedule_retry(&event_tx, item_id, delay);
+                            schedule_retry(&self.event_tx, item_id, delay);
                         }
 
-                        if let Some(w) = workers.get_mut(&worker_id) {
-                            w.executing = None;
-                        }
-
-                        resume_frozen(&mut frozen, &mut workers, coord).await;
-                        assign_ready(
-                            &mut workers,
-                            coord,
-                            config,
-                            &socket_path,
-                            &listener,
-                            &event_tx,
-                            &mut next_worker_id,
-                        )
-                        .await;
+                        self.resume_frozen(coord).await;
+                        self.assign_ready(coord, cost).await;
                     }
                     WorkerMessage::Submit { items } => {
-                        let item_id = workers
-                            .get(&worker_id)
-                            .and_then(|w| w.executing)
-                            .expect("Submit but worker has no executing item");
+                        let Some(handle) = self.workers.get(&worker_id) else {
+                            eprintln!("[barca] Submit from unknown worker {worker_id}, ignoring");
+                            continue;
+                        };
+                        let Some(&item_id) = handle.leases.front() else {
+                            eprintln!(
+                                "[barca] Submit from worker {worker_id} with no lease, ignoring"
+                            );
+                            continue;
+                        };
 
                         let specs: Vec<ItemSpec> = items
                             .into_iter()
@@ -329,35 +345,42 @@ pub async fn run(
 
                         let (group_id, _child_ids) = coord.on_parallel_requested(item_id, specs);
 
+                        // The parent blocks frozen on its group; anything else
+                        // this worker had leased goes back to the queue.
+                        let mut handle = self
+                            .workers
+                            .remove(&worker_id)
+                            .expect("worker existence checked above");
+                        handle.leases.pop_front();
+                        Self::return_leases(&mut handle, coord);
+
                         // SIGSTOP the requesting worker, move it to frozen list
-                        let Some(handle) = workers.remove(&worker_id) else {
-                            eprintln!("[barca] Submit from unknown worker {worker_id}, ignoring");
-                            continue;
-                        };
                         #[cfg(unix)]
                         unsafe {
                             libc::kill(handle.child.id() as i32, libc::SIGSTOP);
                         }
 
                         // Spawn a replacement worker in the same slot
-                        let replacement_id = next_worker_id;
-                        next_worker_id += 1;
+                        let replacement_id = self.next_worker_id;
+                        self.next_worker_id += 1;
                         match spawn_worker(
-                            config,
-                            &socket_path,
+                            &self.config,
+                            &self.socket_path,
                             replacement_id,
-                            &listener,
-                            &event_tx,
+                            &self.listener,
+                            &self.event_tx,
                         )
                         .await
                         {
                             Ok(replacement) => {
-                                workers.insert(replacement_id, replacement);
+                                self.workers.insert(replacement_id, replacement);
                             }
-                            Err(e) => eprintln!("[barca] failed to spawn replacement worker: {e}"),
+                            Err(e) => {
+                                eprintln!("[barca] failed to spawn replacement worker: {e}")
+                            }
                         }
 
-                        frozen.push(FrozenWorker {
+                        self.frozen.push(FrozenWorker {
                             child: handle.child,
                             cmd_tx: handle.cmd_tx,
                             _task: handle._task,
@@ -368,238 +391,287 @@ pub async fn run(
                         });
 
                         // Assign ready items (children are now in the ready queue)
-                        assign_ready(
-                            &mut workers,
-                            coord,
-                            config,
-                            &socket_path,
-                            &listener,
-                            &event_tx,
-                            &mut next_worker_id,
-                        )
-                        .await;
+                        self.assign_ready(coord, cost).await;
                     }
                     WorkerMessage::Heartbeat => {}
-                }
-            }
-            IoEvent::Disconnected { worker_id } => {
-                // Worker crashed — fail its executing item
-                if let Some(handle) = workers.get(&worker_id) {
-                    if let Some(item_id) = handle.executing {
-                        if let FailureAction::RetryAfter(delay) =
-                            coord.on_item_failed(item_id, "worker disconnected".to_string())
-                        {
-                            schedule_retry(&event_tx, item_id, delay);
+                },
+                IoEvent::Disconnected { worker_id } => {
+                    // Worker crashed — its in-flight item failed; unstarted
+                    // leases return to the queue for another worker.
+                    if let Some(mut handle) = self.workers.remove(&worker_id) {
+                        if let Some(in_flight) = handle.leases.pop_front() {
+                            if let FailureAction::RetryAfter(delay) =
+                                coord.on_item_failed(in_flight, "worker disconnected".to_string())
+                            {
+                                schedule_retry(&self.event_tx, in_flight, delay);
+                            }
                         }
+                        Self::return_leases(&mut handle, coord);
+                        tokio::task::spawn_blocking(move || {
+                            let _ = handle.child.kill();
+                            let _ = handle.child.wait();
+                        });
                     }
+                    self.resume_frozen(coord).await;
+                    self.assign_ready(coord, cost).await;
                 }
-                workers.remove(&worker_id);
-                // Spawn replacement
-                let wid = next_worker_id;
-                next_worker_id += 1;
-                if let Ok(h) = spawn_worker(config, &socket_path, wid, &listener, &event_tx).await {
-                    workers.insert(wid, h);
+                IoEvent::RetryReady { item_id } => {
+                    coord.requeue(item_id);
+                    self.assign_ready(coord, cost).await;
                 }
-                resume_frozen(&mut frozen, &mut workers, coord).await;
-                assign_ready(
-                    &mut workers,
-                    coord,
-                    config,
-                    &socket_path,
-                    &listener,
-                    &event_tx,
-                    &mut next_worker_id,
-                )
-                .await;
-            }
-            IoEvent::RetryReady { item_id } => {
-                coord.requeue(item_id);
-                assign_ready(
-                    &mut workers,
-                    coord,
-                    config,
-                    &socket_path,
-                    &listener,
-                    &event_tx,
-                    &mut next_worker_id,
-                )
-                .await;
             }
         }
+
+        Ok(())
     }
 
-    // Cleanup: gracefully terminate workers. Send SIGTERM first to let
-    // Python flush buffered stdout, then SIGKILL after a brief wait if
-    // the process hasn't exited yet.
-    for (_, mut w) in workers {
-        graceful_kill(&mut w.child);
-    }
-    for mut fw in frozen {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(fw.child.id() as i32, libc::SIGCONT);
+    /// Gracefully terminate every worker and remove the socket.
+    pub fn shutdown(self) {
+        for (_, mut w) in self.workers {
+            graceful_kill(&mut w.child);
         }
-        graceful_kill(&mut fw.child);
-    }
-    std::fs::remove_file(&socket_path).ok();
-
-    Ok(())
-}
-
-// ─── Assign ready items to idle workers ──────────────────────────────────────
-
-async fn assign_ready(
-    workers: &mut HashMap<usize, WorkerHandle>,
-    coord: &mut Coordinator,
-    config: &IoConfig,
-    socket_path: &Path,
-    listener: &UnixListener,
-    event_tx: &mpsc::Sender<IoEvent>,
-    next_worker_id: &mut usize,
-) {
-    // Collect idle worker IDs
-    let idle: Vec<usize> = workers
-        .iter()
-        .filter(|(_, w)| w.executing.is_none())
-        .map(|(&id, _)| id)
-        .collect();
-
-    for wid in idle {
-        if let Some(item_id) = coord.next_ready() {
-            let item = coord.item(item_id);
-            let step = build_step_json(item, coord);
-            let msg = serde_json::json!({"type": "execute", "step": step});
-            if let Some(w) = workers.get_mut(&wid) {
-                let _ = w.cmd_tx.send(msg).await;
-                w.executing = Some(item_id);
-            }
-        }
-    }
-
-    // If there are more ready items than idle workers, spawn additional workers
-    // (up to pool_size total active workers — not counting frozen)
-    while coord.ready_count() > 0 {
-        // Don't exceed reasonable pool limits
-        if workers.len() >= 64 {
-            break;
-        }
-        let wid = *next_worker_id;
-        *next_worker_id += 1;
-        match spawn_worker(config, socket_path, wid, listener, event_tx).await {
-            Ok(mut handle) => {
-                if let Some(item_id) = coord.next_ready() {
-                    let item = coord.item(item_id);
-                    let step = build_step_json(item, coord);
-                    let msg = serde_json::json!({"type": "execute", "step": step});
-                    let _ = handle.cmd_tx.send(msg).await;
-                    handle.executing = Some(item_id);
-                }
-                workers.insert(wid, handle);
-            }
-            Err(e) => {
-                eprintln!("[barca] failed to spawn worker: {e}");
-                break;
-            }
-        }
-    }
-}
-
-// ─── Resume frozen workers whose groups completed ────────────────────────────
-
-async fn resume_frozen(
-    frozen: &mut Vec<FrozenWorker>,
-    workers: &mut HashMap<usize, WorkerHandle>,
-    coord: &mut Coordinator,
-) {
-    // Partition: completed groups get drained out
-    let mut i = 0;
-    while i < frozen.len() {
-        if coord.is_group_complete(frozen[i].group_id) {
-            let fw = frozen.swap_remove(i);
-
-            // Kill the replacement worker
-            if let Some(mut replacement) = workers.remove(&fw.replacement_id) {
-                let _ = replacement.child.kill();
-                let _ = replacement.child.wait();
-            }
-
-            // SIGCONT the original worker
+        for mut fw in self.frozen {
             #[cfg(unix)]
             unsafe {
                 libc::kill(fw.child.id() as i32, libc::SIGCONT);
             }
+            graceful_kill(&mut fw.child);
+        }
+        std::fs::remove_file(&self.socket_path).ok();
+    }
 
-            // Build ParallelResponse with results for each child.
-            // Read actual JSON values from the artifact files so the parent
-            // task receives the real return values (not Null).
-            let group = coord.group(fw.group_id);
-            let results: Vec<ParallelResult> = group
-                .items
-                .iter()
-                .map(|&iid| {
-                    if coord.is_done(iid) {
-                        let val = coord
-                            .outputs()
-                            .get(&iid)
-                            .and_then(|artifact| {
-                                let fmt = artifact
-                                    .get("format")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("");
-                                let path =
-                                    artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                                if fmt == "json" && !path.is_empty() {
-                                    if path.contains("://") {
-                                        eprintln!(
-                                            "[barca] Warning: parallel() result values require \
-                                             a local artifact store in v1 — artifact '{path}' \
-                                             is remote; the parent receives null. Unset \
-                                             BARCA_ARTIFACT_URI to use parallel() results."
-                                        );
-                                        None
-                                    } else {
-                                        std::fs::read_to_string(path)
-                                            .ok()
-                                            .and_then(|s| serde_json::from_str(&s).ok())
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(serde_json::Value::Null);
-                        ParallelResult::Ok { result: val }
-                    } else {
-                        let error = coord
-                            .failed_items()
-                            .into_iter()
-                            .find(|(fid, _)| *fid == iid)
-                            .map(|(_, msg)| msg.to_string())
-                            .unwrap_or_else(|| "failed".to_string());
-                        ParallelResult::Error { error }
-                    }
-                })
-                .collect();
-            let response = CoordinatorMessage::ParallelResponse { results };
-            let msg = serde_json::to_value(&response).unwrap_or_default();
-            let _ = fw.cmd_tx.send(msg).await;
+    /// Close a worker's lease for `node_id`. Workers execute their batch in
+    /// order, so this is normally the front of the deque; matching by node id
+    /// keeps us honest if a worker ever reports out of order.
+    fn take_lease(
+        &mut self,
+        worker_id: usize,
+        node_id: &str,
+        coord: &Coordinator,
+    ) -> Option<ItemId> {
+        let handle = self.workers.get_mut(&worker_id)?;
+        let pos = handle
+            .leases
+            .iter()
+            .position(|&iid| coord.item(iid).step_id.display() == node_id)?;
+        handle.leases.remove(pos)
+    }
 
-            // Re-insert using the original worker_id — the worker_io_task
-            // was spawned with this ID, so StepCompleted events arrive keyed
-            // by it.
-            workers.insert(
-                fw.original_worker_id,
-                WorkerHandle {
-                    child: fw.child,
-                    cmd_tx: fw.cmd_tx,
-                    _task: fw._task,
-                    executing: Some(fw.parent_item), // still executing the parent task
-                },
-            );
-            // Don't increment i — swap_remove moved the last element here
-        } else {
-            i += 1;
+    /// Return every unstarted lease on a dead/frozen worker to the queue front.
+    /// Popping from the back preserves the original order across push_fronts.
+    fn return_leases(handle: &mut WorkerHandle, coord: &mut Coordinator) {
+        while let Some(item_id) = handle.leases.pop_back() {
+            coord.return_leased(item_id);
         }
     }
+
+    /// Assign ready items to idle workers in cost-sized batches, spawning
+    /// workers on demand up to `pool_size`.
+    async fn assign_ready(&mut self, coord: &mut Coordinator, cost: &CostModel) {
+        loop {
+            if coord.ready_count() == 0 {
+                return;
+            }
+
+            // Find an idle worker, or spawn one if the pool is under strength.
+            let wid = match self
+                .workers
+                .iter()
+                .find(|(_, w)| w.leases.is_empty())
+                .map(|(&id, _)| id)
+            {
+                Some(id) => id,
+                None => {
+                    if self.workers.len() >= self.config.pool_size.max(1) {
+                        return; // pool saturated — completions will re-enter here
+                    }
+                    let wid = self.next_worker_id;
+                    self.next_worker_id += 1;
+                    match spawn_worker(
+                        &self.config,
+                        &self.socket_path,
+                        wid,
+                        &self.listener,
+                        &self.event_tx,
+                    )
+                    .await
+                    {
+                        Ok(handle) => {
+                            self.workers.insert(wid, handle);
+                            wid
+                        }
+                        Err(e) => {
+                            eprintln!("[barca] failed to spawn worker: {e}");
+                            return;
+                        }
+                    }
+                }
+            };
+
+            // Lease a batch: K sized from the head item's measured cost.
+            let first = coord.next_ready().expect("ready_count checked above");
+            let head_node = coord.item(first).step_id.display();
+            let remaining = coord.remaining_count() + 1;
+            let k = cost
+                .batch_size(&head_node, remaining, self.config.pool_size.max(1))
+                .max(1);
+            let mut batch = vec![first];
+            while batch.len() < k {
+                match coord.next_ready() {
+                    Some(id) => batch.push(id),
+                    None => break,
+                }
+            }
+
+            let msg = if batch.len() == 1 {
+                let step = build_step_json(coord.item(batch[0]), coord);
+                serde_json::json!({"type": "execute", "step": step})
+            } else {
+                let steps: Vec<serde_json::Value> = batch
+                    .iter()
+                    .map(|&iid| build_step_json(coord.item(iid), coord))
+                    .collect();
+                serde_json::json!({"type": "execute_batch", "steps": steps})
+            };
+
+            let handle = self
+                .workers
+                .get_mut(&wid)
+                .expect("worker inserted or found above");
+            if handle.cmd_tx.send(msg).await.is_err() {
+                // Worker's I/O task is gone — undo the lease and drop the
+                // worker; its Disconnected event does no further harm.
+                for &item_id in batch.iter().rev() {
+                    coord.return_leased(item_id);
+                }
+                if let Some(mut dead) = self.workers.remove(&wid) {
+                    tokio::task::spawn_blocking(move || {
+                        let _ = dead.child.kill();
+                        let _ = dead.child.wait();
+                    });
+                }
+                continue;
+            }
+            handle.leases = batch.into_iter().collect();
+        }
+    }
+
+    /// Resume frozen workers whose parallel groups completed.
+    async fn resume_frozen(&mut self, coord: &mut Coordinator) {
+        // Partition: completed groups get drained out
+        let mut i = 0;
+        while i < self.frozen.len() {
+            if coord.is_group_complete(self.frozen[i].group_id) {
+                let fw = self.frozen.swap_remove(i);
+
+                // Kill the replacement worker (returning any leases it holds).
+                if let Some(mut replacement) = self.workers.remove(&fw.replacement_id) {
+                    if let Some(in_flight) = replacement.leases.pop_front() {
+                        coord.return_leased(in_flight);
+                    }
+                    Self::return_leases(&mut replacement, coord);
+                    let _ = replacement.child.kill();
+                    let _ = replacement.child.wait();
+                }
+
+                // SIGCONT the original worker
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(fw.child.id() as i32, libc::SIGCONT);
+                }
+
+                // Build ParallelResponse with results for each child.
+                // Read actual JSON values from the artifact files so the parent
+                // task receives the real return values (not Null).
+                let group = coord.group(fw.group_id);
+                let results: Vec<ParallelResult> = group
+                    .items
+                    .iter()
+                    .map(|&iid| {
+                        if coord.is_done(iid) {
+                            let val = coord
+                                .outputs()
+                                .get(&iid)
+                                .and_then(|artifact| {
+                                    let fmt = artifact
+                                        .get("format")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    let path = artifact
+                                        .get("path")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+                                    if fmt == "json" && !path.is_empty() {
+                                        if path.contains("://") {
+                                            eprintln!(
+                                                "[barca] Warning: parallel() result values require \
+                                                 a local artifact store in v1 — artifact '{path}' \
+                                                 is remote; the parent receives null. Unset \
+                                                 BARCA_ARTIFACT_URI to use parallel() results."
+                                            );
+                                            None
+                                        } else {
+                                            std::fs::read_to_string(path)
+                                                .ok()
+                                                .and_then(|s| serde_json::from_str(&s).ok())
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(serde_json::Value::Null);
+                            ParallelResult::Ok { result: val }
+                        } else {
+                            let error = coord
+                                .failed_items()
+                                .into_iter()
+                                .find(|(fid, _)| *fid == iid)
+                                .map(|(_, msg)| msg.to_string())
+                                .unwrap_or_else(|| "failed".to_string());
+                            ParallelResult::Error { error }
+                        }
+                    })
+                    .collect();
+                let response = CoordinatorMessage::ParallelResponse { results };
+                let msg = serde_json::to_value(&response).unwrap_or_default();
+                let _ = fw.cmd_tx.send(msg).await;
+
+                // Re-insert using the original worker_id — the worker_io_task
+                // was spawned with this ID, so StepCompleted events arrive keyed
+                // by it.
+                self.workers.insert(
+                    fw.original_worker_id,
+                    WorkerHandle {
+                        child: fw.child,
+                        cmd_tx: fw.cmd_tx,
+                        _task: fw._task,
+                        // Still executing the parent task.
+                        leases: VecDeque::from([fw.parent_item]),
+                    },
+                );
+                // Don't increment i — swap_remove moved the last element here
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+// ─── Compatibility entry point ───────────────────────────────────────────────
+
+/// Run a single coordinator to completion with a pool that lives only for
+/// this call. Callers wanting the pool to persist across phases should hold a
+/// [`WorkerPool`] and call [`WorkerPool::run_phase`] directly.
+pub async fn run(
+    coord: &mut Coordinator,
+    config: IoConfig,
+    on_step: Option<StepCallback<'_>>,
+) -> Result<(), String> {
+    let mut pool = WorkerPool::start(config)?;
+    let mut cost = CostModel::new();
+    let result = pool.run_phase(coord, &mut cost, on_step).await;
+    pool.shutdown();
+    result
 }
 
 // ─── Message I/O ─────────────────────────────────────────────────────────────
@@ -669,7 +741,7 @@ async fn spawn_worker(
         child,
         cmd_tx,
         _task: task,
-        executing: None,
+        leases: VecDeque::new(),
     })
 }
 

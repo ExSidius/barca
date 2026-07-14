@@ -163,9 +163,31 @@ pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
             "ALTER TABLE materializations ADD COLUMN error_traceback TEXT",
             "ALTER TABLE materializations ADD COLUMN attempts INTEGER DEFAULT 1",
             "ALTER TABLE materializations ADD COLUMN sinks_json TEXT",
+            "ALTER TABLE materializations ADD COLUMN cpu_seconds REAL",
+            "ALTER TABLE materializations ADD COLUMN max_rss_bytes INTEGER",
         ] {
             conn.execute(col, ()).await.ok();
         }
+
+        // Per-node cost estimates: the persisted EWMA that seeds the next
+        // run's batch sizing, so the 30s cold-start probe is paid once ever
+        // per stable node, not once per run. One row per exact node id
+        // (including partition suffix) — current estimate only, no history
+        // vector.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cost_estimates (
+                node_id TEXT PRIMARY KEY,
+                base_id TEXT NOT NULL,
+                estimate_seconds REAL NOT NULL,
+                cpu_seconds REAL,
+                max_rss_bytes INTEGER,
+                samples INTEGER DEFAULT 0,
+                updated_at TEXT DEFAULT (datetime('now'))
+            )",
+            (),
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to create cost_estimates table: {e}")))?;
 
         // Run history table.
         conn.execute(
@@ -313,6 +335,97 @@ pub fn persist_outputs_sync(
 /// Alias for backward compat in tests — delegates to persist_outputs_sync.
 pub fn persist_output_refs_sync(db_path: &str, outputs: &HashMap<String, OutputRef>) {
     persist_outputs_sync(db_path, outputs, &HashMap::new()).ok();
+}
+
+/// Load every persisted per-node cost estimate (run start — seeds the
+/// in-memory `CostModel` so batch sizing starts pre-warmed).
+pub fn load_cost_estimates_sync(
+    db_path: &str,
+) -> Result<Vec<(String, crate::cost::NodeEstimate)>, BarcaError> {
+    let _g = db_guard();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        let mut rows = conn
+            .query(
+                "SELECT node_id, estimate_seconds, cpu_seconds, max_rss_bytes, samples FROM cost_estimates",
+                (),
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query cost_estimates: {e}")))?;
+        let mut out = Vec::new();
+        while let Ok(Some(row)) = rows.next().await {
+            let node_id = row.get::<String>(0).unwrap_or_default();
+            if node_id.is_empty() {
+                continue;
+            }
+            out.push((
+                node_id,
+                crate::cost::NodeEstimate {
+                    estimate_seconds: row.get::<f64>(1).unwrap_or(0.0),
+                    cpu_seconds: row.get::<f64>(2).unwrap_or(0.0),
+                    max_rss_bytes: row.get::<i64>(3).unwrap_or(0).max(0) as u64,
+                    samples: row.get::<i64>(4).unwrap_or(0).max(0) as u64,
+                },
+            ));
+        }
+        Ok(out)
+    })
+}
+
+/// Upsert per-node cost estimates (run end — persists the EWMA so the next
+/// run skips the cold-start probe entirely).
+pub fn upsert_cost_estimates_sync(
+    db_path: &str,
+    estimates: &[(String, crate::cost::NodeEstimate)],
+) -> Result<(), BarcaError> {
+    if estimates.is_empty() {
+        return Ok(());
+    }
+    let _g = db_guard();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    rt.block_on(async {
+        let db = Builder::new_local(db_path)
+            .build()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        let conn = db
+            .connect()
+            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+        for (node_id, est) in estimates {
+            let base = crate::StepId::parse(node_id).base_id().to_string();
+            conn.execute(
+                "INSERT INTO cost_estimates (node_id, base_id, estimate_seconds, cpu_seconds, max_rss_bytes, samples, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+                 ON CONFLICT(node_id) DO UPDATE SET
+                     estimate_seconds = ?3, cpu_seconds = ?4, max_rss_bytes = ?5,
+                     samples = ?6, updated_at = datetime('now')",
+                [
+                    node_id.clone(),
+                    base,
+                    est.estimate_seconds.to_string(),
+                    est.cpu_seconds.to_string(),
+                    est.max_rss_bytes.to_string(),
+                    est.samples.to_string(),
+                ],
+            )
+            .await
+            .ok();
+        }
+        Ok(())
+    })
 }
 
 /// Generate a short run ID from timestamp + random bits (no uuid crate).
@@ -757,6 +870,74 @@ mod tests {
         let state = get_schedule_state_sync(&db_path).unwrap();
         assert_eq!(state.len(), 2);
         assert_eq!(state.get("test.py:daily"), Some(&3_000));
+    }
+
+    #[test]
+    fn cost_estimates_round_trip_and_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+
+        assert!(load_cost_estimates_sync(&db_path).unwrap().is_empty());
+
+        let est = |s: f64, n: u64| crate::cost::NodeEstimate {
+            estimate_seconds: s,
+            cpu_seconds: s * 0.9,
+            max_rss_bytes: 1024,
+            samples: n,
+        };
+        upsert_cost_estimates_sync(
+            &db_path,
+            &[
+                ("f.py:fetch[t=A]".to_string(), est(0.25, 3)),
+                ("f.py:report".to_string(), est(2.0, 1)),
+            ],
+        )
+        .unwrap();
+
+        let loaded = load_cost_estimates_sync(&db_path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        let fetch = loaded
+            .iter()
+            .find(|(n, _)| n == "f.py:fetch[t=A]")
+            .unwrap();
+        assert!((fetch.1.estimate_seconds - 0.25).abs() < 1e-9);
+        assert_eq!(fetch.1.samples, 3);
+        assert_eq!(fetch.1.max_rss_bytes, 1024);
+
+        // Upsert overwrites the same node rather than inserting a duplicate.
+        upsert_cost_estimates_sync(&db_path, &[("f.py:report".to_string(), est(1.5, 2))]).unwrap();
+        let loaded = load_cost_estimates_sync(&db_path).unwrap();
+        assert_eq!(loaded.len(), 2);
+        let report = loaded.iter().find(|(n, _)| n == "f.py:report").unwrap();
+        assert!((report.1.estimate_seconds - 1.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn schema_has_timing_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        init_db_sync(&db_path).unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let columns = rt.block_on(async {
+            let db = Builder::new_local(&db_path).build().await.unwrap();
+            let conn = db.connect().unwrap();
+            let mut rows = conn
+                .query("PRAGMA table_info(materializations)", ())
+                .await
+                .unwrap();
+            let mut cols = Vec::new();
+            while let Some(row) = rows.next().await.unwrap() {
+                cols.push(row.get::<String>(1).unwrap());
+            }
+            cols
+        });
+        assert!(columns.contains(&"cpu_seconds".to_string()));
+        assert!(columns.contains(&"max_rss_bytes".to_string()));
     }
 
     #[test]

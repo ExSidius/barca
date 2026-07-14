@@ -239,9 +239,31 @@ impl Coordinator {
         }
     }
 
+    /// Return a leased-but-never-started item to the front of the ready queue.
+    ///
+    /// Batch pulls lease several items per worker; when the worker dies (or is
+    /// killed after a step error) only the in-flight item failed — the
+    /// unstarted remainder goes back for another worker, and the dispatch that
+    /// never happened doesn't consume retry budget.
+    pub fn return_leased(&mut self, item_id: ItemId) {
+        if self.executing.remove(&item_id) {
+            if let Some(item) = self.items.get_mut(&item_id) {
+                item.attempts = item.attempts.saturating_sub(1);
+            }
+            self.ready.push_front(item_id);
+        }
+    }
+
     /// How many items are ready to be assigned.
     pub fn ready_count(&self) -> usize {
         self.ready.len()
+    }
+
+    /// How many items still have work ahead of them (ready now or blocked on
+    /// upstreams). Feeds the batch-size ceiling: enough batches must remain
+    /// that every worker stays fed.
+    pub fn remaining_count(&self) -> usize {
+        self.ready.len() + self.pending.len() + self.waiting_retry.len()
     }
 
     // ─── Event handlers ───────────────────────────────────────────────────
@@ -917,6 +939,62 @@ mod tests {
         // Third failure exhausts the budget regardless of backoff.
         assert_eq!(c.on_item_failed(a, "fail 3".into()), FailureAction::Failed);
         assert!(c.is_finished());
+    }
+
+    #[test]
+    fn return_leased_restores_queue_front_and_refunds_attempt() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        let b = c.add_item(dummy_step_id("b"), spec("b"), vec![]);
+
+        // Lease both (a batch of two), as a worker pull would.
+        assert_eq!(c.next_ready(), Some(a));
+        assert_eq!(c.next_ready(), Some(b));
+        assert_eq!(c.item(b).attempts, 1);
+
+        // Worker dies mid-batch: `b` was never started — return it.
+        c.return_leased(b);
+        assert_eq!(c.item(b).attempts, 0, "unstarted dispatch must be refunded");
+        // It comes back at the front, ahead of anything queued later.
+        let d = c.add_item(dummy_step_id("d"), spec("d"), vec![]);
+        assert_eq!(c.next_ready(), Some(b));
+        assert_eq!(c.next_ready(), Some(d));
+        c.on_item_completed(a);
+        c.on_item_completed(b);
+        c.on_item_completed(d);
+        assert!(c.is_finished());
+    }
+
+    #[test]
+    fn return_leased_of_unleased_item_is_noop() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        c.return_leased(a); // never leased — must not duplicate or underflow
+        assert_eq!(c.ready_count(), 1);
+        assert_eq!(c.next_ready(), Some(a));
+        assert_eq!(c.next_ready(), None);
+        assert_eq!(c.item(a).attempts, 1);
+    }
+
+    #[test]
+    fn remaining_count_tracks_ready_and_pending() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        let _b = c.add_item(
+            dummy_step_id("b"),
+            spec("b"),
+            vec![Dep {
+                upstream: a,
+                kind: DepKind::Data,
+            }],
+        );
+        assert_eq!(c.remaining_count(), 2);
+        c.next_ready();
+        assert_eq!(c.remaining_count(), 1); // a leased, b pending
+        c.on_item_completed(a);
+        assert_eq!(c.remaining_count(), 1); // b now ready
+        c.next_ready();
+        assert_eq!(c.remaining_count(), 0);
     }
 
     #[test]

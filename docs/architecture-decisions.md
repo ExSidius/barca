@@ -221,7 +221,62 @@ virtualenvs), we spawn standard Python processes. This means:
 
 ---
 
-## 6. What we didn't build (yet)
+## 6. Adaptive pull-queue executor (measured cost, not declared limits)
+
+### The decision
+
+Workers are a **persistent pool** (spawned once per run, kept warm across
+phases) that **pull leased batches** from the global ready queue. The batch
+size `K` per pull is computed from **measured per-task cost**, not from
+user-declared concurrency limits or code introspection:
+
+```text
+K = clamp(
+      floor   = ceil(comm_cost / (per_task_cost × 1%)),   # amortize per-pull coordination
+      ceiling = max(1, remaining / (workers × 3)),        # keep every worker fed
+    )
+```
+
+Workers self-time every task (CPU time, wall time, peak RSS) and the numbers
+ride back on the completion message — which therefore does triple duty:
+closes the lease, carries the output ref, and updates the cost estimator.
+
+Estimates use a three-tier prior: exact-node EWMA → node-level sibling-partition
+estimate → a **30s cold-start default**. The default is deliberately high
+because the errors are asymmetric: over-estimating cost yields `K = 1` and mild
+comm overhead (cheap); under-estimating over-batches secretly-heavy tasks onto
+one worker and tail-blocks the run (catastrophic). The EWMA rises fast and
+falls slowly (≤30% per observation) for the same reason. Run-end estimates
+persist to the `cost_estimates` table, so the cold-start probe is paid once
+ever per stable node, not once per run.
+
+Leases make crash handling precise: `queued → leased → done`, with
+`failed / worker-died → requeued`. When a worker dies mid-batch, only its
+in-flight task consumes retry budget — the unstarted remainder returns to the
+queue front untouched (at-least-once delivery; pure assets make re-runs safe).
+
+### What we rejected
+
+- **User-declared concurrency limits** (Dagster/Prefect/Airflow tags, slots,
+  pools): a human guessing "max N of these" is the heuristics game we want out
+  of. Barca has a structural advantage — local OS processes plus persisted run
+  history — so it can measure instead of asking.
+- **Calibration pass**: no separate probe run. The first wave of a cold run
+  *is* the probe (the 30s default forces `K = 1`), productive and informative
+  at once.
+- **Payloads in the queue**: the queue carries artifact references; workers
+  fetch inputs from the content-addressed store themselves. Per-pull comm is
+  therefore fixed coordination cost — which batching can amortize — rather
+  than data movement, which scales with `K` and cannot be.
+
+All adaptive machinery stays strictly on the performance side of the
+determinism boundary: the plan (phases, streams, the set of partitions) is
+deterministic; metering tunes only physical placement. Assets are pure, so
+placement never affects results.
+
+---
+
+## 7. What we didn't build (yet)
 
 ### Backoff on retries
 
