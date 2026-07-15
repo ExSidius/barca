@@ -190,6 +190,48 @@ class TestManyTinyPartitions:
         assert distinct_nodes == 24, "every partition must materialize"
         assert total_rows == 24, "no partition may run twice (duplicate lease)"
 
+    def test_mixed_duration_partitions_complete_exactly_once(self, tmp_path):
+        """Dynamic task sizing: partitions of one node with very different
+        costs (1ms vs 60ms) must each materialize exactly once — batch pulls
+        sized from early observations must never lose or double-run the
+        heavy stragglers."""
+        f = write_module(
+            tmp_path,
+            "m.py",
+            """
+            import time
+            from barca import asset, partitions
+
+            KEYS = [f"p{i:02d}" for i in range(12)]
+
+            @asset(partitions={"key": partitions(KEYS)})
+            def work(key):
+                # Even-indexed partitions are ~1ms, odd are 60ms.
+                time.sleep(0.001 if int(key[1:]) % 2 == 0 else 0.06)
+                return {"key": key}
+        """,
+        )
+        barca.get(f)
+        rows = _query(
+            "SELECT COUNT(*), COUNT(DISTINCT node_id) FROM materializations "
+            "WHERE node_id LIKE '%:work[%' AND status = 'success'"
+        )
+        total, distinct = rows[0]
+        assert distinct == 12, "every partition must materialize"
+        assert total == 12, "no partition may run twice"
+
+        # The estimator must reflect the cost split: heavy partitions carry
+        # larger estimates than tiny ones.
+        est = dict(
+            _query("SELECT node_id, estimate_seconds FROM cost_estimates WHERE node_id LIKE '%:work[%'")
+        )
+        assert len(est) == 12
+        heavy = [v for k, v in est.items() if int(k.split("p")[-1].rstrip("]")) % 2 == 1]
+        tiny = [v for k, v in est.items() if int(k.split("p")[-1].rstrip("]")) % 2 == 0]
+        assert min(heavy) > max(tiny), (
+            f"heavy estimates {sorted(heavy)} must exceed tiny {sorted(tiny)}"
+        )
+
     def test_second_run_seeds_estimates_for_partitions(self, tmp_path):
         f = write_module(
             tmp_path,
