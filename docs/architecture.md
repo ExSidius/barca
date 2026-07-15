@@ -44,7 +44,7 @@ crates/
     src/
       lib.rs                serve()/app() entrypoints + ServeConfig
       routes.rs             axum Router (the single API boundary)
-      handlers.rs           Endpoint handlers — delegate to commands via spawn_blocking
+      handlers.rs           Endpoint handlers — await the async core commands directly
       state.rs              AppState, RunState/RunStatus, DAG cache
       error.rs              BarcaError → HTTP status + JSON mapping
       watch.rs              notify-based dev file watcher (--watch)
@@ -81,9 +81,11 @@ pyproject.toml              Maturin build (binary + Python stubs in one wheel)
 
 4. **HTTP server** (`barca serve`):
    - The `barca-server` crate reuses `barca_core::commands::*` directly (no subprocess).
-   - Runs on a multi-thread Tokio runtime driving axum; each core call is run via
-     `spawn_blocking` because the core commands build their own current-thread runtime.
+   - Core commands are async and never construct a runtime — they run on the CLI's single
+     runtime (built in `main()`), which also drives axum for `barca serve`.
    - Runs execute in background tasks and are tracked in a `DashMap`; clients poll `/status`.
+     Each run carries a `CancellationToken`, so `DELETE /run/{id}` (or shutdown) stops it
+     mid-flight: workers are terminated and the run is marked `cancelled`.
    - See [Server API](server-api.md).
 
 ## Node kinds

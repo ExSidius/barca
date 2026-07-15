@@ -16,7 +16,7 @@
 use crate::BarcaError;
 use crate::config::ResolvedConfig;
 use std::path::Path;
-use std::process::Command;
+use tokio::process::Command;
 use turso::Builder;
 
 /// Opaque concurrency token for the remote state blob (etag / generation /
@@ -46,17 +46,18 @@ fn state_cmd(python: &Path, cfg: &ResolvedConfig) -> Command {
 /// Download the shared state blob over `cfg.db_path`. Returns its token, or
 /// `StateToken(None)` when the remote object doesn't exist yet (the local
 /// file is left untouched for bootstrap).
-pub fn pull_state(python: &Path, cfg: &ResolvedConfig) -> Result<StateToken, BarcaError> {
+pub async fn pull_state(python: &Path, cfg: &ResolvedConfig) -> Result<StateToken, BarcaError> {
     let uri = cfg
         .state_uri
         .as_deref()
         .ok_or_else(|| BarcaError::Other("pull_state called without a state uri".into()))?;
-    let _g = crate::db::db_guard();
+    let _g = crate::db::db_guard().await;
     let out = state_cmd(python, cfg)
         .arg("pull")
         .arg(uri)
         .arg(&cfg.db_path)
         .output()
+        .await
         .map_err(|e| BarcaError::Other(format!("failed to spawn state helper: {e}")))?;
     if !out.status.success() {
         return Err(BarcaError::Other(format!(
@@ -76,7 +77,7 @@ pub fn pull_state(python: &Path, cfg: &ResolvedConfig) -> Result<StateToken, Bar
 
 /// Conditionally upload `cfg.db_path` over the shared state blob.
 /// Call `checkpoint_truncate` first — the WAL must be folded in.
-pub fn push_state(
+pub async fn push_state(
     python: &Path,
     cfg: &ResolvedConfig,
     token: &StateToken,
@@ -85,7 +86,7 @@ pub fn push_state(
         .state_uri
         .as_deref()
         .ok_or_else(|| BarcaError::Other("push_state called without a state uri".into()))?;
-    let _g = crate::db::db_guard();
+    let _g = crate::db::db_guard().await;
     let mut cmd = state_cmd(python, cfg);
     cmd.arg("push").arg(uri).arg(&cfg.db_path);
     if let Some(ref t) = token.0 {
@@ -93,6 +94,7 @@ pub fn push_state(
     }
     let out = cmd
         .output()
+        .await
         .map_err(|e| BarcaError::Other(format!("failed to spawn state helper: {e}")))?;
     if out.status.code() == Some(EXIT_CONFLICT) {
         return Ok(PushOutcome::Conflict);
@@ -116,13 +118,9 @@ pub fn push_state(
 /// Checkpoint the WAL into the main database file and verify nothing is
 /// left behind. Must be called with no other connections open on the file
 /// (the caller drops all handles first) and before any upload.
-pub fn checkpoint_truncate(db_path: &str) -> Result<(), BarcaError> {
-    let _g = crate::db::db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
+pub async fn checkpoint_truncate(db_path: &str) -> Result<(), BarcaError> {
+    {
+        let _g = crate::db::db_guard().await;
         let db = Builder::new_local(db_path)
             .build()
             .await
@@ -141,8 +139,7 @@ pub fn checkpoint_truncate(db_path: &str) -> Result<(), BarcaError> {
             .await
             .map_err(|e| BarcaError::Db(format!("wal_checkpoint(TRUNCATE) failed: {e}")))?
         {}
-        Ok::<(), BarcaError>(())
-    })?;
+    }
 
     // Backstop: an upload of the main file is only valid if the WAL is gone.
     let wal = format!("{db_path}-wal");
@@ -175,37 +172,27 @@ fn _path_exists(p: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn open_and_count(db_path: &str, table: &str) -> u64 {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+    async fn open_and_count(db_path: &str, table: &str) -> u64 {
+        let db = Builder::new_local(db_path).build().await.unwrap();
+        let conn = db.connect().unwrap();
+        let mut rows = conn
+            .query(&format!("SELECT COUNT(*) FROM {table}"), ())
+            .await
             .unwrap();
-        rt.block_on(async {
-            let db = Builder::new_local(db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query(&format!("SELECT COUNT(*) FROM {table}"), ())
-                .await
-                .unwrap();
-            let row = rows.next().await.unwrap().unwrap();
-            row.get_value(0).unwrap().as_integer().copied().unwrap() as u64
-        })
+        let row = rows.next().await.unwrap().unwrap();
+        row.get_value(0).unwrap().as_integer().copied().unwrap() as u64
     }
 
     /// The load-bearing spike for shared remote state: after
     /// wal_checkpoint(TRUNCATE), the -wal sidecar must be empty/absent and
     /// all rows must be readable from the main file alone.
-    #[test]
-    fn checkpoint_truncate_collapses_wal_into_main_file() {
+    #[tokio::test]
+    async fn checkpoint_truncate_collapses_wal_into_main_file() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("metadata.db").to_string_lossy().to_string();
 
         // Create a table and write enough rows that data definitely lives in the WAL.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
+        {
             let db = Builder::new_local(&db_path).build().await.unwrap();
             let conn = db.connect().unwrap();
             conn.execute(
@@ -219,7 +206,7 @@ mod tests {
                     .await
                     .unwrap();
             }
-        });
+        }
 
         // Sanity: without a checkpoint the WAL holds the data.
         let wal = format!("{db_path}-wal");
@@ -230,13 +217,13 @@ mod tests {
              if this fails, turso started auto-checkpointing and the sync design should be revisited"
         );
 
-        checkpoint_truncate(&db_path).unwrap();
+        checkpoint_truncate(&db_path).await.unwrap();
         assert!(wal_is_clean(&db_path), "WAL must be empty after checkpoint");
 
         // The main file alone (simulate the uploaded blob: copy it without the WAL)
         // must contain every row.
         let copy = dir.path().join("uploaded.db").to_string_lossy().to_string();
         std::fs::copy(&db_path, &copy).unwrap();
-        assert_eq!(open_and_count(&copy, "t"), 200);
+        assert_eq!(open_and_count(&copy, "t").await, 200);
     }
 }

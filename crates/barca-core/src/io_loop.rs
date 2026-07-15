@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::coordinator::{Coordinator, FailureAction, GroupId, ItemId, ItemSpec};
 use crate::protocol::{CoordinatorMessage, ParallelResult, WorkerMessage};
@@ -33,7 +34,8 @@ pub struct IoConfig {
 }
 
 /// Callback invoked on each step completion with (node_id, artifact_json).
-pub type StepCallback<'a> = Box<dyn FnMut(&str, &serde_json::Value) + 'a>;
+/// `Send` so the whole run future can be spawned onto a multi-thread runtime.
+pub type StepCallback<'a> = Box<dyn FnMut(&str, &serde_json::Value) + Send + 'a>;
 
 // ─── Worker handle ───────────────────────────────────────────────────────────
 
@@ -130,6 +132,7 @@ pub async fn run(
     coord: &mut Coordinator,
     config: &IoConfig,
     mut on_step: Option<StepCallback<'_>>,
+    cancel: &CancellationToken,
 ) -> Result<(), String> {
     let socket_path = crate::protocol::socket_path(&config.run_id, "main");
     std::fs::remove_file(&socket_path).ok();
@@ -169,14 +172,23 @@ pub async fn run(
     .await;
 
     // Main event loop
+    let mut cancelled = cancel.is_cancelled();
     loop {
-        if coord.is_finished() {
+        if coord.is_finished() || cancelled {
             break;
         }
 
-        let event = match event_rx.recv().await {
-            Some(e) => e,
-            None => break,
+        let event = tokio::select! {
+            _ = cancel.cancelled() => {
+                // Cooperative cancellation: fall through to the cleanup below,
+                // which terminates every worker (frozen ones included).
+                cancelled = true;
+                continue;
+            }
+            ev = event_rx.recv() => match ev {
+                Some(e) => e,
+                None => break,
+            },
         };
 
         match event {
@@ -430,19 +442,26 @@ pub async fn run(
 
     // Cleanup: gracefully terminate workers. Send SIGTERM first to let
     // Python flush buffered stdout, then SIGKILL after a brief wait if
-    // the process hasn't exited yet.
-    for (_, mut w) in workers {
-        graceful_kill(&mut w.child);
-    }
-    for mut fw in frozen {
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(fw.child.id() as i32, libc::SIGCONT);
+    // the process hasn't exited yet. Runs on the blocking pool because
+    // graceful_kill sleeps between SIGTERM and SIGKILL.
+    let kill_task = tokio::task::spawn_blocking(move || {
+        for (_, mut w) in workers {
+            graceful_kill(&mut w.child);
         }
-        graceful_kill(&mut fw.child);
-    }
+        for mut fw in frozen {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(fw.child.id() as i32, libc::SIGCONT);
+            }
+            graceful_kill(&mut fw.child);
+        }
+    });
+    let _ = kill_task.await;
     std::fs::remove_file(&socket_path).ok();
 
+    if cancelled {
+        return Err("run cancelled".to_string());
+    }
     Ok(())
 }
 

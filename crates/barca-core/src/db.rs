@@ -1,4 +1,7 @@
 //! Database operations — schema init, output persistence, connection helpers.
+//!
+//! All functions are `async` and run on whatever runtime the caller provides —
+//! this crate never constructs a runtime of its own.
 
 use crate::BarcaError;
 use crate::dispatch::OutputRef;
@@ -6,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use tokio::sync::{Mutex, MutexGuard};
 use turso::Builder;
 
 /// Process-wide serialization of `metadata.db` operations. The server can run
@@ -16,13 +19,17 @@ use turso::Builder;
 /// this guard for the duration of its (short) database work, so runs never race
 /// on the file without depending on WAL support. A one-shot CLI run leaves it
 /// uncontended.
-static DB_LOCK: Mutex<()> = Mutex::new(());
+///
+/// Known limit: this serializes every DB op process-wide and each helper opens
+/// a fresh connection, which becomes the contention point under many
+/// concurrent daemon runs. The Engine extraction (#80) replaces this with a
+/// single owner holding a persistent connection.
+static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
-/// Acquire the process-wide DB lock (recovering from a poisoned mutex — a prior
-/// panic mid-op leaves the data intact for our purposes). Hold the returned
-/// guard only across a single database operation; never across Python execution.
-pub fn db_guard() -> MutexGuard<'static, ()> {
-    DB_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+/// Acquire the process-wide DB lock. Hold the returned guard only across a
+/// single database operation; never across Python execution.
+pub async fn db_guard() -> MutexGuard<'static, ()> {
+    DB_LOCK.lock().await
 }
 
 /// Record of a single run.
@@ -110,162 +117,139 @@ pub fn ensure_db_dir() -> Result<String, BarcaError> {
     Ok(ensure_env_dirs(crate::config::DEFAULT_ENV)?.db_path)
 }
 
-pub fn init_db_sync(db_path: &str) -> Result<(), BarcaError> {
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+/// Open the database at `db_path` and connect. Callers must hold [`db_guard`]
+/// for the duration of their work on the returned connection.
+async fn open_conn(db_path: &str) -> Result<(turso::Database, turso::Connection), BarcaError> {
+    let db = Builder::new_local(db_path)
         .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS materializations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                node_id TEXT NOT NULL,
-                run_hash TEXT,
-                output_json TEXT,
-                artifact_path TEXT,
-                artifact_format TEXT,
-                artifact_size_bytes INTEGER,
-                elapsed_seconds REAL,
-                status TEXT NOT NULL DEFAULT 'success',
-                error_message TEXT,
-                error_traceback TEXT,
-                attempts INTEGER DEFAULT 1,
-                sinks_json TEXT,
-                created_at TEXT DEFAULT (datetime('now'))
-            )",
-            (),
-        )
         .await
-        .map_err(|e| BarcaError::Db(format!("failed to create materializations table: {e}")))?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_mat_node_run ON materializations(node_id, run_hash)",
-            (),
-        )
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to create index: {e}")))?;
+        .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+    let conn = db
+        .connect()
+        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+    Ok((db, conn))
+}
 
-        // Migrate existing databases: add artifact columns if missing.
-        // These are safe no-ops if the columns already exist.
-        for col in [
-            "ALTER TABLE materializations ADD COLUMN artifact_path TEXT",
-            "ALTER TABLE materializations ADD COLUMN artifact_format TEXT",
-            "ALTER TABLE materializations ADD COLUMN artifact_size_bytes INTEGER",
-            "ALTER TABLE materializations ADD COLUMN elapsed_seconds REAL",
-            "ALTER TABLE materializations ADD COLUMN error_message TEXT",
-            "ALTER TABLE materializations ADD COLUMN error_traceback TEXT",
-            "ALTER TABLE materializations ADD COLUMN attempts INTEGER DEFAULT 1",
-            "ALTER TABLE materializations ADD COLUMN sinks_json TEXT",
-        ] {
-            conn.execute(col, ()).await.ok();
-        }
+pub async fn init_db(db_path: &str) -> Result<(), BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS materializations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            node_id TEXT NOT NULL,
+            run_hash TEXT,
+            output_json TEXT,
+            artifact_path TEXT,
+            artifact_format TEXT,
+            artifact_size_bytes INTEGER,
+            elapsed_seconds REAL,
+            status TEXT NOT NULL DEFAULT 'success',
+            error_message TEXT,
+            error_traceback TEXT,
+            attempts INTEGER DEFAULT 1,
+            sinks_json TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+        )",
+        (),
+    )
+    .await
+    .map_err(|e| BarcaError::Db(format!("failed to create materializations table: {e}")))?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_mat_node_run ON materializations(node_id, run_hash)",
+        (),
+    )
+    .await
+    .map_err(|e| BarcaError::Db(format!("failed to create index: {e}")))?;
 
-        // Run history table.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS runs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT UNIQUE NOT NULL,
-                command TEXT NOT NULL,
-                files TEXT NOT NULL,
-                target TEXT,
-                status TEXT NOT NULL DEFAULT 'running',
-                steps_total INTEGER,
-                steps_executed INTEGER DEFAULT 0,
-                steps_cached INTEGER DEFAULT 0,
-                started_at TEXT DEFAULT (datetime('now')),
-                finished_at TEXT,
-                elapsed_seconds REAL
-            )",
-            (),
-        )
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to create runs table: {e}")))?;
+    // Migrate existing databases: add artifact columns if missing.
+    // These are safe no-ops if the columns already exist.
+    for col in [
+        "ALTER TABLE materializations ADD COLUMN artifact_path TEXT",
+        "ALTER TABLE materializations ADD COLUMN artifact_format TEXT",
+        "ALTER TABLE materializations ADD COLUMN artifact_size_bytes INTEGER",
+        "ALTER TABLE materializations ADD COLUMN elapsed_seconds REAL",
+        "ALTER TABLE materializations ADD COLUMN error_message TEXT",
+        "ALTER TABLE materializations ADD COLUMN error_traceback TEXT",
+        "ALTER TABLE materializations ADD COLUMN attempts INTEGER DEFAULT 1",
+        "ALTER TABLE materializations ADD COLUMN sinks_json TEXT",
+    ] {
+        conn.execute(col, ()).await.ok();
+    }
 
-        // Scheduler durability: the last time each scheduled node was fired, as
-        // unix epoch seconds. Lets `barca serve` catch up a single missed tick
-        // after downtime instead of silently skipping it.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS schedule_state (
-                node_id TEXT PRIMARY KEY,
-                last_fired_at INTEGER NOT NULL
-            )",
-            (),
-        )
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to create schedule_state table: {e}")))?;
-        Ok(())
-    })
+    // Run history table.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT UNIQUE NOT NULL,
+            command TEXT NOT NULL,
+            files TEXT NOT NULL,
+            target TEXT,
+            status TEXT NOT NULL DEFAULT 'running',
+            steps_total INTEGER,
+            steps_executed INTEGER DEFAULT 0,
+            steps_cached INTEGER DEFAULT 0,
+            started_at TEXT DEFAULT (datetime('now')),
+            finished_at TEXT,
+            elapsed_seconds REAL
+        )",
+        (),
+    )
+    .await
+    .map_err(|e| BarcaError::Db(format!("failed to create runs table: {e}")))?;
+
+    // Scheduler durability: the last time each scheduled node was fired, as
+    // unix epoch seconds. Lets `barca serve` catch up a single missed tick
+    // after downtime instead of silently skipping it.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schedule_state (
+            node_id TEXT PRIMARY KEY,
+            last_fired_at INTEGER NOT NULL
+        )",
+        (),
+    )
+    .await
+    .map_err(|e| BarcaError::Db(format!("failed to create schedule_state table: {e}")))?;
+    Ok(())
 }
 
 /// Load the last-fired time (unix epoch seconds) for every scheduled node.
-pub fn get_schedule_state_sync(db_path: &str) -> Result<HashMap<String, i64>, BarcaError> {
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        let mut rows = conn
-            .query("SELECT node_id, last_fired_at FROM schedule_state", ())
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to query schedule_state: {e}")))?;
-        let mut out = HashMap::new();
-        while let Ok(Some(row)) = rows.next().await {
-            let node_id = row.get::<String>(0).unwrap_or_default();
-            let last = row.get::<i64>(1).unwrap_or_default();
-            if !node_id.is_empty() {
-                out.insert(node_id, last);
-            }
+pub async fn get_schedule_state(db_path: &str) -> Result<HashMap<String, i64>, BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut rows = conn
+        .query("SELECT node_id, last_fired_at FROM schedule_state", ())
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to query schedule_state: {e}")))?;
+    let mut out = HashMap::new();
+    while let Ok(Some(row)) = rows.next().await {
+        let node_id = row.get::<String>(0).unwrap_or_default();
+        let last = row.get::<i64>(1).unwrap_or_default();
+        if !node_id.is_empty() {
+            out.insert(node_id, last);
         }
-        Ok(out)
-    })
+    }
+    Ok(out)
 }
 
 /// Record that a scheduled node fired at `epoch_secs` (unix epoch seconds).
-pub fn upsert_schedule_state_sync(
+pub async fn upsert_schedule_state(
     db_path: &str,
     node_id: &str,
     epoch_secs: i64,
 ) -> Result<(), BarcaError> {
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        conn.execute(
-            "INSERT INTO schedule_state (node_id, last_fired_at) VALUES (?1, ?2)
-             ON CONFLICT(node_id) DO UPDATE SET last_fired_at = ?2",
-            [node_id.to_string(), epoch_secs.to_string()],
-        )
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to upsert schedule_state: {e}")))?;
-        Ok(())
-    })
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    conn.execute(
+        "INSERT INTO schedule_state (node_id, last_fired_at) VALUES (?1, ?2)
+         ON CONFLICT(node_id) DO UPDATE SET last_fired_at = ?2",
+        [node_id.to_string(), epoch_secs.to_string()],
+    )
+    .await
+    .map_err(|e| BarcaError::Db(format!("failed to upsert schedule_state: {e}")))?;
+    Ok(())
 }
 
-pub fn persist_outputs_sync(
+pub async fn persist_outputs(
     db_path: &str,
     outputs: &HashMap<String, OutputRef>,
     run_hashes: &HashMap<String, String>,
@@ -273,46 +257,36 @@ pub fn persist_outputs_sync(
     if outputs.is_empty() {
         return Ok(());
     }
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        for (node_id, oref) in outputs {
-            let run_hash = run_hashes.get(node_id).cloned().unwrap_or_default();
-            let elapsed_str = oref
-                .elapsed_seconds
-                .map(|e| e.to_string())
-                .unwrap_or_default();
-            conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''))",
-                [
-                    node_id.clone(),
-                    run_hash,
-                    oref.path.clone(),
-                    oref.format.clone(),
-                    oref.size_bytes.to_string(),
-                    elapsed_str,
-                ],
-            )
-            .await
-            .ok();
-        }
-        Ok(())
-    })
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    for (node_id, oref) in outputs {
+        let run_hash = run_hashes.get(node_id).cloned().unwrap_or_default();
+        let elapsed_str = oref
+            .elapsed_seconds
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        conn.execute(
+            "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''))",
+            [
+                node_id.clone(),
+                run_hash,
+                oref.path.clone(),
+                oref.format.clone(),
+                oref.size_bytes.to_string(),
+                elapsed_str,
+            ],
+        )
+        .await
+        .ok();
+    }
+    Ok(())
 }
 
-/// Alias for backward compat in tests — delegates to persist_outputs_sync.
-pub fn persist_output_refs_sync(db_path: &str, outputs: &HashMap<String, OutputRef>) {
-    persist_outputs_sync(db_path, outputs, &HashMap::new()).ok();
+/// Alias for backward compat in tests — delegates to persist_outputs.
+pub async fn persist_output_refs(db_path: &str, outputs: &HashMap<String, OutputRef>) {
+    persist_outputs(db_path, outputs, &HashMap::new())
+        .await
+        .ok();
 }
 
 /// Generate a short run ID from timestamp + random bits (no uuid crate).
@@ -329,7 +303,7 @@ pub fn generate_run_id() -> String {
 }
 
 /// Create a new run record at the start of execution.
-pub fn create_run_sync(
+pub async fn create_run(
     db_path: &str,
     run_id: &str,
     command: &str,
@@ -337,37 +311,25 @@ pub fn create_run_sync(
     target: Option<&str>,
     steps_total: Option<usize>,
 ) -> Result<(), BarcaError> {
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        conn.execute(
-            "INSERT INTO runs (run_id, command, files, target, status, steps_total) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
-            [
-                run_id.to_string(),
-                command.to_string(),
-                files.to_string(),
-                target.unwrap_or("").to_string(),
-                steps_total.map(|n| n.to_string()).unwrap_or_default(),
-            ],
-        )
-        .await
-        .ok();
-        Ok(())
-    })
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    conn.execute(
+        "INSERT INTO runs (run_id, command, files, target, status, steps_total) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+        [
+            run_id.to_string(),
+            command.to_string(),
+            files.to_string(),
+            target.unwrap_or("").to_string(),
+            steps_total.map(|n| n.to_string()).unwrap_or_default(),
+        ],
+    )
+    .await
+    .ok();
+    Ok(())
 }
 
 /// Finalize a run record with status and stats.
-pub fn finish_run_sync(
+pub async fn finish_run(
     db_path: &str,
     run_id: &str,
     status: &str,
@@ -375,203 +337,169 @@ pub fn finish_run_sync(
     steps_cached: usize,
     elapsed_seconds: f64,
 ) -> Result<(), BarcaError> {
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        conn.execute(
-            "UPDATE runs SET status = ?1, steps_executed = ?2, steps_cached = ?3, elapsed_seconds = ?4, finished_at = datetime('now') WHERE run_id = ?5",
-            [
-                status.to_string(),
-                steps_executed.to_string(),
-                steps_cached.to_string(),
-                elapsed_seconds.to_string(),
-                run_id.to_string(),
-            ],
-        )
-        .await
-        .ok();
-        Ok(())
-    })
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    conn.execute(
+        "UPDATE runs SET status = ?1, steps_executed = ?2, steps_cached = ?3, elapsed_seconds = ?4, finished_at = datetime('now') WHERE run_id = ?5",
+        [
+            status.to_string(),
+            steps_executed.to_string(),
+            steps_cached.to_string(),
+            elapsed_seconds.to_string(),
+            run_id.to_string(),
+        ],
+    )
+    .await
+    .ok();
+    Ok(())
 }
 
 /// Retrieve recent run records, newest first.
-pub fn get_recent_runs_sync(db_path: &str, limit: usize) -> Result<Vec<RunRecord>, BarcaError> {
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        let mut rows = conn
-            .query(
-                "SELECT run_id, command, files, target, status, steps_total, steps_executed, steps_cached, started_at, finished_at, elapsed_seconds FROM runs ORDER BY id DESC LIMIT ?1",
-                [limit.to_string()],
-            )
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to query runs: {e}")))?;
-        let mut records = Vec::new();
-        while let Some(row) = rows
-            .next()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
-        {
-            records.push(RunRecord {
-                run_id: row.get::<String>(0).unwrap_or_default(),
-                command: row.get::<String>(1).unwrap_or_default(),
-                files: row.get::<String>(2).unwrap_or_default(),
-                target: {
-                    let t = row.get::<String>(3).unwrap_or_default();
-                    if t.is_empty() { None } else { Some(t) }
-                },
-                status: row.get::<String>(4).unwrap_or_default(),
-                steps_total: row.get::<i64>(5).ok(),
-                steps_executed: row.get::<i64>(6).unwrap_or(0),
-                steps_cached: row.get::<i64>(7).unwrap_or(0),
-                started_at: row.get::<String>(8).unwrap_or_default(),
-                finished_at: {
-                    let t = row.get::<String>(9).unwrap_or_default();
-                    if t.is_empty() { None } else { Some(t) }
-                },
-                elapsed_seconds: row.get::<f64>(10).ok(),
-            });
-        }
-        Ok(records)
-    })
+pub async fn get_recent_runs(db_path: &str, limit: usize) -> Result<Vec<RunRecord>, BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut rows = conn
+        .query(
+            "SELECT run_id, command, files, target, status, steps_total, steps_executed, steps_cached, started_at, finished_at, elapsed_seconds FROM runs ORDER BY id DESC LIMIT ?1",
+            [limit.to_string()],
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to query runs: {e}")))?;
+    let mut records = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+    {
+        records.push(RunRecord {
+            run_id: row.get::<String>(0).unwrap_or_default(),
+            command: row.get::<String>(1).unwrap_or_default(),
+            files: row.get::<String>(2).unwrap_or_default(),
+            target: {
+                let t = row.get::<String>(3).unwrap_or_default();
+                if t.is_empty() { None } else { Some(t) }
+            },
+            status: row.get::<String>(4).unwrap_or_default(),
+            steps_total: row.get::<i64>(5).ok(),
+            steps_executed: row.get::<i64>(6).unwrap_or(0),
+            steps_cached: row.get::<i64>(7).unwrap_or(0),
+            started_at: row.get::<String>(8).unwrap_or_default(),
+            finished_at: {
+                let t = row.get::<String>(9).unwrap_or_default();
+                if t.is_empty() { None } else { Some(t) }
+            },
+            elapsed_seconds: row.get::<f64>(10).ok(),
+        });
+    }
+    Ok(records)
 }
 
 /// Get aggregated stats for a specific asset/node.
-pub fn get_asset_stats_sync(db_path: &str, node_id: &str) -> Result<AssetStats, BarcaError> {
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+pub async fn get_asset_stats(db_path: &str, node_id: &str) -> Result<AssetStats, BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
 
-        // Fetch all elapsed times for percentile computation.
-        let mut all_elapsed: Vec<f64> = Vec::new();
-        {
-            let mut rows = conn
-                .query(
-                    "SELECT elapsed_seconds FROM materializations WHERE node_id = ?1 AND elapsed_seconds IS NOT NULL AND elapsed_seconds > 0 ORDER BY elapsed_seconds",
-                    [node_id.to_string()],
-                )
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to query elapsed: {e}")))?;
-            while let Some(row) = rows
-                .next()
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
-            {
-                if let Ok(e) = row.get::<f64>(0) {
-                    all_elapsed.push(e);
-                }
-            }
-        }
-
-        let total_runs: i64;
-        {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM materializations WHERE node_id = ?1",
-                    [node_id.to_string()],
-                )
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to query count: {e}")))?;
-            total_runs = rows
-                .next()
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
-                .map(|r| r.get::<i64>(0).unwrap_or(0))
-                .unwrap_or(0);
-        }
-
-        let avg_elapsed = if all_elapsed.is_empty() {
-            None
-        } else {
-            Some(all_elapsed.iter().sum::<f64>() / all_elapsed.len() as f64)
-        };
-        let median_elapsed = percentile(&all_elapsed, 50.0);
-        let max_elapsed = all_elapsed.last().copied();
-        let p95_elapsed = percentile(&all_elapsed, 95.0);
-
-        // Cache hit rate: rows with non-null, non-empty run_hash that appear more than once.
-        let cache_hit_rate = if total_runs > 1 {
-            let mut rows = conn
-                .query(
-                    "SELECT COUNT(*) FROM materializations WHERE node_id = ?1 AND run_hash != '' AND run_hash IN (SELECT run_hash FROM materializations WHERE node_id = ?1 GROUP BY run_hash HAVING COUNT(*) > 1)",
-                    [node_id.to_string()],
-                )
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to query cache hits: {e}")))?;
-            let cached_count: i64 = rows
-                .next()
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
-                .map(|r| r.get::<i64>(0).unwrap_or(0))
-                .unwrap_or(0);
-            cached_count as f64 / total_runs as f64
-        } else {
-            0.0
-        };
-
-        // Recent runs (last 10).
+    // Fetch all elapsed times for percentile computation.
+    let mut all_elapsed: Vec<f64> = Vec::new();
+    {
         let mut rows = conn
             .query(
-                "SELECT elapsed_seconds, status, created_at, error_message, attempts FROM materializations WHERE node_id = ?1 ORDER BY id DESC LIMIT 10",
+                "SELECT elapsed_seconds FROM materializations WHERE node_id = ?1 AND elapsed_seconds IS NOT NULL AND elapsed_seconds > 0 ORDER BY elapsed_seconds",
                 [node_id.to_string()],
             )
             .await
-            .map_err(|e| BarcaError::Db(format!("failed to query recent runs: {e}")))?;
-        let mut recent_runs = Vec::new();
+            .map_err(|e| BarcaError::Db(format!("failed to query elapsed: {e}")))?;
         while let Some(row) = rows
             .next()
             .await
             .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
         {
-            recent_runs.push(AssetRunEntry {
-                elapsed_seconds: row.get::<f64>(0).ok(),
-                status: row.get::<String>(1).unwrap_or_else(|_| "success".to_string()),
-                created_at: row.get::<String>(2).unwrap_or_default(),
-                error_message: row.get::<String>(3).ok(),
-                attempts: row.get::<i64>(4).unwrap_or(1),
-            });
+            if let Ok(e) = row.get::<f64>(0) {
+                all_elapsed.push(e);
+            }
         }
+    }
 
-        Ok(AssetStats {
-            node_id: node_id.to_string(),
-            total_runs,
-            avg_elapsed_seconds: avg_elapsed,
-            median_elapsed_seconds: median_elapsed,
-            max_elapsed_seconds: max_elapsed,
-            p95_elapsed_seconds: p95_elapsed,
-            cache_hit_rate,
-            recent_runs,
-        })
+    let total_runs: i64;
+    {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM materializations WHERE node_id = ?1",
+                [node_id.to_string()],
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query count: {e}")))?;
+        total_runs = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+            .map(|r| r.get::<i64>(0).unwrap_or(0))
+            .unwrap_or(0);
+    }
+
+    let avg_elapsed = if all_elapsed.is_empty() {
+        None
+    } else {
+        Some(all_elapsed.iter().sum::<f64>() / all_elapsed.len() as f64)
+    };
+    let median_elapsed = percentile(&all_elapsed, 50.0);
+    let max_elapsed = all_elapsed.last().copied();
+    let p95_elapsed = percentile(&all_elapsed, 95.0);
+
+    // Cache hit rate: rows with non-null, non-empty run_hash that appear more than once.
+    let cache_hit_rate = if total_runs > 1 {
+        let mut rows = conn
+            .query(
+                "SELECT COUNT(*) FROM materializations WHERE node_id = ?1 AND run_hash != '' AND run_hash IN (SELECT run_hash FROM materializations WHERE node_id = ?1 GROUP BY run_hash HAVING COUNT(*) > 1)",
+                [node_id.to_string()],
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query cache hits: {e}")))?;
+        let cached_count: i64 = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+            .map(|r| r.get::<i64>(0).unwrap_or(0))
+            .unwrap_or(0);
+        cached_count as f64 / total_runs as f64
+    } else {
+        0.0
+    };
+
+    // Recent runs (last 10).
+    let mut rows = conn
+        .query(
+            "SELECT elapsed_seconds, status, created_at, error_message, attempts FROM materializations WHERE node_id = ?1 ORDER BY id DESC LIMIT 10",
+            [node_id.to_string()],
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to query recent runs: {e}")))?;
+    let mut recent_runs = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+    {
+        recent_runs.push(AssetRunEntry {
+            elapsed_seconds: row.get::<f64>(0).ok(),
+            status: row
+                .get::<String>(1)
+                .unwrap_or_else(|_| "success".to_string()),
+            created_at: row.get::<String>(2).unwrap_or_default(),
+            error_message: row.get::<String>(3).ok(),
+            attempts: row.get::<i64>(4).unwrap_or(1),
+        });
+    }
+
+    Ok(AssetStats {
+        node_id: node_id.to_string(),
+        total_runs,
+        avg_elapsed_seconds: avg_elapsed,
+        median_elapsed_seconds: median_elapsed,
+        max_elapsed_seconds: max_elapsed,
+        p95_elapsed_seconds: p95_elapsed,
+        cache_hit_rate,
+        recent_runs,
     })
 }
 
@@ -596,104 +524,80 @@ fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
 
 /// Look up the average elapsed_seconds for a list of node_ids.
 /// Used for progress bar ETA estimation.
-pub fn get_avg_elapsed_sync(
+pub async fn get_avg_elapsed(
     db_path: &str,
     node_ids: &[String],
 ) -> Result<HashMap<String, f64>, BarcaError> {
     if node_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut result = HashMap::new();
+    for nid in node_ids {
+        let mut rows = conn
+            .query(
+                "SELECT AVG(elapsed_seconds) FROM materializations WHERE node_id = ?1 AND elapsed_seconds IS NOT NULL",
+                [nid.clone()],
+            )
             .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        let mut result = HashMap::new();
-        for nid in node_ids {
-            let mut rows = conn
-                .query(
-                    "SELECT AVG(elapsed_seconds) FROM materializations WHERE node_id = ?1 AND elapsed_seconds IS NOT NULL",
-                    [nid.clone()],
-                )
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to query avg elapsed: {e}")))?;
-            if let Some(row) = rows
-                .next()
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
-                && let Ok(avg) = row.get::<f64>(0)
-            {
-                result.insert(nid.clone(), avg);
-            }
+            .map_err(|e| BarcaError::Db(format!("failed to query avg elapsed: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+            && let Ok(avg) = row.get::<f64>(0)
+        {
+            result.insert(nid.clone(), avg);
         }
-        Ok(result)
-    })
+    }
+    Ok(result)
 }
 
 /// Look up the average elapsed_seconds for partitioned nodes using LIKE pattern matching.
 /// For base_node_ids like "file.py:fetch", matches all "file.py:fetch[%]" in the DB.
 /// Used for ETA estimation when steps carry partition_keys (late expansion).
-pub fn get_avg_elapsed_for_partitioned_sync(
+pub async fn get_avg_elapsed_for_partitioned(
     db_path: &str,
     base_node_ids: &[String],
 ) -> Result<HashMap<String, f64>, BarcaError> {
     if base_node_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let _g = db_guard();
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
-    rt.block_on(async {
-        let db = Builder::new_local(db_path)
-            .build()
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut result = HashMap::new();
+    for nid in base_node_ids {
+        let pattern = format!("{nid}[%]");
+        let mut rows = conn
+            .query(
+                "SELECT AVG(elapsed_seconds) FROM materializations WHERE node_id LIKE ?1 AND elapsed_seconds IS NOT NULL",
+                [pattern],
+            )
             .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-        let mut result = HashMap::new();
-        for nid in base_node_ids {
-            let pattern = format!("{nid}[%]");
-            let mut rows = conn
-                .query(
-                    "SELECT AVG(elapsed_seconds) FROM materializations WHERE node_id LIKE ?1 AND elapsed_seconds IS NOT NULL",
-                    [pattern],
-                )
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to query avg elapsed: {e}")))?;
-            if let Some(row) = rows
-                .next()
-                .await
-                .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
-                && let Ok(avg) = row.get::<f64>(0)
-            {
-                result.insert(nid.clone(), avg);
-            }
+            .map_err(|e| BarcaError::Db(format!("failed to query avg elapsed: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+            && let Ok(avg) = row.get::<f64>(0)
+        {
+            result.insert(nid.clone(), avg);
         }
-        Ok(result)
-    })
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn round_trip_persist_and_query() {
+    #[tokio::test]
+    async fn round_trip_persist_and_query() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
 
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
         let mut outputs: HashMap<String, OutputRef> = HashMap::new();
         outputs.insert(
@@ -705,30 +609,25 @@ mod tests {
                 elapsed_seconds: None,
             },
         );
-        persist_outputs_sync(&db_path, &outputs, &HashMap::new()).unwrap();
+        persist_outputs(&db_path, &outputs, &HashMap::new())
+            .await
+            .unwrap();
 
         // Read it back.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let (_db, conn) = open_conn(&db_path).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1",
+                ["test.py:foo".to_string()],
+            )
+            .await
             .unwrap();
-        let result = rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query(
-                    "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1",
-                    ["test.py:foo".to_string()],
-                )
-                .await
-                .unwrap();
-            rows.next().await.unwrap().map(|row| {
-                (
-                    row.get::<String>(0).unwrap(),
-                    row.get::<String>(1).unwrap(),
-                    row.get::<i64>(2).unwrap(),
-                )
-            })
+        let result = rows.next().await.unwrap().map(|row| {
+            (
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<i64>(2).unwrap(),
+            )
         });
 
         let (path, format, size) = result.unwrap();
@@ -737,63 +636,73 @@ mod tests {
         assert_eq!(size, 15);
     }
 
-    #[test]
-    fn schedule_state_round_trips_and_upserts() {
+    #[tokio::test]
+    async fn schedule_state_round_trips_and_upserts() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
         // Empty to start.
-        assert!(get_schedule_state_sync(&db_path).unwrap().is_empty());
+        assert!(get_schedule_state(&db_path).await.unwrap().is_empty());
 
-        upsert_schedule_state_sync(&db_path, "test.py:daily", 1_000).unwrap();
-        upsert_schedule_state_sync(&db_path, "test.py:poll", 2_000).unwrap();
-        let state = get_schedule_state_sync(&db_path).unwrap();
+        upsert_schedule_state(&db_path, "test.py:daily", 1_000)
+            .await
+            .unwrap();
+        upsert_schedule_state(&db_path, "test.py:poll", 2_000)
+            .await
+            .unwrap();
+        let state = get_schedule_state(&db_path).await.unwrap();
         assert_eq!(state.get("test.py:daily"), Some(&1_000));
         assert_eq!(state.get("test.py:poll"), Some(&2_000));
 
         // Upsert overwrites the same node rather than inserting a duplicate.
-        upsert_schedule_state_sync(&db_path, "test.py:daily", 3_000).unwrap();
-        let state = get_schedule_state_sync(&db_path).unwrap();
+        upsert_schedule_state(&db_path, "test.py:daily", 3_000)
+            .await
+            .unwrap();
+        let state = get_schedule_state(&db_path).await.unwrap();
         assert_eq!(state.len(), 2);
         assert_eq!(state.get("test.py:daily"), Some(&3_000));
     }
 
-    #[test]
-    fn concurrent_writes_are_serialized_safely() {
-        // Eight threads write runs at once. The process-wide DB lock must keep
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_writes_are_serialized_safely() {
+        // Eight tasks write runs at once. The process-wide DB lock must keep
         // them from racing on the SQLite file — all rows land, none error.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
         let mut handles = vec![];
         for i in 0..8 {
             let p = db_path.clone();
-            handles.push(std::thread::spawn(move || {
+            handles.push(tokio::spawn(async move {
                 let rid = format!("run{i:02}");
-                create_run_sync(&p, &rid, "get", "f.py", None, Some(1)).unwrap();
-                finish_run_sync(&p, &rid, "success", 1, 0, 0.1).unwrap();
-                upsert_schedule_state_sync(&p, &format!("f.py:node{i}"), i).unwrap();
+                create_run(&p, &rid, "get", "f.py", None, Some(1))
+                    .await
+                    .unwrap();
+                finish_run(&p, &rid, "success", 1, 0, 0.1).await.unwrap();
+                upsert_schedule_state(&p, &format!("f.py:node{i}"), i)
+                    .await
+                    .unwrap();
             }));
         }
         for h in handles {
-            h.join().unwrap();
+            h.await.unwrap();
         }
 
-        assert_eq!(get_recent_runs_sync(&db_path, 100).unwrap().len(), 8);
-        assert_eq!(get_schedule_state_sync(&db_path).unwrap().len(), 8);
+        assert_eq!(get_recent_runs(&db_path, 100).await.unwrap().len(), 8);
+        assert_eq!(get_schedule_state(&db_path).await.unwrap().len(), 8);
     }
 
     // ─── OutputRef artifact persistence tests ────────────────────────────────
 
-    #[test]
-    fn round_trip_persist_output_ref() {
+    #[tokio::test]
+    async fn round_trip_persist_output_ref() {
         use crate::dispatch::OutputRef;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
         let mut outputs: HashMap<String, OutputRef> = HashMap::new();
         outputs.insert(
@@ -806,29 +715,22 @@ mod tests {
             },
         );
 
-        persist_output_refs_sync(&db_path, &outputs);
+        persist_output_refs(&db_path, &outputs).await;
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let (_db, conn) = open_conn(&db_path).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1",
+                ["test.py:foo".to_string()],
+            )
+            .await
             .unwrap();
-        let result = rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query(
-                    "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1",
-                    ["test.py:foo".to_string()],
-                )
-                .await
-                .unwrap();
-            rows.next().await.unwrap().map(|row| {
-                (
-                    row.get::<String>(0).unwrap(),
-                    row.get::<String>(1).unwrap(),
-                    row.get::<i64>(2).unwrap(),
-                )
-            })
+        let result = rows.next().await.unwrap().map(|row| {
+            (
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<i64>(2).unwrap(),
+            )
         });
 
         let (path, format, size) = result.unwrap();
@@ -837,13 +739,13 @@ mod tests {
         assert_eq!(size, 42);
     }
 
-    #[test]
-    fn persist_multiple_output_refs() {
+    #[tokio::test]
+    async fn persist_multiple_output_refs() {
         use crate::dispatch::OutputRef;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
         let mut outputs: HashMap<String, OutputRef> = HashMap::new();
         outputs.insert(
@@ -874,52 +776,38 @@ mod tests {
             },
         );
 
-        persist_output_refs_sync(&db_path, &outputs);
+        persist_output_refs(&db_path, &outputs).await;
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let (_db, conn) = open_conn(&db_path).await.unwrap();
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM materializations", ())
+            .await
             .unwrap();
-        let count = rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query("SELECT COUNT(*) FROM materializations", ())
-                .await
-                .unwrap();
-            rows.next()
-                .await
-                .unwrap()
-                .map(|row| row.get::<i64>(0).unwrap())
-                .unwrap()
-        });
+        let count = rows
+            .next()
+            .await
+            .unwrap()
+            .map(|row| row.get::<i64>(0).unwrap())
+            .unwrap();
 
         assert_eq!(count, 3);
     }
 
-    #[test]
-    fn schema_has_artifact_columns() {
+    #[tokio::test]
+    async fn schema_has_artifact_columns() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
+        let (_db, conn) = open_conn(&db_path).await.unwrap();
+        let mut rows = conn
+            .query("PRAGMA table_info(materializations)", ())
+            .await
             .unwrap();
-        let columns = rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query("PRAGMA table_info(materializations)", ())
-                .await
-                .unwrap();
-            let mut cols = Vec::new();
-            while let Some(row) = rows.next().await.unwrap() {
-                cols.push(row.get::<String>(1).unwrap());
-            }
-            cols
-        });
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            columns.push(row.get::<String>(1).unwrap());
+        }
 
         assert!(columns.contains(&"artifact_path".to_string()));
         assert!(columns.contains(&"artifact_format".to_string()));
@@ -932,52 +820,43 @@ mod tests {
         assert!(columns.contains(&"output_json".to_string()));
     }
 
-    #[test]
-    fn failed_row_round_trips_and_is_excluded_from_cache() {
+    #[tokio::test]
+    async fn failed_row_round_trips_and_is_excluded_from_cache() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (status, msg, attempts, success_hits) = rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            // Insert a failed materialization.
-            conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
-                ["f:boom".to_string(), "rh1".to_string(), "kaboom".to_string(), "Traceback…".to_string(), "3".to_string()],
+        let (_db, conn) = open_conn(&db_path).await.unwrap();
+        // Insert a failed materialization.
+        conn.execute(
+            "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
+            ["f:boom".to_string(), "rh1".to_string(), "kaboom".to_string(), "Traceback…".to_string(), "3".to_string()],
+        )
+        .await
+        .unwrap();
+
+        // Read it back.
+        let mut rows = conn
+            .query(
+                "SELECT status, error_message, attempts FROM materializations WHERE node_id = ?1",
+                ["f:boom".to_string()],
             )
             .await
             .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let status = row.get::<String>(0).unwrap();
+        let msg = row.get::<String>(1).unwrap();
+        let attempts = row.get::<i64>(2).unwrap();
 
-            // Read it back.
-            let mut rows = conn
-                .query(
-                    "SELECT status, error_message, attempts FROM materializations WHERE node_id = ?1",
-                    ["f:boom".to_string()],
-                )
-                .await
-                .unwrap();
-            let row = rows.next().await.unwrap().unwrap();
-            let status = row.get::<String>(0).unwrap();
-            let msg = row.get::<String>(1).unwrap();
-            let attempts = row.get::<i64>(2).unwrap();
-
-            // The cache lookup filters on status='success' — a failed row is never served.
-            let mut hit_rows = conn
-                .query(
-                    "SELECT artifact_path FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
-                    ["f:boom".to_string(), "rh1".to_string()],
-                )
-                .await
-                .unwrap();
-            let success_hits = hit_rows.next().await.unwrap().is_some();
-
-            (status, msg, attempts, success_hits)
-        });
+        // The cache lookup filters on status='success' — a failed row is never served.
+        let mut hit_rows = conn
+            .query(
+                "SELECT artifact_path FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
+                ["f:boom".to_string(), "rh1".to_string()],
+            )
+            .await
+            .unwrap();
+        let success_hits = hit_rows.next().await.unwrap().is_some();
 
         assert_eq!(status, "failed");
         assert_eq!(msg, "kaboom");
@@ -988,22 +867,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cache_lookup_returns_output_ref() {
+    #[tokio::test]
+    async fn cache_lookup_returns_output_ref() {
         use crate::dispatch::OutputRef;
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
-        init_db_sync(&db_path).unwrap();
+        init_db(&db_path).await.unwrap();
 
         // Persist with a run_hash.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
+        {
+            let (_db, conn) = open_conn(&db_path).await.unwrap();
             conn.execute(
                 "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
                 [
@@ -1016,25 +890,22 @@ mod tests {
             )
             .await
             .unwrap();
-        });
+        }
 
         // Look it up by node_id + run_hash — should return OutputRef.
-        let result = rt.block_on(async {
-            let db = Builder::new_local(&db_path).build().await.unwrap();
-            let conn = db.connect().unwrap();
-            let mut rows = conn
-                .query(
-                    "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
-                    ["test.py:foo".to_string(), "abc123".to_string()],
-                )
-                .await
-                .unwrap();
-            rows.next().await.unwrap().map(|row| OutputRef {
-                path: row.get::<String>(0).unwrap(),
-                format: row.get::<String>(1).unwrap(),
-                size_bytes: row.get::<i64>(2).unwrap() as u64,
-                elapsed_seconds: None,
-            })
+        let (_db, conn) = open_conn(&db_path).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 ORDER BY id DESC LIMIT 1",
+                ["test.py:foo".to_string(), "abc123".to_string()],
+            )
+            .await
+            .unwrap();
+        let result = rows.next().await.unwrap().map(|row| OutputRef {
+            path: row.get::<String>(0).unwrap(),
+            format: row.get::<String>(1).unwrap(),
+            size_bytes: row.get::<i64>(2).unwrap() as u64,
+            elapsed_seconds: None,
         });
 
         let output_ref = result.unwrap();
