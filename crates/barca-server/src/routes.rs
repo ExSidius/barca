@@ -14,7 +14,11 @@ pub fn router(state: AppState) -> Router {
         .route("/assets", get(handlers::assets))
         .route("/assets/{name}", get(handlers::asset_detail))
         .route("/run", post(handlers::run))
-        .route("/run/{target}", post(handlers::run_target))
+        // POST starts a task run; DELETE cancels an in-flight run by handle.
+        .route(
+            "/run/{target}",
+            post(handlers::run_target).delete(handlers::cancel_run),
+        )
         .route("/get/{target}", post(handlers::get_target))
         .route("/status/{run_id}", get(handlers::status))
         .route("/schedule", get(handlers::schedule))

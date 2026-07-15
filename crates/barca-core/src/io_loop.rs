@@ -17,6 +17,10 @@
 //! On parallel(), the requesting worker is SIGSTOP'd, a temp replacement is
 //! spawned, and children enter the ready queue. When all children complete,
 //! the temp is killed and the original is SIGCONT'd.
+//!
+//! Everything runs on the caller's runtime — no runtime is constructed here.
+//! Cancellation is cooperative: `run_phase` returns early when the token
+//! fires, and `shutdown` terminates every worker.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -27,6 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 use crate::coordinator::{Coordinator, FailureAction, GroupId, ItemId, ItemSpec};
 use crate::cost::CostModel;
@@ -47,7 +52,8 @@ pub struct IoConfig {
 }
 
 /// Callback invoked on each step completion with (node_id, artifact_json).
-pub type StepCallback<'a> = Box<dyn FnMut(&str, &serde_json::Value) + 'a>;
+/// `Send` so the whole run future can be spawned onto a multi-thread runtime.
+pub type StepCallback<'a> = Box<dyn FnMut(&str, &serde_json::Value) + Send + 'a>;
 
 // ─── Worker handle ───────────────────────────────────────────────────────────
 
@@ -159,6 +165,7 @@ pub struct WorkerPool {
 
 impl WorkerPool {
     /// Bind the coordination socket. Workers spawn on demand during phases.
+    /// Must be called from within a tokio runtime context.
     pub fn start(config: IoConfig) -> Result<Self, String> {
         let socket_path = crate::protocol::socket_path(&config.run_id, "main");
         std::fs::remove_file(&socket_path).ok();
@@ -179,12 +186,20 @@ impl WorkerPool {
 
     /// Drive one phase's coordinator to completion against the (persistent)
     /// pool. `cost` supplies batch sizes and absorbs the timings coming back.
+    ///
+    /// Cancelling `cancel` returns `Err("run cancelled")` promptly; workers
+    /// stay alive until [`WorkerPool::shutdown`], which the caller runs on
+    /// every exit path.
     pub async fn run_phase(
         &mut self,
         coord: &mut Coordinator,
         cost: &mut CostModel,
         mut on_step: Option<StepCallback<'_>>,
+        cancel: &CancellationToken,
     ) -> Result<(), String> {
+        if cancel.is_cancelled() {
+            return Err("run cancelled".to_string());
+        }
         self.assign_ready(coord, cost).await;
 
         loop {
@@ -197,9 +212,16 @@ impl WorkerPool {
                 return Err("no workers available and work remains".to_string());
             }
 
-            let event = match self.event_rx.recv().await {
-                Some(e) => e,
-                None => break,
+            let event = tokio::select! {
+                _ = cancel.cancelled() => {
+                    // Cooperative cancellation: the caller's shutdown()
+                    // terminates every worker (frozen ones included).
+                    return Err("run cancelled".to_string());
+                }
+                ev = self.event_rx.recv() => match ev {
+                    Some(e) => e,
+                    None => break,
+                },
             };
 
             match event {
@@ -425,18 +447,25 @@ impl WorkerPool {
         Ok(())
     }
 
-    /// Gracefully terminate every worker and remove the socket.
-    pub fn shutdown(self) {
-        for (_, mut w) in self.workers {
-            graceful_kill(&mut w.child);
-        }
-        for mut fw in self.frozen {
-            #[cfg(unix)]
-            unsafe {
-                libc::kill(fw.child.id() as i32, libc::SIGCONT);
+    /// Gracefully terminate every worker and remove the socket. Runs the
+    /// SIGTERM-grace kills on the blocking pool because `graceful_kill`
+    /// sleeps between SIGTERM and SIGKILL.
+    pub async fn shutdown(self) {
+        let workers = self.workers;
+        let frozen = self.frozen;
+        let kill_task = tokio::task::spawn_blocking(move || {
+            for (_, mut w) in workers {
+                graceful_kill(&mut w.child);
             }
-            graceful_kill(&mut fw.child);
-        }
+            for mut fw in frozen {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(fw.child.id() as i32, libc::SIGCONT);
+                }
+                graceful_kill(&mut fw.child);
+            }
+        });
+        let _ = kill_task.await;
         std::fs::remove_file(&self.socket_path).ok();
     }
 
@@ -655,23 +684,6 @@ impl WorkerPool {
             }
         }
     }
-}
-
-// ─── Compatibility entry point ───────────────────────────────────────────────
-
-/// Run a single coordinator to completion with a pool that lives only for
-/// this call. Callers wanting the pool to persist across phases should hold a
-/// [`WorkerPool`] and call [`WorkerPool::run_phase`] directly.
-pub async fn run(
-    coord: &mut Coordinator,
-    config: IoConfig,
-    on_step: Option<StepCallback<'_>>,
-) -> Result<(), String> {
-    let mut pool = WorkerPool::start(config)?;
-    let mut cost = CostModel::new();
-    let result = pool.run_phase(coord, &mut cost, on_step).await;
-    pool.shutdown();
-    result
 }
 
 // ─── Message I/O ─────────────────────────────────────────────────────────────

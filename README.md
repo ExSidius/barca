@@ -236,6 +236,7 @@ curl localhost:8274/plan                          # execution plan JSON
 curl -XPOST localhost:8274/run                    # → {"run_id":"…"}; poll /status/<id>
 curl -XPOST localhost:8274/get/summary            # run a single target
 curl localhost:8274/status/<run_id>               # poll run status + result
+curl -XDELETE localhost:8274/run/<run_id>         # cancel an in-flight run
 ```
 
 See [docs/server-api.md](docs/server-api.md) for the full endpoint reference.

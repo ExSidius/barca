@@ -25,12 +25,6 @@ impl From<BarcaError> for ApiError {
     }
 }
 
-impl From<tokio::task::JoinError> for ApiError {
-    fn from(e: tokio::task::JoinError) -> Self {
-        ApiError::Barca(BarcaError::Other(format!("background task failed: {e}")))
-    }
-}
-
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
