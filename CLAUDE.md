@@ -85,10 +85,15 @@ benchmarks/chain_100/bench.sh 5   # (coming soon)
 
 ## Git workflow
 
+Trunk-based: `main` is the integration branch — always green, but not necessarily
+released. Merging to main never publishes anything; only pushing a `v*` tag does.
+
 - **Always use worktrees** for local development work
-- **Release branches**: `v<major>.<minor>.<patch>` off main — no descriptive suffix
-- **Topic branches**: one per issue, branched off main, PRed into the release branch
-- **Release**: the version branch is PRed to main when ready; tagging triggers the release workflow
+- **Topic branches**: one per issue, branched off main, PRed straight into main
+- **Release**: when ready to ship, cut a short-lived release branch
+  `v<major>.<minor>.<patch>` off main (no descriptive suffix) containing only the
+  version bump; PR it into main, then tag the merge commit — the tag triggers the
+  release workflow (wheels, GitHub Release, PyPI)
 
 ## Commit messages
 
