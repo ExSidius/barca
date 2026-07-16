@@ -161,6 +161,8 @@ pub struct WorkerPool {
     workers: HashMap<usize, WorkerHandle>,
     frozen: Vec<FrozenWorker>,
     next_worker_id: usize,
+    trace_start: std::time::Instant,
+    trace_on: bool,
 }
 
 impl WorkerPool {
@@ -181,6 +183,8 @@ impl WorkerPool {
             workers: HashMap::new(),
             frozen: Vec::new(),
             next_worker_id: 0,
+            trace_start: std::time::Instant::now(),
+            trace_on: std::env::var("BARCA_TRACE_TIMING").is_ok(),
         })
     }
 
@@ -230,6 +234,14 @@ impl WorkerPool {
                         ref node_id,
                         ref artifact,
                     } => {
+                        if self.trace_on {
+                            eprintln!(
+                                "[trace]  {:>8.1}ms  StepCompleted <- worker {worker_id}: {node_id} (self-reported elapsed={:.1}ms cpu={:.1}ms)",
+                                self.trace_start.elapsed().as_secs_f64() * 1000.0,
+                                artifact.elapsed_seconds.unwrap_or(0.0) * 1000.0,
+                                artifact.cpu_seconds.unwrap_or(0.0) * 1000.0,
+                            );
+                        }
                         let Some(item_id) = self.take_lease(worker_id, node_id, coord) else {
                             eprintln!(
                                 "[barca] StepCompleted for '{node_id}' from worker {worker_id} \
@@ -496,6 +508,18 @@ impl WorkerPool {
 
     /// Assign ready items to idle workers in cost-sized batches, spawning
     /// workers on demand up to `pool_size`.
+    ///
+    /// Workers are spawned one at a time, not concurrently: `spawn_worker`
+    /// pairs a spawned child process with whichever connection its own
+    /// `listener.accept()` call happens to receive, and workers never send an
+    /// identifying handshake after connecting (see `_runtime.connect()` in
+    /// python/barca/_runtime.py — a bare `sock.connect()`, nothing else). Two
+    /// concurrent `spawn_worker` calls racing on the same listener could each
+    /// accept the *other's* connection, pairing a `WorkerHandle`'s `Child`
+    /// (kill target) with a socket that's actually talking to a different
+    /// process — a real process-lifecycle bug, not just a cosmetic ID swap.
+    /// Fixing this properly needs a handshake protocol change; not worth it
+    /// for the ~200ms/run this would save.
     async fn assign_ready(&mut self, coord: &mut Coordinator, cost: &CostModel) {
         loop {
             if coord.ready_count() == 0 {
@@ -581,6 +605,17 @@ impl WorkerPool {
                     .collect();
                 serde_json::json!({"type": "execute_batch", "steps": steps})
             };
+
+            if self.trace_on {
+                let names: Vec<String> = batch
+                    .iter()
+                    .map(|&iid| coord.item(iid).step_id.display())
+                    .collect();
+                eprintln!(
+                    "[trace]  {:>8.1}ms  dispatch -> worker {wid}: {names:?}",
+                    self.trace_start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
 
             let handle = self
                 .workers
@@ -760,13 +795,28 @@ async fn spawn_worker(
     if let Some(ref opts) = config.storage_options_json {
         cmd.env("BARCA_STORAGE_OPTIONS", opts);
     }
+    let trace_on = std::env::var("BARCA_TRACE_TIMING").is_ok();
+    let t_spawn = std::time::Instant::now();
     let child = cmd.spawn().map_err(|e| format!("spawn: {e}"))?;
+    if trace_on {
+        eprintln!(
+            "[trace]  worker {worker_id} process spawned in {:.1}ms",
+            t_spawn.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
+    let t_accept = std::time::Instant::now();
     let stream = tokio::time::timeout(Duration::from_secs(10), listener.accept())
         .await
         .map_err(|_| format!("timeout waiting for worker {worker_id} to connect"))?
         .map_err(|e| format!("accept: {e}"))?
         .0;
+    if trace_on {
+        eprintln!(
+            "[trace]  worker {worker_id} connected (accept) in {:.1}ms",
+            t_accept.elapsed().as_secs_f64() * 1000.0
+        );
+    }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<serde_json::Value>(16);
     let etx = event_tx.clone();
