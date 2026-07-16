@@ -33,5 +33,5 @@ Create a Cloudflare Pages project pointed at this repository with:
 | Framework preset | Astro |
 
 No environment variables or adapters are needed since the output is static.
-Attach a custom domain (e.g. `barca.dev`) from the Cloudflare Pages project
+Attach a custom domain (e.g. `barca.sh`) from the Cloudflare Pages project
 settings once the first deploy succeeds.
