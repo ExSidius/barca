@@ -82,6 +82,7 @@ worker count is read once, at server startup, from the environment.
 | `spaceflights` | 10 | diamond + sklearn | Parallel sources |
 | `mixed_io_cpu` | 8 | 5 API calls → merge → compute | Parallel API calls |
 | `etl_duckdb` | 12 | raw → staging → marts | Parallel sources |
+| `etl_duckdb_dataframes` | 12 | raw → staging → marts (DataFrame/parquet payloads) | Parallel sources |
 | `large_payloads` | 5 | linear chain, 10k rows/step | None (sequential) |
 
 ### Partitioned workloads

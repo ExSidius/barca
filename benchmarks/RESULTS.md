@@ -41,7 +41,8 @@ not the raw ms/s, and don't compare these numbers to the Apple Silicon rows abov
 | resilience_pileup | 2.56s ± 0.02s ⚠ | 3.61s ± 0.04s | 11.75s ± 0.21s | 1.41x faster | 4.59x faster |
 | chain_100 | 765ms ± 80ms | 3.88s ± 0.09s | 11.09s ± 0.13s | 5.07x faster | 14.50x faster |
 | deep_diamond | 1.49s ± 0.04s | 2.41s ± 0.15s | 11.11s ± 0.17s | 1.62x faster | 7.46x faster |
-| etl_duckdb | 4.44s ± 0.10s | 3.59s ± 0.22s | 47.63s ± 0.83s | **dagster 1.24x faster** | 13.28x faster |
+| etl_duckdb | 4.44s ± 0.10s | 3.59s ± 0.22s | 47.63s ± 0.83s | **dagster 1.24x faster** † | 13.28x faster |
+| etl_duckdb_dataframes ‡ | 1.54s ± 0.03s | 2.36s ± 0.05s | 9.56s ± 0.13s | 1.53x faster | 6.19x faster |
 | fan_out_500 | 2.69s ± 0.06s | 8.59s ± 0.32s | 12.95s ± 0.15s | 3.20x faster | 4.82x faster |
 | fan_out_500_50ms | 9.84s ± 0.55s | 34.89s ± 0.27s | 37.92s ± 0.16s | 3.55x faster | 3.85x faster |
 | incremental_backfill | 16.25s ± 0.17s | 20.47s ± 0.29s | 108.52s ± 1.47s | 1.26x faster | 6.68x faster |
@@ -58,6 +59,15 @@ not the raw ms/s, and don't compare these numbers to the Apple Silicon rows abov
 
 ⚠ = hyperfine flagged statistical outliers for that row's barca (or, for
 partitioned_etl, dagster) measurement — see variance notes below.
+
+† = stale as of the serialization fix described in Notes — `etl_duckdb`'s two
+heaviest assets now use `serializer="pickle"`, closing this to ~1.07-1.14x
+dagster-faster (within noise). The row above is left as originally measured
+since it's what motivated the fix; see Notes for before/after numbers. ‡ =
+`etl_duckdb_dataframes` was added later as a follow-up benchmark (same
+topology, DataFrame/parquet payloads instead of dict-of-rows) and measured in
+isolation via `bench.sh 8 2`, not as part of this table's single full-suite
+pass — see Notes before comparing its absolute times to the other rows here.
 
 ### Variance
 
@@ -88,6 +98,7 @@ so it isn't in the variance figures either):
 | chain_100 | 32.2 MB | 132.9 MB | 408.8 MB |
 | deep_diamond | 62.6 MB | 120.5 MB | 373.7 MB |
 | etl_duckdb | **287.6 MB** | 265.8 MB | 482.4 MB |
+| etl_duckdb_dataframes | 258.2 MB | 174.4 MB | 386.7 MB |
 | fan_out_500 | 66.1 MB | 136.5 MB | 404.1 MB |
 | fan_out_500_50ms | 64.4 MB | 137.4 MB | 460.6 MB |
 | incremental_backfill | 25.1 MB | 113.4 MB | 378.0 MB |
@@ -150,6 +161,63 @@ showing up a second way — see Notes.
   handoff — which is consistent with it turning out to be noise, not a real cost:
   the tax shows up when large payloads *and* parallel branching combine, not from
   payload size alone.
+- **`etl_duckdb`'s loss was investigated further and substantially fixed** (not
+  just diagnosed). Root cause was two-layered: (1) the cross-process
+  serialization cost above was real, but (2) barca's own per-step timing was
+  *undercounting* it — `_materialize()` in `python/barca/_worker.py` measured
+  `elapsed`/`cpu_seconds` before calling `serialize()`, so the actual artifact
+  write (the expensive part for large payloads) was invisible to barca's own
+  cost model, `barca stats`, and `barca history`. Fixed by moving the
+  measurement to wrap `serialize()` too — confirmed via a `BARCA_TRACE_TIMING=1`
+  waterfall trace (new, permanent, zero-cost-when-unset debug env var) that
+  `raw_orders`'s self-reported cost jumped from a wrong 396ms to a correct
+  ~1049ms, and the run's previously-"unaccounted" ~1.6s coordination gap shrank
+  to ~0.37s of legitimate, understood overhead (worker spawn + DB init/persist).
+  This fix benefits any barca project with large-payload assets, not just this
+  benchmark. Two follow-up changes then closed most of the actual gap:
+  - **Pickle quick win** (`benchmarks/etl_duckdb/barca/assets.py`): added
+    `serializer="pickle"` to `raw_orders` and `stg_orders`, the two heaviest
+    payloads (14.9MB/8.1MB as JSON vs 5.3MB/3.4MB as pickle — pickle is both
+    smaller and much faster to (de)serialize for this list-of-small-dicts
+    shape: measured `json.dump` ~635ms vs `pickle.dump` ~64ms for
+    `raw_orders`). This is an existing, already-shipped `@asset()` kwarg, not
+    an engine change. Result, two confirming isolated runs
+    (`bench.sh 8 2`): dagster's lead narrowed from 1.24-1.40x to **1.07x, then
+    1.14x** — within noise of tied. One side effect worth documenting: pickled
+    `raw_orders` drops under the in-process `_ArtifactLRU`'s 8MB cache
+    threshold (`python/barca/_worker.py`), making it newly eligible for
+    caching — but its only consumer runs on a different worker process, so the
+    cache can never hit and the `copy.deepcopy()` mutation-safety guard
+    (measured ~469ms for this payload) is pure waste on every read. Left
+    unfixed (out of scope, core-engine cache logic) but noted for anyone
+    chasing a similar case where deepcopy cost outweighs a cache that can't be
+    hit.
+  - **DataFrame + parquet rewrite** (new sibling benchmark,
+    `benchmarks/etl_duckdb_dataframes/`, same 11-asset topology across all
+    three frameworks so the comparison isn't conflated with a framework
+    difference): rewrote each asset from manual Python loops over dict-of-rows
+    to vectorized pandas (`groupby`/`merge`/`assign`). Barca auto-detects
+    DataFrame return values and routes them to parquet
+    (`detect_format()`/`resolve_format()` in `python/barca/_artifacts.py`) —
+    no code changes needed beyond returning DataFrames; confirmed via
+    `.barca/artifacts/` that every asset except the two dict-of-scalars mart
+    outputs serialized as `.parquet`. This is a categorically faster
+    mechanism than JSON or pickle for tabular data (vectorized, typed-array
+    (de)serialization via pyarrow's C++ reader/writer, not Python-level object
+    traversal), not just a smaller payload. Result: barca flipped from
+    *losing* to dagster to **winning 1.53-1.57x faster**, confirmed across two
+    isolated timing runs (1.55x, 1.53x) plus a `BARCA_BENCH_MEMORY=1` pass
+    (1.57x, peak memory 258.2 MB vs dagster's 174.4 MB — both frameworks'
+    memory dropped from the dict-of-rows version, since DataFrames are more
+    memory-efficient than nested dicts in both). All three frameworks produce
+    identical output values on this workload (exact match, not just within
+    tolerance).
+  - Net: the original `etl_duckdb` loss traced to a fixable barca-side gap
+    (missing format optimization for large/tabular payloads), not an inherent
+    architectural ceiling — the multi-process, cross-process-serialization
+    design this benchmark stresses is real, but the *format* used for that
+    serialization was the actual lever, and the DataFrame/parquet path is the
+    strictly better one when the workload is tabular.
 - Prefect is unaffected by any of the above — it loses every benchmark by a wide
   margin regardless of environment or re-run, consistent with a much higher fixed
   per-run overhead swamping everything else (confirmed by its own peak memory,
