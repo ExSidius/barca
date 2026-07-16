@@ -45,7 +45,7 @@ Your code never knows the orchestrator is there.
 
 **Scales down to a single script.** The minimum viable Barca project is one Python file with one decorated function. There is no setup cost. If you later need partitions, scheduling, sensors, or a server — those capabilities are there, but they're opt-in, not required.
 
-**Hyper-performant.** Performance isn't a feature — it's a prerequisite for invisibility. Planning happens in microseconds. Execution uses free-threaded Python for true parallelism. Caching is content-addressed so identical work is never repeated. The framework should be the fastest part of your pipeline, never the bottleneck.
+**Hyper-performant.** Performance isn't a feature — it's a prerequisite for invisibility. Planning happens in microseconds. Execution runs across a pool of stateless Python worker processes for true parallelism. Caching is content-addressed so identical work is never repeated. The framework should be the fastest part of your pipeline, never the bottleneck.
 
 **Flexible and extensible.** Barca has strong opinions about how little it should impose, not about how you should write your code. Sensors bring external state in. Effects push state out. Partitions fan work out. Schedules drive reconciliation. Each primitive composes with the others, and `@unsafe` exists as an explicit escape hatch when static analysis can't follow your code.
 
@@ -64,7 +64,7 @@ The three node types cover the full surface area of data work:
 
 - **Assets** produce and cache values. They're the core abstraction — pure functions from data to data.
 - **Sensors** observe external state and bring it into the graph. They return `(update_detected, output)` tuples, making them the incremental processing primitive — the sensor scopes work to "what changed," and downstream assets process only that delta.
-- **Effects** push state out of the graph — write to a database, send an email, call an API. They're leaf nodes that never cache and can't be consumed by other nodes.
+- **Effects** push state out of the graph — write to a database, send an email, call an API. They never cache and can't be consumed by assets or sensors, though they can chain to other effects.
 
 Partitions extend the model to parallel and dynamic workloads. `partitions()` declares a static fan-out. `partitions_from()` derives partition values from an upstream asset at plan time, enabling dynamic partition universes that change as data changes. `collect()` fans partitions back in for aggregation.
 

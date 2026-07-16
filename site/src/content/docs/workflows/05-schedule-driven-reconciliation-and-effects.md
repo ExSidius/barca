@@ -205,7 +205,7 @@ def report() -> dict:
     return {"rows": 42}
 ```
 
-When the parent asset materialises, all attached sinks write its output to their declared paths. Sink failures are non-blocking (leaf nodes) but surface prominently as failures in `assets list` and job logs.
+When the parent asset materialises, all attached sinks write its output to their declared paths. Sink failures are non-blocking (leaf nodes) but surface prominently as failures in `barca list` and job logs.
 
 ## Partitioned assets and freshness
 

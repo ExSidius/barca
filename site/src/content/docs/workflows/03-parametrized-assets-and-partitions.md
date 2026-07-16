@@ -218,7 +218,7 @@ Barca adds:
 - the ability to materialize one partition or many
 - automatic parallel execution of independent partitions
 
-Example helper usage:
+Example helper usage (proposed — `materialize()`/`list_partitions()` are not part of the shipped Python API; see [Tasks and Workflow Management](/workflows/10-tasks-and-workflow-management/) for the real `barca get`/`barca run` interface):
 
 ```python
 from my_project.assets import fetch_prices
@@ -235,6 +235,8 @@ The default `materialize(fetch_prices)` behavior for a partitioned asset should 
 
 - resolve the current partition universe from its partition source
 - materialize all resolved partitions
+
+Today, `barca get fetch_prices pipeline.py` (or `barca.api.get("fetch_prices", "pipeline.py")`) does the "materialize all resolved partitions" half of this — there is no CLI or API flag yet to target a single partition the way `partition={"ticker": "AAPL"}` implies.
 
 ## Parallelization model
 
@@ -441,8 +443,7 @@ This is consistent with the broader Barca rule that historical definitions and m
 For `partitions_from(...)`, the partition set is resolved lazily at refresh/run time, not at index time. The partition-defining asset must be materialised before the partitioned asset can determine its partitions. Until then:
 
 - `barca plan` shows "partitions: pending" for the partitioned asset
-- the partitioned asset cannot be materialised
-- same staleness rules apply: if the partition-defining asset is stale and `--stale-policy error` (the default), the partitioned asset cannot be refreshed
+- the partitioned asset cannot be materialised until the partition-defining asset has a successful materialization
 
 ## collect(asset)
 
@@ -470,7 +471,7 @@ If any partition has failed, `collect` blocks entirely — the downstream asset 
 
 ## Recommended helper APIs
 
-This workflow implies a few useful helpers:
+This workflow implies a few useful helpers — proposed, not shipped. None of `list_partitions()`, `materialize()`, or `read_asset()` exist in `barca`'s Python package today; the shipped equivalent is the CLI/`barca.api` surface (`get`, `run`, `plan`, `history`, `stats`) described in [Tasks and Workflow Management](/workflows/10-tasks-and-workflow-management/):
 
 ```python
 list_partitions(fetch_prices)
@@ -536,6 +537,8 @@ That magic is appealing, but it is risky for the first implementation because:
 The MVP should prefer explicit partition declaration and explicit validation.
 
 ## `load_inputs()` behavior for partitioned assets
+
+Proposed — `load_inputs()`/`load_call()` are not part of the shipped Python API (see the note under [Recommended helper APIs](#recommended-helper-apis) above).
 
 For a partitioned downstream asset:
 
@@ -646,8 +649,8 @@ This is the narrowest design that still gives users a genuinely useful paralleli
 - A user can declare a partitioned asset with `partitions(iterable)`.
 - A user can declare a partitioned asset with `partitions_from(...)`.
 - Barca indexes one logical asset definition and the appropriate partition source metadata.
-- `materialize(fetch_prices, partition={"ticker": "AAPL"})` runs only one partition.
-- `materialize(fetch_prices)` runs all partitions.
+- Targeting a single partition (`materialize(fetch_prices, partition={"ticker": "AAPL"})` or equivalent) runs only one partition. Not yet available — `barca get fetch_prices pipeline.py` runs all partitions today.
+- `barca get fetch_prices pipeline.py` (or `materialize(fetch_prices)`) runs all partitions.
 - Independent partitions can execute concurrently with Barca-managed concurrency.
 - Successful materializations are cached per partition.
 - Changing code invalidates all partitions for that asset definition.

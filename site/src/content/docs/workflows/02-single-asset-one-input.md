@@ -143,7 +143,16 @@ Those all make notebook and direct-function use worse.
 
 ## User-facing execution helpers
 
-This workflow requires a minimal helper API:
+This workflow requires a minimal helper API — proposed here, but not what shipped. `load_inputs()`, `materialize()`, and `read_asset()` do not exist in `barca`'s Python package. The shipped shape is CLI/subprocess-based: `barca.api.get()` shells out to the `barca` binary and returns `b`'s deserialized value directly, resolving and materializing `a` first if needed — there is no separate step that exposes the resolved `{"fruit": "banana"}` kwargs so you can call `b(...)` yourself:
+
+```python
+from barca import get
+
+result = get("b", "my_project/assets.py")
+# "BANANA"
+```
+
+This mirrors `barca get b my_project/assets.py` on the CLI. The proposed (unshipped) design below described a lower-level API for notebook use:
 
 ```python
 from barca import load_inputs, materialize, read_asset
@@ -164,13 +173,13 @@ The default `load_inputs()` behavior should be:
 - resolve the latest successful upstream materialization
 - raise clear errors if an input cannot be resolved
 
-This is a strong fit for regular Python because users can always do:
+This is a strong fit for regular Python because users could always do:
 
 ```python
 b(**load_inputs(b))
 ```
 
-That is exactly the kind of notebook-friendly workflow Barca should optimize for.
+That is exactly the kind of notebook-friendly workflow Barca should optimize for, but today `get("b", "my_project/assets.py")` is the only shipped path to `b`'s materialized value.
 
 ## Asset identity and dependency identity
 
@@ -318,6 +327,8 @@ The crucial point is that "usable materialization" means "a successful materiali
 
 ## `load_inputs()` behavior
 
+Proposed — not shipped; see the note under [User-facing execution helpers](#user-facing-execution-helpers) above.
+
 For this workflow, `load_inputs(b)` should:
 
 1. Resolve `b`'s decorator metadata.
@@ -442,7 +453,7 @@ with the function-object form shown as the preferred happy path.
 
 ### Automatic upstream materialization can surprise users
 
-If `materialize(b)` silently materializes `a`, that is convenient but also implicit.
+If `get("b", ...)` silently materializes `a`, that is convenient but also implicit.
 
 That is still the right default, but the CLI and UI should show the full planned execution graph before running.
 
@@ -493,10 +504,10 @@ That is the minimum API that is both usable and honest.
 
 - A user can define `a` and `b` exactly as shown.
 - Barca indexes both assets and stores the dependency mapping.
-- `load_inputs(b)` returns `{"fruit": "banana"}`.
-- `b(**load_inputs(b))` works in normal Python.
-- `materialize(b)` computes `a` first if needed.
-- Re-running `materialize(b)` reuses cached materializations when neither `b` nor `a` changed.
+- `load_inputs(b)` returns `{"fruit": "banana"}`. Not shipped — `get("b", "my_project/assets.py")` returns `"BANANA"` directly today; there's no shipped helper that stops short of running `b` and hands back just its resolved kwargs.
+- `b(**load_inputs(b))` works in normal Python. Not shipped, same caveat.
+- `get("b", ...)` (or `barca get b ...`) computes `a` first if needed.
+- Re-running `get("b", ...)` reuses cached materializations when neither `b` nor `a` changed.
 - Changing `a` invalidates `b` through `run_hash`, even if `b`'s own definition did not change.
 - Changing `b` invalidates only `b`, not `a`.
 - Changing `a`, then changing it back to a previously seen definition, allows Barca to reuse the old matching `b` materialization without recomputation.

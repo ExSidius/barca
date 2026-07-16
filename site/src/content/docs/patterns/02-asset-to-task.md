@@ -55,7 +55,8 @@ Tasks always re-run, so any asset downstream of a task would have its cache perp
 
 ```bash
 # Wrong -- tasks are not cacheable artifacts
-barca get pipeline.py  # will materialize assets but skip tasks
+barca get deploy pipeline.py
+# Error: 'deploy' is a task -- use `barca run` instead
 ```
 
-`barca get` materializes assets. Tasks require `barca run` because they represent work that must execute every time. If you use `barca get` alone, the task will not fire.
+`barca get` targets assets; naming a task explicitly is rejected with a clear error pointing you to `barca run`. Note that running `barca get pipeline.py` on a whole file (no target) still executes every node in the file, tasks included -- it does not silently skip them. Scope to `barca get <asset> pipeline.py` if you want to materialize just the asset without side effects firing.

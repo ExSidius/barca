@@ -153,7 +153,7 @@ See [Error Handling](/patterns/06-error-handling/) for details on failure propag
 ## What tasks cannot do
 
 - **Cannot be inputs to assets.** An asset depending on a task would be perpetually stale. DAG validation rejects this.
-- **Cannot be inputs to sensors.** Same reason -- sensors are cached and tasks always re-run.
+- **Cannot be inputs to sensors.** Sensors cannot have inputs at all, from any node kind -- they're source nodes only.
 - **Cannot use `barca get`.** Running `barca get` on a task name gives an error directing you to use `barca run`.
 
 ## Worked examples
