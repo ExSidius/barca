@@ -55,3 +55,107 @@ bench_env_banner() {
     echo "  total ram    : ${total_ram:-unknown}"
     echo "  worker count : $BARCA_BENCH_WORKERS (barca pool_size / dagster max_concurrent / prefect max_workers)"
 }
+
+# ─── Memory (opt-in) ─────────────────────────────────────────────────────────
+#
+# hyperfine only measures wall time, so peak memory is a separate, optional
+# pass: set BARCA_BENCH_MEMORY=1 and call bench_mem_report after the hyperfine
+# block in a bench.sh. It's opt-in because it re-runs each framework once more
+# (untimed) and adds noticeable wall-clock, especially for slow-starting
+# frameworks.
+#
+# barca is multi-process by design (Rust coordinator + N Python workers), so
+# a naive wrapper that only samples the directly-execed process — e.g.
+# `/usr/bin/time -v` — would report only the coordinator's own footprint and
+# make barca look artificially light next to Dagster/Prefect's single
+# process. bench_mem_peak instead runs the command inside a fresh, empty
+# cgroup and reads back that cgroup's peak-memory counter, which sums every
+# process that ever lived in it — parent or descendant, however many times
+# the tree forks. Falls back to `/usr/bin/time -v` (single-process only,
+# clearly labeled) if no cgroup memory controller is writable, and reports
+# "unavailable" rather than a misleading number if neither works.
+
+_bench_mem_cgroup_base() {
+    # v2 unified hierarchy: only usable if "memory" is actually among the
+    # enabled controllers (a hybrid v1+v2 mount can expose an empty/unrelated
+    # v2 hierarchy — e.g. cpuset/hugetlb only — alongside v1 memory).
+    if [[ -f /sys/fs/cgroup/cgroup.controllers ]] \
+        && grep -qw memory /sys/fs/cgroup/cgroup.controllers \
+        && [[ -w /sys/fs/cgroup/cgroup.subtree_control ]]; then
+        echo "v2:/sys/fs/cgroup"
+        return
+    fi
+    if [[ -f /sys/fs/cgroup/unified/cgroup.controllers ]] \
+        && grep -qw memory /sys/fs/cgroup/unified/cgroup.controllers \
+        && [[ -w /sys/fs/cgroup/unified/cgroup.subtree_control ]]; then
+        echo "v2:/sys/fs/cgroup/unified"
+        return
+    fi
+    if [[ -d /sys/fs/cgroup/memory ]]; then
+        local own
+        own="$(awk -F: '$2=="memory"{print $3}' /proc/self/cgroup 2>/dev/null)"
+        if [[ -n "$own" && -w "/sys/fs/cgroup/memory$own" ]]; then
+            echo "v1:/sys/fs/cgroup/memory$own"
+            return
+        fi
+    fi
+    echo ""
+}
+
+bench_mem_peak() {
+    local label="$1"
+    local cmd="$2"
+    local base kind path cg peak_bytes
+
+    base="$(_bench_mem_cgroup_base)"
+    if [[ -z "$base" ]]; then
+        if command -v /usr/bin/time >/dev/null 2>&1; then
+            local kb
+            kb="$(/usr/bin/time -v bash -c "$cmd" 2>&1 >/dev/null | grep -oE 'Maximum resident set size \(kbytes\): [0-9]+' | grep -oE '[0-9]+$')"
+            if [[ -n "$kb" ]]; then
+                awk -v l="$label:" -v kb="$kb" 'BEGIN{printf "  %-24s %8.1f MB peak (top process only — no cgroup access, undercounts multi-process frameworks)\n", l, kb/1024}'
+            else
+                echo "  $label: memory measurement unavailable"
+            fi
+        else
+            echo "  $label: memory measurement unavailable (no cgroup access, no /usr/bin/time)"
+        fi
+        return
+    fi
+
+    kind="${base%%:*}"
+    path="${base#*:}"
+    cg="$path/barca-bench-mem-$$-$RANDOM"
+    if ! mkdir "$cg" 2>/dev/null; then
+        echo "  $label: memory measurement unavailable (couldn't create cgroup)"
+        return
+    fi
+    [[ "$kind" == v1 ]] && echo 0 > "$cg/memory.max_usage_in_bytes" 2>/dev/null
+
+    ( echo $BASHPID > "$cg/cgroup.procs" 2>/dev/null; exec bash -c "$cmd" >/dev/null 2>&1 )
+
+    if [[ "$kind" == v1 ]]; then
+        peak_bytes="$(cat "$cg/memory.max_usage_in_bytes" 2>/dev/null || echo 0)"
+    else
+        peak_bytes="$(cat "$cg/memory.peak" 2>/dev/null || echo 0)"
+    fi
+    rmdir "$cg" 2>/dev/null
+
+    awk -v l="$label:" -v b="$peak_bytes" 'BEGIN{printf "  %-24s %8.1f MB peak (whole process tree, cgroup)\n", l, b/1048576}'
+}
+
+# Convenience wrapper: reports peak memory for barca/dagster/prefect's
+# run.sh in the calling bench.sh's SCRIPT_DIR, each pinned the same way the
+# timed runs are. Call after the hyperfine block, guarded by
+# BARCA_BENCH_MEMORY=1. Extra args (e.g. an N for parallel_tasks) are passed
+# through to every run.sh so the memory pass exercises the same workload
+# size as the timed runs.
+bench_mem_report() {
+    local script_dir="$1"; shift
+    local extra_args="$*"
+    echo ""
+    echo "Peak memory (opt-in, BARCA_BENCH_MEMORY=1):"
+    bench_mem_peak "barca (Rust+Python)" "$(bench_pin "$script_dir/barca/run.sh $extra_args")"
+    bench_mem_peak "dagster" "$(bench_pin "$script_dir/dagster/run.sh $extra_args")"
+    bench_mem_peak "prefect" "$(bench_pin "$script_dir/prefect/run.sh $extra_args")"
+}

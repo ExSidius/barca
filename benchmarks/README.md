@@ -22,6 +22,15 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 - **RAM**: total system RAM and CPU model are captured and printed in every `bench.sh`
   run's banner for transparency; no benchmark here is memory-bound enough to warrant
   an artificial memory ceiling
+- **Peak memory (opt-in)**: `BARCA_BENCH_MEMORY=1 benchmarks/<name>/bench.sh` adds an
+  extra untimed pass per framework that reports peak memory for the *whole process
+  tree* (parent + every child it spawns), via a fresh cgroup per run — falls back to
+  `/usr/bin/time -v` (single-process only, clearly labeled) if no cgroup memory
+  controller is writable. This matters because barca is multi-process (Rust
+  coordinator + N Python workers): a naive single-process wrapper would only see the
+  coordinator and make barca look artificially light next to Dagster/Prefect's single
+  process. Off by default since it re-runs each framework once more and adds
+  wall-clock, especially for slow-starting frameworks.
 
 ### What differs
 - **Python version**: Barca uses Python 3.14 (from workspace .venv). Dagster and Prefect use Python 3.12 (latest compatible with both)

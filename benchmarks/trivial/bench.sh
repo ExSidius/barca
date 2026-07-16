@@ -20,3 +20,6 @@ hyperfine \
     --command-name "barca (Rust+Python)" "$(bench_pin "$SCRIPT_DIR/barca/run.sh")" \
     --command-name "dagster" "$(bench_pin "$SCRIPT_DIR/dagster/run.sh")" \
     --command-name "prefect" "$(bench_pin "$SCRIPT_DIR/prefect/run.sh")"
+
+# Peak memory (opt-in — set BARCA_BENCH_MEMORY=1; adds an extra untimed run per framework)
+[[ "${BARCA_BENCH_MEMORY:-0}" == "1" ]] && bench_mem_report "$SCRIPT_DIR"
