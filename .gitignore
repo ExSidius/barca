@@ -13,9 +13,11 @@ build/
 **/*.rs.bk
 *.pdb
 
-# Environments
+# Environments (`.venv` without the slash also catches venv symlinks,
+# e.g. benchmark dirs pointing at a shared framework venv)
 .env
 .envrc
+.venv
 .venv/
 
 # Barca runtime state
