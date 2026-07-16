@@ -56,6 +56,7 @@ jobs:
           mkdir -p .venv/bin
           ln -sf "$(command -v barca)" .venv/bin/barca
           pip install scikit-learn  # only benchmarks/spaceflights needs this
+          pip install pandas pyarrow  # only benchmarks/etl_duckdb_dataframes needs this
           bash tests/integration/test_benchmark_examples.sh
 
   backends:
