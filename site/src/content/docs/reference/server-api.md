@@ -55,7 +55,8 @@ server-side polling handle:
 { "run_id": "1b942bb33182" }
 ```
 
-Poll `GET /status/{run_id}` until `status` is `complete` or `failed`:
+Poll `GET /status/{run_id}` until `status` reaches a terminal state (`complete`, `failed`, or
+`cancelled`):
 
 ```json
 {
@@ -79,7 +80,10 @@ the server's polling id; `result.run_id` is the persisted database run id (the r
 written to `.barca/metadata.db`, same as a CLI run).
 
 In-flight run state is held in memory and is not persisted across a server restart. The run
-history in the database persists regardless.
+history in the database persists regardless. A background sweep evicts finished runs
+(`complete`/`failed`/`cancelled`) from memory once they are more than an hour old (checked every 5
+minutes), so `GET /status/{run_id}` for an old run eventually returns `404` even though its row
+remains in `barca history`.
 
 ### Cancelling a run
 
@@ -207,7 +211,9 @@ which shells out to the binary for one-shot commands rather than talking to a se
 ## Errors
 
 Errors return a JSON body `{ "error": "..." }` with an appropriate status code: `404` for an
-unknown asset or run, `400` for parse/DAG errors, `500` for execution or database failures.
+unknown asset or run, `400` for parse/DAG errors, `409` for conflicts (an ambiguous `{name}` match
+in `GET /assets/{name}`, or cancelling a run that already finished), and `500` for execution or
+database failures.
 
 ## Not in v1
 

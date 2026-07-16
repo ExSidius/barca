@@ -168,6 +168,8 @@ of your world. It wants you in its project structure, its web UI, its process mo
 logging format.
 
 Barca's thesis is the opposite — the orchestrator is invisible. As features are added
-(scheduling, server, integrations), each one will push toward making the framework more
-visible. The discipline is to keep asking: "can this feature work without the user knowing
-barca is there?"
+(alerting, remote execution, integrations), each one will push toward making the framework
+more visible — scheduling and a server already shipped (`barca serve`) without becoming the
+center of the workflow: it's opt-in, binds to localhost, and the default `barca get` path
+never touches it. The discipline is to keep asking: "can this feature work without the user
+knowing barca is there?"
