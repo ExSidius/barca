@@ -247,6 +247,14 @@ Both tasks run in the same phase (they're independent of each other) after `dail
 
 Partitions fan a single asset definition into N independent runs, one per partition key.
 
+:::caution[Known issue]
+As of this writing, a `collect()`-consuming asset downstream of partitioned producers can be
+scheduled into the same phase as the still-running producers instead of waiting for them,
+causing a `TypeError` at runtime. Tracked in
+[ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97). The syntax below is the
+intended API; it does not yet execute correctly end-to-end.
+:::
+
 ```python
 from barca import asset, partitions, collect
 
@@ -339,6 +347,12 @@ The plan shows:
 ## Putting it together
 
 Here's a complete pipeline that uses everything:
+
+:::caution[Known issue]
+This pipeline hits the same partition fan-in issue as above — see
+[ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97). `merge` is not yet guaranteed
+to wait for all `transform` partitions to finish.
+:::
 
 ```python
 # pipeline.py

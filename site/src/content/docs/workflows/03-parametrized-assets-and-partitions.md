@@ -449,6 +449,13 @@ For `partitions_from(...)`, the partition set is resolved lazily at refresh/run 
 
 `collect(asset)` aggregates all partitions of a partitioned asset into a single dict, allowing a non-partitioned downstream asset to consume all partition outputs at once.
 
+:::caution[Known issue]
+On the current implementation, the planner can schedule a `collect()`-consuming asset into the
+same phase as the still-running partition producers instead of a phase gated on their
+completion, so the consumer runs before its inputs exist and fails with a `TypeError`. Tracked
+in [ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97) — not yet fixed.
+:::
+
 ```python
 from barca import asset, partitions_from, collect
 
