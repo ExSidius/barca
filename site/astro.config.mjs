@@ -116,6 +116,24 @@ export default defineConfig({
             { label: 'Changelog', slug: 'contributing/changelog' },
           ],
         },
+        {
+          label: 'RFCs',
+          items: [
+            { label: 'Process & Template', slug: 'rfcs/template' },
+            { label: 'RFC-0001: Node Kinds & Freshness', slug: 'rfcs/0001-node-kinds-and-freshness' },
+            { label: 'RFC-0002: CLI Surface', slug: 'rfcs/0002-cli-surface' },
+            { label: 'RFC-0003: Decorators & Python API', slug: 'rfcs/0003-decorator-and-python-api' },
+            { label: 'RFC-0004: HTTP Server API', slug: 'rfcs/0004-http-server-api' },
+            {
+              label: 'RFC-0005: Artifacts & Storage',
+              slug: 'rfcs/0005-artifact-serialization-and-storage',
+            },
+            {
+              label: 'RFC-0006: Config & Remote State',
+              slug: 'rfcs/0006-configuration-and-remote-state',
+            },
+          ],
+        },
       ],
     }),
   ],
