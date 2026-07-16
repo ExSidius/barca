@@ -95,5 +95,6 @@ uv run barca plan pipeline.py
 ## Next steps
 
 - [Guide](/guide/) -- full tutorial covering tasks, sensors, partitions, parallel dispatch, freshness markers, and multi-file pipelines
+- [Scheduling](/scheduling/) -- run a script on a cron schedule (e.g. every 10 minutes) with `barca serve`
 - [Patterns: Asset to Task](/patterns/02-asset-to-task/) -- common patterns and anti-patterns
 - [CLI Reference](/reference/cli/) -- all CLI commands

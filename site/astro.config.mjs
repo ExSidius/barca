@@ -34,6 +34,7 @@ export default defineConfig({
           items: [
             { label: 'Getting Started', slug: 'getting-started' },
             { label: 'Guide', slug: 'guide' },
+            { label: 'Scheduling', slug: 'scheduling' },
           ],
         },
         {
