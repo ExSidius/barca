@@ -260,8 +260,8 @@ impl Coordinator {
     }
 
     /// How many items still have work ahead of them (ready now or blocked on
-    /// upstreams). Feeds the batch-size ceiling: enough batches must remain
-    /// that every worker stays fed.
+    /// upstreams). Note: batch sizing uses `ready_count` (the pull-eligible
+    /// pool), not this — blocked items mustn't inflate a batch.
     pub fn remaining_count(&self) -> usize {
         self.ready.len() + self.pending.len() + self.waiting_retry.len()
     }

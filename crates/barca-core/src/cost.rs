@@ -186,6 +186,10 @@ impl CostModel {
     /// K       = clamp(floor, ceiling)
     /// ```
     ///
+    /// `remaining_tasks` is the *pull-eligible* pool (ready items) — work
+    /// blocked on upstreams can't be pulled this wave and must not let one
+    /// worker drain the whole ready queue.
+    ///
     /// When the goals conflict (`floor > ceiling`), total workload breaks the
     /// tie: a trivial workload collapses toward sequential (comm-amortized);
     /// a large one favors the ceiling (balance beats shaving comm).

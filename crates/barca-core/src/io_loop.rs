@@ -538,16 +538,35 @@ impl WorkerPool {
             };
 
             // Lease a batch: K sized from the head item's measured cost.
+            // The ceiling input is the pull-eligible pool (ready items), not
+            // pending work blocked on upstreams — items that can't be pulled
+            // this wave mustn't let one worker drain the whole ready queue.
             let first = coord.next_ready().expect("ready_count checked above");
             let head_node = coord.item(first).step_id.display();
-            let remaining = coord.remaining_count() + 1;
+            let remaining = coord.ready_count() + 1;
             let k = cost
                 .batch_size(&head_node, remaining, self.config.pool_size.max(1))
                 .max(1);
+            // Fill the batch up to K, but never pack estimated-heavy items
+            // behind a light head: the batch has a work budget of K × the
+            // head's cost (what K was computed for), and an item that would
+            // blow it goes back for its own pull. Guards the over-batch
+            // tail-block when a phase mixes light and heavy nodes.
+            let head_est = cost.estimate(&head_node);
+            let budget = head_est * k as f64 * 1.5;
+            let mut acc = head_est;
             let mut batch = vec![first];
             while batch.len() < k {
                 match coord.next_ready() {
-                    Some(id) => batch.push(id),
+                    Some(id) => {
+                        let est = cost.estimate(&coord.item(id).step_id.display());
+                        if acc + est > budget {
+                            coord.return_leased(id);
+                            break;
+                        }
+                        acc += est;
+                        batch.push(id);
+                    }
                     None => break,
                 }
             }
@@ -593,7 +612,11 @@ impl WorkerPool {
             if coord.is_group_complete(self.frozen[i].group_id) {
                 let fw = self.frozen.swap_remove(i);
 
-                // Kill the replacement worker (returning any leases it holds).
+                // Kill the replacement worker. Its in-flight item (if any) is
+                // deliberately returned rather than failed: the kill is ours,
+                // not the task's — re-running is safe under the pure-asset
+                // contract (at-least-once), and no retry budget is charged
+                // for an interruption the task didn't cause.
                 if let Some(mut replacement) = self.workers.remove(&fw.replacement_id) {
                     if let Some(in_flight) = replacement.leases.pop_front() {
                         coord.return_leased(in_flight);

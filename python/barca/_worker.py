@@ -60,10 +60,11 @@ _LRU_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 
 
 def _lru_cacheable(path: str, size_bytes=None) -> bool:
-    if size_bytes is not None:
-        return size_bytes <= _LRU_MAX_ARTIFACT_BYTES
+    # Remote first: skipping a network fetch beats any copy, whatever the size.
     if _storage.is_remote(path):
         return True
+    if size_bytes is not None:
+        return size_bytes <= _LRU_MAX_ARTIFACT_BYTES
     try:
         return os.path.getsize(path) <= _LRU_MAX_ARTIFACT_BYTES
     except OSError:
