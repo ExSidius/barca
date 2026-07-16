@@ -109,7 +109,7 @@ def deploy_all(model):
 
 Key behaviors:
 
-- In v0.2.0, parallel branches use default retry settings (1 attempt, no retry). Per-branch retry configuration via the sub-task's `retries=` policy is planned for a future release.
+- Currently, parallel branches use default retry settings (1 attempt, no retry) regardless of the sub-task's own `retries=`/`retry_backoff=` decorator kwargs. Per-branch retry configuration is planned for a future release.
 - `ParallelError.error` contains the stringified exception from the failed branch.
 - The parent task continues executing after `parallel()` returns, regardless of branch failures.
 
@@ -157,7 +157,7 @@ def my_task():
     return parallel(partial(fetch_a), partial(fetch_b))
 ```
 
-Assets define the static DAG and cannot spawn dynamic sub-work. Use `@task` for imperative orchestration patterns.
+Barca only scans `@task` bodies for `parallel()` calls when building the static DAG -- `@asset` bodies are not scanned. Branches launched from inside an asset aren't tracked in the plan and aren't governed by the DAG's caching guarantees. Use `@task` for imperative orchestration patterns.
 
 ### 4. Calling parallel() with raw function calls (eager evaluation trap)
 

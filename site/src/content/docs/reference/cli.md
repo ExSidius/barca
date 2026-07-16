@@ -1,6 +1,6 @@
 ---
 title: CLI Reference
-description: All barca CLI commands — get, run, plan, history, stats, serve, version.
+description: All barca CLI commands — get, run, plan, history, stats, serve, list, version.
 ---
 
 The `barca` binary is the entry point. Once installed (e.g. `uv add barca`), the `barca` command
@@ -14,7 +14,9 @@ barca run <task> <file.py> [--burst a,b]     Run a task (always re-runs)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
 barca history [-l N]                          Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
-barca serve [file.py ...] [--port N] [--watch] Run the HTTP API server
+barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
+                                               Run the HTTP API server
+barca list <file.py> [file.py ...]            List discovered definitions and their deps
 barca version                                 Print version
 barca --help                                  Show help
 ```
@@ -89,10 +91,26 @@ reference.
 barca serve pipeline.py                 # default port 8274
 barca serve pipeline.py --port 8400     # custom port
 barca serve pipeline.py --watch         # dev mode: re-parse the DAG on file change
+barca serve pipeline.py --no-schedule   # disable the cron scheduler
+barca serve pipeline.py --timezone utc  # evaluate cron in UTC (default: local)
 ```
 
 `--watch` is a local-development convenience and is off by default; a production deployment serves
 a fixed set of files and does not need it.
+
+`barca serve` does not yet support shared remote state — if `barca.toml` resolves to
+`state = "optimistic"` with a state URI, `serve` refuses to start with an error telling you to set
+`state = "off"` (or `BARCA_STATE=off`) to serve with a local metadata DB. See
+[Configuration](/reference/config/).
+
+## list
+
+List all discovered definitions (assets, tasks, sensors) with their kind, freshness, and
+dependencies. Scheduled definitions also show their next fire time in local time.
+
+```bash
+barca list pipeline.py
+```
 
 ## version
 

@@ -39,13 +39,13 @@ barca get pipeline.py
 You'll see output like:
 
 ```json
-{"elapsed_seconds":0.039,"steps_executed":1,"phases":1,"final_output":{"message":"Hello from barca!"}}
+{"elapsed_seconds":0.039,"final_output":{"message":"Hello from barca!"},"phases":1,"run_id":"b1b1ff29d6cc","steps_executed":1}
 ```
 
-And on stderr, the timing breakdown:
+And on stderr, a one-line progress summary:
 
 ```
-[barca] 1 nodes, 0 edges, 1 phases, 1 streams | plan: 0.8ms | exec: 37ms | total: 38ms
+[barca] 1/1 steps done in 0.0s
 ```
 
 **What just happened?**
@@ -90,10 +90,11 @@ barca get pipeline.py
 
 Barca sees that `summary` depends on `raw_data`, so it:
 
-1. Creates two phases
-2. Phase 1: executes `raw_data` in a worker
-3. Passes `raw_data`'s output to phase 2 as a provided input
-4. Phase 2: executes `summary` with the data injected as the `data` kwarg
+1. Puts both in the same phase, same worker stream — a linear chain has no
+   parallelism to gain from a phase split
+2. Runs `raw_data` first in that stream's worker
+3. Hands `raw_data`'s output straight to `summary` in the same process
+4. Runs `summary` with the data injected as the `data` kwarg
 
 You can inspect the plan without running anything:
 
@@ -106,12 +107,10 @@ barca plan pipeline.py
   "total_steps": 2,
   "phases": [
     {
-      "reason": "Independent",
-      "streams": [{"stream_id": 0, "steps": ["raw_data"]}]
-    },
-    {
-      "reason": "Dependent",
-      "streams": [{"stream_id": 1, "steps": ["summary"]}]
+      "reason": "Initial",
+      "streams": [
+        {"stream_id": "p0-w0", "steps": ["pipeline.py:raw_data", "pipeline.py:summary"]}
+      ]
     }
   ]
 }
@@ -148,8 +147,8 @@ def report(users: list[dict], products: list[dict], orders: list[dict]) -> dict:
 The plan will look like:
 
 ```
-Phase 1 (Independent): users, products, orders  ← 3 parallel streams
-Phase 2 (Dependent):   report                    ← waits for all 3
+Phase 1 (Initial): users, products, orders  ← 3 parallel streams
+Phase 2 (FanIn):    report                   ← waits for all 3
 ```
 
 Barca spawns up to `available_parallelism()` workers per phase. On an 8-core machine, all three source assets run concurrently.
@@ -188,10 +187,15 @@ def dashboard(sales: list[dict], inventory: list[dict]) -> dict:
 The execution plan:
 
 ```
-Phase 1: raw_sales, raw_inventory           ← parallel
-Phase 2: clean_sales, clean_inventory       ← parallel (each depends on one source)
-Phase 3: dashboard                          ← waits for both clean steps
+Phase 1 (Initial): raw_sales → clean_sales        ← one stream, one worker, chained
+                    raw_inventory → clean_inventory ← parallel stream, chained
+Phase 2 (FanIn):    dashboard                       ← waits for both chains
 ```
+
+Each source-and-its-transform pair is a linear chain, so barca runs it as one
+worker stream rather than splitting it across phases; the two chains still run
+in parallel with each other. `dashboard` depends on both chains' outputs, so it
+gets its own fan-in phase.
 
 ## 5. Sensors
 
@@ -211,7 +215,7 @@ def process_inbox(files: list[str]) -> dict:
     return {"processed": len(files), "files": files}
 ```
 
-Sensors are never cached -- they always re-run. Downstream assets only execute when the sensor reports `True` as the first element.
+Sensors are never cached -- they always re-run. The worker unpacks the `(update_detected, output)` tuple automatically, so a downstream asset's kwarg receives just `output` (as in `files: list[str]` above), not the tuple.
 
 ## 6. Tasks
 
@@ -237,9 +241,19 @@ def write_to_s3(report: dict) -> None:
 
 Both tasks run in the same phase (they're independent of each other) after `daily_report` completes. Use `barca run` to execute tasks.
 
+`barca run` always force-reruns every upstream asset in the task's cone (it "bursts" the cache) -- so `daily_report` re-executes on every `barca run send_slack_notification pipeline.py`, even if it's already cached. Pass `--burst report_name_a,report_name_b` to burst only specific upstream assets and leave the rest cache-aware.
+
 ## 7. Partitions
 
 Partitions fan a single asset definition into N independent runs, one per partition key.
+
+:::caution[Known issue]
+As of this writing, a `collect()`-consuming asset downstream of partitioned producers can be
+scheduled into the same phase as the still-running producers instead of waiting for them,
+causing a `TypeError` at runtime. Tracked in
+[ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97). The syntax below is the
+intended API; it does not yet execute correctly end-to-end.
+:::
 
 ```python
 from barca import asset, partitions, collect
@@ -281,6 +295,8 @@ Barca merges all discovered nodes into a single DAG and plans execution across t
 Control when assets should re-run:
 
 ```python
+import time
+
 from barca import asset, Always, Manual, Schedule
 
 @asset(freshness=Always())
@@ -326,11 +342,17 @@ The plan shows:
 - **Phases**: groups of work that execute sequentially
 - **Streams**: parallel workers within a phase
 - **Steps**: individual asset functions within a stream
-- **Reason**: why a phase boundary exists (`Independent` or `Dependent`)
+- **Reason**: why a phase boundary exists (`Initial` for the first phase, or `FanIn` when a step needs outputs from multiple prior streams)
 
 ## Putting it together
 
 Here's a complete pipeline that uses everything:
+
+:::caution[Known issue]
+This pipeline hits the same partition fan-in issue as above — see
+[ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97). `merge` is not yet guaranteed
+to wait for all `transform` partitions to finish.
+:::
 
 ```python
 # pipeline.py
@@ -360,9 +382,10 @@ def merge(tables: dict) -> dict:
 
 # Sensor-driven asset
 @asset(inputs={"lake_status": check_data_lake, "data": merge})
-def report(lake_status, data: dict) -> dict:
-    _, status = lake_status
-    return {"source": status["path"], **data}
+def report(lake_status: dict, data: dict) -> dict:
+    # The worker already unpacked check_data_lake's (update_detected, output)
+    # tuple, so lake_status here is just the sensor's output dict.
+    return {"source": lake_status["path"], **data}
 
 # Side-effect task
 @task(inputs={"report": report})

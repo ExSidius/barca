@@ -10,67 +10,61 @@ How to install and develop barca from source.
 ```bash
 git clone https://github.com/ExSidius/barca.git
 cd barca
-uv sync                              # install all workspace packages + dev deps
-uv run pytest tests/ -v              # run tests
+uv sync                              # Python dev deps (pytest, etc.)
+cargo build --release                # build the Rust binary
+maturin develop --release            # install binary + Python stubs into .venv
+cargo test                           # run the Rust test suite
 ```
 
 ## Running an example
 
 ```bash
-cd examples/basic_app && uv sync
-uv run barca get pipeline.py         # materialize all assets
-uv run barca plan pipeline.py        # inspect the execution plan
-uv run barca run pipeline.py         # run tasks + upstream assets
+.venv/bin/barca get examples/basic_app/example_project/assets.py    # materialize all assets
+.venv/bin/barca plan examples/basic_app/example_project/assets.py   # inspect the execution plan
 ```
 
 ## How it works
 
-Barca is a uv workspace with three Python packages:
+Barca is a Cargo workspace with a Python package layered on top:
 
-| Package | Path | Purpose |
+| Crate/Package | Path | Purpose |
 |---------|------|---------|
-| `barca` | `packages/barca-core/` | Core library — decorators, models, store, engine |
-| `barca-cli` | `packages/barca-cli/` | CLI — typer app |
-| `barca-server` | `packages/barca-server/` | HTTP API — FastAPI + uvicorn (optional) |
+| `barca-core` | `crates/barca-core/` | Core library — parser, DAG, execution planning, hashing |
+| `barca-cli` | `crates/barca-cli/` | CLI binary (the `barca` command) |
+| `barca-server` | `crates/barca-server/` | HTTP API + cron scheduler, used by `barca serve` |
+| `barca` (Python) | `python/barca/` | No-op decorator stubs, the batch worker (`_worker.py`), and artifact serialization |
 
-`uv sync` at the workspace root installs all three packages in development mode. The CLI entry point `barca` is provided by `barca-cli`.
+`maturin develop --release` builds the Rust binary and installs it, plus the Python stubs,
+into `.venv` in one step — this is what `pyproject.toml`'s `[tool.maturin]` config drives.
 
 ## Running tests
 
 ```bash
-# Full test suite
-uv run pytest tests/ -v
+# Rust unit + integration tests (crates/*/tests/ and inline #[test] modules)
+cargo test
 
-# Specific test file
-uv run pytest tests/test_sensor.py -v
-
-# Just server tests (requires niquests)
-uv run pytest tests/test_server.py -v
+# Python tests (worker, runtime, storage backends)
+uv run pytest python/tests -q
 ```
 
-## Free-threaded Python
-
-Barca defaults to Python 3.14t (free-threaded) via `.python-version`.
-
-To opt out and use standard Python:
-
-```bash
-echo "3.14" > .python-version
-uv sync
-```
+CI additionally runs shell-based integration tests against the built wheel:
+`tests/integration/*.sh` (CLI behavior, caching, environments, remote state).
 
 ## Project structure
 
 ```
 barca/
-├── packages/
-│   ├── barca-core/          # Core library
-│   ├── barca-cli/           # CLI tool
-│   └── barca-server/        # HTTP server (optional)
-├── tests/                   # All tests (pytest)
-├── examples/                # Example projects
+├── Cargo.toml                # Rust workspace root
+├── crates/
+│   ├── barca-core/           # Core library: models, parser, DAG, planning, hashing
+│   ├── barca-cli/            # CLI binary
+│   └── barca-server/         # HTTP server + cron scheduler
+├── python/
+│   ├── barca/                # Decorator stubs, worker, artifact I/O
+│   └── tests/                # Python tests (pytest)
+├── examples/                 # Example projects
 ├── benchmarks/               # Performance benchmarks
-├── docs/                    # Documentation and specs
-├── pyproject.toml           # Workspace root
-└── .python-version          # 3.14t (free-threaded)
+├── tests/integration/        # Shell-based CLI integration tests
+├── pyproject.toml            # Maturin build config
+└── site/                     # This documentation site
 ```

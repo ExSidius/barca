@@ -16,7 +16,7 @@ def deploy_model(model: dict) -> None:
 ```
 
 - `retries` -- total number of attempts. `retries=3` means up to 3 attempts (1 initial + 2 retries). Default is 1 (no retry).
-- `retry_backoff` -- base backoff in seconds. Delay before attempt N is `retry_backoff * N`. Default is 0.
+- `retry_backoff` -- base backoff in seconds. Delay before attempt N is `retry_backoff * (N-1)` -- no delay before the first attempt. Default is 0.
 
 With `retries=3, retry_backoff=1.0`:
 

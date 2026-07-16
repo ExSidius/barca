@@ -9,14 +9,14 @@ The goal is to keep the orchestration model small:
 
 - assets define the graph
 - sensors bring external state into the graph
-- `barca run` continuously maintains each asset at its declared freshness level
+- `barca serve` continuously maintains each asset at its declared freshness level; `barca get`/`barca run` apply freshness for a single one-shot pass
 - no pipeline DSL is required
 
 This workflow assumes the Barca core constraints documented in [Core Constraints](/core-constraints/).
 
 ## Summary
 
-Every asset, sensor, and task declares a `freshness` value that controls when Barca keeps it up to date during `barca run`.
+Every asset, sensor, and task declares a `freshness` value that controls when Barca keeps it up to date.
 
 ```python
 @asset()                                    # freshness=Always (default)
@@ -124,24 +124,17 @@ timeout_seconds: int = 300
 
 This timeout applies per attempt. If an attempt exceeds the timeout, Barca terminates the worker and marks the attempt as timed out.
 
-## barca run model
+## barca serve model
 
-`barca run` is a long-running process. On each pass (topo order):
+`barca get`/`barca run` are one-shot commands: each invocation parses the DAG, plans the subgraph for the target, and executes it once before exiting. Continuous freshness enforcement is `barca serve`'s job.
 
-1. Reindex current definitions
-2. Compute provenance-based staleness
-3. Compute freshness-based eligibility
-4. Enqueue runnable stale nodes
-5. Dispatch workers
-6. Record results and update descendant states
+`barca serve` runs a long-running process that serves the DAG over HTTP (`GET /assets`, `GET /plan`, `POST /run`, ...) and drives a background cron scheduler. At startup the scheduler enumerates every node whose `freshness` is `Schedule(cron)`. On each live cron match (evaluated in the configured `--timezone`, local by default) it triggers that node through the same `get`/`run` path the HTTP API uses:
 
-`Always` assets: materialise if stale and all upstreams fresh.
-`Schedule` assets: materialise if a cron tick has elapsed since last run.
-`Manual` assets: never auto-materialise.
-Sensors: observe on each `Schedule` tick (or `Manual` trigger).
-Tasks/Sinks: run when upstream freshens.
+- scheduled assets/sensors go through the `get` path — cache-aware, so unrelated upstreams are reused
+- scheduled tasks go through the `run` path — always re-run
+- `Always` and `Manual` nodes are not independently polled; they materialise as a side effect of being upstream of whatever is triggered (a scheduled node, or an explicit `POST /run`/`POST /get/{target}` call)
 
-If a pass is already running when the next tick arrives, the tick is skipped — passes do not overlap.
+If a job's previous run is still in flight when its next tick arrives, that tick is skipped for that job only — other jobs' ticks are unaffected. On startup, a job fires once immediately if a tick elapsed while the server was down (catch-up); last-fired times are persisted so catch-up survives restarts.
 
 ## State model
 
@@ -212,7 +205,7 @@ def report() -> dict:
     return {"rows": 42}
 ```
 
-When the parent asset materialises, all attached sinks write its output to their declared paths. Sink failures are non-blocking (leaf nodes) but surface prominently as failures in `assets list` and job logs.
+When the parent asset materialises, all attached sinks write its output to their declared paths. Sink failures are non-blocking (leaf nodes) but surface prominently as failures in `barca list` and job logs.
 
 ## Partitioned assets and freshness
 

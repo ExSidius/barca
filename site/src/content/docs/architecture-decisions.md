@@ -1,5 +1,5 @@
 ---
-title: Architecture Decisions (v0.2.0)
+title: Architecture Decisions
 description: Key design decisions in barca's execution engine, alternatives tried, and why the current approach won.
 ---
 

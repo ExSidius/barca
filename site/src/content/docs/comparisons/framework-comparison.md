@@ -242,14 +242,14 @@ Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn
 
 | Feature | Dagster | Prefect | Airflow | Barca | Roadmap |
 |---------|---------|---------|---------|-------|---------|
-| **Web UI / dashboard** | Yes (dagster dev) | Yes (Prefect Cloud / server) | Yes (webserver) | No | Possible after `barca serve` ([#53]) |
+| **Web UI / dashboard** | Yes (dagster dev) | Yes (Prefect Cloud / server) | Yes (webserver) | No | `barca serve` ships an HTTP API only, no UI planned |
 | **Run history / lineage** | Full event log, asset catalog | Flow run tracking, task states | DagRun/TaskInstance records | Basic: rows in SQLite, no UI | Planned — just more DB rows ([#50]) |
-| **Retry on failure** | Built-in per-op retries | Built-in per-task retries | Built-in retries + SLAs | No — fails and persists partial results | Planned — `@asset(retries=3, retry_backoff=2.0)` ([#51]) |
+| **Retry on failure** | Built-in per-op retries | Built-in per-task retries | Built-in retries + SLAs | Yes — `@asset(retries=N, retry_backoff=...)`, linear backoff, applied by the Rust coordinator | Shipped ([#51]) |
 | **Alerting / notifications** | Sensors + hooks | Automations, Slack/email | Email, Slack, PagerDuty | No | Planned — Slack + Resend hooks via `barca.toml` ([#52]) |
 | **Scheduling** | Built-in cron + sensors | Built-in via deployments | Core feature (scheduler daemon) | Cron enforcement in `barca serve`: timezone-aware, durable catch-up, parallel runs, `GET /schedule` | Shipped ([#54]); per-tick replay of long outages not supported |
-| **Server mode** | Built-in (dagster dev) | Built-in (prefect server) | Built-in (webserver + scheduler) | No | Planned — `barca serve` with HTTP API ([#53]) |
-| **Remote storage** | Pluggable I/O managers (S3, GCS, etc.) | Result storage backends | XCom + external storage hooks | Local filesystem only | Planned — pluggable DB + artifact backends ([#55], [#56]) |
-| **Docker / containers** | Supported via Kubernetes executor | Supported via Docker infra | Celery/Kubernetes executors | Not built-in | Trivial once backends are pluggable ([#56]) |
+| **Server mode** | Built-in (dagster dev) | Built-in (prefect server) | Built-in (webserver + scheduler) | Yes — `barca serve` (HTTP API + cron scheduler; binds 127.0.0.1, no auth) | Shipped ([#53]) |
+| **Remote storage** | Pluggable I/O managers (S3, GCS, etc.) | Result storage backends | XCom + external storage hooks | Yes — Azure ADLS Gen2, S3, GCS, and Cloudflare R2 via fsspec scheme dispatch, plus a shared metadata DB pulled/pushed as a blob | Shipped ([#55]); pluggable DB engine beyond Turso/libSQL still planned ([#56]) |
+| **Docker / containers** | Supported via Kubernetes executor | Supported via Docker infra | Celery/Kubernetes executors | Not built-in | Artifact storage is already pluggable; trivial once the DB backend is too ([#56]) |
 | **Multi-user / team** | Workspace permissions, code locations | Workspace RBAC, service accounts | DAG-level permissions, RBAC | Single-user only | Not planned — deliberate decision for simplicity |
 | **Backfills** | Built-in partitioned backfills | Via deployments | `dags backfill` (v2) | Supported — `barca get` re-runs subgraphs; needs partition filter on CLI | CLI flag: `--partition region=us` ([#57]) |
 | **Dynamic pipelines** | Dynamic partitions, graph DSL | Dynamic tasks via `.map()` | Dynamic task mapping | Supported — static, dynamic (eval at plan time), derived (`partitions_from`) | — |
@@ -269,7 +269,7 @@ Minimalism is a tradeoff. Here's what the other frameworks have that barca doesn
 [#58]: https://github.com/ExSidius/barca/issues/58
 [#59]: https://github.com/ExSidius/barca/issues/59
 
-Barca is fast and minimal **because** it doesn't do most of this yet. But the roadmap is deliberate: each feature is designed to add capability without adding framework complexity. Run history is just more DB rows. Retries are a loop in the worker. Scheduling is a cron check in the server. None of these require new services, config languages, or architectural overhead.
+Barca is fast and minimal **because** it doesn't do most of this yet. But the roadmap is deliberate: each feature is designed to add capability without adding framework complexity. Run history is just more DB rows. Retries are extra attempts the Rust coordinator dispatches to workers, not a new service. Scheduling is a cron check in the server. None of these require new services, config languages, or architectural overhead.
 
 The bet is that for many workloads — especially agent-driven pipelines, local data processing, and development iteration — you want to start minimal and add what you need, rather than pay for everything upfront.
 
@@ -296,7 +296,7 @@ Barca is not a replacement for any of these in production data platform scenario
 | **Behavior transparency** | Best (binary + files) | Mixed (I/O managers hidden) | Mixed (state machine hidden) | Low (scheduler/executor hidden) |
 | **Runs standalone** | Yes | No | No | No |
 | **Feature richness** | Low | High | High | Highest |
-| **Production readiness** | Early (v0.1.x) | Mature | Mature | Very mature |
+| **Production readiness** | Early (pre-1.0) | Mature | Mature | Very mature |
 | **Team / multi-user** | No | Yes | Yes | Yes |
 | **Remote execution** | No | Yes | Yes | Yes |
 

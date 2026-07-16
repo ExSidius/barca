@@ -36,10 +36,11 @@ Run it:
 uv run barca get pipeline.py
 ```
 
-You'll see structured JSON on stdout and timing on stderr:
+You'll see a one-line progress summary on stderr, followed by structured JSON on stdout:
 
 ```
-[barca] 1 nodes, 0 edges, 1 phases, 1 streams | plan: 0.8ms | exec: 37ms | total: 38ms
+[barca] 1/1 steps done in 0.0s
+{"elapsed_seconds":0.296,"final_output":{"message":"Hello from barca!"},"phases":1,"run_id":"b1b72bc4c9e3","steps_executed":1}
 ```
 
 The `@asset()` decorator itself does nothing at runtime -- it's an identity function. Your code runs exactly the same with or without barca installed.
@@ -64,7 +65,7 @@ def summary(data: list[dict]) -> dict:
 uv run barca get pipeline.py
 ```
 
-Barca sees that `summary` depends on `raw_data`, creates two phases, executes `raw_data` first, then passes its output to `summary` as the `data` kwarg.
+Barca sees that `summary` depends on `raw_data`, plans them as a single sequential chain, executes `raw_data` first, then passes its output to `summary` as the `data` kwarg.
 
 ## See the plan
 
@@ -79,12 +80,13 @@ uv run barca plan pipeline.py
   "total_steps": 2,
   "phases": [
     {
-      "reason": "Independent",
-      "streams": [{"stream_id": 0, "steps": ["raw_data"]}]
-    },
-    {
-      "reason": "Dependent",
-      "streams": [{"stream_id": 1, "steps": ["summary"]}]
+      "reason": "Initial",
+      "streams": [
+        {
+          "stream_id": "p0-w0",
+          "steps": ["pipeline.py:raw_data", "pipeline.py:summary"]
+        }
+      ]
     }
   ]
 }

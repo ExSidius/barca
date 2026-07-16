@@ -12,11 +12,11 @@ This workflow assumes the Barca core constraints documented in [Core Constraints
 For the MVP:
 
 - assets, sensors, and tasks all support `timeout_seconds`, defaulting to `300`
-- failed attempts retry 3 times with exponential backoff
+- failed attempts retry per-node `retries`/`retry_backoff`, defaulting to `retries=1` (no retry)
 - running work must be visible in real time in UI and TUI
 - users can cancel running work in real time
 - cancelled work is marked `cancelled` and treated as incomplete
-- ad hoc runtime params are supported and included in cache identity
+- ad hoc runtime params are a planned concept — the cache-identity hash already reserves a slot for them, but no CLI or API surface sets them yet
 
 ## Timeout
 
@@ -40,23 +40,27 @@ If a node exceeds its timeout:
 
 ## Retry policy
 
-For the MVP, retry policy should be fixed and not configurable:
+Retry policy is per-node and configurable, declared as decorator kwargs:
 
-- maximum 3 attempts total
-- exponential backoff between retries
+```python
+@asset(retries=3, retry_backoff=1.0)
+@sensor(retries=3, retry_backoff=1.0)
+@task(retries=3, retry_backoff=1.0)
+```
 
-This is enough for an MVP and avoids early policy complexity.
+- `retries` — total attempts on failure (`1` = no retry, the default).
+- `retry_backoff` — base delay in seconds. Delay before attempt N is `retry_backoff * N` (linear, not exponential).
 
-### Why this is acceptable
+Rust owns the retry loop; each retry is a fresh worker invocation. Retries do not cascade — a parent's retry does not re-run its children, and a child's retries do not trigger its parent.
+
+### Why per-node configuration
 
 For pure assets, repeated failure usually means:
 
 - bad input
 - bad logic
 
-That is fine.
-
-Barca does not need sophisticated adaptive retry policy in the MVP.
+A fixed global policy would either retry cheap flaky steps too little or retry expensive deterministic failures too much. Letting each node declare its own `retries`/`retry_backoff` (with a conservative `retries=1` default) keeps the common case simple while leaving room for flaky I/O-bound steps to opt into retries explicitly.
 
 If all retries fail, the node remains failed/stale until the user fixes the issue and reruns it.
 
@@ -112,6 +116,8 @@ So Barca should:
 
 ## Ad hoc runtime parameters
 
+**Not yet implemented.** `barca get`/`barca run` take no `--param` flag today, and nothing in the CLI or `barca.api` sets per-run parameters. `run_hash` already reserves a slot for them (`hash::run_hash(definition_hash, partition_key, upstream_ids, params)`), but every call site passes `None` — the plumbing exists at the hashing layer only. The design below is the intended shape once it ships.
+
 Barca should support explicit runtime parameters that are not durable partition keys.
 
 This is a separate concept from partitions.
@@ -127,6 +133,7 @@ def square(x: int) -> int:
 Users should be able to run this with ad hoc params like:
 
 ```bash
+# Proposed — not implemented today.
 barca get square pipeline.py --param x=7
 barca get square pipeline.py --param x=14
 ```
@@ -200,6 +207,7 @@ For the MVP:
 Useful shapes:
 
 ```bash
+# Proposed — not implemented today.
 barca get square pipeline.py --param x=7
 ```
 
@@ -218,10 +226,10 @@ Barca does not need to add more complicated automatic healing behavior in the MV
 ## Acceptance criteria
 
 - Assets, sensors, and tasks all support `timeout_seconds=300` by default.
-- Failed attempts retry up to 3 times with exponential backoff.
+- Failed attempts retry per the node's `retries`/`retry_backoff` (default `retries=1`, i.e. no retry).
 - Running nodes are visible in UI and TUI.
 - Users can cancel running nodes in real time.
 - Cancelled runs are marked `cancelled` and remain incomplete.
-- Ad hoc params are supported in CLI invocations.
-- Ad hoc params are included in cache identity.
+- Ad hoc params are supported in CLI invocations. (Not yet implemented.)
+- Ad hoc params are included in cache identity. (Reserved in `run_hash`, but unset — not yet wired to any input.)
 - Repeated calls with the same code, upstream provenance, and params reuse cache immediately.

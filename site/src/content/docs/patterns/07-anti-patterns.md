@@ -52,7 +52,7 @@ def processed(data: dict) -> dict:
     return data
 ```
 
-**Why it is a problem.** Each worker runs in a separate process, so the deserialized input is a copy. Mutations do not corrupt the upstream artifact. But the code is misleading -- it looks like it modifies shared state when it does not. Readers will assume `raw_data` is affected.
+**Why it is a problem.** Each worker process deserializes its own copy from the artifact file, so mutating it never corrupts the artifact on disk. But within a single worker batch, multiple steps can share the same in-memory object -- a downstream step's cached input is the same reference another step produced, not a fresh copy. Mutating in place can therefore corrupt what a sibling step in the same batch sees, and even when it doesn't, the code is misleading: it looks like it modifies shared state, so readers will assume `raw_data` is affected.
 
 **What to do instead.** Create a new value and return it:
 

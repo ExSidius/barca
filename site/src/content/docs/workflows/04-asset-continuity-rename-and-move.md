@@ -20,31 +20,22 @@ This workflow assumes the Barca core constraints documented in [Core Constraints
 Barca uses this continuity policy:
 
 - if `@asset(name="...")` is provided, that explicit name is the continuity key
-- otherwise, continuity is repo-relative file path + function name
-- old definitions and materializations are never deleted
-- rename/move detection uses AST matching as the primary signal, `name=` match as secondary
+- otherwise, continuity is repo-relative file path + function name (`DagNode::continuity_key()`)
+- materializations are keyed by continuity key + `run_hash` in an append-only table and are never deleted by normal operation
+- **there is no rename/move detection.** Continuity is decided purely by whether the continuity key is unchanged. Without an explicit `name=`, changing the file path or function name produces a different continuity key, which Barca treats as an unrelated new node — there is no AST-similarity heuristic that reconnects it to the old one
 
 This means:
 
 - explicit names preserve identity across renames and moves
-- implicit path/function identity does not
+- implicit path/function identity does not — not even when the function body is untouched
 
-That tradeoff is intentional.
+That tradeoff is intentional: it keeps identity a pure function of declared metadata, with no heuristic matching that could silently merge two different functions or split history on a trivial refactor.
 
-## Reindex diff
+## No reindex diff today
 
-Every `barca get` or `barca run` pass shows a three-way diff of what changed since the last index:
+Barca does not currently print an added/removed/renamed diff on `barca get`/`barca run`/`barca list`. Each invocation just parses the current source files into a DAG; there is no comparison against a previous index. `barca list` shows the live set of definitions only.
 
-- **Added** assets: name
-- **Removed** assets: name (pruned from active DAG, history preserved)
-- **Renamed/moved** assets: old_name → new_name
-
-Rename detection uses two signals, in priority order:
-
-1. **AST match** (primary): a removed and an added asset have identical function bodies. This covers file reorganisation — the common case — without requiring any `name=` annotation.
-2. **`name=` match** (secondary): the same explicit `name=` appears at a different location.
-
-Without either signal, a rename appears as remove + add. The CLI does not prompt users to confirm renames — AST matching is sufficient for the common case.
+The subsections below describe what continuity looks like across a rename in the two supported cases — with and without an explicit `name=` — not a diffing feature.
 
 ## Case 1: rename or move without explicit asset name
 
@@ -94,20 +85,16 @@ The new continuity key is:
 my_project/pricing.py:fetch_prices
 ```
 
-If the function body is identical to the old `prices` function, Barca detects this as a rename via AST match and treats it as:
+Regardless of whether the function body changed, Barca treats this as two unrelated lineages, because the continuity key changed:
 
-- one continuous logical asset lineage (old_name → new_name shown in reindex diff)
-- two definition snapshots
-- old materializations retained as historical
+- `my_project/assets.py:prices` — no longer produced by any source file; its old materializations remain in the local metadata DB (keyed by that continuity key) but are no longer reachable through `barca get`/`barca stats` once the file no longer defines it
+- `my_project/pricing.py:fetch_prices` — a brand-new node with no prior materializations, so its first run cannot be a cache hit
 
-If the function body differs (the function was both moved and changed), no AST match occurs. Barca then treats this as:
+This is true even when the function body is byte-for-byte identical — Barca does not compare function bodies across nodes to infer a rename. Only an explicit `name=` carries identity across a move.
 
-- one historical asset lineage for `my_project/assets.py:prices`
-- one new live asset lineage for `my_project/pricing.py:fetch_prices`
+## Why continuity requires an explicit name
 
-## Why AST match is the primary signal
-
-AST matching covers the most common case: a developer reorganises files without changing function logic. It requires no annotation from the user. `name=` matching is a fallback for cases where the function body changed alongside the move.
+Matching renames by function-body similarity would mean two independently-authored functions with the same body get silently treated as "the same asset," and a one-line edit made during a move would silently split history instead. Requiring `name=` for continuity makes identity an explicit, auditable decision rather than a heuristic guess.
 
 ## Case 2: rename or move with explicit asset name
 
@@ -267,10 +254,9 @@ Without an explicit name, Barca will preserve old history, but it will treat the
 
 ## Acceptance criteria
 
-- Moving or renaming an unnamed asset with an identical function body is detected as a rename via AST match and shown as old_name → new_name in the reindex diff.
-- Moving or renaming an unnamed asset where the function body also changed creates a new logical asset lineage while preserving the old one as historical.
+- Moving or renaming an unnamed asset — even with an identical function body — creates a new logical asset lineage; Barca has no rename-detection heuristic, so this is indistinguishable from deleting the old asset and adding a new one.
 - Moving or renaming a named asset (same `name=` at new location) preserves one logical asset lineage with multiple definition snapshots.
-- Old materializations remain queryable in both cases.
+- Old materializations remain in the local metadata DB in both cases (never deleted by normal operation), though only the named-continuity case keeps them reachable under the current asset's identity.
 - Duplicate continuity keys fail indexing.
 - UI/TUI can show definition history for a single logical asset when explicit `name` continuity is used.
-- Reindex output shows a three-way diff: added / removed / renamed.
+- There is no added/removed/renamed diff output today — this is a possible future feature, not current behavior.

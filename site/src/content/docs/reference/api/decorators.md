@@ -1,6 +1,6 @@
 ---
 title: Decorators API
-description: Reference for @asset, @sink, @sensor, @task, @unsafe, Schedule, and partitions.
+description: Reference for @asset, @sink, @sensor, @task, @unsafe, Schedule, partitions, and parallel().
 ---
 
 Core decorators for defining assets, sensors, tasks, sinks, and related primitives.
@@ -15,12 +15,17 @@ Core decorators for defining assets, sensors, tasks, sinks, and related primitiv
     serializer: SerializerKind | None = None,
     freshness: Freshness = Always,
     timeout_seconds: int = 300,
+    retries: int = 1,
+    retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
 )
 ```
 
 Declares a cacheable, provenance-tracked asset. The default freshness is `Always` — the asset is kept up to date automatically during `barca run`.
+
+`retries` is the total number of attempts on failure (1 = no retry). `retry_backoff` is the base
+delay in seconds between attempts (delay grows linearly: `retry_backoff * attempt`).
 
 ```python
 from barca import asset, Always, Manual, Schedule
@@ -39,6 +44,52 @@ def daily_report() -> dict:
 ```
 
 `Manual` freshness blocks downstream `Always` assets from auto-updating — a downstream asset cannot be fresher than its most-upstream `Manual` dependency.
+
+## Partitions
+
+```python
+partitions(values: list[str | int])          # static partition values
+partitions_from(source: AssetLike)            # derive partitions from an upstream asset
+collect(source: AssetLike)                    # fan-in: aggregate all partitions of an upstream asset
+asset_ref(canonical_name: str)                # reference a node by canonical id, not Python import
+```
+
+Use `partitions=` on `@asset` to split an asset's work across a set of keys, executed as
+independent steps:
+
+```python
+from barca import asset, partitions, partitions_from, collect
+
+@asset(partitions={"ticker": partitions(["AAPL", "MSFT", "GOOG"])})
+def price(ticker: str) -> dict:
+    return fetch_price(ticker)
+
+@asset(partitions={"ticker": partitions_from(price)})   # same partition keys as `price`
+def signal(ticker: str, price: dict) -> dict:
+    return compute_signal(price)
+
+@asset(inputs={"prices": collect(price)})                # fan-in: all partitions as a list
+def summary(prices: list[dict]) -> dict:
+    return aggregate(prices)
+```
+
+`partitions(...)` accepts a literal list (extracted statically at parse time) or any other Python
+expression — e.g. a list comprehension or function call — which is evaluated by the Python runtime
+at plan time. `partitions_from(...)` derives an asset's partition keys from an upstream asset's own
+partitions, rather than declaring them again. `collect(...)`, used inside `inputs=`, aggregates
+every partition of an upstream asset into a single list delivered to the parameter.
+
+`asset_ref("path/to/file.py:function_name")`, used inside `inputs=`, references a node by its
+canonical id (source file path + function name, or its explicit `name=`) instead of importing the
+Python function directly — useful for cross-file references:
+
+```python
+from barca import asset, asset_ref
+
+@asset(inputs={"data": asset_ref("other_module/assets.py:raw_data")})
+def process(data: dict) -> dict:
+    return data
+```
 
 ## @sink
 
@@ -74,12 +125,14 @@ For partitioned assets, each partition writes its own sink file with the partiti
     name: str | None = None,
     freshness: Manual | Schedule = Manual,
     timeout_seconds: int = 300,
+    retries: int = 1,
+    retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
 )
 ```
 
-Declares an external-state observer. Sensors must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors (polling frequency must be declared explicitly).
+Declares an external-state observer. Sensors must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors (polling frequency must be declared explicitly). See `@asset` above for `retries` / `retry_backoff` semantics.
 
 Sensors return `(update_detected: bool, output)` tuples. The full tuple is passed as input to downstream assets.
 
@@ -146,6 +199,46 @@ def migrate() -> None:
 def notify(_migrate) -> None:
     send_slack("migration done")
 ```
+
+## parallel
+
+```python
+parallel(*callables) -> list
+parallel_map(fn, items, **kwargs) -> list
+```
+
+Fan out work from inside a `@task` body across worker processes. `parallel()` takes
+`functools.partial`-wrapped calls to other `@task`-decorated functions and returns their results
+(or `ParallelError` objects for failed branches) in argument order. `parallel_map(fn, items)` is
+sugar for `parallel(*(partial(fn, item) for item in items))`.
+
+```python
+from functools import partial
+from barca import task, parallel, parallel_map
+
+@task()
+def deploy_us(model) -> str: ...
+
+@task()
+def deploy_eu(model) -> str: ...
+
+@task()
+def deploy_all(model) -> None:
+    results = parallel(partial(deploy_us, model), partial(deploy_eu, model))
+    # or: results = parallel_map(deploy, ["us", "eu"])
+```
+
+When running inside a barca worker, `parallel()` dispatches each branch to a separate worker
+process via the coordinator (the calling worker is frozen for the duration and resumed on
+completion); called standalone (outside a worker), it runs the callables sequentially. Barca's
+static analysis recognizes `partial(fn, ...)` arguments (including inside a starred generator or
+list comprehension, e.g. `parallel(*(partial(deploy, r) for r in regions))`) to build the
+dependency graph; fully dynamic call sets (e.g. `parallel(*work_items)`) are supported at runtime
+but can't be resolved statically. `parallel()`/`parallel_map()` calls are only recognized inside
+`@task` bodies, not `@asset` bodies.
+
+A failed branch is returned as a `ParallelError` (with `.error` holding the message) rather than
+raising — inspect each result to detect failures.
 
 ## @unsafe
 

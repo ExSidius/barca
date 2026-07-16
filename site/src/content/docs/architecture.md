@@ -38,11 +38,17 @@ crates/
       cone.rs               Dependency-cone analysis for definition hashing
       dag.rs                petgraph DAG construction + validation
       planner.rs            Phase/stream execution planning
-      dispatch.rs            Coordinates worker pool via UDS, manages the global ready queue
-      cache.rs              run_hash computation for cache lookups
+      dispatch.rs            Partition expansion + input resolution types
+      coordinator.rs         Pure ready-queue logic: tracks items, deps, parallel groups
+      io_loop.rs              Async worker pool: leased batch pulls, UDS I/O, spawn/SIGSTOP/SIGCONT
+      protocol.rs             Length-prefixed JSON framing for the coordinator ↔ worker socket
+      cost.rs                 Measured-cost EWMA + adaptive batch sizing (`cost_estimates` table)
+      cache.rs               run_hash computation for cache lookups
       hash.rs                SHA-256 definition/run hashing
       db.rs                  Turso/libSQL persistence (.barca/metadata.db)
-      commands.rs            User-facing ops: get, plan, history, stats, list_assets, build_dag
+      config.rs               barca.toml + env var + CLI flag resolution
+      state_sync.rs           Shared remote state: pull/checkpoint/push the metadata DB blob
+      commands.rs            User-facing ops: get, run, plan, history, stats, list_assets, build_dag
   barca-server/             HTTP server (optional, started by `barca serve`)
     src/
       lib.rs                serve()/app() entrypoints + ServeConfig
@@ -51,12 +57,20 @@ crates/
       state.rs               AppState, RunState/RunStatus, DAG cache
       error.rs               BarcaError → HTTP status + JSON mapping
       watch.rs               notify-based dev file watcher (--watch)
+      scheduler.rs            Cron scheduler that fires `Freshness::Schedule(...)` nodes
   barca-cli/                The `barca` binary
     src/main.rs             clap Cli enum + thin dispatch to commands / barca-server
 python/barca/               Python stubs + worker (shipped in the same wheel)
   __init__.py                No-op decorator stubs (identity functions)
+  __main__.py                 `python -m barca` entry point, delegates to `_worker.main()`
   _worker.py                 Batch worker invoked as `python -m barca._worker`
+  _runtime.py                 Socket communication with the Rust executor (BARCA_SOCKET)
   _artifacts.py              json / pickle / parquet serialization
+  _storage.py                 Local + remote (fsspec) artifact storage backends
+  _state.py                   Shared-state DB blob pull/push (`python -m barca._state`)
+  api.py                      Programmatic Python API — shells out to the barca binary
+  client.py                   Thin HTTP client for a running `barca serve`
+  py.typed                    PEP 561 marker
 pyproject.toml               Maturin build (binary + Python stubs in one wheel)
 ```
 
@@ -89,6 +103,8 @@ pyproject.toml               Maturin build (binary + Python stubs in one wheel)
    - Runs execute in background tasks and are tracked in a `DashMap`; clients poll `/status`.
      Each run carries a `CancellationToken`, so `DELETE /run/{id}` (or shutdown) stops it
      mid-flight: workers are terminated and the run is marked `cancelled`.
+   - A cron scheduler (unless `--no-schedule`) gives `Freshness::Schedule(...)` nodes teeth:
+     it enumerates scheduled definitions at startup and fires them on their cron tick.
    - See [Server API](/reference/server-api/).
 
 ## Node kinds
@@ -127,6 +143,9 @@ files (json / pickle / parquet), never in-process.
 ## Dependencies
 
 - **Rust**: `ruff_python_parser` (AST), `petgraph` (DAG), `turso` (DB), `serde`/`serde_json`,
-  `sha2`; the server adds `axum`, `tokio` (multi-thread), `dashmap`, and `notify`.
-- **Python**: stdlib only at runtime (`pyarrow` optional for parquet).
+  `sha2`; the server adds `axum`, `tokio` (multi-thread), `dashmap`, `notify`, and `croner`/`chrono`
+  (chrono-tz) for the cron scheduler.
+- **Python**: no runtime dependencies (stdlib only). Optional extras: `parquet` (pyarrow, pandas),
+  `fast` (orjson), and `azure`/`s3`/`r2`/`gcs`/`remote` (fsspec + the matching object-store client)
+  for remote artifact storage and shared state.
 - **Build**: `maturin` packages the Rust binary + Python stubs into one wheel.
