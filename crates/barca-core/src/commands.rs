@@ -102,7 +102,18 @@ pub fn find_python() -> PathBuf {
     PathBuf::from("python3")
 }
 
+/// Worker pool size: `BARCA_POOL_SIZE` overrides auto-detection when set to a
+/// positive integer. Lets benchmark harnesses (and anyone else) pin the pool
+/// to a fixed core count instead of whatever `available_parallelism()` reports
+/// on the current machine.
 fn default_pool_size() -> usize {
+    if let Some(n) = env::var("BARCA_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)

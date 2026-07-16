@@ -280,17 +280,18 @@ dependencies = [
 
 [[package]]
 name = "barca"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "barca-core",
  "barca-server",
  "clap",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
 name = "barca-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "futures",
  "indicatif",
@@ -306,13 +307,14 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "tokio-util",
  "toml",
  "turso",
 ]
 
 [[package]]
 name = "barca-server"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "barca-core",
@@ -2924,6 +2926,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-util"
+version = "0.7.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ae9cec805b01e8fc3fd2fe289f89149a9b66dd16786abd8b19cfa7b48cb0098"
+dependencies = [
+ "bytes",
+ "futures-core",
+ "futures-sink",
+ "pin-project-lite",
+ "tokio",
 ]
 
 [[package]]
