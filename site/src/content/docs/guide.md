@@ -402,7 +402,7 @@ barca get pipeline.py    # run it
 
 - **Decorators are no-ops.** Your code works without barca installed. `from barca import asset` imports an identity function. This means you can unit test your functions normally.
 
-- **Outputs must be JSON-serializable.** Barca serializes return values to pass between phases and persist to the database. Stick to dicts, lists, strings, numbers, and booleans.
+- **Outputs are serialized between phases.** By default barca uses JSON, so dicts, lists, strings, numbers, and booleans work with no extra configuration. Two escape hatches beyond that: `@asset(serializer="pickle")` for large or non-JSON-serializable plain-Python payloads (faster than JSON for large list-of-dict structures too — see `benchmarks/RESULTS.md`'s `etl_duckdb` notes), or return a pandas/polars DataFrame and barca automatically serializes it as parquet — no `serializer=` needed, and it's the fastest option for tabular data (vectorized columnar (de)serialization instead of row-by-row).
 
 - **Use `barca plan` liberally.** It's free (no execution) and shows you exactly how barca decomposes your DAG.
 

@@ -2,6 +2,261 @@
 
 Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 
+> **Note (2026-07-16):** the benchmark harness was since standardized for CPU/worker
+> fairness — every framework's parallelism is now pinned to the same core count and
+> worker count instead of Barca auto-detecting `cpu_count` while Dagster/Prefect
+> hardcoded 16 workers (see `benchmarks/README.md#methodology` and
+> `benchmarks/lib/env.sh`). The numbers below predate that change and should be
+> treated as illustrative, not reproducible as-is; re-run via `bench.sh` for
+> current, standardized numbers.
+>
+> All 19 benchmarks with a `bench.sh` at the time were re-run end to end under
+> the new harness — see [Standardized re-run (2026-07-16)](#standardized-re-run-2026-07-16)
+> below. (A 20th, `etl_duckdb_dataframes`, was added afterward as a follow-up
+> to the `etl_duckdb` investigation below and measured separately, in
+> isolation — see the table's ‡ footnote.) This pass ran in a shared, virtualized CI-style container (not the
+> dedicated Apple Silicon box the original numbers came from), so absolute
+> times aren't comparable across the two environments — only the
+> barca/dagster/prefect ratios *within* the same run are meaningful. The table
+> below shows dagster ahead or tied on 9 of 18 — **but most of that is
+> confirmed container noise, not a real result**: re-running individual rows
+> in isolation afterward reversed several of them outright (see Notes). Only
+> `etl_duckdb` held up as a genuine, reproducible barca loss across repeat
+> runs, with a specific identified cause (cross-process serialization of large
+> payloads across parallel branches). Read the Notes section before drawing
+> any conclusion from a single row in the table.
+
+## Standardized re-run (2026-07-16)
+
+Ran on this container: 4 vCPU (Intel Xeon @ 2.80GHz, pinned via `taskset -c 0-3`),
+15 GiB RAM, barca Rust release build, Python 3.13 (barca) / 3.12 (Dagster, Prefect).
+Worker count = 4 for all three frameworks (`BARCA_BENCH_CORES` default, `--warmup 1
+--runs 5` except trivial at `--warmup 3 --runs 10`). Absolute times are inflated by
+container overhead (cold PyPI-installed venvs, virtualized CPU, no dedicated
+hardware, shared with whatever else is on the host) — read the **relative** ratios,
+not the raw ms/s, and don't compare these numbers to the Apple Silicon rows above.
+
+| Benchmark | barca | dagster | prefect | barca vs dagster | barca vs prefect |
+|---|---:|---:|---:|---:|---:|
+| trivial | 339ms ± 13ms | 1.98s ± 0.15s | 10.74s ± 0.24s | 5.85x faster | 31.68x faster |
+| parallel_tasks | 1.28s ± 0.02s | 2.10s ± 0.06s | 11.46s ± 0.94s | 1.64x faster | 8.92x faster |
+| resilience_pileup | 2.56s ± 0.02s ⚠ | 3.61s ± 0.04s | 11.75s ± 0.21s | 1.41x faster | 4.59x faster |
+| chain_100 | 765ms ± 80ms | 3.88s ± 0.09s | 11.09s ± 0.13s | 5.07x faster | 14.50x faster |
+| deep_diamond | 1.49s ± 0.04s | 2.41s ± 0.15s | 11.11s ± 0.17s | 1.62x faster | 7.46x faster |
+| etl_duckdb | 4.44s ± 0.10s | 3.59s ± 0.22s | 47.63s ± 0.83s | **dagster 1.24x faster** † | 13.28x faster |
+| etl_duckdb_dataframes ‡ | 1.54s ± 0.03s | 2.36s ± 0.05s | 9.56s ± 0.13s | 1.53x faster | 6.19x faster |
+| fan_out_500 | 2.69s ± 0.06s | 8.59s ± 0.32s | 12.95s ± 0.15s | 3.20x faster | 4.82x faster |
+| fan_out_500_50ms | 9.84s ± 0.55s | 34.89s ± 0.27s | 37.92s ± 0.16s | 3.55x faster | 3.85x faster |
+| incremental_backfill | 16.25s ± 0.17s | 20.47s ± 0.29s | 108.52s ± 1.47s | 1.26x faster | 6.68x faster |
+| large_payloads | 3.67s ± 0.40s | 2.14s ± 0.07s | 17.70s ± 0.12s | **dagster 1.72x faster** | 8.29x faster |
+| map_reduce | 2.57s ± 0.07s | 3.09s ± 0.14s | 10.48s ± 0.04s | 1.20x faster | 4.08x faster |
+| mixed_io_cpu | 3.07s ± 0.08s | 3.05s ± 0.11s | 11.27s ± 0.34s | **dagster 1.01x faster** (~tied) | 3.70x faster |
+| multi_file_discovery | 3.16s ± 0.51s ⚠ | 3.15s ± 0.15s | 10.73s ± 0.33s | **~tied** (1.00x) | 3.40x faster |
+| partitioned_chain | 3.37s ± 0.13s | 4.32s ± 0.05s | 11.45s ± 0.50s | 1.28x faster | 3.40x faster |
+| partitioned_etl | 2.96s ± 0.06s | 2.95s ± 0.17s ⚠ | 10.98s ± 0.14s | **~tied** (1.00x) | 3.72x faster |
+| partitioned_fan_in | 3.43s ± 0.11s | 3.49s ± 0.07s | 10.81s ± 0.11s | 1.02x faster (~tied) | 3.15x faster |
+| spaceflights | 4.34s ± 0.22s | 4.01s ± 0.20s | 12.26s ± 0.17s | **dagster 1.08x faster** | 3.06x faster |
+| wide_join | 3.14s ± 0.13s | 2.19s ± 0.08s | 11.18s ± 0.26s | **dagster 1.43x faster** | 5.10x faster |
+| wide_layers | 3.53s ± 0.61s ⚠ | 3.47s ± 0.10s | 11.09s ± 0.21s | **~tied** (1.02x) | 3.19x faster |
+
+⚠ = hyperfine flagged statistical outliers for that row's barca (or, for
+partitioned_etl, dagster) measurement — see variance notes below.
+
+† = stale as of the serialization fix described in Notes — `etl_duckdb`'s two
+heaviest assets now use `serializer="pickle"`, closing this to ~1.07-1.14x
+dagster-faster (within noise). The row above is left as originally measured
+since it's what motivated the fix; see Notes for before/after numbers. ‡ =
+`etl_duckdb_dataframes` was added later as a follow-up benchmark (same
+topology, DataFrame/parquet payloads instead of dict-of-rows) and measured in
+isolation via `bench.sh 8 2`, not as part of this table's single full-suite
+pass — see Notes before comparing its absolute times to the other rows here.
+
+### Variance
+
+Relative standard deviation (σ/mean) per framework, averaged across the original
+19 full-suite-pass rows (excludes `etl_duckdb_dataframes`, added later and
+measured separately — see the table's ‡ footnote):
+**barca ~5.2%, dagster ~3.6%, prefect ~1.9%**. Barca is consistently the noisiest
+of the three here, and four rows crossed hyperfine's outlier-detection threshold
+(resilience_pileup, multi_file_discovery, partitioned_etl's dagster leg,
+wide_layers) — worst case was wide_layers at σ = 17% of the mean. Prefect and
+dagster are quieter because their per-run cost is dominated by fixed Python
+import/framework overhead, which swamps scheduler jitter; barca's per-run cost is
+smaller in absolute terms, so the same container noise is a larger fraction of it.
+This reads as environment noise (a shared, virtualized 4-vCPU container), not a
+barca-specific issue — but it does mean any individual row within ~1.3x of 1.0
+(the "~tied" ones above) shouldn't be read as a confident win either direction
+without more runs or a quieter machine. `benchmarks/lib/env.sh` pins cores via
+`taskset`, which helps, but can't fully isolate a shared host from noisy
+neighbors the way dedicated hardware would.
+
+### Peak memory (whole process tree)
+
+Collected separately via `BARCA_BENCH_MEMORY=1` (opt-in — see
+`benchmarks/README.md#methodology` — not part of the timed hyperfine runs above,
+so it isn't in the variance figures either):
+
+| Benchmark | barca | dagster | prefect |
+|---|---:|---:|---:|
+| trivial | 55.8 MB | 156.7 MB | 410.5 MB |
+| chain_100 | 32.2 MB | 132.9 MB | 408.8 MB |
+| deep_diamond | 62.6 MB | 120.5 MB | 373.7 MB |
+| etl_duckdb | **287.6 MB** | 265.8 MB | 482.4 MB |
+| etl_duckdb_dataframes | 258.2 MB | 174.4 MB | 386.7 MB |
+| fan_out_500 | 66.1 MB | 136.5 MB | 404.1 MB |
+| fan_out_500_50ms | 64.4 MB | 137.4 MB | 460.6 MB |
+| incremental_backfill | 25.1 MB | 113.4 MB | 378.0 MB |
+| large_payloads | 62.2 MB | 124.6 MB | 384.9 MB |
+| map_reduce | 56.2 MB | 116.9 MB | 376.3 MB |
+| mixed_io_cpu | 53.3 MB | 112.2 MB | 359.4 MB |
+| multi_file_discovery | 56.6 MB | 116.4 MB | 373.6 MB |
+| parallel_tasks | 63.2 MB | 117.0 MB | 395.4 MB |
+| partitioned_chain | 54.7 MB | 119.6 MB | 381.7 MB |
+| partitioned_etl | 56.1 MB | 115.1 MB | 370.4 MB |
+| partitioned_fan_in | 55.2 MB | 117.2 MB | 371.8 MB |
+| resilience_pileup | 52.8 MB | 119.5 MB | 372.5 MB |
+| spaceflights | **409.4 MB** | 322.5 MB | 563.7 MB |
+| wide_join | 54.6 MB | 87.6 MB | 361.6 MB |
+| wide_layers | 55.6 MB | 90.8 MB | 371.5 MB |
+| **median** | **56.1 MB** | **119.5 MB** | **378.0 MB** |
+
+Barca's footprint is roughly half dagster's and a sixth to an eighth of prefect's
+almost everywhere — except `etl_duckdb` and `spaceflights`, which spike to match
+or exceed dagster's own footprint. Those are the same two benchmarks flagged below
+as barca's genuine (not noise) losses, and the memory spike is the same root cause
+showing up a second way — see Notes.
+
+### Notes
+
+- **Barca does not universally win here, and most of that turned out to be noise
+  rather than a real result — verified, not assumed.** The table above was
+  generated over roughly an hour; re-running individual rows afterward, in
+  isolation, showed several "dagster wins" reverse completely (`wide_layers`:
+  dagster-favored in the table above → barca 2.17x faster on rerun; `wide_join`:
+  dagster 1.43x faster above → barca 1.29x faster on rerun; `large_payloads`:
+  dagster 1.72x faster above → ~tied, barca 1.05x faster on rerun). The tell is in
+  the CPU-time breakdown hyperfine already reports: dagster's `(user+sys)/wall` is
+  ≈1.00 on almost every row (it's single-process and sequential — script mode, per
+  the Execution modes table below — so wall time *is* CPU time, nothing hidden).
+  Barca's ratio sits at 0.3–0.5 almost everywhere: most of its wall-clock time is
+  spent *waiting* (process coordination, socket IPC, DB writes), which is exactly
+  what a shared, virtualized container's scheduler jitter hits hardest — a
+  multi-process architecture has more "waiting" surface for noise to land on than
+  a single sequential process does.
+- **`etl_duckdb` is the one benchmark confirmed real, not noise** — re-run twice
+  (~1.24x, then ~1.40x dagster-faster) under different container load and it held
+  both times, unlike the others above. Its CPU-time pattern is also qualitatively
+  different: barca's *user* time is higher than dagster's here (barca is doing
+  more total compute, not just waiting), and its peak memory (287.6 MB) roughly
+  matches dagster's rather than sitting far below it like every other benchmark.
+  The mechanism: `etl_duckdb` generates three separate 100k-row datasets
+  (`raw_orders`, `raw_customers`, `raw_products`) that flow through *parallel*
+  raw→staging→intermediate branches before merging. Barca's coordinator + separate
+  Python workers is genuinely multi-process, so each parallel branch's 100k-row
+  payload gets serialized to a JSON artifact on disk and deserialized by the next
+  worker — real, repeated cross-process I/O and duplicated in-memory copies.
+  Dagster's script-mode execution is single-process and sequential, so it just
+  passes Python objects by reference between steps — zero serialization cost.
+  `spaceflights` (sklearn models/dataframes, also flagged above) shows the same
+  memory-spike signature and is worth the same suspicion, though it wasn't
+  independently re-run to confirm reproducibility the way `etl_duckdb` was.
+  `large_payloads` looks superficially similar (also large payloads) but is a
+  *linear* chain — one worker handles it start to finish with no cross-process
+  handoff — which is consistent with it turning out to be noise, not a real cost:
+  the tax shows up when large payloads *and* parallel branching combine, not from
+  payload size alone.
+- **`etl_duckdb`'s loss was investigated further and substantially fixed** (not
+  just diagnosed). Root cause was two-layered: (1) the cross-process
+  serialization cost above was real, but (2) barca's own per-step timing was
+  *undercounting* it — `_materialize()` in `python/barca/_worker.py` measured
+  `elapsed`/`cpu_seconds` before calling `serialize()`, so the actual artifact
+  write (the expensive part for large payloads) was invisible to barca's own
+  cost model, `barca stats`, and `barca history`. Fixed by moving the
+  measurement to wrap `serialize()` too — confirmed via a `BARCA_TRACE_TIMING=1`
+  waterfall trace (new, permanent, zero-cost-when-unset debug env var) that
+  `raw_orders`'s self-reported cost jumped from a wrong 396ms to a correct
+  ~1049ms, and the run's previously-"unaccounted" ~1.6s coordination gap shrank
+  to ~0.37s of legitimate, understood overhead (worker spawn + DB init/persist).
+  This fix benefits any barca project with large-payload assets, not just this
+  benchmark. Two follow-up changes then closed most of the actual gap:
+  - **Pickle quick win** (`benchmarks/etl_duckdb/barca/assets.py`): added
+    `serializer="pickle"` to `raw_orders` and `stg_orders`, the two heaviest
+    payloads (14.9MB/8.1MB as JSON vs 5.3MB/3.4MB as pickle — pickle is both
+    smaller and much faster to (de)serialize for this list-of-small-dicts
+    shape: measured `json.dump` ~635ms vs `pickle.dump` ~64ms for
+    `raw_orders`). This is an existing, already-shipped `@asset()` kwarg, not
+    an engine change. Result, two confirming isolated runs
+    (`bench.sh 8 2`): dagster's lead narrowed from 1.24-1.40x to **1.07x, then
+    1.14x** — within noise of tied. One side effect worth documenting: pickled
+    `raw_orders` drops under the in-process `_ArtifactLRU`'s 8MB cache
+    threshold (`python/barca/_worker.py`), making it newly eligible for
+    caching — but its only consumer runs on a different worker process, so the
+    cache can never hit and the `copy.deepcopy()` mutation-safety guard
+    (measured ~469ms for this payload) is pure waste on every read. Left
+    unfixed (out of scope, core-engine cache logic) but noted for anyone
+    chasing a similar case where deepcopy cost outweighs a cache that can't be
+    hit.
+  - **DataFrame + parquet rewrite** (new sibling benchmark,
+    `benchmarks/etl_duckdb_dataframes/`, same 11-asset topology across all
+    three frameworks so the comparison isn't conflated with a framework
+    difference): rewrote each asset from manual Python loops over dict-of-rows
+    to vectorized pandas (`groupby`/`merge`/`assign`). Barca auto-detects
+    DataFrame return values and routes them to parquet
+    (`detect_format()`/`resolve_format()` in `python/barca/_artifacts.py`) —
+    no code changes needed beyond returning DataFrames; confirmed via
+    `.barca/artifacts/` that every asset except the two dict-of-scalars mart
+    outputs serialized as `.parquet`. This is a categorically faster
+    mechanism than JSON or pickle for tabular data (vectorized, typed-array
+    (de)serialization via pyarrow's C++ reader/writer, not Python-level object
+    traversal), not just a smaller payload. Result: barca flipped from
+    *losing* to dagster to **winning 1.53-1.57x faster**, confirmed across two
+    isolated timing runs (1.55x, 1.53x) plus a `BARCA_BENCH_MEMORY=1` pass
+    (1.57x, peak memory 258.2 MB vs dagster's 174.4 MB — both frameworks'
+    memory dropped from the dict-of-rows version, since DataFrames are more
+    memory-efficient than nested dicts in both). All three frameworks produce
+    identical output values on this workload (exact match, not just within
+    tolerance).
+  - Net: the original `etl_duckdb` loss traced to a fixable barca-side gap
+    (missing format optimization for large/tabular payloads), not an inherent
+    architectural ceiling — the multi-process, cross-process-serialization
+    design this benchmark stresses is real, but the *format* used for that
+    serialization was the actual lever, and the DataFrame/parquet path is the
+    strictly better one when the workload is tabular.
+- Prefect is unaffected by any of the above — it loses every benchmark by a wide
+  margin regardless of environment or re-run, consistent with a much higher fixed
+  per-run overhead swamping everything else (confirmed by its own peak memory,
+  6-8x barca's baseline, and `(user+sys)/wall` also ≈1.0 — it's not parallelizing
+  in script mode either).
+- **Takeaway**: don't trust any single hyperfine table from a shared/virtualized
+  host at face value — re-run rows that look surprising in isolation before
+  drawing conclusions, and check whether the CPU-time ratio and (if available)
+  peak memory corroborate the wall-clock story. A re-run of this whole suite on
+  dedicated hardware would settle both the noise question and give a cleaner
+  baseline for the `etl_duckdb`/`spaceflights` cross-process-serialization cost.
+- Fixed three pre-existing bugs uncovered while running this, unrelated to the
+  CPU/RAM standardization work itself:
+  - `parallel_tasks/{barca,dagster,prefect}/run.sh` called bare `barca`/`python`
+    instead of the pinned venv binaries (worked only if a venv happened to
+    already be active on `PATH`).
+  - `resilience_pileup/barca/run.sh` was missing `--no-cache`, so every run after
+    the first was a cache-hit no-op (measured: 2.5s cold vs 8ms warm) — the
+    historical "330ms" figure above is suspect for the same reason.
+    `resilience_pileup/prefect/run.py` had a variable name collision (`t0` was
+    both a `@task` and the `__main__` timer, so every run raised
+    `TypeError: 'float' object is not callable`) — always broken, not a
+    regression from this change.
+  - A real correctness bug in `barca-core`: dynamic partitions (`partitions_from`)
+    combined with explicit `inputs={}` wiring to a downstream partitioned
+    consumer could silently drop the dependency edge (root cause: partition-key
+    chunks get bin-packed across dispatch streams by load alone, with no
+    dependency awareness, so a consumer's chunk could be visited before its
+    producer's). This broke `partitioned_etl` — confirmed pre-existing via
+    bisect, not a regression from the adaptive-executor merge. Fixed in
+    `coordinator.rs` (two-pass dependency resolution) and covered by a new Rust
+    unit test plus `tests/integration/test_partitions.sh`, both wired into CI
+    along with `tests/integration/test_benchmark_examples.sh` (runs every
+    benchmark's barca side as a correctness smoke test on every PR).
+
 ## Methodology
 
 ### Environment
@@ -118,7 +373,9 @@ cargo build --release && maturin develop --release
 # Script-mode benchmarks:
 for bench in trivial chain_100 fan_out_500 fan_out_500_50ms spaceflights deep_diamond \
              wide_layers mixed_io_cpu large_payloads map_reduce multi_file_discovery \
-             etl_duckdb wide_join incremental_backfill partitioned_chain resilience_pileup; do
+             etl_duckdb etl_duckdb_dataframes wide_join incremental_backfill \
+             partitioned_chain partitioned_etl partitioned_fan_in resilience_pileup \
+             parallel_tasks; do
   echo "=== $bench ==="
   hyperfine --warmup 1 --runs 3 benchmarks/$bench/*/run.sh
 done

@@ -307,7 +307,12 @@ def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=Fa
 
     `timing` (cpu_seconds, max_rss_bytes) rides on the artifact dict — the
     completion message does triple duty: closes the lease, carries the output
-    ref, and feeds the coordinator's cost estimator.
+    ref, and feeds the coordinator's cost estimator. `elapsed`/`timing` as
+    passed in cover only the step function's own execution; this adds the
+    serialization time measured here on top, so a step's true cost — what the
+    cost model, `barca stats`, and `barca history` all see — isn't
+    systematically undercounted for large payloads (serialization can be the
+    majority of a step's real wall time and was previously invisible).
     """
     explicit_fmt = step.get("serializer")
     fmt = resolve_format(result, detect_format(result, explicit=explicit_fmt))
@@ -317,7 +322,12 @@ def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=Fa
     # path gets a per-item hash from Rust and batch mode is test-only).
     run_hash = step.get("run_hash") if node_id == step.get("node_id") else None
     path = artifact_path(art_dir, node_id, fmt, run_hash)
+    _ser_wall0 = time.perf_counter()
+    _ser_cpu0 = time.process_time()
     size = serialize(result, path, fmt)
+    elapsed += time.perf_counter() - _ser_wall0
+    if timing and timing.get("cpu_seconds") is not None:
+        timing = {**timing, "cpu_seconds": timing["cpu_seconds"] + (time.process_time() - _ser_cpu0)}
     artifact = {"path": str(path), "format": fmt, "size_bytes": size}
     if elapsed_in_artifact:
         artifact["elapsed_seconds"] = elapsed

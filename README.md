@@ -323,22 +323,12 @@ Barca's total overhead (parse + plan + spawn + persist) is **38ms**. Dagster nee
 
 ### Benchmark suite
 
-The `benchmarks/` directory contains 12 scenarios covering a range of DAG topologies and workloads:
-
-| Benchmark | Assets | Topology | What it tests |
-|-----------|--------|----------|--------------|
-| `trivial` | 1 | single node | Pure framework overhead |
-| `chain_100` | 100 | linear chain | Sequential dependency resolution |
-| `fan_out_500` | 500 | flat (independent) | Wide parallelism, process spawning |
-| `fan_out_500_50ms` | 500 | flat + 50ms sleep | Parallelism under I/O latency |
-| `deep_diamond` | 18 | diamond (5-wide, 6-deep) | Fan-out/fan-in patterns |
-| `wide_layers` | varies | parallel layers | Tier-based parallel execution |
-| `large_payloads` | varies | varied | JSON serialization overhead |
-| `map_reduce` | varies | map-reduce | Scatter-gather pattern |
-| `mixed_io_cpu` | varies | varied | Mixed I/O and CPU workloads |
-| `multi_file_discovery` | varies | multi-file | Cross-file asset discovery |
-| `iris_pipeline` | varies | diamond | ML pipeline (iris dataset) |
-| `spaceflights` | 10 | diamond (3-wide, 6-deep) | Full ML pipeline (Kedro-style) |
+The `benchmarks/` directory covers a wide range of DAG topologies and workloads —
+overhead/scaling, DAG shapes, real workloads (ETL, ML pipelines), partitioned
+runs, and dynamic dispatch/resilience — each with equivalent Dagster and Prefect
+implementations for apples-to-apples comparison. See
+[`benchmarks/README.md`](benchmarks/README.md) for the full topology tables and
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for current results.
 
 Run any benchmark:
 
@@ -346,8 +336,6 @@ Run any benchmark:
 cd benchmarks/trivial
 ./bench.sh 10    # 10 measured runs
 ```
-
-Each benchmark includes equivalent Dagster and Prefect implementations for apples-to-apples comparison.
 
 ## Architecture
 

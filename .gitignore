@@ -48,6 +48,5 @@ Thumbs.db
 .pytest_cache/
 
 # Benchmark auto-generated hyperfine output (per-benchmark dir)
-benchmarks/trivial/results.md
-benchmarks/chain_100/results.md
+benchmarks/*/results.md
 

@@ -42,8 +42,22 @@ jobs:
           bash tests/integration/test_cli.sh
           bash tests/integration/test_cache.sh
           bash tests/integration/test_cache_gaps.sh
+          bash tests/integration/test_cache_fuzz.sh
           bash tests/integration/test_env.sh
           bash tests/integration/test_remote_state.sh
+          bash tests/integration/test_partitions.sh
+
+      - name: Run benchmark examples as integration smoke tests
+        run: |
+          # benchmarks/*/barca/run.sh hardcode $REPO_ROOT/.venv/bin/barca, matching
+          # the local dev convention (`maturin develop --release` installs there) —
+          # link it to the wheel-installed barca from the build step above instead
+          # of building a second copy.
+          mkdir -p .venv/bin
+          ln -sf "$(command -v barca)" .venv/bin/barca
+          pip install scikit-learn  # only benchmarks/spaceflights needs this
+          pip install pandas pyarrow  # only benchmarks/etl_duckdb_dataframes needs this
+          bash tests/integration/test_benchmark_examples.sh
 
   backends:
     # Full Python suite, including the state-backend conformance suite that runs

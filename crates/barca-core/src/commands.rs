@@ -102,7 +102,18 @@ pub fn find_python() -> PathBuf {
     PathBuf::from("python3")
 }
 
+/// Worker pool size: `BARCA_POOL_SIZE` overrides auto-detection when set to a
+/// positive integer. Lets benchmark harnesses (and anyone else) pin the pool
+/// to a fixed core count instead of whatever `available_parallelism()` reports
+/// on the current machine.
 fn default_pool_size() -> usize {
+    if let Some(n) = env::var("BARCA_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -191,9 +202,27 @@ async fn execute(
     cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
+    // BARCA_TRACE_TIMING=1: emit a millisecond-resolution waterfall of every
+    // major checkpoint in this run to stderr (DAG parse, planning, DB setup,
+    // per-phase cache-check/dispatch/shutdown, persist_run — plus per-worker
+    // spawn and per-step dispatch/completion timestamps from io_loop.rs).
+    // One `env::var` check per call site; free when unset. Written to track
+    // down where wall-clock time actually goes on a slow run — e.g. it's how
+    // a real ~1.3s of JSON serialization on a couple of heavy assets was
+    // found to be invisible to barca's own per-step timing (see the fix to
+    // `_materialize`'s timer placement in python/barca/_worker.py).
+    let trace_on = std::env::var("BARCA_TRACE_TIMING").is_ok();
+    macro_rules! trace_point {
+        ($($arg:tt)*) => {
+            if trace_on {
+                eprintln!("[trace] {:>8.1}ms  {}", t0.elapsed().as_secs_f64() * 1000.0, format!($($arg)*));
+            }
+        };
+    }
     let run_id = db::generate_run_id();
 
     let dag = build_dag(file_args, python).await?;
+    trace_point!("dag_built");
 
     // Resolve target: if Some, find it and extract subgraph; if None, use full DAG.
     let target_id: Option<String> = match target_name {
@@ -239,6 +268,7 @@ async fn execute(
     } else {
         full_plan
     };
+    trace_point!("planned");
 
     db::ensure_env_dirs(&cfg.env)?;
     let db_path = cfg.db_path.clone();
@@ -253,8 +283,10 @@ async fn execute(
     } else {
         None
     };
+    trace_point!("state_sync_pull (enabled={state_sync_on})");
 
     db::init_db(&db_path).await?;
+    trace_point!("db_init");
 
     db::create_run(
         &db_path,
@@ -265,12 +297,14 @@ async fn execute(
         Some(exec_plan.total_steps),
     )
     .await?;
+    trace_point!("db_create_run");
 
     // Measured-cost model: seed from persisted estimates so batch sizing is
     // pre-warmed — the cold-start probe is paid once ever per stable node,
     // not once per run.
     let mut cost_model = crate::cost::CostModel::new();
     cost_model.seed(db::load_cost_estimates(&db_path).await?);
+    trace_point!("cost_model_seeded");
 
     let db = {
         let _g = db::db_guard().await;
@@ -282,6 +316,7 @@ async fn execute(
     let conn = db
         .connect()
         .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+    trace_point!("db_connect");
 
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut run_hashes: HashMap<String, String> = HashMap::new();
@@ -319,6 +354,7 @@ async fn execute(
     let avg_times = db::get_avg_elapsed(&db_path, &unpartitioned_node_ids).await?;
     let partitioned_avg_times =
         db::get_avg_elapsed_for_partitioned(&db_path, &partitioned_base_ids).await?;
+    trace_point!("eta_queries ({} unpartitioned, {} partitioned base ids)", unpartitioned_node_ids.len(), partitioned_base_ids.len());
     let total_estimated: f64 = unpartitioned_node_ids
         .iter()
         .filter_map(|nid| avg_times.get(nid))
@@ -372,8 +408,9 @@ async fn execute(
         storage_options_json: cfg.storage_options_json.clone(),
     };
     let mut pool = crate::io_loop::WorkerPool::start(io_config).map_err(BarcaError::Other)?;
+    trace_point!("pool_started");
 
-    for phase in &exec_plan.phases {
+    for (phase_idx, phase) in exec_plan.phases.iter().enumerate() {
         // Stop scheduling new phases once cancelled; partial results from
         // completed phases are persisted below.
         if cancel.is_cancelled() {
@@ -382,6 +419,7 @@ async fn execute(
             }
             break;
         }
+        trace_point!("phase{phase_idx}_start");
 
         let expanded_phase = dispatch::expand_pending_partitions(phase, &all_outputs, pool_size);
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
@@ -514,6 +552,8 @@ async fn execute(
             }
         }
 
+        trace_point!("phase{phase_idx}_cache_check_done");
+
         if uncached_streams.is_empty() {
             continue;
         }
@@ -617,6 +657,7 @@ async fn execute(
         let phase_err = pool
             .run_phase(&mut coord, &mut cost_model, Some(on_step_cb), &cancel)
             .await;
+        trace_point!("phase{phase_idx}_run_phase_done");
         if let Err(e) = phase_err {
             if phase_error.is_none() {
                 phase_error = Some(e);
@@ -718,6 +759,7 @@ async fn execute(
     // All phases done (or aborted/cancelled) — release the worker pool before
     // persisting.
     pool.shutdown().await;
+    trace_point!("pool_shutdown");
 
     // Finish progress bar.
     if let Some(ref bar) = pb {
@@ -780,6 +822,7 @@ async fn execute(
         cost_snapshot: &cost_snapshot,
     };
     persist_run(&db_path, &ledger).await?;
+    trace_point!("persist_run_done");
 
     // Shared remote state: fold the WAL into the main file and conditionally
     // upload it. On conflict (another machine pushed first): pull the fresh

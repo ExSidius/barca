@@ -167,9 +167,26 @@ impl Coordinator {
     /// Add an item. If all deps satisfied, push to ready queue.
     /// If has unsatisfied deps, add to pending.
     pub fn add_item(&mut self, step_id: crate::StepId, spec: ItemSpec, deps: Vec<Dep>) -> ItemId {
+        let id = self.reserve_item_id();
+        self.finalize_item(id, step_id, spec, deps);
+        id
+    }
+
+    /// Reserve an [`ItemId`] without creating the item yet. Lets a caller
+    /// register an item's id (e.g. in a lookup table other items' deps will
+    /// resolve against) before that item's own deps are known — see
+    /// [`Coordinator::load_phase`]'s two-pass construction.
+    fn reserve_item_id(&mut self) -> ItemId {
         let id = ItemId(self.next_item_id);
         self.next_item_id += 1;
+        id
+    }
 
+    /// Create the item for a previously [`reserve_item_id`](Self::reserve_item_id)'d
+    /// id: inserts it, registers dependents, and places it on the ready or
+    /// pending queue. This is `add_item`'s body, split out so `load_phase` can
+    /// reserve every id up front and only then resolve deps.
+    fn finalize_item(&mut self, id: ItemId, step_id: crate::StepId, spec: ItemSpec, deps: Vec<Dep>) {
         let item = Item {
             id,
             step_id,
@@ -215,8 +232,6 @@ impl Coordinator {
         } else {
             self.pending.insert(id, unsatisfied);
         }
-
-        id
     }
 
     // ─── Scheduling ────────────────────────────────────────────────────────
@@ -373,28 +388,98 @@ impl Coordinator {
     /// Resolves in-phase dependencies and fills dag_inputs from provided inputs.
     /// Partitioned steps are expanded: one item per partition key.
     /// Returns the number of items added.
+    ///
+    /// Two passes, deliberately: pass 1 reserves every item's [`ItemId`] and
+    /// registers it in `node_to_item` *before* pass 2 resolves any
+    /// dependency. A single interleaved pass would resolve a step's
+    /// dependencies against whatever's been registered so far — correct only
+    /// if producers always precede their consumers in stream order. That
+    /// holds for the planner's initial phases, but not for phases rebuilt by
+    /// `dispatch::expand_pending_partitions` (dynamic `partitions_from`
+    /// partitions): its load-balancing bin-packing distributes partition-key
+    /// chunks across streams by size alone, with no awareness of cross-step
+    /// data dependencies, so a consumer's chunk can land in a stream
+    /// processed before its producer's. With two passes, resolution order no
+    /// longer depends on stream order at all.
     pub fn load_phase(
         &mut self,
         phase: &crate::planner::Phase,
         provided: &HashMap<String, crate::dispatch::ProvidedInput>,
     ) -> usize {
-        let mut count = 0;
-        let mut node_to_item: HashMap<String, ItemId> = HashMap::new();
-        // For partitioned steps, track all items for a given base node so
-        // downstream partitioned steps can find their partition-aligned upstream.
-        let mut base_to_partition_items: HashMap<
-            String,
-            Vec<(crate::model::PartitionKey, ItemId)>,
-        > = HashMap::new();
+        enum Pending<'p> {
+            Plain {
+                step: &'p crate::planner::StreamStep,
+                step_id: crate::StepId,
+                item_id: ItemId,
+                prev_items: Vec<ItemId>,
+            },
+            Partition {
+                step: &'p crate::planner::StreamStep,
+                pk: &'p crate::model::PartitionKey,
+                partition_step_id: crate::StepId,
+                item_id: ItemId,
+                prev_items: Vec<ItemId>,
+            },
+        }
 
+        let mut node_to_item: HashMap<String, ItemId> = HashMap::new();
+        let mut pending: Vec<Pending> = Vec::new();
+
+        // Pass 1: reserve ids and register every display id this phase will
+        // produce. Within-stream ordering chains (`prev_items`) only ever
+        // reference the immediately preceding step in the same stream, which
+        // has already been reserved by this point in the walk — they don't
+        // need a second pass.
         for stream in &phase.streams {
             let mut prev_items: Vec<ItemId> = Vec::new();
             for step in &stream.steps {
                 if step.partition_keys.is_empty() {
-                    // Non-partitioned step: single item
                     let step_id = step.step_id.clone();
                     let display_id = step_id.display();
+                    let item_id = self.reserve_item_id();
+                    node_to_item.insert(display_id, item_id);
+                    pending.push(Pending::Plain {
+                        step,
+                        step_id,
+                        item_id,
+                        prev_items: prev_items.clone(),
+                    });
+                    prev_items = vec![item_id];
+                } else {
+                    let mut partition_item_ids: Vec<ItemId> = Vec::new();
 
+                    for pk in &step.partition_keys {
+                        let partition_step_id =
+                            crate::StepId::new(step.step_id.base.clone(), pk.clone());
+                        let partition_display = partition_step_id.display();
+                        let item_id = self.reserve_item_id();
+                        node_to_item.insert(partition_display, item_id);
+                        partition_item_ids.push(item_id);
+                        pending.push(Pending::Partition {
+                            step,
+                            pk,
+                            partition_step_id,
+                            item_id,
+                            prev_items: prev_items.clone(),
+                        });
+                    }
+
+                    prev_items = partition_item_ids;
+                }
+            }
+        }
+
+        // Pass 2: every id this phase will create is now in `node_to_item`,
+        // so dependency resolution no longer depends on visit order.
+        let count = pending.len();
+        for p in pending {
+            match p {
+                Pending::Plain {
+                    step,
+                    step_id,
+                    item_id,
+                    prev_items,
+                } => {
                     let mut deps = Vec::new();
                     for upstream_id in step.inputs.values() {
                         if let Some(&upstream_item) = node_to_item.get(upstream_id) {
@@ -426,109 +511,88 @@ impl Coordinator {
                         }
                     }
 
-                    let item_id = self.add_item(step_id, spec, deps);
-                    node_to_item.insert(display_id, item_id);
-                    prev_items = vec![item_id];
-                    count += 1;
-                } else {
-                    // Partitioned step: one item per partition key
-                    let base_id = step.step_id.base_id().to_string();
-                    let mut partition_item_ids: Vec<ItemId> = Vec::new();
-
-                    for pk in &step.partition_keys {
-                        let partition_step_id =
-                            crate::StepId::new(step.step_id.base.clone(), pk.clone());
-                        let partition_display = partition_step_id.display();
-
-                        let mut deps = Vec::new();
-                        // Resolve partition-aligned upstream dependencies
-                        for (param_name, upstream_id) in &step.inputs {
-                            if param_name.starts_with('_') {
-                                continue;
-                            }
-                            // Try partition-aligned first: upstream_id[pk]
-                            let aligned_id = pk.display_id(upstream_id);
-                            if let Some(&upstream_item) = node_to_item.get(&aligned_id) {
-                                deps.push(Dep {
-                                    upstream: upstream_item,
-                                    kind: DepKind::Data,
-                                });
-                            } else if let Some(&upstream_item) = node_to_item.get(upstream_id) {
-                                deps.push(Dep {
-                                    upstream: upstream_item,
-                                    kind: DepKind::Data,
-                                });
-                            }
+                    self.finalize_item(item_id, step_id, spec, deps);
+                }
+                Pending::Partition {
+                    step,
+                    pk,
+                    partition_step_id,
+                    item_id,
+                    prev_items,
+                } => {
+                    let partition_display = partition_step_id.display();
+                    let mut deps = Vec::new();
+                    // Resolve partition-aligned upstream dependencies
+                    for (param_name, upstream_id) in &step.inputs {
+                        if param_name.starts_with('_') {
+                            continue;
                         }
-                        // Chain ordering from previous step's partitions
-                        for &p in &prev_items {
-                            if !deps.iter().any(|d| d.upstream == p) {
-                                deps.push(Dep {
-                                    upstream: p,
-                                    kind: DepKind::Ordering,
-                                });
-                            }
+                        // Try partition-aligned first: upstream_id[pk]
+                        let aligned_id = pk.display_id(upstream_id);
+                        if let Some(&upstream_item) = node_to_item.get(&aligned_id) {
+                            deps.push(Dep {
+                                upstream: upstream_item,
+                                kind: DepKind::Data,
+                            });
+                        } else if let Some(&upstream_item) = node_to_item.get(upstream_id) {
+                            deps.push(Dep {
+                                upstream: upstream_item,
+                                kind: DepKind::Data,
+                            });
                         }
-
-                        let mut spec = ItemSpec::from_step(step);
-                        spec.run_hash = step.run_hashes.get(&partition_display).cloned();
-                        // Add partition values as direct_kwargs so they're
-                        // injected into the function call.
-                        for (k, v) in &pk.0 {
-                            spec.direct_kwargs
-                                .insert(k.clone(), serde_json::Value::String(v.clone()));
+                    }
+                    // Chain ordering from previous step's partitions
+                    for &p in &prev_items {
+                        if !deps.iter().any(|d| d.upstream == p) {
+                            deps.push(Dep {
+                                upstream: p,
+                                kind: DepKind::Ordering,
+                            });
                         }
-                        // Fill dag_inputs from provided (cross-phase) or
-                        // rely on in-phase resolution at dispatch time via upstream_inputs.
-                        for (param_name, upstream_id) in &step.inputs {
-                            if param_name.starts_with('_') {
-                                continue;
-                            }
-                            let aligned_id = pk.display_id(upstream_id);
-                            if let Some(pi) = provided.get(&aligned_id) {
-                                let path = match pi {
-                                    crate::dispatch::ProvidedInput::Single(oref) => {
-                                        oref.path.clone()
-                                    }
-                                    crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                        orefs.first().map(|o| o.path.clone()).unwrap_or_default()
-                                    }
-                                };
-                                spec.dag_inputs.insert(param_name.clone(), path);
-                            } else if let Some(pi) = provided.get(upstream_id) {
-                                let path = match pi {
-                                    crate::dispatch::ProvidedInput::Single(oref) => {
-                                        oref.path.clone()
-                                    }
-                                    crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                        orefs.first().map(|o| o.path.clone()).unwrap_or_default()
-                                    }
-                                };
-                                spec.dag_inputs.insert(param_name.clone(), path);
-                            }
-                            // Update upstream_inputs to point to partition-aligned IDs
-                            // for in-phase resolution at dispatch time.
-                            spec.upstream_inputs.insert(param_name.clone(), aligned_id);
-                        }
-
-                        let item_id = self.add_item(partition_step_id, spec, deps);
-                        node_to_item.insert(partition_display, item_id);
-                        partition_item_ids.push(item_id);
-                        count += 1;
                     }
 
-                    base_to_partition_items.insert(
-                        base_id,
-                        step.partition_keys
-                            .iter()
-                            .zip(partition_item_ids.iter())
-                            .map(|(pk, &id)| (pk.clone(), id))
-                            .collect(),
-                    );
-                    prev_items = partition_item_ids;
+                    let mut spec = ItemSpec::from_step(step);
+                    spec.run_hash = step.run_hashes.get(&partition_display).cloned();
+                    // Add partition values as direct_kwargs so they're
+                    // injected into the function call.
+                    for (k, v) in &pk.0 {
+                        spec.direct_kwargs
+                            .insert(k.clone(), serde_json::Value::String(v.clone()));
+                    }
+                    // Fill dag_inputs from provided (cross-phase) or
+                    // rely on in-phase resolution at dispatch time via upstream_inputs.
+                    for (param_name, upstream_id) in &step.inputs {
+                        if param_name.starts_with('_') {
+                            continue;
+                        }
+                        let aligned_id = pk.display_id(upstream_id);
+                        if let Some(pi) = provided.get(&aligned_id) {
+                            let path = match pi {
+                                crate::dispatch::ProvidedInput::Single(oref) => oref.path.clone(),
+                                crate::dispatch::ProvidedInput::Collected(orefs) => {
+                                    orefs.first().map(|o| o.path.clone()).unwrap_or_default()
+                                }
+                            };
+                            spec.dag_inputs.insert(param_name.clone(), path);
+                        } else if let Some(pi) = provided.get(upstream_id) {
+                            let path = match pi {
+                                crate::dispatch::ProvidedInput::Single(oref) => oref.path.clone(),
+                                crate::dispatch::ProvidedInput::Collected(orefs) => {
+                                    orefs.first().map(|o| o.path.clone()).unwrap_or_default()
+                                }
+                            };
+                            spec.dag_inputs.insert(param_name.clone(), path);
+                        }
+                        // Update upstream_inputs to point to partition-aligned IDs
+                        // for in-phase resolution at dispatch time.
+                        spec.upstream_inputs.insert(param_name.clone(), aligned_id);
+                    }
+
+                    self.finalize_item(item_id, partition_step_id, spec, deps);
                 }
             }
         }
+
         count
     }
 
@@ -1171,5 +1235,105 @@ mod tests {
                 ("f:plain".to_string(), Some("hash-plain".to_string())),
             ]
         );
+    }
+
+    /// Regression test for a bug where a partitioned consumer's data dependency
+    /// on its partitioned producer is silently dropped when the producer's
+    /// partition instance is loaded into the coordinator *after* the
+    /// consumer's — which is exactly what `dispatch::expand_pending_partitions`'s
+    /// load-balancing bin-packing can produce for dynamic (`partitions_from`)
+    /// partitions, since it distributes partition-key chunks across streams by
+    /// size alone, with no awareness of cross-step data dependencies.
+    ///
+    /// `load_phase` wires each partitioned item's deps by looking up its
+    /// upstream in `node_to_item`, which is only populated for items already
+    /// visited by the `for stream { for step { .. } }` walk — so stream order
+    /// must never matter for correctness, only for scheduling. This phase
+    /// deliberately interleaves `fetch`/`enrich` partition instances across
+    /// streams so that two of the three `enrich` instances are loaded *before*
+    /// the `fetch` instance they depend on.
+    #[test]
+    fn load_phase_wires_partition_aligned_deps_regardless_of_stream_order() {
+        use crate::planner::{Phase, PhaseReason, StreamStep, WorkerStream};
+        use crate::{PartitionKey, StepId};
+
+        let pk = |k: &str| PartitionKey::from(HashMap::from([("t".to_string(), k.to_string())]));
+
+        let mk = |name: &str, inputs: HashMap<String, String>, pks: Vec<PartitionKey>| StreamStep {
+            step_id: StepId::unpartitioned(name),
+            kind: crate::NodeKind::Asset,
+            function_name: std::sync::Arc::from(name.rsplit(':').next().unwrap()),
+            source_file: std::sync::Arc::from("f"),
+            inputs,
+            pending_partitions: HashMap::new(),
+            serializer: None,
+            sinks: vec![],
+            run_hashes: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            partition_keys: pks,
+        };
+
+        let no_inputs = HashMap::new();
+        let enrich_inputs = HashMap::from([("data".to_string(), "f:fetch".to_string())]);
+
+        // Interleaved like a real bin-packing result: enrich[B] and enrich[C]
+        // are loaded in streams that precede the stream loading fetch[B] and
+        // fetch[C] respectively. Only enrich[A] follows fetch[A].
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![
+                WorkerStream {
+                    stream_id: "w0".to_string(),
+                    steps: vec![
+                        mk("f:fetch", no_inputs.clone(), vec![pk("A")]),
+                        mk("f:enrich", enrich_inputs.clone(), vec![pk("B")]),
+                    ],
+                },
+                WorkerStream {
+                    stream_id: "w1".to_string(),
+                    steps: vec![
+                        mk("f:fetch", no_inputs.clone(), vec![pk("B")]),
+                        mk("f:enrich", enrich_inputs.clone(), vec![pk("C")]),
+                    ],
+                },
+                WorkerStream {
+                    stream_id: "w2".to_string(),
+                    steps: vec![
+                        mk("f:fetch", no_inputs, vec![pk("C")]),
+                        mk("f:enrich", enrich_inputs, vec![pk("A")]),
+                    ],
+                },
+            ],
+        };
+
+        let mut c = Coordinator::new();
+        let loaded = c.load_phase(&phase, &HashMap::new());
+        assert_eq!(loaded, 6);
+
+        for k in ["A", "B", "C"] {
+            let fetch_id = format!("f:fetch[t={k}]");
+            let enrich_id = format!("f:enrich[t={k}]");
+            let fetch_item = c
+                .items
+                .values()
+                .find(|it| it.step_id.display() == fetch_id)
+                .unwrap_or_else(|| panic!("{fetch_id} not loaded"));
+            let enrich_item = c
+                .items
+                .values()
+                .find(|it| it.step_id.display() == enrich_id)
+                .unwrap_or_else(|| panic!("{enrich_id} not loaded"));
+
+            assert!(
+                enrich_item
+                    .deps
+                    .iter()
+                    .any(|d| d.upstream == fetch_item.id && d.kind == DepKind::Data),
+                "{enrich_id} is missing its Data dependency on {fetch_id} — \
+                 stream order must not affect partition-aligned dependency wiring"
+            );
+        }
     }
 }

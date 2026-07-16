@@ -16,9 +16,17 @@ from barca import asset
 # -- Raw layer: generate synthetic data --
 
 
-@asset()
+@asset(serializer="pickle")
 def raw_orders() -> dict:
-    """100k orders over 3 years."""
+    """100k orders over 3 years.
+
+    Pickled rather than the default JSON: this payload is a list of ~100k
+    small dicts, and pickle is both smaller and dramatically faster to
+    (de)serialize than JSON for this shape (measured: json.dump ~635ms vs
+    pickle.dump ~64ms for this exact 14.9MB/100k-row payload; json.load
+    ~165ms vs pickle.load ~64ms). See benchmarks/RESULTS.md's etl_duckdb
+    notes for the full investigation.
+    """
     rng = random.Random(42)
     rows = []
     for i in range(100_000):
@@ -76,9 +84,13 @@ def raw_products() -> dict:
 # -- Staging layer: clean + transform --
 
 
-@asset(inputs={"raw": raw_orders})
+@asset(inputs={"raw": raw_orders}, serializer="pickle")
 def stg_orders(raw: dict) -> dict:
-    """Filter to completed orders, compute total."""
+    """Filter to completed orders, compute total.
+
+    Pickled like raw_orders — this is the fan-out point (read by all three
+    int_* assets below), so a cheaper format here pays off three times over.
+    """
     rows = []
     for r in raw["rows"]:
         if r["status"] == "completed":
