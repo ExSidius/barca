@@ -16,6 +16,34 @@ Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 > to the `etl_duckdb` investigation below and measured separately, in
 > isolation — see the table's ‡ footnote.) This pass ran in a shared, virtualized CI-style container (not the
 > dedicated Apple Silicon box the original numbers came from), so absolute
+
+> **Further note (2026-07-16, same day):** a second fairness pass found that even with
+> worker *counts* matched, most `prefect/run.py` scripts on benchmarks with genuinely
+> independent branches were calling tasks directly/sequentially instead of via
+> `.submit()` — so Prefect never actually used the concurrency budget it was just given,
+> making it look slower than it fairly should on parallel-shaped benchmarks. That's now
+> fixed (see `benchmarks/README.md#methodology`) on every benchmark that has real
+> independent branches: `etl_duckdb`, `etl_duckdb_dataframes`, `fan_out_500`,
+> `fan_out_500_50ms`, `map_reduce`, `multi_file_discovery`, `parallel_tasks`,
+> `partitioned_chain`, `partitioned_etl`, `partitioned_fan_in`, `spaceflights`,
+> `timeseries_1000`, `wide_join`, and `wide_layers` — 13 of which have a row in the
+> table below (`timeseries_1000` doesn't). `deep_diamond` and `mixed_io_cpu` already had
+> this fix applied before this pass. Benchmarks that are strict sequential chains with
+> nothing to parallelize either way were correctly left unchanged: `trivial`,
+> `chain_100`, `large_payloads`, `incremental_backfill`. `resilience_pileup` is a
+> deliberate exception — its whole point is comparing barca's non-blocking retry/backoff
+> against Dagster/Prefect's sequential baseline (see the comment in
+> `resilience_pileup/bench.sh`), so it's intentionally left as-is rather than "fixed."
+>
+> Dagster was investigated too and deliberately left unchanged everywhere — its only
+> real multiprocess mechanism spawns a fresh OS subprocess per step (measured
+> ~0.5–1.5s each), which dwarfs every task in this suite (all ≤50ms), so enabling it
+> would trade one distortion for a worse one; see "Why Dagster is excluded" in the
+> methodology doc.
+>
+> **The Prefect numbers in the table below predate the `.submit()` fix and should be
+> treated as a worst case for Prefect** on the 13 affected rows listed above — re-run
+> via `bench.sh` for current numbers.
 > times aren't comparable across the two environments — only the
 > barca/dagster/prefect ratios *within* the same run are meaningful. The table
 > below shows dagster ahead or tied on 9 of 18 — **but most of that is

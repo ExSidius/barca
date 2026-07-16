@@ -2,9 +2,15 @@
 
 import json
 import math
+import os
 import time
 
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
+
+# Matches barca's pool_size and dagster's max_concurrent for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 
 # ── Layer 0: 20 independent sources ──
@@ -469,84 +475,84 @@ def final_output(
     return {"final_sum": round(sum(values), 4), "total_assets": 63}
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=BENCH_WORKERS))
 def wide_layers_flow():
     # Layer 0 (parallel)
     l0 = [
-        layer0_00(),
-        layer0_01(),
-        layer0_02(),
-        layer0_03(),
-        layer0_04(),
-        layer0_05(),
-        layer0_06(),
-        layer0_07(),
-        layer0_08(),
-        layer0_09(),
-        layer0_10(),
-        layer0_11(),
-        layer0_12(),
-        layer0_13(),
-        layer0_14(),
-        layer0_15(),
-        layer0_16(),
-        layer0_17(),
-        layer0_18(),
-        layer0_19(),
+        layer0_00.submit(),
+        layer0_01.submit(),
+        layer0_02.submit(),
+        layer0_03.submit(),
+        layer0_04.submit(),
+        layer0_05.submit(),
+        layer0_06.submit(),
+        layer0_07.submit(),
+        layer0_08.submit(),
+        layer0_09.submit(),
+        layer0_10.submit(),
+        layer0_11.submit(),
+        layer0_12.submit(),
+        layer0_13.submit(),
+        layer0_14.submit(),
+        layer0_15.submit(),
+        layer0_16.submit(),
+        layer0_17.submit(),
+        layer0_18.submit(),
+        layer0_19.submit(),
     ]
 
     # Aggregation 0
-    a0 = agg_0(*l0)
+    a0 = agg_0.submit(*l0)
 
     # Layer 1 (parallel, each depends on agg_0)
     l1 = [
-        layer1_00(a0),
-        layer1_01(a0),
-        layer1_02(a0),
-        layer1_03(a0),
-        layer1_04(a0),
-        layer1_05(a0),
-        layer1_06(a0),
-        layer1_07(a0),
-        layer1_08(a0),
-        layer1_09(a0),
-        layer1_10(a0),
-        layer1_11(a0),
-        layer1_12(a0),
-        layer1_13(a0),
-        layer1_14(a0),
-        layer1_15(a0),
-        layer1_16(a0),
-        layer1_17(a0),
-        layer1_18(a0),
-        layer1_19(a0),
+        layer1_00.submit(a0),
+        layer1_01.submit(a0),
+        layer1_02.submit(a0),
+        layer1_03.submit(a0),
+        layer1_04.submit(a0),
+        layer1_05.submit(a0),
+        layer1_06.submit(a0),
+        layer1_07.submit(a0),
+        layer1_08.submit(a0),
+        layer1_09.submit(a0),
+        layer1_10.submit(a0),
+        layer1_11.submit(a0),
+        layer1_12.submit(a0),
+        layer1_13.submit(a0),
+        layer1_14.submit(a0),
+        layer1_15.submit(a0),
+        layer1_16.submit(a0),
+        layer1_17.submit(a0),
+        layer1_18.submit(a0),
+        layer1_19.submit(a0),
     ]
 
     # Aggregation 1
-    a1 = agg_1(*l1)
+    a1 = agg_1.submit(*l1)
 
     # Layer 2 (parallel, each depends on agg_1)
     l2 = [
-        layer2_00(a1),
-        layer2_01(a1),
-        layer2_02(a1),
-        layer2_03(a1),
-        layer2_04(a1),
-        layer2_05(a1),
-        layer2_06(a1),
-        layer2_07(a1),
-        layer2_08(a1),
-        layer2_09(a1),
-        layer2_10(a1),
-        layer2_11(a1),
-        layer2_12(a1),
-        layer2_13(a1),
-        layer2_14(a1),
-        layer2_15(a1),
-        layer2_16(a1),
-        layer2_17(a1),
-        layer2_18(a1),
-        layer2_19(a1),
+        layer2_00.submit(a1),
+        layer2_01.submit(a1),
+        layer2_02.submit(a1),
+        layer2_03.submit(a1),
+        layer2_04.submit(a1),
+        layer2_05.submit(a1),
+        layer2_06.submit(a1),
+        layer2_07.submit(a1),
+        layer2_08.submit(a1),
+        layer2_09.submit(a1),
+        layer2_10.submit(a1),
+        layer2_11.submit(a1),
+        layer2_12.submit(a1),
+        layer2_13.submit(a1),
+        layer2_14.submit(a1),
+        layer2_15.submit(a1),
+        layer2_16.submit(a1),
+        layer2_17.submit(a1),
+        layer2_18.submit(a1),
+        layer2_19.submit(a1),
     ]
 
     # Final output

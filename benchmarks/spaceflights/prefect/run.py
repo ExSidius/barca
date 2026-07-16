@@ -1,10 +1,16 @@
 """Prefect spaceflights benchmark — 10-task diamond DAG."""
 
 import json
+import os
 import random
 import time
 
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
+
+# Matches barca's pool_size and dagster's max_concurrent for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 
 @task
@@ -200,17 +206,17 @@ def evaluate_model(model, data):
     }
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=BENCH_WORKERS))
 def spaceflights_flow():
-    shuttles = raw_shuttles()
-    companies = raw_companies()
-    reviews = raw_reviews()
-    ps = prep_shuttles(shuttles)
-    pc = prep_companies(companies)
-    pr = prep_reviews(reviews)
-    mt = master_table(ps, pc, pr)
-    sp = split_data(mt)
-    model = train_model(sp)
+    shuttles = raw_shuttles.submit()
+    companies = raw_companies.submit()
+    reviews = raw_reviews.submit()
+    ps = prep_shuttles.submit(shuttles)
+    pc = prep_companies.submit(companies)
+    pr = prep_reviews.submit(reviews)
+    mt = master_table.submit(ps, pc, pr)
+    sp = split_data.submit(mt)
+    model = train_model.submit(sp)
     return evaluate_model(model, sp)
 
 
