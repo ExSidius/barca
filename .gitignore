@@ -50,5 +50,3 @@ Thumbs.db
 # Benchmark auto-generated hyperfine output (per-benchmark dir)
 benchmarks/*/results.md
 
-# MkDocs
-site/

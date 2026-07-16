@@ -1,0 +1,17 @@
+/* ============================================================
+   Barca docs — self-hosted brand fonts
+   Space Grotesk (display/UI) + JetBrains Mono (code/data), per
+   the barca Design System's tokens/fonts.css. Self-hosted via
+   @fontsource instead of a Google Fonts CDN link so the brand
+   font always renders, with no third-party request at runtime.
+   ============================================================ */
+
+@import '@fontsource/space-grotesk/400.css';
+@import '@fontsource/space-grotesk/500.css';
+@import '@fontsource/space-grotesk/600.css';
+@import '@fontsource/space-grotesk/700.css';
+
+@import '@fontsource/jetbrains-mono/400.css';
+@import '@fontsource/jetbrains-mono/500.css';
+@import '@fontsource/jetbrains-mono/600.css';
+@import '@fontsource/jetbrains-mono/700.css';

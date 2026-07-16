@@ -81,7 +81,7 @@ benchmarks/chain_100/bench.sh 5   # (coming soon)
 4. **Single install** — `uv add barca` gives users everything
 5. **Turso for persistence** — Rust owns the DB; Python has no DB access
 6. **Artifact-based data passing** — serialized files (json/pickle/parquet) between worker batches
-7. **Content-addressed artifacts** — `{artifacts}/{node}/{run_hash}{ext}`; shared remote state pulls/pushes the metadata DB as a blob (see docs/config.md and docs/remote-storage.md)
+7. **Content-addressed artifacts** — `{artifacts}/{node}/{run_hash}{ext}`; shared remote state pulls/pushes the metadata DB as a blob (see site/src/content/docs/reference/config.mdx and site/src/content/docs/reference/remote-storage.md, published at https://barca.sh/reference/config/ and https://barca.sh/reference/remote-storage/)
 
 ## Git workflow
 

@@ -239,7 +239,7 @@ curl localhost:8274/status/<run_id>               # poll run status + result
 curl -XDELETE localhost:8274/run/<run_id>         # cancel an in-flight run
 ```
 
-See [docs/server-api.md](docs/server-api.md) for the full endpoint reference.
+See the [Server API reference](https://barca.sh/reference/server-api/) for the full endpoint reference.
 
 ## Python API
 
@@ -405,7 +405,7 @@ barca plan examples/basic_app/example_project/assets.py
 
 ## Project status
 
-Barca is in active development. The core pipeline (parse -> DAG -> plan -> execute -> persist) is working and benchmarked. See the [guide](./docs/guide.md) for a walkthrough.
+Barca is in active development. The core pipeline (parse -> DAG -> plan -> execute -> persist) is working and benchmarked. See the [guide](https://barca.sh/guide/) for a walkthrough.
 
 ## License
 
