@@ -1,38 +1,166 @@
-/* Barca docs theme — a nautical teal accent, dark by default. */
+/* ============================================================
+   Barca docs theme
+   Mapped from the "barca Design System" (claude.ai/design):
+   a calm, terminal-grade dark console — green-tinted near-black
+   surfaces, one cool emerald "signal" green used sparingly, a
+   calm cyan for links/running/info, and a mono-forward type
+   system (Space Grotesk for prose/UI, JetBrains Mono for
+   anything a machine produced: code, ids, durations, counts).
+   ============================================================ */
 
 :root {
-  --sl-color-accent-low: #0b3a3f;
-  --sl-color-accent: #17838c;
-  --sl-color-accent-high: #a8e6e0;
-  --sl-color-white: #ffffff;
-  --sl-color-gray-1: #eaf2f2;
-  --sl-color-gray-2: #c2cccc;
-  --sl-color-gray-3: #8fa0a0;
-  --sl-color-gray-4: #55696a;
-  --sl-color-gray-5: #354546;
-  --sl-color-gray-6: #212f30;
-  --sl-color-black: #131b1c;
+  /* ---- Neutral ramp -> Starlight gray scale (dark, green-tinted) ---- */
+  --sl-color-white: #e9f1ec;
+  --sl-color-gray-1: #c2ccc5;
+  --sl-color-gray-2: #97a19a;
+  --sl-color-gray-3: #6a746c;
+  --sl-color-gray-4: #475149;
+  --sl-color-gray-5: #313b34;
+  --sl-color-gray-6: #171d19;
+  --sl-color-black: #080b0a;
 
-  --sl-font: 'Inter', ui-sans-serif, system-ui, sans-serif;
-  --sl-font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  /* ---- Signal green -> accent scale (bg-accent, badges, current nav item, hero button) ---- */
+  --sl-color-accent-low: #145a38;
+  --sl-color-accent: #2db46c;
+  --sl-color-accent-high: #3fd181;
+
+  /* ---- Cyan secondary -> link/text-accent color (kept distinct from signal green) ---- */
+  --sl-color-text-accent: #5fdde2;
+
+  --sl-color-text: var(--sl-color-gray-1);
+  --sl-color-text-invert: var(--sl-color-black);
+  --sl-color-bg: var(--sl-color-black);
+  --sl-color-bg-nav: #0f1311;
+  --sl-color-bg-sidebar: #0f1311;
+  --sl-color-bg-inline-code: #171d19;
+  --sl-color-bg-accent: var(--sl-color-accent-high);
+  --sl-color-hairline-light: #232b26;
+  --sl-color-hairline: #161b18;
+  --sl-color-hairline-shade: var(--sl-color-black);
+
+  /* ---- Typography: Space Grotesk (prose/UI) + JetBrains Mono (machine voice) ---- */
+  --sl-font: 'Space Grotesk', system-ui, -apple-system, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
+
+  /* ---- Search modal corners: small + sharp, not the Starlight default ---- */
+  --sl-search-corners: 0.1875rem;
 }
 
 :root[data-theme='light'] {
-  --sl-color-accent-low: #d3ede9;
-  --sl-color-accent: #0f6b70;
-  --sl-color-accent-high: #0b3a3f;
-  --sl-color-white: #131b1c;
-  --sl-color-gray-1: #212f30;
-  --sl-color-gray-2: #354546;
-  --sl-color-gray-3: #55696a;
-  --sl-color-gray-4: #8fa0a0;
-  --sl-color-gray-5: #c2cccc;
-  --sl-color-gray-6: #e6eeee;
-  --sl-color-gray-7: #f2f7f7;
+  /* ---- Neutral ramp (light: warm-neutral off-white, faint green cast) ---- */
+  --sl-color-white: #0b1410;
+  --sl-color-gray-1: #243029;
+  --sl-color-gray-2: #586860;
+  --sl-color-gray-3: #8a968e;
+  --sl-color-gray-4: #aeb8b1;
+  --sl-color-gray-5: #dce3dd;
+  --sl-color-gray-6: #eaefea;
+  --sl-color-gray-7: #f3f6f3;
   --sl-color-black: #ffffff;
+
+  /* Signal drops to a deeper, more saturated emerald on light so it keeps real weight */
+  --sl-color-accent-low: #beebd2;
+  --sl-color-accent: #0e9150;
+  --sl-color-accent-high: #12a65c;
+
+  --sl-color-text-accent: #0e96a0;
+
+  --sl-color-bg-nav: var(--sl-color-gray-7);
+  --sl-color-bg-sidebar: var(--sl-color-bg);
+  --sl-color-bg-inline-code: var(--sl-color-gray-6);
+  --sl-color-bg-accent: var(--sl-color-accent);
+  --sl-color-hairline-light: var(--sl-color-gray-6);
+  --sl-color-hairline-shade: var(--sl-color-gray-6);
 }
 
-/* Slightly tighter, more confident hero — closer to doc.rust-lang.org's density. */
-.hero h1 {
-  letter-spacing: -0.02em;
+/* Tighter, tracked-in display type; headings are the "human voice" (Space Grotesk) */
+.hero h1,
+.sl-markdown-content :is(h1, h2, h3, h4, h5, h6) {
+  letter-spacing: -0.01em;
+}
+
+/* Code, ids, durations, counts: the machine voice always renders in mono with tabular figures */
+code,
+kbd,
+samp,
+pre {
+  font-feature-settings: 'tnum' 1, 'cv01' 1;
+}
+
+/* Small, sharp radii everywhere — this is console software, not a consumer app */
+.sl-badge {
+  border-radius: 999rem; /* badges: pill */
+}
+.sl-link-button {
+  border-radius: 3px; /* controls: sm */
+}
+.card {
+  border-radius: 8px; /* panels: lg */
+  background-color: var(--sl-color-bg-nav) !important;
+}
+.card .icon {
+  border-radius: 3px;
+}
+
+/* Cards read as one calm system, not a rainbow — every card uses the signal accent only */
+.card,
+.card:nth-child(4n + 1),
+.card:nth-child(4n + 3),
+.card:nth-child(4n + 4),
+.card:nth-child(4n + 5) {
+  --sl-card-border: var(--sl-color-hairline-light);
+  --sl-card-bg: var(--sl-color-accent-low);
+}
+.card .icon {
+  border-color: var(--sl-color-accent-high) !important;
+}
+
+/* Fast, mechanical motion — no bounce */
+.sl-link-button,
+a {
+  transition:
+    color 110ms cubic-bezier(0.2, 0, 0, 1),
+    background-color 110ms cubic-bezier(0.2, 0, 0, 1),
+    border-color 110ms cubic-bezier(0.2, 0, 0, 1);
+}
+
+/* ----------------------------------------------------------------
+   Two-hue split: cyan is reserved for links/running/info (the
+   default --sl-color-text-accent below). Signal green is reserved
+   for the single primary action, brand, and "selected/current"
+   states — so it stays meaningful instead of being everywhere.
+   ---------------------------------------------------------------- */
+
+/* Primary button (hero "Get Started") — the one primary action per view */
+.sl-link-button.primary {
+  background: var(--sl-color-accent-high) !important;
+  border-color: var(--sl-color-accent-high) !important;
+  color: var(--sl-color-black) !important;
+}
+.sl-link-button.primary:hover {
+  filter: brightness(1.1);
+}
+
+/* Current sidebar item — "active nav accent" */
+.sidebar-content a[aria-current='page'] {
+  background-color: var(--sl-color-accent-high) !important;
+  color: var(--sl-color-black) !important;
+}
+
+/* Brand wordmark in the top nav */
+.site-title {
+  color: var(--sl-color-accent-high) !important;
+}
+
+/* Selected tab */
+.tab [role='tab'][aria-selected='true'] {
+  --sl-tab-color-border: var(--sl-color-accent-high);
+}
+
+/* Current heading in the "on this page" outline — a selection state, not a link */
+a[aria-current='true'] {
+  color: var(--sl-color-accent-high) !important;
+}
+.isMobile a[aria-current='true']::after {
+  background-color: var(--sl-color-accent-high) !important;
 }
