@@ -30,7 +30,7 @@ fast = ["orjson"]
 azure = ["fsspec", "adlfs"]
 s3 = ["fsspec", "s3fs"]
 # Cloudflare R2 is S3-compatible: install the s3 extra and point
-# storage_options at the R2 endpoint (see docs/remote-storage.md).
+# storage_options at the R2 endpoint (see https://barca.dev/reference/remote-storage/).
 r2 = ["fsspec", "s3fs"]
 # gcsfs speaks the GCS API for artifact I/O, but the shared-state push path
 # uses google-cloud-storage directly (gcsfs cannot express a generation

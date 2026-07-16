@@ -1,0 +1,81 @@
+---
+title: Barca
+description: The invisible asset orchestrator. Rust plans it. Python runs it. You just write functions.
+template: splash
+hero:
+  tagline: Rust plans it. Python runs it. You just write functions.
+  actions:
+    - text: Get Started
+      link: /getting-started/
+      icon: right-arrow
+    - text: View on GitHub
+      link: https://github.com/ExSidius/barca
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+Barca is a hybrid Rust+Python asset orchestrator. It discovers functions decorated
+with `@asset()`, `@sensor()`, and `@task()`, builds a dependency graph via static
+analysis (no imports), generates a phased execution plan, and dispatches work to
+Python workers — all in under 40ms of framework overhead.
+
+```python
+from barca import asset
+
+@asset()
+def raw_data() -> list[dict]:
+    return [{"x": 1}, {"x": 2}, {"x": 3}]
+
+@asset(inputs={"data": raw_data})
+def summary(data: list[dict]) -> dict:
+    return {"count": len(data), "total": sum(d["x"] for d in data)}
+```
+
+```bash
+barca get pipeline.py
+```
+
+No config files. No YAML. No daemon. Just functions and a fast binary.
+
+## Install
+
+```bash
+uv add barca
+```
+
+<CardGrid>
+	<Card title="Static analysis, always" icon="magnifier">
+		The Rust binary parses your Python source with [ruff](https://github.com/astral-sh/ruff)'s
+		AST — it never imports your code to build the dependency graph.
+	</Card>
+	<Card title="Rust-speed planning" icon="rocket">
+		Parsing, DAG construction, and phased execution planning happen in
+		compiled Rust — around 38ms of total framework overhead for a trivial asset.
+	</Card>
+	<Card title="Content-addressed caching" icon="seti:lock">
+		Every artifact is hashed and stored at `{artifacts}/{node}/{run_hash}{ext}`,
+		so unchanged assets never re-run.
+	</Card>
+	<Card title="Artifact-based data passing" icon="seti:db">
+		Results move between worker batches as serialized files — json, pickle, or
+		parquet — detected and handled automatically.
+	</Card>
+</CardGrid>
+
+## How it works
+
+1. **Rust binary** parses Python source using ruff's AST (pure static analysis, no import)
+2. Builds a petgraph DAG from decorator metadata
+3. Generates a phased execution plan (phases run sequentially, streams within a phase run in parallel)
+4. Maintains a pool of stateless Python workers and dispatches one task at a time via a Unix domain socket
+5. Collects results and persists them to `.barca/metadata.db` (Turso/libSQL)
+
+## Node kinds
+
+| Kind | Decorator | Cached | Can be input |
+|------|-----------|--------|---------------|
+| **asset** | `@asset()` | Yes | Yes |
+| **sensor** | `@sensor()` | No (always re-runs) | Yes |
+| **task** | `@task()` | No (always re-runs) | No (leaf node) |

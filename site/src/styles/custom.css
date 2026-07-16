@@ -1,0 +1,38 @@
+/* Barca docs theme — a nautical teal accent, dark by default. */
+
+:root {
+  --sl-color-accent-low: #0b3a3f;
+  --sl-color-accent: #17838c;
+  --sl-color-accent-high: #a8e6e0;
+  --sl-color-white: #ffffff;
+  --sl-color-gray-1: #eaf2f2;
+  --sl-color-gray-2: #c2cccc;
+  --sl-color-gray-3: #8fa0a0;
+  --sl-color-gray-4: #55696a;
+  --sl-color-gray-5: #354546;
+  --sl-color-gray-6: #212f30;
+  --sl-color-black: #131b1c;
+
+  --sl-font: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --sl-font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+}
+
+:root[data-theme='light'] {
+  --sl-color-accent-low: #d3ede9;
+  --sl-color-accent: #0f6b70;
+  --sl-color-accent-high: #0b3a3f;
+  --sl-color-white: #131b1c;
+  --sl-color-gray-1: #212f30;
+  --sl-color-gray-2: #354546;
+  --sl-color-gray-3: #55696a;
+  --sl-color-gray-4: #8fa0a0;
+  --sl-color-gray-5: #c2cccc;
+  --sl-color-gray-6: #e6eeee;
+  --sl-color-gray-7: #f2f7f7;
+  --sl-color-black: #ffffff;
+}
+
+/* Slightly tighter, more confident hero — closer to doc.rust-lang.org's density. */
+.hero h1 {
+  letter-spacing: -0.02em;
+}
