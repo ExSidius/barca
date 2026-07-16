@@ -10,9 +10,11 @@ Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 > treated as illustrative, not reproducible as-is; re-run via `bench.sh` for
 > current, standardized numbers.
 >
-> All 18 benchmarks with a `bench.sh` were re-run end to end under the new
-> harness — see [Standardized re-run (2026-07-16)](#standardized-re-run-2026-07-16)
-> below. This pass ran in a shared, virtualized CI-style container (not the
+> All 19 benchmarks with a `bench.sh` at the time were re-run end to end under
+> the new harness — see [Standardized re-run (2026-07-16)](#standardized-re-run-2026-07-16)
+> below. (A 20th, `etl_duckdb_dataframes`, was added afterward as a follow-up
+> to the `etl_duckdb` investigation below and measured separately, in
+> isolation — see the table's ‡ footnote.) This pass ran in a shared, virtualized CI-style container (not the
 > dedicated Apple Silicon box the original numbers came from), so absolute
 > times aren't comparable across the two environments — only the
 > barca/dagster/prefect ratios *within* the same run are meaningful. The table
@@ -71,7 +73,9 @@ pass — see Notes before comparing its absolute times to the other rows here.
 
 ### Variance
 
-Relative standard deviation (σ/mean) per framework, averaged across all 19 rows:
+Relative standard deviation (σ/mean) per framework, averaged across the original
+19 full-suite-pass rows (excludes `etl_duckdb_dataframes`, added later and
+measured separately — see the table's ‡ footnote):
 **barca ~5.2%, dagster ~3.6%, prefect ~1.9%**. Barca is consistently the noisiest
 of the three here, and four rows crossed hyperfine's outlier-detection threshold
 (resilience_pileup, multi_file_discovery, partitioned_etl's dagster leg,
@@ -369,7 +373,9 @@ cargo build --release && maturin develop --release
 # Script-mode benchmarks:
 for bench in trivial chain_100 fan_out_500 fan_out_500_50ms spaceflights deep_diamond \
              wide_layers mixed_io_cpu large_payloads map_reduce multi_file_discovery \
-             etl_duckdb wide_join incremental_backfill partitioned_chain resilience_pileup; do
+             etl_duckdb etl_duckdb_dataframes wide_join incremental_backfill \
+             partitioned_chain partitioned_etl partitioned_fan_in resilience_pileup \
+             parallel_tasks; do
   echo "=== $bench ==="
   hyperfine --warmup 1 --runs 3 benchmarks/$bench/*/run.sh
 done
