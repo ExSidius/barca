@@ -22,29 +22,12 @@ export default defineConfig({
         alt: 'barca',
       },
       favicon: '/favicon.svg',
-      head: [
-        {
-          tag: 'link',
-          attrs: { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
-        },
-        {
-          tag: 'link',
-          attrs: { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: true },
-        },
-        {
-          tag: 'link',
-          attrs: {
-            rel: 'stylesheet',
-            href: 'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap',
-          },
-        },
-      ],
       expressiveCode: {
         styleOverrides: {
           codeFontFamily: 'var(--sl-font-mono)',
         },
       },
-      customCss: ['./src/styles/custom.css'],
+      customCss: ['./src/styles/fonts.css', './src/styles/custom.css'],
       sidebar: [
         {
           label: 'Start Here',
