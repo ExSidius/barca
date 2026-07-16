@@ -1,3 +1,39 @@
+---
+title: 'RFC Process & Template'
+description: How barca RFCs work, and the template to copy for a new one.
+---
+
+An RFC is how a change to barca's design gets written down and reviewed *before*
+it's built, so the tradeoffs get argued about on paper instead of discovered in
+review. Every RFC in this section either shipped as a real change (`Accepted`)
+or documents a piece of barca's current surface as a retroactive baseline —
+see [RFC-0001](/rfcs/0001-node-kinds-and-freshness/) onward.
+
+## When to write one
+
+Any change that touches the public surface — the CLI, the Python API, decorator
+kwargs, the HTTP API, or the artifact/wire format — or that changes the
+Rust↔Python boundary (`crates/barca-core` ↔ `python/barca/_worker.py`) should
+start as an RFC. A pure internal refactor with no surface change doesn't need
+one; that kind of decision belongs in
+[Architecture Decisions](/architecture-decisions/) instead.
+
+## Process
+
+1. Copy this file to `NNNN-slug.md` in `site/src/content/docs/rfcs/`, using the
+   next free number (check the sidebar and this directory for the highest
+   existing `NNNN`). Leave `NNNN` zero-padded to 4 digits.
+2. Fill in the sections that apply — see "Usage notes" at the bottom. Set
+   `Status: Draft`.
+3. Open a PR. Reviewers argue about the design in the PR, not just the code.
+4. On merge, set `Status: Accepted` (or `Rejected`, if the PR closes without
+   merging the design) and add the page to the `RFCs` group in
+   `site/astro.config.mjs`.
+5. If a later RFC replaces this one, set this one's `Status` to `Superseded`
+   and link forward in `Supersedes / Related`; link back from the new one.
+
+---
+
 # RFC-NNNN: [Title]
 
 - **Status:** Draft | Under Review | Accepted | Rejected | Superseded
@@ -41,7 +77,7 @@ If this adds/changes `@asset`, `@sensor`, `@task`, `@sink`, or freshness markers
 ```
 curl -XPOST localhost:8274/<endpoint>
 ```
-Request/response shape. This should also become a diff to `docs/server-api.md`.
+Request/response shape. This should also become a diff to the [Server API](/reference/server-api/) reference.
 
 ### 3.5 Dev server / `--watch` / UI
 What does `barca serve --watch` do differently? Any UI-visible change?
@@ -104,7 +140,7 @@ Any change touching the hot path (parse → DAG → plan → spawn → persist) 
 
 ## 9. Prior Art
 
-(Dagster/Prefect equivalents are good reference points given the benchmark comparisons already in the repo.)
+(Dagster/Prefect equivalents are good reference points given the [benchmark comparisons](/comparisons/framework-comparison/) already in the repo.)
 
 ## 10. Unresolved Questions
 
