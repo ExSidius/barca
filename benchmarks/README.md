@@ -9,16 +9,25 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 ### What's controlled
 - **Same machine**: all benchmarks run on the same hardware
 - **Same workload**: each benchmark implements identical logic across all three frameworks
-- **Cold start**: every run starts a fresh process (no warm caches)
-- **Parallel where applicable**: benchmarks with independent nodes enable parallelism in all frameworks
+- **Process-level cold start**: every timed run execs a fresh process (no warm interpreter,
+  no in-memory caches carried between samples). Note this is *not* a full state wipe: each
+  framework's own run-history/metadata store (barca's `.barca/metadata.db`, Dagster's and
+  Prefect's SQLite run storage under `DAGSTER_HOME`/`PREFECT_HOME`) persists and grows
+  across hyperfine's repeated samples within one `bench.sh` invocation. This is symmetric
+  across all three frameworks (none of them get a full wipe between samples either), so it
+  isn't a between-framework fairness issue, but it does mean a single `bench.sh` invocation
+  isn't a set of fully independent cold-start measurements.
+- **Parallel where applicable**: benchmarks whose steps have genuinely independent branches
+  (no dependency on each other, so they could run concurrently) enable real concurrency in
+  barca and Prefect, both capped to the same worker count (see "Worker count" below).
+  Dagster is a deliberate exception — see the dedicated note below.
 - **CPU affinity**: every measured process is pinned to the same fixed set of cores via
   `taskset` (see `benchmarks/lib/env.sh`), so the OS scheduler can't migrate work mid-run
   and load on unrelated cores doesn't leak into the measurement
-- **Worker count**: Barca's `pool_size`, Dagster's `max_concurrent`, and Prefect's
-  `max_workers` are all set to the *same* value for a given run — none of them is
-  over- or under-subscribed relative to the others (previously Dagster/Prefect
-  benchmarks hardcoded 16 workers while Barca auto-detected `cpu_count`, which made
-  parallel-throughput comparisons depend on how many cores the benchmark machine had)
+- **Worker count**: Barca's `pool_size` and Prefect's `max_workers` are set to the *same*
+  value for a given run on every benchmark that has real parallel branches to exploit, via
+  `BARCA_BENCH_WORKERS`/`BARCA_POOL_SIZE` (see `benchmarks/lib/env.sh`) — neither is over- or
+  under-subscribed relative to the other. Dagster does not participate in this — see below.
 - **RAM**: total system RAM and CPU model are captured and printed in every `bench.sh`
   run's banner for transparency; no benchmark here is memory-bound enough to warrant
   an artificial memory ceiling
@@ -32,9 +41,38 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
   process. Off by default since it re-runs each framework once more and adds
   wall-clock, especially for slow-starting frameworks.
 
+### Why Dagster is excluded from the worker-count fix
+
+Dagster's `materialize()`/`job.execute_in_process()` — what every `dagster/run.py` here
+calls — **hard-ignores `executor_def`** regardless of configuration; it's documented
+behavior ("The executor_def on the Job will be ignored, and replaced with the in-process
+executor") and confirmed empirically against the installed package. Dagster's *only* way to
+get real multiprocess parallelism is the out-of-process `execute_job(reconstructable(...),
+instance=...)` API, which spawns a brand-new OS subprocess **per step** — not a reused pool.
+Measured directly: 12 zero-work steps at `max_concurrent=4` took 8.5s wall time, i.e. roughly
+0.5–1.5s of pure interpreter-boot/import overhead per step. Every task in this benchmark
+suite does ≤50ms of real work, so switching any benchmark to Dagster's real multiprocess
+executor would make Dagster slower, not more comparable — trading the original bug (Dagster
+never parallelizing genuinely parallel work) for a different distortion (Dagster measured on
+subprocess-spawn cost that swamps the actual task). Given the current suite's task sizes,
+there is no benchmark where the out-of-process executor would be a net win, so `dagster/run.py`
+is deliberately left on the default in-process (sequential) executor everywhere, and Dagster's
+numbers on parallel-shaped benchmarks should be read as "Dagster's realistic default local-run
+behavior for this workload size," not as "Dagster's best possible parallel throughput." If a
+future benchmark's individual steps are heavy enough (roughly >500ms each, per the measured
+spawn cost above) to amortize that per-step subprocess cost, `execute_job`/`reconstructable`
+is the right mechanism to revisit this — see `dagster_server/`/`prefect_server` in a few
+benchmark directories for a partially-built alternative (a warm `dagster dev` daemon + GraphQL
+`launchRun`, which amortizes the spawn cost differently). Those aren't wired into `bench.sh`
+today.
+
 ### What differs
 - **Python version**: Barca uses Python 3.14 (from workspace .venv). Dagster and Prefect use Python 3.12 (latest compatible with both)
-- **Parallelism model**: Barca uses multi-process (Rust spawns N Python workers). Dagster uses multiprocess executor. Prefect uses ConcurrentTaskRunner
+- **Parallelism model**: Barca uses multi-process (Rust spawns N persistent Python workers,
+  reused across tasks). Prefect uses `ConcurrentTaskRunner`, capped to the same worker count
+  (see above). Dagster uses its default in-process executor (sequential) everywhere in this
+  suite — see "Why Dagster is excluded" above for why its multiprocess executor isn't a fair
+  comparison point here.
 - **DB persistence**: Barca writes to Turso/libSQL. Dagster and Prefect use their own internal SQLite stores
 
 ### Parallelism configuration
@@ -43,8 +81,13 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 default to `BARCA_BENCH_CORES`, default `4`) for every framework to read:
 
 - **Barca**: `pool_size` — set via the `BARCA_POOL_SIZE` env var (falls back to `cpu_count` if unset)
-- **Dagster**: `multiprocess_executor` — `max_concurrent` would read `BARCA_BENCH_WORKERS` if wired up (falls back to 16 if unset)
-- **Prefect**: `ConcurrentTaskRunner` — `max_workers` would read `BARCA_BENCH_WORKERS` if wired up (falls back to 16 if unset)
+- **Prefect**: `ConcurrentTaskRunner(max_workers=BARCA_BENCH_WORKERS)` — wired on every
+  `prefect/run.py` whose workload has independent branches to parallelize (falls back to 16 if
+  unset, matching Barca's own cpu_count fallback and Dagster's historical default). Benchmarks
+  that are a strict single chain (no step ever has an independent sibling ready at the same
+  time) are intentionally left on Prefect's plain sequential calls, since there's nothing to
+  parallelize either way.
+- **Dagster**: not wired to `BARCA_BENCH_WORKERS` — see "Why Dagster is excluded" above.
 
 In practice, only `deep_diamond/prefect/run.py` and `mixed_io_cpu/prefect/run.py`
 (plus the `*_server` variants, which aren't invoked by `bench.sh`) actually read

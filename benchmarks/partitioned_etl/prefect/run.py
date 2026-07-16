@@ -3,9 +3,15 @@ Mirrors barca's partitioned ETL with deferred partition resolution."""
 
 import hashlib
 import json
+import os
 import random
 import time
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
+
+# Matches barca's pool_size and dagster's max_concurrent for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 TICKERS = [f"TICK_{i:03d}" for i in range(30)]
 
@@ -48,15 +54,15 @@ def _make_enrich(i, ticker):
 enrich_tasks = [_make_enrich(i, t) for i, t in enumerate(TICKERS)]
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=BENCH_WORKERS))
 def partitioned_etl_flow():
     universe = ticker_universe()  # noqa: F841 — mirrors barca's source asset
-    results = []
+    futures = []
     for i in range(len(TICKERS)):
-        fetched = fetch_tasks[i]()
-        enriched = enrich_tasks[i](fetched)
-        results.append(enriched)
-    return results
+        fetched = fetch_tasks[i].submit()
+        enriched = enrich_tasks[i].submit(fetched)
+        futures.append(enriched)
+    return [f.result() for f in futures]
 
 
 if __name__ == "__main__":

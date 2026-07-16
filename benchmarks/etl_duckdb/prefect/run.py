@@ -1,11 +1,17 @@
 """Prefect: ETL pipeline — dbt-style layered transforms on synthetic 100k-row data."""
 
 import json
+import os
 import random
 import time
 from collections import defaultdict
 
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
+
+# Matches barca's pool_size and dagster's max_concurrent for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 
 # -- Raw layer: generate synthetic data --
@@ -204,25 +210,27 @@ def mart_summary(data):
     }
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=BENCH_WORKERS))
 def etl_duckdb_flow():
     # Raw layer (parallel)
-    orders_raw = raw_orders()
-    customers_raw = raw_customers()
-    products_raw = raw_products()
+    orders_raw = raw_orders.submit()
+    customers_raw = raw_customers.submit()
+    products_raw = raw_products.submit()
 
-    # Staging layer
-    orders_stg = stg_orders(orders_raw)
-    customers_stg = stg_customers(customers_raw)
-    products_stg = stg_products(products_raw)
+    # Staging layer (parallel, each depends on its raw source)
+    orders_stg = stg_orders.submit(orders_raw)
+    customers_stg = stg_customers.submit(customers_raw)
+    products_stg = stg_products.submit(products_raw)
 
-    # Intermediate layer
-    order_metrics = int_order_metrics(orders_stg)
-    customer_agg = int_customer_agg(orders_stg, customers_stg)
-    product_stats = int_product_stats(orders_stg, products_stg)
+    # Intermediate layer (parallel, each depends on its staging inputs)
+    order_metrics = int_order_metrics.submit(orders_stg)
+    customer_agg = int_customer_agg.submit(orders_stg, customers_stg)
+    product_stats = int_product_stats.submit(orders_stg, products_stg)
 
     # Mart layer
-    customer_orders = mart_customer_orders(customer_agg, order_metrics, product_stats)
+    customer_orders = mart_customer_orders.submit(
+        customer_agg, order_metrics, product_stats
+    )
     summary = mart_summary(customer_orders)
     return summary
 
