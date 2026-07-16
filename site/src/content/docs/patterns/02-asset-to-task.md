@@ -22,10 +22,10 @@ def deploy(model):
 
 ```bash
 # Materialize the asset (cached)
-barca get pipeline.py
+barca get trained_model pipeline.py
 
 # Execute the task (always runs)
-barca run pipeline.py
+barca run deploy pipeline.py
 ```
 
 ## Why this works

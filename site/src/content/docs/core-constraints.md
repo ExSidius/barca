@@ -32,34 +32,15 @@ For the MVP, Barca should not attempt fixed-point computation, iterative cycles,
 
 If users need iteration, they should write it inside a single asset function.
 
-## `uv` is required
+## Python interpreter resolution
 
-Barca should require `uv` for Python execution and environment management.
-
-This is a hard product decision, not an optional adapter.
-
-That means:
-
-- indexing happens against a `uv`-managed project environment
-- execution happens within the `uv`-managed virtualenv
-- dependency state is tracked via the project's dependency graph
-
-### Why this is the right constraint
-
-- it narrows environment behavior
-- it makes dependency hashing concrete
-- it avoids supporting multiple Python launch models
-- it reduces packaging ambiguity between indexing and execution
-
-For the MVP, Barca should not support:
-
-- raw `python`
-- `poetry run`
-- `pipenv`
-- conda
-- arbitrary user-defined execution shims
-
-Those can be reconsidered later, but supporting them now would add a lot of complexity with little product value.
+This section originally proposed requiring `uv` for Python execution and environment
+management. That was never implemented: Barca does not depend on `uv`, check for it, or
+manage a virtualenv on the user's behalf. At runtime the Rust CLI resolves a `python`/`python3`
+binary sitting next to the `barca` executable (i.e. the same virtualenv `barca` was installed
+into, `uv`-managed or not) and falls back to whatever `python3` is on `PATH` — see
+`find_python()` in `crates/barca-core/src/commands.rs`. Any environment manager that puts a
+working `python3` on `PATH` or alongside the binary works today.
 
 ## Preflight consistency is required
 
@@ -101,7 +82,11 @@ The storage model should therefore be append-only for definitions and materializ
 
 ### Pruning
 
-History accumulates over time. `barca prune` is the only operation that permanently removes history — it deletes all artifacts, materialisations, and DB records not reachable from the current active DAG (removed assets, removed partition values, old definition hash versions no longer referenced by any current asset). It is explicit and destructive; run it before production deployments or to recover disk space.
+History accumulates over time. The intent is a `barca prune` command that permanently removes
+history unreachable from the current active DAG (removed assets, removed partition values, old
+definition hash versions no longer referenced by any current asset) as an explicit, destructive
+opt-in. **This command does not exist yet** — there is currently no way to reclaim disk space
+from old artifacts/materializations short of manually clearing `.barca/`.
 
 ## Freshness declarations
 
@@ -109,11 +94,20 @@ Every asset, sensor, and task declares how eagerly Barca keeps its output up to 
 
 Three freshness kinds exist:
 
-- `Always` (default for `@asset` and `@task`): Barca keeps this node fresh automatically. Any upstream change cascades through and re-materialises it during `barca run`.
-- `Manual`: Barca never auto-updates this node, even when stale. Only refreshed via explicit request. **`Manual` freshness blocks downstream**: a downstream `Always` asset cannot be auto-materialised if any of its transitive upstream assets has `Manual` freshness.
-- `Schedule("cron_expr")`: Barca refreshes this node when a cron tick has elapsed since last run.
+- `Always` (default for `@asset` and `@task`)
+- `Manual`: intended to mean Barca never auto-updates this node, even when stale
+- `Schedule("cron_expr")`: refreshes this node when a cron tick has elapsed since last run
 
-Sensors use `Manual` or `Schedule` only — `Always` is not valid for sensors (polling frequency must be declared explicitly).
+Today, `freshness` is parsed, stored, and echoed back in the plan JSON, but only the `Schedule`
+kind has runtime teeth: `barca serve`'s cron scheduler (`crates/barca-server/src/scheduler.rs`)
+polls `Schedule`-freshness nodes and fires them on their cron tick. Nothing in the executor
+currently branches on `Always` vs. `Manual` — regular `barca get`/`barca run` caching is driven
+entirely by content-hash matching (see "Freshness is provenance-based, not recency-based"
+below), not by this field. In particular, **`Manual` does not currently block downstream
+auto-materialization**, and Barca does not reject an explicit `Always` on a `@sensor` — both are
+still just design intent.
+
+Sensors default to `Manual` freshness (they have no meaningful "always" refresh cadence).
 
 ## Freshness is provenance-based, not recency-based
 
