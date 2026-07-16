@@ -11,6 +11,17 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 - **Same workload**: each benchmark implements identical logic across all three frameworks
 - **Cold start**: every run starts a fresh process (no warm caches)
 - **Parallel where applicable**: benchmarks with independent nodes enable parallelism in all frameworks
+- **CPU affinity**: every measured process is pinned to the same fixed set of cores via
+  `taskset` (see `benchmarks/lib/env.sh`), so the OS scheduler can't migrate work mid-run
+  and load on unrelated cores doesn't leak into the measurement
+- **Worker count**: Barca's `pool_size`, Dagster's `max_concurrent`, and Prefect's
+  `max_workers` are all set to the *same* value for a given run — none of them is
+  over- or under-subscribed relative to the others (previously Dagster/Prefect
+  benchmarks hardcoded 16 workers while Barca auto-detected `cpu_count`, which made
+  parallel-throughput comparisons depend on how many cores the benchmark machine had)
+- **RAM**: total system RAM and CPU model are captured and printed in every `bench.sh`
+  run's banner for transparency; no benchmark here is memory-bound enough to warrant
+  an artificial memory ceiling
 
 ### What differs
 - **Python version**: Barca uses Python 3.14 (from workspace .venv). Dagster and Prefect use Python 3.12 (latest compatible with both)
@@ -18,9 +29,20 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 - **DB persistence**: Barca writes to Turso/libSQL. Dagster and Prefect use their own internal SQLite stores
 
 ### Parallelism configuration
-- **Barca**: pool_size = cpu_count (automatic)
-- **Dagster**: `multiprocess_executor` with `max_concurrent = cpu_count` for parallel benchmarks
-- **Prefect**: `ConcurrentTaskRunner` with `.submit()` for parallel benchmarks
+
+All three frameworks share one worker count per run, controlled by `benchmarks/lib/env.sh`:
+
+- **Barca**: `pool_size` — set via the `BARCA_POOL_SIZE` env var (falls back to `cpu_count` if unset)
+- **Dagster**: `multiprocess_executor` — `max_concurrent` read from `BARCA_BENCH_WORKERS` (falls back to 16 if unset)
+- **Prefect**: `ConcurrentTaskRunner` — `max_workers` read from `BARCA_BENCH_WORKERS` (falls back to 16 if unset)
+
+Both env vars default to `BARCA_BENCH_CORES` (default `4`), the same core count the
+benchmark processes are pinned to, so the worker count and the CPU budget always match.
+Override with `BARCA_BENCH_CORES=8 benchmarks/trivial/bench.sh`.
+
+For the `*_server` benchmarks (persistent `dagster dev` / long-running Prefect
+processes), source `benchmarks/lib/env.sh` in the shell that runs `start.sh` — the
+worker count is read once, at server startup, from the environment.
 
 ## Benchmark suite
 
@@ -72,14 +94,21 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 ## Running benchmarks
 
 ```bash
-# Prerequisites: Rust toolchain, uv, hyperfine
+# Prerequisites: Rust toolchain, uv, hyperfine, taskset (util-linux)
 cargo build --release && maturin develop --release
 
 # Run individual benchmark (sets up venvs on first run):
 benchmarks/trivial/bench.sh 10
 
-# Or run manually with hyperfine:
-hyperfine --warmup 3 --runs 10 benchmarks/trivial/*/run.sh
+# Override the pinned core count / worker count (default: 4 cores):
+BARCA_BENCH_CORES=8 benchmarks/trivial/bench.sh 10
+
+# Or run manually with hyperfine, pinned and worker-matched the same way bench.sh does:
+source benchmarks/lib/env.sh
+hyperfine --warmup 3 --runs 10 \
+  "$(bench_pin benchmarks/trivial/barca/run.sh)" \
+  "$(bench_pin benchmarks/trivial/dagster/run.sh)" \
+  "$(bench_pin benchmarks/trivial/prefect/run.sh)"
 ```
 
 Each benchmark directory contains:

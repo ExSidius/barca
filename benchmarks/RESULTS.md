@@ -2,6 +2,14 @@
 
 Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 
+> **Note (2026-07-16):** the benchmark harness was since standardized for CPU/worker
+> fairness — every framework's parallelism is now pinned to the same core count and
+> worker count instead of Barca auto-detecting `cpu_count` while Dagster/Prefect
+> hardcoded 16 workers (see `benchmarks/README.md#methodology` and
+> `benchmarks/lib/env.sh`). The numbers below predate that change and should be
+> treated as illustrative, not reproducible as-is; re-run via `bench.sh` for
+> current, standardized numbers.
+
 ## Methodology
 
 ### Environment
