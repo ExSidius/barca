@@ -39,15 +39,20 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
 
 ### Parallelism configuration
 
-All three frameworks share one worker count per run, controlled by `benchmarks/lib/env.sh`:
+`benchmarks/lib/env.sh` exports `BARCA_POOL_SIZE` and `BARCA_BENCH_WORKERS` (both
+default to `BARCA_BENCH_CORES`, default `4`) for every framework to read:
 
 - **Barca**: `pool_size` — set via the `BARCA_POOL_SIZE` env var (falls back to `cpu_count` if unset)
-- **Dagster**: `multiprocess_executor` — `max_concurrent` read from `BARCA_BENCH_WORKERS` (falls back to 16 if unset)
-- **Prefect**: `ConcurrentTaskRunner` — `max_workers` read from `BARCA_BENCH_WORKERS` (falls back to 16 if unset)
+- **Dagster**: `multiprocess_executor` — `max_concurrent` would read `BARCA_BENCH_WORKERS` if wired up (falls back to 16 if unset)
+- **Prefect**: `ConcurrentTaskRunner` — `max_workers` would read `BARCA_BENCH_WORKERS` if wired up (falls back to 16 if unset)
 
-Both env vars default to `BARCA_BENCH_CORES` (default `4`), the same core count the
-benchmark processes are pinned to, so the worker count and the CPU budget always match.
-Override with `BARCA_BENCH_CORES=8 benchmarks/trivial/bench.sh`.
+In practice, only `deep_diamond/prefect/run.py` and `mixed_io_cpu/prefect/run.py`
+(plus the `*_server` variants, which aren't invoked by `bench.sh`) actually read
+`BARCA_BENCH_WORKERS` today — the rest of the script-mode Dagster/Prefect files
+call `materialize()` / `execute_in_process()` / `@flow` with framework defaults.
+For those, cross-framework worker parity comes from the shared `taskset` CPU pin
+alone (same core budget), not a matched worker count. Override the pin with
+`BARCA_BENCH_CORES=8 benchmarks/trivial/bench.sh`.
 
 For the `*_server` benchmarks (persistent `dagster dev` / long-running Prefect
 processes), source `benchmarks/lib/env.sh` in the shell that runs `start.sh` — the

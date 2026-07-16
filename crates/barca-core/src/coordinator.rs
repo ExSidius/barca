@@ -423,12 +423,6 @@ impl Coordinator {
         }
 
         let mut node_to_item: HashMap<String, ItemId> = HashMap::new();
-        // For partitioned steps, track all items for a given base node so
-        // downstream partitioned steps can find their partition-aligned upstream.
-        let mut base_to_partition_items: HashMap<
-            String,
-            Vec<(crate::model::PartitionKey, ItemId)>,
-        > = HashMap::new();
         let mut pending: Vec<Pending> = Vec::new();
 
         // Pass 1: reserve ids and register every display id this phase will
@@ -452,7 +446,6 @@ impl Coordinator {
                     });
                     prev_items = vec![item_id];
                 } else {
-                    let base_id = step.step_id.base_id().to_string();
                     let mut partition_item_ids: Vec<ItemId> = Vec::new();
 
                     for pk in &step.partition_keys {
@@ -471,14 +464,6 @@ impl Coordinator {
                         });
                     }
 
-                    base_to_partition_items.insert(
-                        base_id,
-                        step.partition_keys
-                            .iter()
-                            .zip(partition_item_ids.iter())
-                            .map(|(pk, &id)| (pk.clone(), id))
-                            .collect(),
-                    );
                     prev_items = partition_item_ids;
                 }
             }

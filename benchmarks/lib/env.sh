@@ -105,7 +105,7 @@ _bench_mem_cgroup_base() {
 bench_mem_peak() {
     local label="$1"
     local cmd="$2"
-    local base kind path cg peak_bytes
+    local base kind path cg peak_bytes peak_file join_marker
 
     base="$(_bench_mem_cgroup_base)"
     if [[ -z "$base" ]]; then
@@ -132,13 +132,31 @@ bench_mem_peak() {
     fi
     [[ "$kind" == v1 ]] && echo 0 > "$cg/memory.max_usage_in_bytes" 2>/dev/null
 
-    ( echo $BASHPID > "$cg/cgroup.procs" 2>/dev/null; exec bash -c "$cmd" >/dev/null 2>&1 )
+    # Written by the subshell only if it actually joins the cgroup before
+    # exec-ing the command — lets us tell "measured, genuinely ~0 bytes"
+    # apart from "never joined, ran outside the cgroup unmeasured" instead
+    # of both silently reading back as a 0 MB peak.
+    join_marker="$(mktemp)"
+    ( echo $BASHPID > "$cg/cgroup.procs" 2>/dev/null && echo ok > "$join_marker" && exec bash -c "$cmd" >/dev/null 2>&1 )
+    if [[ ! -s "$join_marker" ]]; then
+        rm -f "$join_marker"
+        rmdir "$cg" 2>/dev/null
+        echo "  $label: memory measurement unavailable (couldn't join cgroup)"
+        return
+    fi
+    rm -f "$join_marker"
 
     if [[ "$kind" == v1 ]]; then
-        peak_bytes="$(cat "$cg/memory.max_usage_in_bytes" 2>/dev/null || echo 0)"
+        peak_file="$cg/memory.max_usage_in_bytes"
     else
-        peak_bytes="$(cat "$cg/memory.peak" 2>/dev/null || echo 0)"
+        peak_file="$cg/memory.peak"
     fi
+    if [[ ! -f "$peak_file" ]]; then
+        rmdir "$cg" 2>/dev/null
+        echo "  $label: memory measurement unavailable (kernel/cgroup lacks $(basename "$peak_file"))"
+        return
+    fi
+    peak_bytes="$(cat "$peak_file" 2>/dev/null || echo 0)"
     rmdir "$cg" 2>/dev/null
 
     awk -v l="$label:" -v b="$peak_bytes" 'BEGIN{printf "  %-24s %8.1f MB peak (whole process tree, cgroup)\n", l, b/1048576}'
