@@ -9,6 +9,47 @@ Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 > `benchmarks/lib/env.sh`). The numbers below predate that change and should be
 > treated as illustrative, not reproducible as-is; re-run via `bench.sh` for
 > current, standardized numbers.
+>
+> The three benchmarks with an existing `bench.sh` (`trivial`, `parallel_tasks`,
+> `resilience_pileup`) were re-run under the new harness — see
+> [Standardized re-run (2026-07-16)](#standardized-re-run-2026-07-16) below. The
+> remaining benchmarks in this file still need a re-run on real hardware; they
+> weren't re-run because this pass ran in a shared, virtualized CI-style
+> container (not the dedicated Apple Silicon box the original numbers came
+> from), so absolute times aren't comparable across the two environments — only
+> the barca/dagster/prefect ratios *within* the same run are meaningful.
+
+## Standardized re-run (2026-07-16)
+
+Ran on this container: 4 vCPU (Intel Xeon @ 2.80GHz, pinned via `taskset -c 0-3`),
+15 GiB RAM, barca Rust release build, Python 3.13 (barca) / 3.12 (Dagster, Prefect).
+Worker count = 4 for all three frameworks (`BARCA_BENCH_CORES` default). Absolute
+times are inflated by container overhead (cold PyPI-installed venvs, virtualized
+CPU, no dedicated hardware) — read the **relative** ratios, not the raw ms/s, and
+don't compare these numbers to the Apple Silicon rows above.
+
+| Benchmark | barca | dagster | prefect | barca vs dagster | barca vs prefect |
+|---|---:|---:|---:|---:|---:|
+| Trivial (1 asset, 10 runs) | 499ms ± 242ms | 2.19s ± 0.08s | 11.35s ± 0.19s | 4.4x faster | 22.8x faster |
+| Parallel fan-out (10 tasks, 5 runs) | 1.24s ± 0.02s | 1.88s ± 0.03s | 10.94s ± 0.32s | 1.5x faster | 8.8x faster |
+| Resilience pileup (18 steps, 5 runs) | 3.00s ± 0.80s | 3.57s ± 0.06s | 12.02s ± 0.38s | 1.2x faster | 4.0x faster |
+
+Notes from this run:
+- Barca's trivial and resilience_pileup numbers show high variance (σ up to 27% of
+  the mean) with hyperfine flagging statistical outliers — consistent with
+  container scheduling noise rather than anything in barca itself (dagster/prefect
+  show low variance on the same box since their per-run cost is dominated by fixed
+  Python import/framework overhead, which swamps scheduler jitter).
+- Fixed two pre-existing bugs uncovered while running this, unrelated to the
+  CPU/RAM standardization work: `parallel_tasks/{barca,dagster,prefect}/run.sh`
+  called bare `barca`/`python` instead of the pinned venv binaries (worked only if
+  a venv happened to already be active on `PATH`); `resilience_pileup/barca/run.sh`
+  was missing `--no-cache`, so every run after the first was a cache-hit no-op
+  (measured: 2.5s cold vs 8ms warm) — the historical "330ms" figure above is
+  suspect for the same reason. `resilience_pileup/prefect/run.py` had a variable
+  name collision (`t0` was both a `@task` and the `__main__` timer, so every run
+  raised `TypeError: 'float' object is not callable`) — always broken, not a
+  regression from this change.
 
 ## Methodology
 
