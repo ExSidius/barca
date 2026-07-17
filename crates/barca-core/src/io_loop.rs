@@ -171,8 +171,7 @@ impl WorkerPool {
     pub fn start(config: IoConfig) -> Result<Self, String> {
         let socket_path = crate::protocol::socket_path(&config.run_id, "main");
         std::fs::remove_file(&socket_path).ok();
-        let listener =
-            UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
+        let listener = UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
         let (event_tx, event_rx) = mpsc::channel::<IoEvent>(config.pool_size.max(1) * 8);
         Ok(Self {
             config,
@@ -459,22 +458,66 @@ impl WorkerPool {
         Ok(())
     }
 
-    /// Gracefully terminate every worker and remove the socket. Runs the
-    /// SIGTERM-grace kills on the blocking pool because `graceful_kill`
-    /// sleeps between SIGTERM and SIGKILL.
+    /// Gracefully terminate every worker and remove the socket. Runs on the
+    /// blocking pool because this polls for exit between SIGTERM and SIGKILL.
+    ///
+    /// Signals every worker up front and then polls them all together for one
+    /// shared 200ms grace window, rather than the previous sequential
+    /// SIGTERM-then-sleep(200ms)-then-check per worker — that cost
+    /// `pool_size * 200ms` in the common case (every worker still mid-cleanup
+    /// at the first `try_wait()`, right after its own SIGTERM), which for a
+    /// default `pool_size` of 4 meant shutdown alone could take ~800ms
+    /// regardless of how little work the run actually did (confirmed via
+    /// `BARCA_TRACE_TIMING=1` — see benchmarks/RESULTS.md's docker-harness
+    /// re-run notes).
     pub async fn shutdown(self) {
         let workers = self.workers;
         let frozen = self.frozen;
         let kill_task = tokio::task::spawn_blocking(move || {
-            for (_, mut w) in workers {
-                graceful_kill(&mut w.child);
+            let mut children: Vec<Child> = Vec::with_capacity(workers.len() + frozen.len());
+
+            #[cfg(unix)]
+            for (_, w) in workers {
+                unsafe {
+                    libc::kill(w.child.id() as i32, libc::SIGTERM);
+                }
+                children.push(w.child);
             }
-            for mut fw in frozen {
-                #[cfg(unix)]
+            #[cfg(not(unix))]
+            for (_, w) in workers {
+                children.push(w.child);
+            }
+
+            #[cfg(unix)]
+            for fw in frozen {
                 unsafe {
                     libc::kill(fw.child.id() as i32, libc::SIGCONT);
+                    libc::kill(fw.child.id() as i32, libc::SIGTERM);
                 }
-                graceful_kill(&mut fw.child);
+                children.push(fw.child);
+            }
+            #[cfg(not(unix))]
+            for fw in frozen {
+                children.push(fw.child);
+            }
+
+            #[cfg(unix)]
+            {
+                let deadline = std::time::Instant::now() + Duration::from_millis(200);
+                while std::time::Instant::now() < deadline
+                    && children
+                        .iter_mut()
+                        .any(|c| !matches!(c.try_wait(), Ok(Some(_))))
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            for mut c in children {
+                if !matches!(c.try_wait(), Ok(Some(_))) {
+                    let _ = c.kill();
+                }
+                let _ = c.wait();
             }
         });
         let _ = kill_task.await;
@@ -684,10 +727,8 @@ impl WorkerPool {
                                         .get("format")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    let path = artifact
-                                        .get("path")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
+                                    let path =
+                                        artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
                                     if fmt == "json" && !path.is_empty() {
                                         if path.contains("://") {
                                             eprintln!(

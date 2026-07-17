@@ -354,7 +354,11 @@ async fn execute(
     let avg_times = db::get_avg_elapsed(&db_path, &unpartitioned_node_ids).await?;
     let partitioned_avg_times =
         db::get_avg_elapsed_for_partitioned(&db_path, &partitioned_base_ids).await?;
-    trace_point!("eta_queries ({} unpartitioned, {} partitioned base ids)", unpartitioned_node_ids.len(), partitioned_base_ids.len());
+    trace_point!(
+        "eta_queries ({} unpartitioned, {} partitioned base ids)",
+        unpartitioned_node_ids.len(),
+        partitioned_base_ids.len()
+    );
     let total_estimated: f64 = unpartitioned_node_ids
         .iter()
         .filter_map(|nid| avg_times.get(nid))

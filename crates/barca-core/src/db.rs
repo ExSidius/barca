@@ -778,10 +778,7 @@ mod tests {
 
         let loaded = load_cost_estimates(&db_path).await.unwrap();
         assert_eq!(loaded.len(), 2);
-        let fetch = loaded
-            .iter()
-            .find(|(n, _)| n == "f.py:fetch[t=A]")
-            .unwrap();
+        let fetch = loaded.iter().find(|(n, _)| n == "f.py:fetch[t=A]").unwrap();
         assert!((fetch.1.estimate_seconds - 0.25).abs() < 1e-9);
         assert_eq!(fetch.1.samples, 3);
         assert_eq!(fetch.1.max_rss_bytes, 1024);

@@ -64,9 +64,11 @@ Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 > documented standard way to reproduce this suite. **That pass ran on different hardware
 > and a different virtualization stack** (Docker Desktop's Linux VM on an Apple Silicon
 > Mac, ARM64, nested) **than the 2026-07-16 pass below** (a dedicated x86_64 Linux
-> container) — the two passes are not comparable to each other, in absolute times or in
-> which framework wins which row; read the 2026-07-17 section's own environment notes
-> before drawing conclusions from either pass in isolation.
+> container) — the two passes are not comparable to each other in absolute times. A first
+> attempt on the new hardware showed dagster winning or tying on 14/20 rows, which turned
+> out to be a real, fixable barca-core bug (a `pool_size * 200ms` worker-shutdown tax that
+> a faster CPU no longer hides), not an environment artifact — see the section below for
+> the root cause, the fix, and the corrected numbers.
 
 ## Standardized re-run via Docker harness (2026-07-17)
 
@@ -84,65 +86,63 @@ banner; two bugs this exposed are fixed as part of this pass, see Notes.
 for `trivial`), `BARCA_BENCH_MEMORY=1` requested on every run but unavailable this pass —
 see Notes.
 
-**Read this before the table**: this is a *nested-virtualization* environment (macOS host →
-Docker Desktop's Linux VM → container), materially different from the 2026-07-16 pass's
-dedicated x86_64 Linux container below. Don't compare absolute times, or even the
-win/loss pattern, across the two passes — each is internally consistent (ratios *within* a
-single pass are meaningful) but the environments aren't the same experiment. The most
-visible difference: **dagster now wins or roughly ties on 14 of the 20 rows** below
-(`deep_diamond`, `etl_duckdb`, `etl_duckdb_dataframes`, `large_payloads`, `map_reduce`,
-`mixed_io_cpu`, `multi_file_discovery`, `parallel_tasks`, `partitioned_etl`,
-`partitioned_fan_in`, `resilience_pileup` (~tied), `spaceflights`, `wide_join`,
-`wide_layers`) — a real shift from the 2026-07-16 pass, where barca won nearly everything
-outright. This was checked for noise, not assumed: `deep_diamond`, `mixed_io_cpu`, and
-`wide_join` were each re-run a second time in isolation and reproduced within ~2-3% of
-their first-pass numbers (1.59x → 1.62x, 1.13x → 1.12x, 1.66x → 1.64x dagster-faster
-respectively) — this is a stable effect *within this environment*, not sampling noise.
-What it is *not* checked against: a non-Dockerized native run on this same Mac (which lacks
-`taskset`/cgroups so isn't a fair comparison point either), or a bare-metal ARM64 Linux box
-— so "Docker Desktop's nested virtualization specifically" vs "ARM64 vs x86_64 generally"
-hasn't been isolated as the cause, only observed as correlated. The working hypothesis:
-Dagster's `(user+sys)/wall` sits at ≈1.00 on every row here, exactly as in every prior pass
-(single sequential process — wall time *is* CPU time, nothing hidden). barca's ratio here
-runs **~0.15-0.25** — markedly lower than the 2026-07-16 pass's ~0.3-0.5 — meaning
-proportionally *more* of barca's wall-clock in this environment is spent waiting on process
-coordination (spawn + Unix-socket IPC round trips) rather than doing CPU work. A plausible
-mechanism: nested virtualization (Docker Desktop's Linux VM, which itself uses gVisor for
-networking — see the VM's launch flags) taxes process-spawn/IPC syscalls more than a
-dedicated Linux container does, which would hit barca's multi-process
-coordinator-plus-worker-pool architecture harder than Dagster's single in-process
-sequential model — and would explain why benchmarks dominated by *coordination overhead
-relative to trivial actual work* (small DAGs, many independent leaf tasks: `deep_diamond`,
-`wide_layers`, `wide_join`, `map_reduce`, `mixed_io_cpu`, `multi_file_discovery`,
-`partitioned_etl`/`partitioned_fan_in`, `parallel_tasks` itself) shifted against barca here,
-while benchmarks dominated by long sequential chains or genuinely large parallel workloads
-(where barca's real concurrency advantage swamps any fixed per-round-trip tax) —
-`trivial`, `chain_100`, `fan_out_500`, `fan_out_500_50ms`, `incremental_backfill`,
-`partitioned_chain` — still favor barca decisively, consistent with *every* prior pass on
-those specific rows. Treat the mechanism as a hypothesis, not a confirmed root cause.
+**A first attempt on this environment surfaced a real barca-core bug, not just environment
+noise — fixed before the table below, not after.** A first full pass showed dagster winning
+or roughly tying on 14 of the 20 rows (`deep_diamond`, `etl_duckdb`, `etl_duckdb_dataframes`,
+`large_payloads`, `map_reduce`, `mixed_io_cpu`, `multi_file_discovery`, `parallel_tasks`,
+`partitioned_etl`, `partitioned_fan_in`, `resilience_pileup` (~tied), `spaceflights`,
+`wide_join`, `wide_layers`) — a sharp reversal from the 2026-07-16 pass, where barca won
+nearly everything. Re-running `deep_diamond`, `mixed_io_cpu`, and `wide_join` a second time
+in isolation reproduced the same ratios within ~2-3%, ruling out sampling noise as the
+explanation. `BARCA_TRACE_TIMING=1` (the waterfall tracer already in
+`crates/barca-core/src/commands.rs`, see its doc comment) pointed at the actual cause: on
+`deep_diamond`, the trace showed 18/18 steps complete by ~285ms into a ~1160ms total run —
+the missing ~830ms was entirely inside a single call, `pool.shutdown()`. `fan_out_500`
+showed the identical ~830ms shutdown cost despite doing 500x more real work, while
+`chain_100` — which never needs more than one worker, since a linear chain has no
+independent-branch parallelism to spawn a second one for — paid only ~200ms. That pointed
+straight at `WorkerPool::shutdown()` in `crates/barca-core/src/io_loop.rs`: it looped over
+every spawned worker *sequentially*, sending SIGTERM and then unconditionally sleeping
+200ms before checking whether the process had exited (`graceful_kill()`) — a flat
+`pool_size * 200ms` tax on every single run (~800ms for the default 4-worker pool),
+regardless of how much or little actual work the run did. This bug isn't new — it's been in
+every prior pass too — but a slower CPU (the 2026-07-16 pass's Intel Xeon @ 2.80GHz
+container) made Dagster's own compute-bound overhead proportionally larger, which masked
+barca's flat, CPU-speed-independent shutdown tax. On the much faster cores here (Apple M4
+Max), Dagster's overhead shrank while barca's fixed `sleep()`-based teardown didn't, so it
+started dominating wall time on every benchmark whose DAG isn't a single long chain.
+**Fixed** in this PR: `shutdown()` now signals every worker first, then polls all of them
+together for one shared 200ms grace window instead of sleeping 200ms per worker in
+sequence, before falling back to SIGKILL for stragglers. Confirmed via the same tracer:
+`deep_diamond`'s `pool_shutdown` phase dropped from ~830ms to ~9ms, and its total run time
+roughly halved. The table below is the **post-fix** re-run — barca now wins or ties on
+19/20 rows, restoring (and, on several rows, beating) the 2026-07-16 pass's pattern, with
+`etl_duckdb` (1.06x dagster) and `large_payloads` (1.05x dagster) the only two within noise
+of a tie, consistent with those two being the pass's known cross-process-serialization edge
+cases (see the 2026-07-16 section's Notes on `etl_duckdb`).
 
 | Benchmark | barca | dagster | prefect | barca vs dagster | barca vs prefect |
 |---|---:|---:|---:|---:|---:|
-| trivial | 262.6ms ± 7.1ms | 512.2ms ± 15.2ms | 4.078s ± 0.128s | 1.95x faster | 15.53x faster |
-| chain_100 | 351.5ms ± 6.1ms | 1.074s ± 0.009s | 4.091s ± 0.045s | 3.06x faster | 11.64x faster |
-| deep_diamond | 1.005s ± 0.005s | 633.7ms ± 8.2ms | 4.133s ± 0.049s | **dagster 1.59x faster** | 4.11x faster |
-| etl_duckdb | 1.665s ± 0.070s | 984.1ms ± 23.0ms | 10.313s ± 0.098s | **dagster 1.69x faster** | 6.19x faster |
-| etl_duckdb_dataframes | 1.019s ± 0.021s | 809.1ms ± 22.9ms | 4.278s ± 0.065s | **dagster 1.26x faster** | 4.20x faster |
-| fan_out_500 | 1.739s ± 0.020s | 2.286s ± 0.010s | 4.158s ± 0.061s | 1.31x faster | 2.39x faster |
-| fan_out_500_50ms | 8.445s ± 0.036s | 35.639s ± 0.179s | 10.099s ± 0.061s | 4.22x faster | 1.20x faster |
-| incremental_backfill | 2.882s ± 0.022s | 5.823s ± 0.069s | 42.032s ± 1.123s | 2.02x faster | 14.58x faster |
-| large_payloads | 887.5ms ± 1.3ms | 633.7ms ± 10.4ms | 6.241s ± 0.175s | **dagster 1.40x faster** | 7.03x faster |
-| map_reduce | 977.2ms ± 7.5ms | 905.8ms ± 10.1ms | 4.220s ± 0.030s | **dagster 1.08x faster** | 4.32x faster |
-| mixed_io_cpu | 1.127s ± 0.004s | 994.1ms ± 6.3ms | 4.213s ± 0.018s | **dagster 1.13x faster** | 3.74x faster |
-| multi_file_discovery | 1.032s ± 0.012s | 870.9ms ± 4.7ms | 4.145s ± 0.063s | **dagster 1.18x faster** | 4.02x faster |
-| parallel_tasks | 981.4ms ± 3.6ms | 563.4ms ± 5.2ms | 3.997s ± 0.053s | **dagster 1.74x faster** | 4.07x faster |
-| partitioned_chain | 1.145s ± 0.040s | 1.290s ± 0.017s | 3.917s ± 0.039s | 1.13x faster | 3.42x faster |
-| partitioned_etl | 986.1ms ± 23.6ms | 824.4ms ± 7.4ms | 3.997s ± 0.062s | **dagster 1.20x faster** | 4.05x faster |
-| partitioned_fan_in | 1.061s ± 0.024s | 985.2ms ± 9.2ms | 3.918s ± 0.059s | **dagster 1.08x faster** | 3.69x faster |
-| resilience_pileup | 2.375s ± 0.020s | 2.315s ± 0.067s | 5.607s ± 0.567s | **~tied** (dagster 1.03x) | 2.36x faster |
-| spaceflights | 1.205s ± 0.012s | 1.068s ± 0.007s | 4.213s ± 0.084s | **dagster 1.13x faster** | 3.50x faster |
-| wide_join | 983.6ms ± 26.6ms | 593.4ms ± 14.9ms | 3.979s ± 0.064s | **dagster 1.66x faster** | 4.04x faster |
-| wide_layers | 1.043s ± 0.012s | 911.5ms ± 5.6ms | 4.357s ± 0.837s | **dagster 1.14x faster** | 4.18x faster |
+| trivial | 37.7ms ± 1.7ms | 521.6ms ± 6.7ms | 4.108s ± 0.047s | 13.84x faster | 109.01x faster |
+| chain_100 | 123.1ms ± 6.2ms | 1.101s ± 0.017s | 4.128s ± 0.051s | 8.94x faster | 33.53x faster |
+| deep_diamond | 161.2ms ± 1.1ms | 652.2ms ± 3.6ms | 4.169s ± 0.050s | 4.05x faster | 25.86x faster |
+| etl_duckdb | 1.047s ± 0.077s | 992.7ms ± 13.5ms | 10.241s ± 0.088s | **~tied** (dagster 1.06x) | 9.78x faster |
+| etl_duckdb_dataframes | 394.9ms ± 16.2ms | 820.2ms ± 10.7ms | 4.355s ± 0.059s | 2.08x faster | 11.03x faster |
+| fan_out_500 | 903.4ms ± 58.2ms | 2.306s ± 0.007s | 4.648s ± 1.032s | 2.55x faster | 5.15x faster |
+| fan_out_500_50ms | 7.620s ± 0.053s | 35.415s ± 0.095s | 10.166s ± 0.047s | 4.65x faster | 1.33x faster |
+| incremental_backfill | 608.6ms ± 12.2ms | 5.904s ± 0.032s | 41.773s ± 0.918s | 9.70x faster | 68.64x faster |
+| large_payloads | 660.3ms ± 9.7ms | 629.1ms ± 5.7ms | 6.193s ± 0.030s | **~tied** (dagster 1.05x) | 9.38x faster |
+| map_reduce | 197.0ms ± 8.4ms | 882.1ms ± 5.3ms | 4.192s ± 0.014s | 4.48x faster | 21.28x faster |
+| mixed_io_cpu | 310.1ms ± 14.0ms | 1.038s ± 0.005s | 4.465s ± 0.756s | 3.35x faster | 14.40x faster |
+| multi_file_discovery | 276.7ms ± 8.7ms | 862.5ms ± 3.9ms | 4.149s ± 0.037s | 3.12x faster | 15.00x faster |
+| parallel_tasks | 150.1ms ± 2.0ms | 563.2ms ± 10.2ms | 3.975s ± 0.057s | 3.75x faster | 26.49x faster |
+| partitioned_chain | 288.5ms ± 5.7ms | 1.276s ± 0.015s | 3.925s ± 0.057s | 4.42x faster | 13.60x faster |
+| partitioned_etl | 149.8ms ± 3.8ms | 818.5ms ± 11.4ms | 3.973s ± 0.060s | 5.46x faster | 26.53x faster |
+| partitioned_fan_in | 229.7ms ± 12.4ms | 978.6ms ± 6.6ms | 3.965s ± 0.086s | 4.26x faster | 17.26x faster |
+| resilience_pileup | 1.934s ± 0.009s | 2.297s ± 0.028s | 5.915s ± 0.655s | 1.19x faster | 3.06x faster |
+| spaceflights | 580.2ms ± 7.9ms | 1.058s ± 0.002s | 4.013s ± 0.046s | 1.82x faster | 6.92x faster |
+| wide_join | 133.4ms ± 1.3ms | 599.7ms ± 14.9ms | 3.946s ± 0.061s | 4.50x faster | 29.59x faster |
+| wide_layers | 360.6ms ± 6.5ms | 905.7ms ± 2.5ms | 3.910s ± 0.058s | 2.51x faster | 10.84x faster |
 
 ### Peak memory
 
@@ -152,14 +152,26 @@ to create its own child cgroup with a writable `cgroup.subtree_control` inside t
 already-restricted outer container, which Docker Desktop's container doesn't expose without
 `--privileged` (out of scope for a "minimal" harness) — every row correctly falls back to
 reporting "memory measurement unavailable" per its documented graceful-degradation path
-rather than a misleading number. Not a bug in this pass; noted here since the
-2026-07-16 pass below does have a peak-memory table and this one doesn't.
+rather than a misleading number.
 
 ### Notes
 
-- Two bugs surfaced and fixed while building `benchmarks/docker/`, both specific to running
-  the existing native harness on ARM64 Linux for the first time (every prior pass ran
-  x86_64):
+- **The worker-pool shutdown fix** (`crates/barca-core/src/io_loop.rs`,
+  `WorkerPool::shutdown()`): previously, `graceful_kill()` was called once per worker in a
+  plain `for` loop — each call sent SIGTERM, then unconditionally `std::thread::sleep`'d
+  200ms before its first liveness check, only moving to SIGKILL if the worker was still
+  alive after that. With `pool_size` workers (default 4) all needing termination at the end
+  of a run, that's up to 4 sequential 200ms sleeps — ~800ms of pure `thread::sleep`, on
+  every single `barca get`/`barca run` invocation, independent of workload size. Fixed by
+  sending SIGTERM (and SIGCONT-then-SIGTERM for frozen `parallel()` workers) to every
+  worker up front, then polling all of them together in one shared 200ms window (5ms poll
+  interval) before SIGKILL-ing any stragglers — turning an O(pool_size) cost into O(1). This
+  is a real, general barca-core performance fix, not benchmark-specific: any `barca`
+  invocation that spawns more than one worker pays this tax on exit, so every real-world
+  multi-asset project benefits, not just this suite.
+- Two smaller bugs surfaced and fixed while building `benchmarks/docker/`, both specific to
+  running the existing benchmark harness on ARM64 Linux for the first time (every prior
+  pass ran x86_64):
   - `bench_env_banner()` in `benchmarks/lib/env.sh` unconditionally did
     `cpu_model="$(grep -m1 'model name' /proc/cpuinfo | ...)"`; ARM64's `/proc/cpuinfo` has
     no `model name` line (it uses `CPU part`/`CPU implementer` instead), so `grep` exits 1,
