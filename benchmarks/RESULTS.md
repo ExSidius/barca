@@ -54,6 +54,136 @@ Last run: 2026-06-10 | Apple Silicon (M-series) | Rust release build | v0.2.0
 > payloads across parallel branches). Read the Notes section before drawing
 > any conclusion from a single row in the table.
 
+> **Latest (2026-07-17):** the Prefect `.submit()` fix referenced above has now been
+> validated in a fresh full-suite pass — see
+> [Standardized re-run via Docker harness (2026-07-17)](#standardized-re-run-via-docker-harness-2026-07-17)
+> below. That pass also introduces `benchmarks/docker/`, a new Docker-based harness that
+> gives barca/Dagster/Prefect a genuinely **enforced** shared CPU + memory ceiling (`docker
+> run --cpuset-cpus`/`--memory`, not just CPU pinning with unenforced memory reporting) —
+> see `benchmarks/README.md#reproducible-fairness-via-docker-recommended` — and is now the
+> documented standard way to reproduce this suite. **That pass ran on different hardware
+> and a different virtualization stack** (Docker Desktop's Linux VM on an Apple Silicon
+> Mac, ARM64, nested) **than the 2026-07-16 pass below** (a dedicated x86_64 Linux
+> container) — the two passes are not comparable to each other, in absolute times or in
+> which framework wins which row; read the 2026-07-17 section's own environment notes
+> before drawing conclusions from either pass in isolation.
+
+## Standardized re-run via Docker harness (2026-07-17)
+
+Ran via the new `benchmarks/docker/bench.sh` (see `benchmarks/README.md#reproducible-fairness-via-docker-recommended`):
+Docker Desktop's Linux VM on an Apple Silicon Mac (M4 Max host, 16 cores/64GB — VM itself
+provisioned with 12 vCPU/24GB), container `arm64` (aarch64), **hard-enforced** via `docker
+run --cpuset-cpus=0-3 --memory=4g`  — 4 cores, 4GiB RAM, identical ceiling for barca,
+Dagster, and Prefect alike, not just reported but actually unexceedable by the container.
+barca Python 3.12 (uv venv baked into the image alongside the wheel), Dagster/Prefect each
+in their own `uv sync`'d venv, also baked in at image build time so no timed run touches
+the network. `/proc/cpuinfo` on this VM's kernel doesn't expose a `model name` field (ARM64
+convention — `CPU part`/`CPU implementer` instead), hence "cpu model: unknown" in each run's
+banner; two bugs this exposed are fixed as part of this pass, see Notes.
+`--warmup 1 --runs 5` per each benchmark's own `bench.sh` defaults (`--warmup 3 --runs 10`
+for `trivial`), `BARCA_BENCH_MEMORY=1` requested on every run but unavailable this pass —
+see Notes.
+
+**Read this before the table**: this is a *nested-virtualization* environment (macOS host →
+Docker Desktop's Linux VM → container), materially different from the 2026-07-16 pass's
+dedicated x86_64 Linux container below. Don't compare absolute times, or even the
+win/loss pattern, across the two passes — each is internally consistent (ratios *within* a
+single pass are meaningful) but the environments aren't the same experiment. The most
+visible difference: **dagster now wins or roughly ties on 14 of the 20 rows** below
+(`deep_diamond`, `etl_duckdb`, `etl_duckdb_dataframes`, `large_payloads`, `map_reduce`,
+`mixed_io_cpu`, `multi_file_discovery`, `parallel_tasks`, `partitioned_etl`,
+`partitioned_fan_in`, `resilience_pileup` (~tied), `spaceflights`, `wide_join`,
+`wide_layers`) — a real shift from the 2026-07-16 pass, where barca won nearly everything
+outright. This was checked for noise, not assumed: `deep_diamond`, `mixed_io_cpu`, and
+`wide_join` were each re-run a second time in isolation and reproduced within ~2-3% of
+their first-pass numbers (1.59x → 1.62x, 1.13x → 1.12x, 1.66x → 1.64x dagster-faster
+respectively) — this is a stable effect *within this environment*, not sampling noise.
+What it is *not* checked against: a non-Dockerized native run on this same Mac (which lacks
+`taskset`/cgroups so isn't a fair comparison point either), or a bare-metal ARM64 Linux box
+— so "Docker Desktop's nested virtualization specifically" vs "ARM64 vs x86_64 generally"
+hasn't been isolated as the cause, only observed as correlated. The working hypothesis:
+Dagster's `(user+sys)/wall` sits at ≈1.00 on every row here, exactly as in every prior pass
+(single sequential process — wall time *is* CPU time, nothing hidden). barca's ratio here
+runs **~0.15-0.25** — markedly lower than the 2026-07-16 pass's ~0.3-0.5 — meaning
+proportionally *more* of barca's wall-clock in this environment is spent waiting on process
+coordination (spawn + Unix-socket IPC round trips) rather than doing CPU work. A plausible
+mechanism: nested virtualization (Docker Desktop's Linux VM, which itself uses gVisor for
+networking — see the VM's launch flags) taxes process-spawn/IPC syscalls more than a
+dedicated Linux container does, which would hit barca's multi-process
+coordinator-plus-worker-pool architecture harder than Dagster's single in-process
+sequential model — and would explain why benchmarks dominated by *coordination overhead
+relative to trivial actual work* (small DAGs, many independent leaf tasks: `deep_diamond`,
+`wide_layers`, `wide_join`, `map_reduce`, `mixed_io_cpu`, `multi_file_discovery`,
+`partitioned_etl`/`partitioned_fan_in`, `parallel_tasks` itself) shifted against barca here,
+while benchmarks dominated by long sequential chains or genuinely large parallel workloads
+(where barca's real concurrency advantage swamps any fixed per-round-trip tax) —
+`trivial`, `chain_100`, `fan_out_500`, `fan_out_500_50ms`, `incremental_backfill`,
+`partitioned_chain` — still favor barca decisively, consistent with *every* prior pass on
+those specific rows. Treat the mechanism as a hypothesis, not a confirmed root cause.
+
+| Benchmark | barca | dagster | prefect | barca vs dagster | barca vs prefect |
+|---|---:|---:|---:|---:|---:|
+| trivial | 262.6ms ± 7.1ms | 512.2ms ± 15.2ms | 4.078s ± 0.128s | 1.95x faster | 15.53x faster |
+| chain_100 | 351.5ms ± 6.1ms | 1.074s ± 0.009s | 4.091s ± 0.045s | 3.06x faster | 11.64x faster |
+| deep_diamond | 1.005s ± 0.005s | 633.7ms ± 8.2ms | 4.133s ± 0.049s | **dagster 1.59x faster** | 4.11x faster |
+| etl_duckdb | 1.665s ± 0.070s | 984.1ms ± 23.0ms | 10.313s ± 0.098s | **dagster 1.69x faster** | 6.19x faster |
+| etl_duckdb_dataframes | 1.019s ± 0.021s | 809.1ms ± 22.9ms | 4.278s ± 0.065s | **dagster 1.26x faster** | 4.20x faster |
+| fan_out_500 | 1.739s ± 0.020s | 2.286s ± 0.010s | 4.158s ± 0.061s | 1.31x faster | 2.39x faster |
+| fan_out_500_50ms | 8.445s ± 0.036s | 35.639s ± 0.179s | 10.099s ± 0.061s | 4.22x faster | 1.20x faster |
+| incremental_backfill | 2.882s ± 0.022s | 5.823s ± 0.069s | 42.032s ± 1.123s | 2.02x faster | 14.58x faster |
+| large_payloads | 887.5ms ± 1.3ms | 633.7ms ± 10.4ms | 6.241s ± 0.175s | **dagster 1.40x faster** | 7.03x faster |
+| map_reduce | 977.2ms ± 7.5ms | 905.8ms ± 10.1ms | 4.220s ± 0.030s | **dagster 1.08x faster** | 4.32x faster |
+| mixed_io_cpu | 1.127s ± 0.004s | 994.1ms ± 6.3ms | 4.213s ± 0.018s | **dagster 1.13x faster** | 3.74x faster |
+| multi_file_discovery | 1.032s ± 0.012s | 870.9ms ± 4.7ms | 4.145s ± 0.063s | **dagster 1.18x faster** | 4.02x faster |
+| parallel_tasks | 981.4ms ± 3.6ms | 563.4ms ± 5.2ms | 3.997s ± 0.053s | **dagster 1.74x faster** | 4.07x faster |
+| partitioned_chain | 1.145s ± 0.040s | 1.290s ± 0.017s | 3.917s ± 0.039s | 1.13x faster | 3.42x faster |
+| partitioned_etl | 986.1ms ± 23.6ms | 824.4ms ± 7.4ms | 3.997s ± 0.062s | **dagster 1.20x faster** | 4.05x faster |
+| partitioned_fan_in | 1.061s ± 0.024s | 985.2ms ± 9.2ms | 3.918s ± 0.059s | **dagster 1.08x faster** | 3.69x faster |
+| resilience_pileup | 2.375s ± 0.020s | 2.315s ± 0.067s | 5.607s ± 0.567s | **~tied** (dagster 1.03x) | 2.36x faster |
+| spaceflights | 1.205s ± 0.012s | 1.068s ± 0.007s | 4.213s ± 0.084s | **dagster 1.13x faster** | 3.50x faster |
+| wide_join | 983.6ms ± 26.6ms | 593.4ms ± 14.9ms | 3.979s ± 0.064s | **dagster 1.66x faster** | 4.04x faster |
+| wide_layers | 1.043s ± 0.012s | 911.5ms ± 5.6ms | 4.357s ± 0.837s | **dagster 1.14x faster** | 4.18x faster |
+
+### Peak memory
+
+Unavailable this pass. `BARCA_BENCH_MEMORY=1` was set on every run, but the opt-in
+whole-process-tree memory measurement (`bench_mem_peak` in `benchmarks/lib/env.sh`) needs
+to create its own child cgroup with a writable `cgroup.subtree_control` inside the
+already-restricted outer container, which Docker Desktop's container doesn't expose without
+`--privileged` (out of scope for a "minimal" harness) — every row correctly falls back to
+reporting "memory measurement unavailable" per its documented graceful-degradation path
+rather than a misleading number. Not a bug in this pass; noted here since the
+2026-07-16 pass below does have a peak-memory table and this one doesn't.
+
+### Notes
+
+- Two bugs surfaced and fixed while building `benchmarks/docker/`, both specific to running
+  the existing native harness on ARM64 Linux for the first time (every prior pass ran
+  x86_64):
+  - `bench_env_banner()` in `benchmarks/lib/env.sh` unconditionally did
+    `cpu_model="$(grep -m1 'model name' /proc/cpuinfo | ...)"`; ARM64's `/proc/cpuinfo` has
+    no `model name` line (it uses `CPU part`/`CPU implementer` instead), so `grep` exits 1,
+    and under the calling `bench.sh`'s `set -euo pipefail` that aborted the entire benchmark
+    before hyperfine ever ran. Fixed by tolerating the failure (`|| true`) for both the CPU
+    model and `free -h` lookups, falling back to "unknown" — matches the function's existing
+    `${cpu_model:-unknown}` display fallback, which was already written assuming the
+    assignment could come back empty but not that it could kill the script outright.
+  - The runtime image was also missing `free` (`procps` isn't installed by default in the
+    `bookworm-slim` base) — added explicitly for the same banner.
+  - Root barca venv (`/work/.venv` in the image, `.venv` in local dev) needs
+    `scikit-learn`, `pandas`, and `pyarrow` installed alongside the barca wheel itself —
+    `spaceflights/barca/assets.py` and `etl_duckdb_dataframes/barca/assets.py` import them
+    directly, and unlike the Dagster/Prefect sides there's no separate per-benchmark barca
+    venv to isolate them in. This mirrors `.github/workflows/ci.yml`'s benchmark-smoke-test
+    step, which does the same `pip install scikit-learn` / `pip install pandas pyarrow`
+    alongside its own wheel-installed barca. Without this, both benchmarks failed their
+    first hyperfine warmup run with a barca-side import error before any timing was
+    collected.
+- The Prefect `.submit()` fix from the 2026-07-16 "Further note" above is included in this
+  pass (it landed on `main` before this pass ran) — Prefect still loses every single row by
+  a wide margin regardless, consistent with the 2026-07-16 pass's conclusion that its high
+  fixed per-run overhead dominates regardless of environment or concurrency fixes.
+
 ## Standardized re-run (2026-07-16)
 
 Ran on this container: 4 vCPU (Intel Xeon @ 2.80GHz, pinned via `taskset -c 0-3`),

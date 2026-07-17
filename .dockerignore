@@ -1,0 +1,15 @@
+# Keep the Docker build context small and, critically, keep macOS-built
+# .venv dirs already present under benchmarks/*/dagster/ and
+# benchmarks/*/prefect/ out of the image entirely — they're host artifacts
+# (wrong platform/ABI for a Linux container) that would otherwise shadow or
+# conflict with the fresh Linux venvs `uv sync` builds inside the image.
+target/
+.venv/
+**/.venv/
+**/__pycache__/
+.barca/
+benchmarks/partitioned_10k/wheels/
+.git/
+site/dist/
+site/.astro/
+node_modules/

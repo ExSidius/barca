@@ -50,3 +50,5 @@ Thumbs.db
 # Benchmark auto-generated hyperfine output (per-benchmark dir)
 benchmarks/*/results.md
 
+# Docker benchmark harness output (raw logs extracted from the container)
+benchmarks/docker/out/
