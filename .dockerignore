@@ -9,6 +9,7 @@ target/
 **/__pycache__/
 .barca/
 benchmarks/partitioned_10k/wheels/
+benchmarks/docker/out/
 .git/
 site/dist/
 site/.astro/

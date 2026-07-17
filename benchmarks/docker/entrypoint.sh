@@ -60,19 +60,23 @@ for name in "${BENCHMARKS[@]}"; do
         continue
     fi
 
-    set +e
+    # `|| status=$?` captures the exit code without ever invoking errexit —
+    # simpler and safer than toggling `set -e`/`set +e` around the command,
+    # which (with only `set -u` enabled at the top of this script) left
+    # errexit on from the end of one iteration until the top of the next,
+    # silently turning any failure in the `cat`/`cp` lines below into a
+    # script-aborting error instead of the "continue past failures" behavior
+    # this loop is designed for.
+    status=0
     (
         cd "$dir" && BARCA_BENCH_MEMORY=1 ./bench.sh
-    ) >"$log" 2>&1
-    status=$?
-    set -e
+    ) >"$log" 2>&1 || status=$?
 
     if [[ $status -eq 0 ]]; then
         SUCCEEDED+=("$name")
     else
         FAILED+=("$name (exit $status)")
     fi
-    set -u
 
     # Surface the log to the container's own stdout too, so `docker run`
     # without a detach still shows live progress.
