@@ -1012,4 +1012,112 @@ mod tests {
         assert_eq!(step["sinks"], serde_json::json!([]));
         assert_eq!(step["run_hash"], serde_json::Value::Null);
     }
+
+    /// Regression test for the pool_size*200ms shutdown bug: `shutdown()`
+    /// used to call `graceful_kill()` (SIGTERM, then an unconditional 200ms
+    /// sleep before the first liveness check) once per worker in a plain
+    /// loop, so N workers took ~N*200ms to tear down. Each dummy worker here
+    /// traps SIGTERM (`trap '' TERM`), so it can only die via the SIGKILL
+    /// fallback — forcing every worker through the full grace-period path
+    /// and making the old O(pool_size) vs. new O(1) timing deterministic
+    /// rather than racing against how fast a real process happens to react
+    /// to SIGTERM.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_terminates_all_workers_in_one_shared_grace_window() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let n = 4;
+            let socket_path = std::env::temp_dir().join(format!(
+                "barca_test_shutdown_{}_{}.sock",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let (event_tx, event_rx) = mpsc::channel(8);
+
+            let mut workers = HashMap::new();
+            let mut pids = Vec::new();
+            for i in 0..n {
+                let child = Command::new("sh")
+                    .args(["-c", "trap '' TERM; sleep 30"])
+                    .spawn()
+                    .unwrap();
+                pids.push(child.id());
+                let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+                workers.insert(
+                    i,
+                    WorkerHandle {
+                        child,
+                        cmd_tx,
+                        _task: tokio::spawn(async {}),
+                        leases: VecDeque::new(),
+                    },
+                );
+            }
+
+            // Let every shell finish installing its `trap '' TERM` before we
+            // start signaling — without this, a SIGTERM landing mid-startup
+            // (default disposition, trap not yet installed) can kill the
+            // process instantly and silently turn this into a no-op test.
+            std::thread::sleep(Duration::from_millis(100));
+            for &pid in &pids {
+                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                assert!(
+                    alive,
+                    "worker pid {pid} died before shutdown() was even called"
+                );
+            }
+
+            let pool = WorkerPool {
+                config: IoConfig {
+                    python: PathBuf::from("python3"),
+                    pool_size: n,
+                    run_id: "test-shutdown".to_string(),
+                    artifact_root: ".".to_string(),
+                    storage_options_json: None,
+                },
+                socket_path: socket_path.clone(),
+                listener,
+                event_tx,
+                event_rx,
+                workers,
+                frozen: Vec::new(),
+                next_worker_id: n,
+                trace_start: std::time::Instant::now(),
+                trace_on: false,
+            };
+
+            let start = std::time::Instant::now();
+            pool.shutdown().await;
+            let elapsed = start.elapsed();
+
+            // Old code: n * 200ms sequential sleeps (~800ms for 4 workers
+            // that never die on their own). New code: one shared ~200ms
+            // grace window regardless of worker count, plus SIGKILL
+            // overhead. Lower bound guards against the exact race this test
+            // is designed to catch: if a worker died before its trap took
+            // effect, shutdown would return almost instantly without ever
+            // exercising the shared-grace-window path at all.
+            assert!(
+                elapsed >= Duration::from_millis(150) && elapsed < Duration::from_millis(500),
+                "shutdown of {n} SIGTERM-ignoring workers took {elapsed:?} — expected one \
+                 shared ~200ms grace window, not ~0 (race) or ~{}ms (one window per worker)",
+                n * 200
+            );
+
+            for pid in pids {
+                // kill(pid, 0) sends no signal, just checks liveness/permission;
+                // a nonzero return (ESRCH) confirms the process was reaped.
+                let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                assert!(
+                    !still_alive,
+                    "worker pid {pid} should have been terminated by shutdown()"
+                );
+            }
+
+            let _ = std::fs::remove_file(&socket_path);
+        });
+    }
 }
