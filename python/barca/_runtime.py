@@ -15,7 +15,7 @@ import threading
 try:
     import orjson  # ty: ignore[unresolved-import]
 except ImportError:
-    orjson = None  # type: ignore[assignment]
+    orjson = None  # ty: ignore[invalid-assignment]
 
 
 # ─── Socket connection ────────────────────────────────────────────────────────
