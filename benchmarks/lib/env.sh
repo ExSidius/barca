@@ -48,8 +48,8 @@ bench_pin() {
 
 bench_env_banner() {
     local cpu_model total_ram
-    cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//')"
-    total_ram="$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}')"
+    cpu_model="$(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 | sed 's/^ *//' || true)"
+    total_ram="$(free -h 2>/dev/null | awk '/^Mem:/ {print $2}' || true)"
     echo "  cores pinned : $BARCA_BENCH_CORES ($BARCA_BENCH_CORE_RANGE)$([[ -z "$BARCA_BENCH_PIN" ]] && echo ' [unpinned: taskset unavailable]')"
     echo "  cpu model    : ${cpu_model:-unknown}"
     echo "  total ram    : ${total_ram:-unknown}"

@@ -171,8 +171,7 @@ impl WorkerPool {
     pub fn start(config: IoConfig) -> Result<Self, String> {
         let socket_path = crate::protocol::socket_path(&config.run_id, "main");
         std::fs::remove_file(&socket_path).ok();
-        let listener =
-            UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
+        let listener = UnixListener::bind(&socket_path).map_err(|e| format!("socket bind: {e}"))?;
         let (event_tx, event_rx) = mpsc::channel::<IoEvent>(config.pool_size.max(1) * 8);
         Ok(Self {
             config,
@@ -459,22 +458,66 @@ impl WorkerPool {
         Ok(())
     }
 
-    /// Gracefully terminate every worker and remove the socket. Runs the
-    /// SIGTERM-grace kills on the blocking pool because `graceful_kill`
-    /// sleeps between SIGTERM and SIGKILL.
+    /// Gracefully terminate every worker and remove the socket. Runs on the
+    /// blocking pool because this polls for exit between SIGTERM and SIGKILL.
+    ///
+    /// Signals every worker up front and then polls them all together for one
+    /// shared 200ms grace window, rather than the previous sequential
+    /// SIGTERM-then-sleep(200ms)-then-check per worker — that cost
+    /// `pool_size * 200ms` in the common case (every worker still mid-cleanup
+    /// at the first `try_wait()`, right after its own SIGTERM), which for a
+    /// default `pool_size` of 4 meant shutdown alone could take ~800ms
+    /// regardless of how little work the run actually did (confirmed via
+    /// `BARCA_TRACE_TIMING=1` — see benchmarks/RESULTS.md's docker-harness
+    /// re-run notes).
     pub async fn shutdown(self) {
         let workers = self.workers;
         let frozen = self.frozen;
         let kill_task = tokio::task::spawn_blocking(move || {
-            for (_, mut w) in workers {
-                graceful_kill(&mut w.child);
+            let mut children: Vec<Child> = Vec::with_capacity(workers.len() + frozen.len());
+
+            #[cfg(unix)]
+            for (_, w) in workers {
+                unsafe {
+                    libc::kill(w.child.id() as i32, libc::SIGTERM);
+                }
+                children.push(w.child);
             }
-            for mut fw in frozen {
-                #[cfg(unix)]
+            #[cfg(not(unix))]
+            for (_, w) in workers {
+                children.push(w.child);
+            }
+
+            #[cfg(unix)]
+            for fw in frozen {
                 unsafe {
                     libc::kill(fw.child.id() as i32, libc::SIGCONT);
+                    libc::kill(fw.child.id() as i32, libc::SIGTERM);
                 }
-                graceful_kill(&mut fw.child);
+                children.push(fw.child);
+            }
+            #[cfg(not(unix))]
+            for fw in frozen {
+                children.push(fw.child);
+            }
+
+            #[cfg(unix)]
+            {
+                let deadline = std::time::Instant::now() + Duration::from_millis(200);
+                while std::time::Instant::now() < deadline
+                    && children
+                        .iter_mut()
+                        .any(|c| !matches!(c.try_wait(), Ok(Some(_))))
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+
+            for mut c in children {
+                if !matches!(c.try_wait(), Ok(Some(_))) {
+                    let _ = c.kill();
+                }
+                let _ = c.wait();
             }
         });
         let _ = kill_task.await;
@@ -684,10 +727,8 @@ impl WorkerPool {
                                         .get("format")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
-                                    let path = artifact
-                                        .get("path")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("");
+                                    let path =
+                                        artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
                                     if fmt == "json" && !path.is_empty() {
                                         if path.contains("://") {
                                             eprintln!(
@@ -970,5 +1011,113 @@ mod tests {
         let step = build_step_json(coord.item(id), &coord);
         assert_eq!(step["sinks"], serde_json::json!([]));
         assert_eq!(step["run_hash"], serde_json::Value::Null);
+    }
+
+    /// Regression test for the pool_size*200ms shutdown bug: `shutdown()`
+    /// used to call `graceful_kill()` (SIGTERM, then an unconditional 200ms
+    /// sleep before the first liveness check) once per worker in a plain
+    /// loop, so N workers took ~N*200ms to tear down. Each dummy worker here
+    /// traps SIGTERM (`trap '' TERM`), so it can only die via the SIGKILL
+    /// fallback — forcing every worker through the full grace-period path
+    /// and making the old O(pool_size) vs. new O(1) timing deterministic
+    /// rather than racing against how fast a real process happens to react
+    /// to SIGTERM.
+    #[cfg(unix)]
+    #[test]
+    fn shutdown_terminates_all_workers_in_one_shared_grace_window() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let n = 4;
+            let socket_path = std::env::temp_dir().join(format!(
+                "barca_test_shutdown_{}_{}.sock",
+                std::process::id(),
+                n
+            ));
+            let _ = std::fs::remove_file(&socket_path);
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let (event_tx, event_rx) = mpsc::channel(8);
+
+            let mut workers = HashMap::new();
+            let mut pids = Vec::new();
+            for i in 0..n {
+                let child = Command::new("sh")
+                    .args(["-c", "trap '' TERM; sleep 30"])
+                    .spawn()
+                    .unwrap();
+                pids.push(child.id());
+                let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+                workers.insert(
+                    i,
+                    WorkerHandle {
+                        child,
+                        cmd_tx,
+                        _task: tokio::spawn(async {}),
+                        leases: VecDeque::new(),
+                    },
+                );
+            }
+
+            // Let every shell finish installing its `trap '' TERM` before we
+            // start signaling — without this, a SIGTERM landing mid-startup
+            // (default disposition, trap not yet installed) can kill the
+            // process instantly and silently turn this into a no-op test.
+            std::thread::sleep(Duration::from_millis(100));
+            for &pid in &pids {
+                let alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                assert!(
+                    alive,
+                    "worker pid {pid} died before shutdown() was even called"
+                );
+            }
+
+            let pool = WorkerPool {
+                config: IoConfig {
+                    python: PathBuf::from("python3"),
+                    pool_size: n,
+                    run_id: "test-shutdown".to_string(),
+                    artifact_root: ".".to_string(),
+                    storage_options_json: None,
+                },
+                socket_path: socket_path.clone(),
+                listener,
+                event_tx,
+                event_rx,
+                workers,
+                frozen: Vec::new(),
+                next_worker_id: n,
+                trace_start: std::time::Instant::now(),
+                trace_on: false,
+            };
+
+            let start = std::time::Instant::now();
+            pool.shutdown().await;
+            let elapsed = start.elapsed();
+
+            // Old code: n * 200ms sequential sleeps (~800ms for 4 workers
+            // that never die on their own). New code: one shared ~200ms
+            // grace window regardless of worker count, plus SIGKILL
+            // overhead. Lower bound guards against the exact race this test
+            // is designed to catch: if a worker died before its trap took
+            // effect, shutdown would return almost instantly without ever
+            // exercising the shared-grace-window path at all.
+            assert!(
+                elapsed >= Duration::from_millis(150) && elapsed < Duration::from_millis(500),
+                "shutdown of {n} SIGTERM-ignoring workers took {elapsed:?} — expected one \
+                 shared ~200ms grace window, not ~0 (race) or ~{}ms (one window per worker)",
+                n * 200
+            );
+
+            for pid in pids {
+                // kill(pid, 0) sends no signal, just checks liveness/permission;
+                // a nonzero return (ESRCH) confirms the process was reaped.
+                let still_alive = unsafe { libc::kill(pid as i32, 0) } == 0;
+                assert!(
+                    !still_alive,
+                    "worker pid {pid} should have been terminated by shutdown()"
+                );
+            }
+
+            let _ = std::fs::remove_file(&socket_path);
+        });
     }
 }

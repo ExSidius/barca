@@ -186,7 +186,13 @@ impl Coordinator {
     /// id: inserts it, registers dependents, and places it on the ready or
     /// pending queue. This is `add_item`'s body, split out so `load_phase` can
     /// reserve every id up front and only then resolve deps.
-    fn finalize_item(&mut self, id: ItemId, step_id: crate::StepId, spec: ItemSpec, deps: Vec<Dep>) {
+    fn finalize_item(
+        &mut self,
+        id: ItemId,
+        step_id: crate::StepId,
+        spec: ItemSpec,
+        deps: Vec<Dep>,
+    ) {
         let item = Item {
             id,
             step_id,

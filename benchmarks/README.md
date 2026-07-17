@@ -41,6 +41,56 @@ All measurements use [hyperfine](https://github.com/sharkdp/hyperfine). See [RES
   process. Off by default since it re-runs each framework once more and adds
   wall-clock, especially for slow-starting frameworks.
 
+### Reproducible fairness via Docker (recommended)
+
+The native path above (`benchmarks/<name>/bench.sh`, `benchmarks/lib/env.sh`) pins CPU
+affinity via `taskset` but only *reports* RAM — there's no enforced memory ceiling, and
+`taskset` itself isn't available everywhere (e.g. macOS has no `taskset`, and no writable
+cgroup memory controller outside a Linux container). That's fine for fast local iteration,
+but it means the CPU/memory budget barca, Dagster, and Prefect actually run under can
+silently vary by host.
+
+`benchmarks/docker/bench.sh` is the standard, documented way to get a genuinely
+**enforced**, reproducible CPU + memory ceiling shared identically across all three
+frameworks, on any Docker-capable machine (including Apple Silicon Macs, via Docker
+Desktop's Linux VM):
+
+```bash
+# Build the image and run the full 20-benchmark suite
+benchmarks/docker/bench.sh
+
+# Or a subset, for quick iteration
+benchmarks/docker/bench.sh trivial chain_100
+
+# Override the shared resource ceiling (defaults: 4 cores, 4g memory)
+BARCA_BENCH_CORES=8 BARCA_BENCH_MEM=8g benchmarks/docker/bench.sh
+```
+
+What it does differently from the native path:
+- **Enforced CPU ceiling**: `docker run --cpuset-cpus` hard-restricts which host cores the
+  whole container (barca's coordinator + worker pool, Dagster, and Prefect alike) can ever
+  schedule onto — not just an advisory pin inside the process, but a limit the container
+  cannot exceed regardless of host load. `BARCA_BENCH_CORES` reuses the same env var name
+  and convention as `benchmarks/lib/env.sh` (default 4), translated into a
+  `--cpuset-cpus=0-N-1` range.
+- **Enforced memory ceiling**: `docker run --memory` gives all three frameworks a real,
+  identical, kernel-enforced RAM budget (default `4g`, generous relative to the largest
+  peak-memory figure ever recorded in `RESULTS.md` — ~560MB for Prefect on
+  `spaceflights` — but a genuine ceiling rather than "no limit"), overridable via
+  `BARCA_BENCH_MEM`.
+- **Fully offline, reproducible timed runs**: `benchmarks/docker/Dockerfile` builds the
+  barca wheel from source, then bakes every benchmark's Dagster/Prefect `uv sync` venv at
+  *image build time* — so the timed portion of a run never touches the network, and one
+  image can be reused across repeated runs without first-run cold-cache variance.
+  `benchmarks/docker/entrypoint.sh` (baked into the image) then loops over all 20
+  benchmarks (or a subset passed as args), running each with
+  `BARCA_BENCH_MEMORY=1 ./bench.sh` and collecting logs + `results.md` under
+  `benchmarks/docker/out/` on the host (gitignored — raw output, not committed).
+
+The native path stays documented and unchanged for fast local iteration without a Docker
+image build; the Docker path is what to reach for when the numbers need to be defensible
+across machines (e.g. for a `RESULTS.md` update).
+
 ### Why Dagster is excluded from the worker-count fix
 
 Dagster's `materialize()`/`job.execute_in_process()` — what every `dagster/run.py` here
