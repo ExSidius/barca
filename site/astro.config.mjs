@@ -2,8 +2,11 @@
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
+import cloudflare from '@astrojs/cloudflare';
+
 export default defineConfig({
   site: 'https://barca.sh',
+
   integrations: [
     starlight({
       title: 'Barca',
@@ -137,4 +140,6 @@ export default defineConfig({
       ],
     }),
   ],
+
+  adapter: cloudflare(),
 });
