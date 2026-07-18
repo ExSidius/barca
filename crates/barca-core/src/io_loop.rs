@@ -370,6 +370,7 @@ impl WorkerPool {
                                     sinks: Vec::new(),
                                     run_hash: None,
                                     upstream_inputs: HashMap::new(),
+                                    collected_inputs: HashMap::new(),
                                     kind: "task".to_string(),
                                     is_dynamic: false,
                                 }
@@ -901,13 +902,23 @@ fn graceful_kill(child: &mut Child) {
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 fn build_step_json(item: &crate::coordinator::Item, coord: &Coordinator) -> serde_json::Value {
-    // Start with dag_inputs from spec (cross-phase provided inputs).
-    let mut inputs = item.spec.dag_inputs.clone();
+    // Start with dag_inputs from spec (cross-phase provided inputs), as plain
+    // artifact-path strings.
+    let mut inputs: serde_json::Map<String, serde_json::Value> = item
+        .spec
+        .dag_inputs
+        .iter()
+        .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+        .collect();
 
-    // Fill in-phase upstream artifacts: for params that don't have a path yet,
-    // look up the coordinator's outputs using the upstream_inputs mapping.
+    // Fill in-phase upstream artifacts: for params that don't have a value yet
+    // (and aren't a fan-in collected param, filled below), look up the
+    // coordinator's outputs using the upstream_inputs mapping.
     for (param, upstream_node_id) in &item.spec.upstream_inputs {
-        if inputs.contains_key(param) && !inputs[param].is_empty() {
+        if item.spec.collected_inputs.contains_key(param) {
+            continue;
+        }
+        if inputs.get(param).is_some_and(|v| v.as_str() != Some("")) {
             continue;
         }
         for (&uid, artifact) in coord.outputs() {
@@ -915,11 +926,26 @@ fn build_step_json(item: &crate::coordinator::Item, coord: &Coordinator) -> serd
             if upstream_item.step_id.display() == *upstream_node_id {
                 let path = artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 if !path.is_empty() {
-                    inputs.insert(param.clone(), path.to_string());
+                    inputs.insert(param.clone(), serde_json::Value::String(path.to_string()));
                 }
                 break;
             }
         }
+    }
+
+    // Fan-in (`collect()`) params: every partition artifact of the upstream,
+    // sent as a `{"_collected": true, "artifacts": [...]}` marker — the same
+    // shape batch mode's `_resolve_input` already understands — so the worker
+    // deserializes the full list instead of a single artifact.
+    for (param, orefs) in &item.spec.collected_inputs {
+        let artifacts: Vec<serde_json::Value> = orefs
+            .iter()
+            .map(|oref| serde_json::json!({"path": oref.path, "format": oref.format}))
+            .collect();
+        inputs.insert(
+            param.clone(),
+            serde_json::json!({"_collected": true, "artifacts": artifacts}),
+        );
     }
 
     serde_json::json!({
@@ -971,6 +997,7 @@ mod tests {
                 },
             ],
             upstream_inputs: HashMap::new(),
+            collected_inputs: HashMap::new(),
             kind: "asset".to_string(),
             is_dynamic: false,
         };
@@ -1004,6 +1031,7 @@ mod tests {
             sinks: Vec::new(),
             run_hash: None,
             upstream_inputs: HashMap::new(),
+            collected_inputs: HashMap::new(),
             kind: "asset".to_string(),
             is_dynamic: false,
         };
@@ -1011,6 +1039,62 @@ mod tests {
         let step = build_step_json(coord.item(id), &coord);
         assert_eq!(step["sinks"], serde_json::json!([]));
         assert_eq!(step["run_hash"], serde_json::Value::Null);
+    }
+
+    /// Regression test for #93: a `collect()` param must be sent to the
+    /// worker as the `{"_collected": true, "artifacts": [...]}` marker with
+    /// every partition artifact, not collapsed to a single path.
+    #[test]
+    fn build_step_json_sends_collected_param_as_artifact_list() {
+        let mut coord = Coordinator::new();
+        let mut spec = ItemSpec {
+            fn_ref: "f.py:sink".to_string(),
+            function_name: "sink".to_string(),
+            source_file: "f.py".to_string(),
+            direct_args: Vec::new(),
+            direct_kwargs: HashMap::new(),
+            dag_inputs: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            serializer: None,
+            sinks: Vec::new(),
+            run_hash: None,
+            upstream_inputs: HashMap::from([("data".to_string(), "f.py:source".to_string())]),
+            collected_inputs: HashMap::new(),
+            kind: "asset".to_string(),
+            is_dynamic: false,
+        };
+        spec.collected_inputs.insert(
+            "data".to_string(),
+            vec![
+                crate::dispatch::OutputRef {
+                    path: "f--source_key_a.json".to_string(),
+                    format: "json".to_string(),
+                    size_bytes: 10,
+                    elapsed_seconds: None,
+                },
+                crate::dispatch::OutputRef {
+                    path: "f--source_key_b.json".to_string(),
+                    format: "json".to_string(),
+                    size_bytes: 12,
+                    elapsed_seconds: None,
+                },
+            ],
+        );
+        let id = coord.add_item(crate::StepId::unpartitioned("f.py:sink"), spec, Vec::new());
+        let step = build_step_json(coord.item(id), &coord);
+
+        assert_eq!(
+            step["inputs"]["data"],
+            serde_json::json!({
+                "_collected": true,
+                "artifacts": [
+                    {"path": "f--source_key_a.json", "format": "json"},
+                    {"path": "f--source_key_b.json", "format": "json"},
+                ],
+            })
+        );
     }
 
     /// Regression test for the pool_size*200ms shutdown bug: `shutdown()`

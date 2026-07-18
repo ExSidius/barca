@@ -166,9 +166,8 @@ class TestManyTinyPartitions:
     def test_fan_out_completes_correctly(self, tmp_path):
         """Batch-pulled tiny partitions must all materialize exactly once.
 
-        (Fan-in via collect() is exercised elsewhere and still xfail in the
-        get path — this guards the lease/batch machinery: no partition lost,
-        none run twice.)
+        (Fan-in via collect() is exercised in test_reliability.py — this
+        guards the lease/batch machinery: no partition lost, none run twice.)
         """
         f = write_module(
             tmp_path,
@@ -223,7 +222,9 @@ class TestManyTinyPartitions:
         # The estimator must reflect the cost split: heavy partitions carry
         # larger estimates than tiny ones.
         est = dict(
-            _query("SELECT node_id, estimate_seconds FROM cost_estimates WHERE node_id LIKE '%:work[%'")
+            _query(
+                "SELECT node_id, estimate_seconds FROM cost_estimates WHERE node_id LIKE '%:work[%'"
+            )
         )
         assert len(est) == 12
         heavy = [v for k, v in est.items() if int(k.split("p")[-1].rstrip("]")) % 2 == 1]

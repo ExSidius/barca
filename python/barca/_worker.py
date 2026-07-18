@@ -239,6 +239,22 @@ def _resolve_input(raw_value):
     return raw_value
 
 
+def _load_artifact(path, lru, fmt=None):
+    """Resolve one artifact path to its deserialized value via the tier-1 LRU
+    cache, falling through to the artifact store on miss."""
+    hot = lru.get(path)
+    if hot is not None:
+        return hot
+    if not _storage.exists(path):
+        raise FileNotFoundError(f"Input artifact not found: {path}")
+    if fmt is None:
+        fmt = _EXT_FORMATS.get(_storage.suffix(path), "json")
+    value = deserialize(path, fmt)
+    if _lru_cacheable(path):
+        lru.put(path, value)
+    return value
+
+
 def _execute(fn, kwargs, step):
     """Run a step function with optional timeout, unpacking sensor tuples."""
     timeout = step.get("timeout_seconds", 0)
@@ -327,7 +343,10 @@ def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=Fa
     size = serialize(result, path, fmt)
     elapsed += time.perf_counter() - _ser_wall0
     if timing and timing.get("cpu_seconds") is not None:
-        timing = {**timing, "cpu_seconds": timing["cpu_seconds"] + (time.process_time() - _ser_cpu0)}
+        timing = {
+            **timing,
+            "cpu_seconds": timing["cpu_seconds"] + (time.process_time() - _ser_cpu0),
+        }
     artifact = {"path": str(path), "format": fmt, "size_bytes": size}
     if elapsed_in_artifact:
         artifact["elapsed_seconds"] = elapsed
@@ -520,29 +539,32 @@ def _run_daemon_step(step, modules, art_dir, lru):
         # Resolve dag_inputs as function arguments.
         inputs = step.get("inputs", {})
         kwargs = dict(d_kwargs) if d_kwargs else {}
-        for param, artifact_path_str in inputs.items():
+        for param, value in inputs.items():
             # Skip ordering-only deps (underscore-prefixed params carry no data).
             if param.startswith("_"):
                 kwargs[param] = None
                 continue
-            if not artifact_path_str:
+            # Fan-in (collect()): every partition artifact of the upstream,
+            # deserialized into a list — matches batch mode's _resolve_input.
+            if isinstance(value, dict) and value.get("_collected"):
+                try:
+                    kwargs[param] = [
+                        _load_artifact(a["path"], lru, fmt=a.get("format"))
+                        for a in value.get("artifacts", [])
+                    ]
+                except FileNotFoundError as e:
+                    raise FileNotFoundError(
+                        f"Input artifact for parameter '{param}' not found: {e}"
+                    ) from e
                 continue
-            # Tier 1: in-process LRU (content-addressed path = safe key).
-            hot = lru.get(artifact_path_str)
-            if hot is not None:
-                kwargs[param] = hot
+            if not value:
                 continue
-            # Tier 2: the artifact store.
-            if not _storage.exists(artifact_path_str):
+            try:
+                kwargs[param] = _load_artifact(value, lru)
+            except FileNotFoundError:
                 raise FileNotFoundError(
-                    f"Input artifact for parameter '{param}' not found: {artifact_path_str}"
-                )
-            # Infer format from file extension (URI-safe).
-            fmt = _EXT_FORMATS.get(_storage.suffix(artifact_path_str), "json")
-            value = deserialize(artifact_path_str, fmt)
-            if _lru_cacheable(artifact_path_str):
-                lru.put(artifact_path_str, value)
-            kwargs[param] = value
+                    f"Input artifact for parameter '{param}' not found: {value}"
+                ) from None
 
         timeout = step.get("timeout_seconds", 0)
         if d_args:

@@ -247,14 +247,6 @@ Both tasks run in the same phase (they're independent of each other) after `dail
 
 Partitions fan a single asset definition into N independent runs, one per partition key.
 
-:::caution[Known issue]
-As of this writing, a `collect()`-consuming asset downstream of partitioned producers can be
-scheduled into the same phase as the still-running producers instead of waiting for them,
-causing a `TypeError` at runtime. Tracked in
-[ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97). The syntax below is the
-intended API; it does not yet execute correctly end-to-end.
-:::
-
 ```python
 from barca import asset, partitions, collect
 
@@ -264,13 +256,13 @@ def regional_sales(region: str) -> dict:
     return {"region": region, "total": hash(region) % 10000}
 
 @asset(inputs={"sales": collect(regional_sales)})
-def global_summary(sales: dict) -> dict:
-    total = sum(v["total"] for v in sales.values())
+def global_summary(sales: list[dict]) -> dict:
+    total = sum(v["total"] for v in sales)
     return {"regions": len(sales), "global_total": total}
 ```
 
 - `regional_sales` runs 3 times, once per region
-- `collect(regional_sales)` aggregates all partition outputs into a single dict
+- `collect(regional_sales)` aggregates all partition outputs into a single list
 - `global_summary` receives all three results at once
 
 ## 8. Multi-file pipelines
@@ -348,15 +340,11 @@ The plan shows:
 
 Here's a complete pipeline that uses everything:
 
-:::caution[Known issue]
-This pipeline hits the same partition fan-in issue as above — see
-[ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97). `merge` is not yet guaranteed
-to wait for all `transform` partitions to finish.
-:::
-
 ```python
 # pipeline.py
 from barca import asset, sensor, task, partitions, collect
+
+TABLES = ["users", "events", "purchases"]
 
 # Sensor: poll for new data
 @sensor()
@@ -365,19 +353,20 @@ def check_data_lake() -> tuple[bool, dict]:
     return True, {"path": "s3://bucket/raw/", "files": 3}
 
 # Source assets (parallel)
-@asset(partitions={"table": partitions(["users", "events", "purchases"])})
+@asset(partitions={"table": partitions(TABLES)})
 def extract(table: str) -> dict:
     return {"table": table, "rows": 1000}
 
-# Transform (runs per partition, inheriting from extract)
-@asset(inputs={"raw": extract})
-def transform(raw: dict) -> dict:
+# Transform (runs per partition — declares the same partition values as
+# extract so each transform(table=X) pairs with extract(table=X))
+@asset(inputs={"raw": extract}, partitions={"table": partitions(TABLES)})
+def transform(raw: dict, table: str) -> dict:
     return {"table": raw["table"], "clean_rows": raw["rows"] - 10}
 
 # Aggregate all partitions
 @asset(inputs={"tables": collect(transform)})
-def merge(tables: dict) -> dict:
-    total = sum(v["clean_rows"] for v in tables.values())
+def merge(tables: list[dict]) -> dict:
+    total = sum(v["clean_rows"] for v in tables)
     return {"total_rows": total, "tables": len(tables)}
 
 # Sensor-driven asset

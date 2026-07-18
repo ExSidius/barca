@@ -40,6 +40,25 @@ fn fmt_eta(secs: f64) -> String {
     }
 }
 
+/// Total schedulable steps in a phase: 1 per unpartitioned step, `partition_keys.len()`
+/// for late-expanded ones. Used to keep the live progress-bar total in sync with
+/// `dispatch::expand_pending_partitions`, which turns a single planned
+/// (`partitions_from`) step into its real per-key count only at dispatch time.
+fn phase_step_count(phase: &Phase) -> usize {
+    phase
+        .streams
+        .iter()
+        .flat_map(|s| &s.steps)
+        .map(|st| {
+            if st.partition_keys.is_empty() {
+                1
+            } else {
+                st.partition_keys.len()
+            }
+        })
+        .sum()
+}
+
 // ─── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,8 +350,10 @@ async fn execute(
     let mut all_attempts: HashMap<String, u32> = HashMap::new();
     let mut steps_executed = 0;
 
-    // Progress bar setup.
-    let total_steps = exec_plan.total_steps;
+    // Progress bar setup. `total_steps` starts as the plan-time estimate and
+    // grows as dynamic (`partitions_from`) phases expand at dispatch time —
+    // see the `phase_step_count` reconciliation below.
+    let mut total_steps = exec_plan.total_steps;
     // Collect unpartitioned node_ids for exact ETA lookup.
     let unpartitioned_node_ids: Vec<String> = exec_plan
         .phases
@@ -427,6 +448,21 @@ async fn execute(
 
         let expanded_phase = dispatch::expand_pending_partitions(phase, &all_outputs, pool_size);
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
+
+        // Dynamic partitions (`partitions_from`) are a single placeholder step
+        // in the plan-time count but expand to their real per-key count here —
+        // reconcile `total_steps` so the ETA math below can't underflow and
+        // the printed summary reflects what actually ran.
+        if expanded_phase.is_some() {
+            let expanded_count = phase_step_count(phase_ref);
+            let planned_count = phase_step_count(phase);
+            if expanded_count > planned_count {
+                total_steps += expanded_count - planned_count;
+                if let Some(ref bar) = pb {
+                    bar.set_length(total_steps as u64);
+                }
+            }
+        }
 
         let mut uncached_streams: Vec<crate::planner::WorkerStream> = Vec::new();
 
