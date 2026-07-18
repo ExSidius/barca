@@ -139,6 +139,50 @@ def daily_job(): pass
     );
 }
 
+#[test]
+fn freshness_schedule_rejects_6_field_seconds_cron() {
+    // Issue #109: a 6-field (seconds) cron must be rejected loudly at parse
+    // time instead of silently degrading to once-a-minute at runtime.
+    let src = r#"
+from barca import asset, Schedule
+
+@asset(freshness=Schedule("*/30 * * * * *"))
+def daily_job(): pass
+"#;
+    let err = extract_nodes(src, "pipeline.py").unwrap_err().to_string();
+    assert!(err.contains("pipeline.py"), "error names the file: {err}");
+    assert!(
+        err.contains("daily_job"),
+        "error names the definition: {err}"
+    );
+    assert!(
+        err.contains("*/30 * * * * *"),
+        "error echoes the cron: {err}"
+    );
+}
+
+#[test]
+fn freshness_schedule_rejects_malformed_cron() {
+    let src = r#"
+from barca import asset, Schedule
+
+@asset(freshness=Schedule("not a cron"))
+def daily_job(): pass
+"#;
+    assert!(extract_nodes(src, "test.py").is_err());
+}
+
+#[test]
+fn freshness_schedule_rejects_empty_cron() {
+    let src = r#"
+from barca import asset, Schedule
+
+@asset(freshness=Schedule(""))
+def daily_job(): pass
+"#;
+    assert!(extract_nodes(src, "test.py").is_err());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 3. Input declarations — aliasing and references
 // ═══════════════════════════════════════════════════════════════════════════════

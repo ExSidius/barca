@@ -8,6 +8,7 @@
 //! - `SmallVec<[T; N]>` for small collections (inputs, sinks — usually ≤4 items, stays on stack)
 //! - `String` everywhere else (ruff's AST already gives us owned Strings; no point converting)
 
+use croner::parser::{CronParser, Seconds, Year};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
@@ -57,6 +58,26 @@ impl Freshness {
 /// A validated 5-field cron expression.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CronExpr(pub String);
+
+impl CronExpr {
+    /// Validate a cron string against Barca's supported grammar: exactly 5
+    /// fields, minute-granular (no seconds, no year field). Barca's scheduler
+    /// only ever ticks once a minute (see `barca-server::scheduler`), so a
+    /// 6- or 7-field expression would silently degrade to once-a-minute
+    /// instead of running at the cadence the user asked for — reject it
+    /// loudly instead (issue #109).
+    ///
+    /// Returns a human-readable reason on failure.
+    pub fn validate(s: &str) -> Result<(), String> {
+        CronParser::builder()
+            .seconds(Seconds::Disallowed)
+            .year(Year::Disallowed)
+            .build()
+            .parse(s.trim())
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
 
 // ─── Partition specification ─────────────────────────────────────────────────
 
