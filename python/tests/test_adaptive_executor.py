@@ -9,12 +9,14 @@ import contextlib
 import shutil
 import sqlite3
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
 
 import barca
-from barca._worker import _ArtifactLRU, _peak_rss_bytes
+from barca._artifacts import serialize
+from barca._worker import _ArtifactLRU, _load_collected_artifacts, _peak_rss_bytes
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +98,82 @@ class TestArtifactLRU:
         lru.put("/a", Uncopyable())
         # put failed silently → miss, caller falls through to the store.
         assert lru.get("/a") is None
+
+
+class TestLoadCollectedArtifacts:
+    """`_load_collected_artifacts` — the concurrent loader for a collect()
+    fan-in param's artifact list (see #93's follow-up: sequential loading of
+    N partition artifacts was needlessly slow for I/O-bound reads)."""
+
+    def _write_artifacts(self, tmp_path, values):
+        """Write each value to its own json artifact, return the refs in order."""
+        artifacts = []
+        for i, value in enumerate(values):
+            path = tmp_path / f"a{i}.json"
+            serialize(value, path, "json")
+            artifacts.append({"path": str(path), "format": "json"})
+        return artifacts
+
+    def test_empty_list_returns_empty(self):
+        assert _load_collected_artifacts([]) == []
+
+    def test_loads_values_in_declared_order(self, tmp_path):
+        # The thread pool's completion order is not guaranteed to match
+        # submission order — the result list must still match `artifacts`'
+        # declared order regardless of which thread finishes first.
+        values = [{"n": i} for i in range(10)]
+        artifacts = self._write_artifacts(tmp_path, values)
+        result = _load_collected_artifacts(artifacts)
+        assert result == values
+
+    def test_populates_lru_on_miss(self, tmp_path):
+        lru = _ArtifactLRU()
+        artifacts = self._write_artifacts(tmp_path, [{"n": 1}, {"n": 2}])
+        _load_collected_artifacts(artifacts, lru)
+        assert lru.get(artifacts[0]["path"]) == {"n": 1}
+        assert lru.get(artifacts[1]["path"]) == {"n": 2}
+
+    def test_lru_hit_skips_storage_entirely(self, tmp_path):
+        # Path that was never written to disk — a storage read would raise
+        # FileNotFoundError. An LRU hit must return the cached value without
+        # ever touching storage.
+        lru = _ArtifactLRU()
+        ghost_path = str(tmp_path / "never_written.json")
+        lru.put(ghost_path, {"cached": True})
+        result = _load_collected_artifacts([{"path": ghost_path, "format": "json"}], lru)
+        assert result == [{"cached": True}]
+
+    def test_missing_artifact_raises_file_not_found(self, tmp_path):
+        artifacts = self._write_artifacts(tmp_path, [{"n": 1}])
+        artifacts.append({"path": str(tmp_path / "missing.json"), "format": "json"})
+        with pytest.raises(FileNotFoundError, match="missing.json"):
+            _load_collected_artifacts(artifacts)
+
+    def test_cache_misses_load_concurrently(self, tmp_path, monkeypatch):
+        # Each artifact's deserialize takes ~50ms. Sequential loading of 8
+        # would take ~400ms; a thread pool should collapse this toward the
+        # single-artifact cost. Generous upper bound to avoid CI flakiness
+        # while still clearly failing if concurrency regresses to sequential.
+        import barca._worker as worker_mod
+
+        real_deserialize = worker_mod.deserialize
+
+        def _slow_deserialize(path, fmt):
+            time.sleep(0.05)
+            return real_deserialize(path, fmt)
+
+        monkeypatch.setattr(worker_mod, "deserialize", _slow_deserialize)
+
+        artifacts = self._write_artifacts(tmp_path, [{"n": i} for i in range(8)])
+        t0 = time.perf_counter()
+        result = _load_collected_artifacts(artifacts)
+        elapsed = time.perf_counter() - t0
+
+        assert result == [{"n": i} for i in range(8)]
+        assert elapsed < 0.05 * 8 * 0.5, (
+            f"took {elapsed:.3f}s — expected well under the sequential bound "
+            "(8 * 50ms), concurrency may have regressed"
+        )
 
 
 # ─── Integration: timing + estimates persisted through a real run ───────────

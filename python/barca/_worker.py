@@ -16,6 +16,7 @@ import os
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from barca import _storage
@@ -233,7 +234,7 @@ def _resolve_input(raw_value):
     """
     if isinstance(raw_value, dict):
         if raw_value.get("_collected") and "artifacts" in raw_value:
-            return [deserialize(a["path"], a["format"]) for a in raw_value["artifacts"]]
+            return _load_collected_artifacts(raw_value["artifacts"])
         if "path" in raw_value and "format" in raw_value:
             return deserialize(raw_value["path"], raw_value["format"])
     return raw_value
@@ -253,6 +254,53 @@ def _load_artifact(path, lru, fmt=None):
     if _lru_cacheable(path):
         lru.put(path, value)
     return value
+
+
+# Fan-in (collect()) reads are I/O-bound (local disk or a remote fsspec
+# fetch-to-temp-file), so worker threads spend most of their time blocked
+# with the GIL released — a thread pool collapses wall time toward the
+# slowest single artifact instead of their sum. Capped rather than one
+# thread per artifact so a 10k-partition collect() doesn't open 10k files
+# at once.
+_COLLECT_IO_MAX_WORKERS = 8
+
+
+def _load_collected_artifacts(artifacts, lru=None):
+    """Load every artifact of a collect() fan-in param, in order.
+
+    Tier-1 LRU lookups happen up front on the calling thread (cheap,
+    in-memory — `_ArtifactLRU` isn't safe for concurrent mutation from
+    worker threads). Only genuine cache misses — the actual blocking I/O —
+    are dispatched to the thread pool; results are written back to the LRU
+    on the calling thread as they arrive.
+    """
+    results = [None] * len(artifacts)
+    to_fetch = []
+    for i, artifact in enumerate(artifacts):
+        hot = lru.get(artifact["path"]) if lru is not None else None
+        if hot is not None:
+            results[i] = hot
+        else:
+            to_fetch.append((i, artifact))
+
+    if not to_fetch:
+        return results
+
+    def _fetch(item):
+        _, artifact = item
+        path = artifact["path"]
+        if not _storage.exists(path):
+            raise FileNotFoundError(f"Input artifact not found: {path}")
+        fmt = artifact.get("format") or _EXT_FORMATS.get(_storage.suffix(path), "json")
+        return deserialize(path, fmt)
+
+    with ThreadPoolExecutor(max_workers=min(len(to_fetch), _COLLECT_IO_MAX_WORKERS)) as ex:
+        for (i, artifact), value in zip(to_fetch, ex.map(_fetch, to_fetch)):
+            results[i] = value
+            if lru is not None and _lru_cacheable(artifact["path"]):
+                lru.put(artifact["path"], value)
+
+    return results
 
 
 def _execute(fn, kwargs, step):
@@ -546,12 +594,10 @@ def _run_daemon_step(step, modules, art_dir, lru):
                 continue
             # Fan-in (collect()): every partition artifact of the upstream,
             # deserialized into a list — matches batch mode's _resolve_input.
+            # Cache misses load concurrently (see _load_collected_artifacts).
             if isinstance(value, dict) and value.get("_collected"):
                 try:
-                    kwargs[param] = [
-                        _load_artifact(a["path"], lru, fmt=a.get("format"))
-                        for a in value.get("artifacts", [])
-                    ]
+                    kwargs[param] = _load_collected_artifacts(value.get("artifacts", []), lru)
                 except FileNotFoundError as e:
                     raise FileNotFoundError(
                         f"Input artifact for parameter '{param}' not found: {e}"
