@@ -310,13 +310,18 @@ def daily_at_5am() -> dict:
 :::note
 `Schedule` freshness is enforced by the long-running server. Run
 `barca serve pipeline.py` and the scheduler fires each scheduled asset on its cron tick
-(evaluated in local time by default; `--timezone` to change). Last-fire times are
-persisted, so a job whose tick passed while the server was down fires once to catch up on
-restart. Inspect the schedule with `barca list pipeline.py` (scheduled definitions show
-their next fire time) or `GET /schedule`, and
-disable it with `--no-schedule`. A one-shot `barca get`/`barca run` does *not* consult the
-clock — it materializes on demand. See [Scheduling](/reference/server-api/#scheduling).
+(evaluated in local time by default; `--timezone` to change). Cron is standard 5-field,
+plus a 6-field form with a leading seconds field (`*/15 * * * * *` — every 15s) for
+sub-minute schedules. Last-fire times are persisted, so a job whose tick passed while the
+server was down fires once to catch up on restart. Inspect the schedule with
+`barca list pipeline.py` (scheduled definitions show their next fire time) or
+`GET /schedule`, and disable it with `--no-schedule`. A one-shot `barca get`/`barca run`
+does *not* consult the clock — it materializes on demand.
 :::
+
+If your goal is simply **running tasks on a timer** (rather than keeping data assets
+fresh), see the dedicated [Scheduling](/scheduling/) guide — it covers the minimal
+`@task(freshness=Schedule(...))` + `barca serve` setup end to end.
 
 ## 10. Inspecting plans
 

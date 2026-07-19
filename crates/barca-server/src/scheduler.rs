@@ -17,13 +17,12 @@
 use crate::handlers;
 use crate::state::{AppState, JobStatus, RunStatus};
 use barca_core::commands::{self, AssetSummary};
-use barca_core::{Freshness, NodeKind, db};
+use barca_core::{CronExpr, Freshness, NodeKind, db};
 use chrono::{DateTime, FixedOffset, Local, TimeZone, Timelike, Utc};
 use croner::Cron;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -53,7 +52,7 @@ pub async fn describe_schedule(files: &[String], python: &PathBuf) -> Vec<Schedu
                 cron: j.cron_str.clone(),
                 kind: j.kind,
                 next_fire: next.map(|t| t.timestamp()),
-                next_fire_local: next.map(|t| t.format("%Y-%m-%d %H:%M").to_string()),
+                next_fire_local: next.map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string()),
             }
         })
         .collect()
@@ -67,7 +66,8 @@ struct ScheduledJob {
     kind: NodeKind,
     /// The original cron string, kept for logging.
     cron_str: String,
-    /// Parsed 5-field cron expression, evaluated in local time.
+    /// Parsed cron (5-field minute-granular, or 6-field seconds-granular),
+    /// evaluated in the scheduler's configured timezone.
     cron: Cron,
 }
 
@@ -92,7 +92,7 @@ fn jobs_from_summaries(summaries: Vec<AssetSummary>) -> Vec<ScheduledJob> {
         let Freshness::Schedule(expr) = &s.freshness else {
             continue;
         };
-        match Cron::from_str(&expr.0) {
+        match CronExpr::parse(&expr.0) {
             Ok(cron) => jobs.push(ScheduledJob {
                 id: s.id,
                 kind: s.kind,
@@ -111,33 +111,32 @@ fn jobs_from_summaries(summaries: Vec<AssetSummary>) -> Vec<ScheduledJob> {
 /// Pure eligibility check: which jobs fire at `now`? Split out so it can be
 /// unit-tested against fixed timestamps without a running server or wall clock.
 ///
-/// `now` is truncated to the start of its minute before matching, because a
-/// 5-field cron implicitly pins seconds to `0`; the tick loop wakes a few
-/// milliseconds *after* the minute boundary, so we normalize here.
+/// Matching is at whole-second resolution: the tick loop wakes just after each
+/// second boundary, so we drop only the sub-millisecond remainder and match the
+/// wall-clock second directly. A 6-field cron fires at its declared seconds; a
+/// 5-field cron has its seconds field pinned to `0` by the parser, so it still
+/// matches only at second `0` of a matching minute.
 fn due_jobs<'a, Tz: TimeZone>(
     now: &DateTime<Tz>,
     jobs: &'a [ScheduledJob],
 ) -> Vec<&'a ScheduledJob> {
-    let minute = now
-        .with_second(0)
-        .and_then(|t| t.with_nanosecond(0))
-        .unwrap_or_else(|| now.clone());
+    let tick = now.with_nanosecond(0).unwrap_or_else(|| now.clone());
     jobs.iter()
-        .filter(|j| j.cron.is_time_matching(&minute).unwrap_or(false))
+        .filter(|j| j.cron.is_time_matching(&tick).unwrap_or(false))
         .collect()
 }
 
-/// Milliseconds from `now` until just after the next minute boundary. A small
-/// cushion guarantees the tick wakes with the second component at `0`. Pure so
-/// the boundary arithmetic can be unit-tested without sleeping.
-fn millis_to_next_minute<Tz: TimeZone>(now: &DateTime<Tz>) -> u64 {
-    let elapsed_ms = now.second() as u64 * 1_000 + now.nanosecond() as u64 / 1_000_000;
-    60_000u64.saturating_sub(elapsed_ms) + 5
+/// Milliseconds from `now` until just after the next second boundary. A small
+/// cushion guarantees the tick wakes with the sub-second component at ~`0`. Pure
+/// so the boundary arithmetic can be unit-tested without sleeping.
+fn millis_to_next_second<Tz: TimeZone>(now: &DateTime<Tz>) -> u64 {
+    let elapsed_ms = now.nanosecond() as u64 / 1_000_000;
+    1_000u64.saturating_sub(elapsed_ms) + 5
 }
 
-/// Sleep until just after the next minute boundary in the scheduler's timezone.
-async fn sleep_to_next_minute(zone: &Zone) {
-    tokio::time::sleep(Duration::from_millis(millis_to_next_minute(&zone.now()))).await;
+/// Sleep until just after the next second boundary in the scheduler's timezone.
+async fn sleep_to_next_second(zone: &Zone) {
+    tokio::time::sleep(Duration::from_millis(millis_to_next_second(&zone.now()))).await;
 }
 
 /// Resolved timezone that cron expressions are evaluated in.
@@ -305,7 +304,7 @@ fn log_schedule(jobs: &[ScheduledJob], zone: &Zone) {
         let next = job
             .cron
             .find_next_occurrence(&now, false)
-            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+            .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|_| "?".to_string());
         eprintln!("  {} — {} (next {})", job.id, job.cron_str, next);
     }
@@ -375,7 +374,7 @@ pub async fn run_scheduler(state: AppState) {
     let mut seen_gen = state.dag_generation.load(Ordering::Relaxed);
 
     loop {
-        sleep_to_next_minute(&zone).await;
+        sleep_to_next_second(&zone).await;
 
         // `--watch`: re-read the job set when a source file changed.
         let current_gen = state.dag_generation.load(Ordering::Relaxed);
@@ -440,6 +439,13 @@ mod tests {
     fn at(hour: u32, minute: u32) -> DateTime<Local> {
         Local
             .with_ymd_and_hms(2026, 7, 2, hour, minute, 0)
+            .single()
+            .unwrap()
+    }
+
+    fn at_s(hour: u32, minute: u32, sec: u32) -> DateTime<Local> {
+        Local
+            .with_ymd_and_hms(2026, 7, 2, hour, minute, sec)
             .single()
             .unwrap()
     }
@@ -522,14 +528,40 @@ mod tests {
     }
 
     #[test]
-    fn matching_ignores_sub_minute_component() {
-        // A time a few seconds into the minute must still match (loop wakes late).
+    fn five_field_cron_pinned_to_second_zero() {
+        // A 5-field cron has its seconds field pinned to `0` by the parser, so it
+        // matches only at second 0 of its minute — NOT at other seconds. This is
+        // the regression guard that the per-second tick loop never fires a
+        // 5-field job 60× within its matching minute.
         let jobs = jobs_from_summaries(vec![summary("f.py:daily", NodeKind::Asset, "0 5 * * *")]);
-        let late = Local
-            .with_ymd_and_hms(2026, 7, 2, 5, 0, 42)
-            .single()
-            .unwrap();
-        assert_eq!(due_jobs(&late, &jobs).len(), 1);
+        assert_eq!(due_jobs(&at_s(5, 0, 0), &jobs).len(), 1, "05:00:00 fires");
+        assert!(
+            due_jobs(&at_s(5, 0, 30), &jobs).is_empty(),
+            "05:00:30 does not fire"
+        );
+        assert!(
+            due_jobs(&at_s(5, 0, 42), &jobs).is_empty(),
+            "05:00:42 does not fire"
+        );
+    }
+
+    #[test]
+    fn six_field_seconds_cron_parses() {
+        // The shared parse helper must accept a 6-field cron in the *execution*
+        // path (jobs_from_summaries), not just in CronExpr::validate — this was
+        // rejected at parse time before sub-minute support (issue #109).
+        let jobs = jobs_from_summaries(vec![summary("f.py:tick", NodeKind::Task, "*/5 * * * * *")]);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].kind, NodeKind::Task);
+    }
+
+    #[test]
+    fn six_field_cron_fires_on_second_multiples() {
+        // A 6-field cron fires at its declared seconds cadence, not once a minute.
+        let jobs = jobs_from_summaries(vec![summary("f.py:tick", NodeKind::Task, "*/5 * * * * *")]);
+        assert_eq!(due_jobs(&at_s(5, 0, 0), &jobs).len(), 1, ":00 fires");
+        assert_eq!(due_jobs(&at_s(5, 0, 5), &jobs).len(), 1, ":05 fires");
+        assert!(due_jobs(&at_s(5, 0, 3), &jobs).is_empty(), ":03 does not fire");
     }
 
     // ─── catch-up detection ────────────────────────────────────────────────
@@ -605,20 +637,21 @@ mod tests {
         assert_eq!(jobs[0].kind, NodeKind::Task);
     }
 
-    // ─── minute-boundary arithmetic ────────────────────────────────────────
+    // ─── second-boundary arithmetic ────────────────────────────────────────
 
     #[test]
-    fn millis_to_next_minute_from_boundary_and_mid() {
-        let at_s = |sec: u32| {
+    fn millis_to_next_second_from_boundary_and_mid() {
+        let with_nanos = |nanos: u32| {
             Local
-                .with_ymd_and_hms(2026, 7, 2, 5, 0, sec)
+                .with_ymd_and_hms(2026, 7, 2, 5, 0, 0)
                 .single()
                 .unwrap()
+                .with_nanosecond(nanos)
+                .unwrap()
         };
-        assert_eq!(millis_to_next_minute(&at_s(0)), 60_005);
-        assert_eq!(millis_to_next_minute(&at_s(30)), 30_005);
-        let almost = at_s(59).with_nanosecond(500_000_000).unwrap();
-        assert_eq!(millis_to_next_minute(&almost), 505);
+        assert_eq!(millis_to_next_second(&with_nanos(0)), 1_005);
+        assert_eq!(millis_to_next_second(&with_nanos(500_000_000)), 505);
+        assert_eq!(millis_to_next_second(&with_nanos(999_000_000)), 6);
     }
 
     // ─── in-flight detection ───────────────────────────────────────────────

@@ -1,6 +1,38 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+
+## [Unreleased]
+
+### Features
+
+- Sub-minute cron scheduling: `Schedule(...)` now accepts a 6-field cron with a
+  leading seconds field (e.g. `*/15 * * * * *` — every 15 seconds); the `barca serve`
+  scheduler evaluates at 1-second resolution. 5-field crons are unchanged (seconds
+  pinned to `0`).
+- Built-in cron scheduler in `barca serve`: enforces `@asset`/`@task`/`@sensor`
+  `freshness=Schedule(...)`, timezone-aware (`--timezone`), durable catch-up on
+  restart, self-overlap skip, and live status via `GET /schedule`; toggle with
+  `--no-schedule`.
+- Shared remote state and content-addressed artifacts: `barca.toml` config, `--env`
+  environment separation, and remote artifact storage (Azure/S3/GCS/R2 via fsspec)
+  with the metadata DB pushed/pulled as a blob.
+- Minimal standalone scheduler example under `examples/scheduler`.
+
+### Refactor
+
+- Async-native core: the async runtime is owned by the caller, with cancellable runs.
+- Centralized cron parsing behind a single `CronExpr::parse` helper so validation,
+  the scheduler, and the `/schedule` handler share one grammar.
+
+### Documentation
+
+- Surface the task-scheduler workflow in the README and docs splash; new
+  "Barca vs cron / systemd timers" comparison; sub-minute cron documented across
+  the Scheduling guide and reference.
+- Real `freshness=` (and other) keyword parameters on the `@asset`/`@sensor`/`@task`
+  Python stubs for IDE autocomplete and type checking.
+
 ## [0.1.1] - 2026-06-04
 
 ### Bug Fixes

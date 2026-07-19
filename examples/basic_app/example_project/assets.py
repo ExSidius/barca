@@ -59,7 +59,7 @@ def manual_only() -> dict:
 
 @asset(freshness=Schedule("0 */6 * * *"))
 def six_hourly() -> dict:
-    """Runs every 6 hours when `barca run` is active."""
+    """Runs every 6 hours while `barca serve` is running (the scheduler fires it)."""
     return {"schedule": "6h", "ts": time.time()}
 
 

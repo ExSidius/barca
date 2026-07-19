@@ -30,7 +30,7 @@ minutes for as long as the server is up:
 ```
 [barca] serving on http://127.0.0.1:8274  (1 file)
 [barca] scheduling 1 asset:
-  job.py:refresh — */10 * * * * (next 2026-07-16 12:30)
+  job.py:refresh — */10 * * * * (next 2026-07-16 12:30:00)
 ```
 
 `@task` is the right decorator when the point is the side effect — a task always
@@ -51,7 +51,21 @@ evaluated in the machine's local time by default:
 | `0 9 * * 1`     | 09:00 every Monday             |
 | `0 0 1 * *`     | midnight on the 1st each month |
 
-The finest granularity is **one minute** — seconds are not supported.
+### Sub-minute schedules
+
+For cadences faster than a minute, add a **sixth** leading field for seconds
+(`second minute hour day-of-month month day-of-week`). Barca's scheduler
+evaluates at **1-second resolution**:
+
+| Cron              | Fires             |
+| ----------------- | ----------------- |
+| `*/15 * * * * *`  | every 15 seconds  |
+| `*/5 * * * * *`   | every 5 seconds   |
+| `0 */2 * * * *`   | every 2 minutes, on the minute |
+
+A 5-field expression has its seconds pinned to `0`, so it fires once per matching
+minute exactly as before — adding the seconds field is the only thing that opts
+into sub-minute firing. One second is the finest granularity.
 
 ## Keeping it running
 
@@ -82,9 +96,9 @@ barca list job.py
 ```
 
 ```
-NAME          KIND  FRESHNESS         NEXT FIRE         DEPS
-------------------------------------------------------------
-job.py:refresh  task  cron: */10 * * * *  2026-07-16 12:30  -
+NAME          KIND  FRESHNESS         NEXT FIRE            DEPS
+---------------------------------------------------------------
+job.py:refresh  task  cron: */10 * * * *  2026-07-16 12:30:00  -
 ```
 
 While the server is running, `GET /schedule` returns live status (next fire,

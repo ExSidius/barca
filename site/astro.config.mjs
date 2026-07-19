@@ -108,6 +108,7 @@ export default defineConfig({
             { label: 'Framework Comparison', slug: 'comparisons/framework-comparison' },
             { label: 'vs. Dagster', slug: 'comparisons/dagster' },
             { label: 'vs. Prefect', slug: 'comparisons/prefect' },
+            { label: 'vs. cron / systemd', slug: 'comparisons/cron' },
           ],
         },
         {

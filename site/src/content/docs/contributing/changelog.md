@@ -7,8 +7,25 @@ description: Notable changes to barca, release by release.
 
 ### Added
 
+- **Sub-minute scheduling** — `Schedule(...)` accepts a 6-field cron with a leading
+  seconds field (e.g. `*/15 * * * * *`); the scheduler evaluates at 1-second
+  resolution. 5-field crons are unchanged.
+- **Built-in cron scheduler** in `barca serve` — enforces `freshness=Schedule(...)`,
+  timezone-aware (`--timezone`), durable catch-up on restart, self-overlap skip,
+  and live status via `GET /schedule`; disable with `--no-schedule`.
+- **Shared remote state** — `barca.toml` config, `--env` separation, and remote
+  artifact storage (Azure/S3/GCS/R2 via fsspec) with the metadata DB as a blob.
+- Real `freshness=` keyword parameters on the `@asset`/`@sensor`/`@task` Python
+  stubs (IDE autocomplete + type checking).
+- `examples/scheduler` — a minimal standalone task-scheduler example.
 - Sensors as first-class nodes with observation history
 - Sensor-aware CLI display (observation info instead of materialization info)
+
+### Changed
+
+- Async-native core: the async runtime is owned by the caller, with cancellable runs.
+- Cron parsing centralized behind one `CronExpr::parse` helper shared by validation,
+  the scheduler, and the `/schedule` handler.
 
 ## [0.1.0] - 2025
 
