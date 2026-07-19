@@ -7,8 +7,9 @@
 # the native benchmarks/<name>/bench.sh path).
 #
 # Usage:
-#   benchmarks/docker/bench.sh                    # all 20 benchmarks
+#   benchmarks/docker/bench.sh                    # all 21 benchmarks
 #   benchmarks/docker/bench.sh trivial chain_100   # a subset
+#   benchmarks/docker/bench.sh scheduler_overhead  # the daemon/scheduler one (slow)
 #
 # Override the resource ceiling with:
 #   BARCA_BENCH_CORES=8   # pinned core count (default: 4, same convention

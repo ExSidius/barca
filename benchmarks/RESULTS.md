@@ -427,6 +427,38 @@ showing up a second way — see Notes.
     along with `tests/integration/test_benchmark_examples.sh` (runs every
     benchmark's barca side as a correctness smoke test on every PR).
 
+## Scheduler overhead (daemon mode)
+
+Unlike every table above (one-shot cold start), `scheduler_overhead` compares the
+long-running **cron scheduler daemons**: `barca serve` vs `dagster dev` vs
+`prefect .serve()`. See [`scheduler_overhead/README.md`](scheduler_overhead/README.md)
+for the harness and fairness rationale.
+
+**Numbers pending a dedicated run** (this benchmark waits on real minute
+boundaries, so it isn't part of the fast standardized passes above; run
+`benchmarks/scheduler_overhead/bench.sh` or `benchmarks/docker/bench.sh
+scheduler_overhead` and transcribe the three tables here).
+
+Three dimensions:
+
+1. **Trigger latency** — measured at a **1-minute cron** (`* * * * *`), the finest
+   cadence all three share, so it is apples-to-apples. Expectation from the
+   architecture: barca's ≤1s tick loop vs Dagster's ~30s daemon-eval interval and
+   Prefect's ~10–15s runner poll (each floors how soon a fire can follow the tick).
+2. **Idle footprint** — peak memory of the daemon holding 10 idle jobs. This is
+   the closest head-to-head axis: barca is a single Rust process (workers spawned
+   only on fire), Dagster runs a webserver + code server + schedule daemon, and
+   Prefect's `.serve()` runs its own ephemeral API in-process.
+3. **Minimum cadence** — **barca schedules sub-minute (6-field cron, 1-second
+   resolution); Dagster and Prefect cannot express any cron finer than 1 minute.**
+   Barca fires ~10× in a 20s window where the other two fire 0–1×.
+
+| Dimension | barca | dagster | prefect |
+|---|---|---|---|
+| Trigger latency (median, 1-min cron) | _pending_ | _pending_ | _pending_ |
+| Idle footprint (peak MB, 10 jobs) | _pending_ | _pending_ | _pending_ |
+| Minimum cadence | **1 second** | 60 seconds | 60 seconds |
+
 ## Methodology
 
 ### Environment

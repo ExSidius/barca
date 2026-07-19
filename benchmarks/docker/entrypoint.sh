@@ -34,6 +34,7 @@ ALL_BENCHMARKS=(
     spaceflights
     wide_join
     wide_layers
+    scheduler_overhead
 )
 
 if [[ $# -gt 0 ]]; then
