@@ -1,4 +1,4 @@
-# barca-docs
+# barca
 
 The Barca documentation site — [Astro](https://astro.build) +
 [Starlight](https://starlight.astro.build), source content in
