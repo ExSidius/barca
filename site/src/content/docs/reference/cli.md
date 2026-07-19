@@ -106,7 +106,8 @@ a fixed set of files and does not need it.
 ## list
 
 List all discovered definitions (assets, tasks, sensors) with their kind, freshness, and
-dependencies. Scheduled definitions also show their next fire time in local time.
+dependencies. Scheduled definitions also show their next fire time in local time (to the
+second, so sub-minute schedules are legible).
 
 ```bash
 barca list pipeline.py

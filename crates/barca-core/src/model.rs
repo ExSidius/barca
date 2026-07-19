@@ -55,27 +55,45 @@ impl Freshness {
     }
 }
 
-/// A validated 5-field cron expression.
+/// A validated cron expression. Accepts standard 5-field, minute-granular cron
+/// (`minute hour dom month dow`) and 6-field cron with a leading seconds field
+/// (`*/5 * * * * *` — every 5 seconds). Barca's scheduler evaluates at 1-second
+/// resolution: a 6-field expression fires at its seconds cadence, while a 5-field
+/// expression pins seconds to `0` and fires once per matching minute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CronExpr(pub String);
 
 impl CronExpr {
-    /// Validate a cron string against Barca's supported grammar: exactly 5
-    /// fields, minute-granular (no seconds, no year field). Barca's scheduler
-    /// only ever ticks once a minute (see `barca-server::scheduler`), so a
-    /// 6- or 7-field expression would silently degrade to once-a-minute
-    /// instead of running at the cadence the user asked for — reject it
-    /// loudly instead (issue #109).
+    /// Parse a cron string under Barca's uniform field policy: seconds are
+    /// OPTIONAL (5-field minute-granular, or 6-field with a leading seconds
+    /// field) and the year field is disallowed. This is the single source of
+    /// truth for the cron grammar — validation, the scheduler, and the
+    /// `/schedule` handler all parse through here, so they can never disagree on
+    /// what a valid schedule is. (The 5-field-only restriction from issue #109
+    /// was widened to allow seconds once the scheduler gained sub-minute ticks;
+    /// an omitted seconds field is pinned to `0`, so 5-field crons are unchanged.)
     ///
     /// Returns a human-readable reason on failure.
-    pub fn validate(s: &str) -> Result<(), String> {
+    pub fn parse(s: &str) -> Result<croner::Cron, String> {
         CronParser::builder()
-            .seconds(Seconds::Disallowed)
+            .seconds(Seconds::Optional)
             .year(Year::Disallowed)
             .build()
             .parse(s.trim())
-            .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+
+    /// Parse this expression's stored string. Convenience over [`CronExpr::parse`].
+    pub fn parsed(&self) -> Result<croner::Cron, String> {
+        Self::parse(&self.0)
+    }
+
+    /// Validate a cron string without retaining the parsed schedule. Delegates to
+    /// [`CronExpr::parse`] so validation and execution share one grammar.
+    ///
+    /// Returns a human-readable reason on failure.
+    pub fn validate(s: &str) -> Result<(), String> {
+        Self::parse(s).map(|_| ())
     }
 }
 

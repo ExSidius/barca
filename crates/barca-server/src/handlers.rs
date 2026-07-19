@@ -137,16 +137,15 @@ pub async fn cancel_run(
 /// Reads the scheduler's published registry; volatile fields (next fire, live
 /// status) are computed per request.
 pub async fn schedule(State(state): State<AppState>) -> Json<Value> {
+    use barca_core::CronExpr;
     use chrono::Local;
-    use croner::Cron;
-    use std::str::FromStr;
 
     let now = Local::now();
     let jobs = state.schedule.read().map(|g| g.clone()).unwrap_or_default();
     let items: Vec<Value> = jobs
         .into_iter()
         .map(|j| {
-            let next_fire = Cron::from_str(&j.cron)
+            let next_fire = CronExpr::parse(&j.cron)
                 .ok()
                 .and_then(|c| c.find_next_occurrence(&now, false).ok())
                 .map(|t| t.timestamp());

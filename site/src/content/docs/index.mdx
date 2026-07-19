@@ -62,6 +62,10 @@ uv add barca
 		Results move between worker batches as serialized files — json, pickle, or
 		parquet — detected and handled automatically.
 	</Card>
+	<Card title="Built-in scheduler" icon="setting">
+		`barca serve` runs your `@task`s on a cron tick — down to the second — with
+		no external cron and no daemon service. See [Scheduling](/scheduling/).
+	</Card>
 </CardGrid>
 
 ## How it works

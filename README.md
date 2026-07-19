@@ -183,7 +183,7 @@ def my_data() -> dict:
 |--------|----------|
 | `Always` | Auto-materializes whenever stale (default for `@asset` and `@task`) |
 | `Manual` | Only runs on explicit refresh |
-| `Schedule("0 5 * * *")` | Cron expression |
+| `Schedule("0 5 * * *")` | Cron expression (5-field, or 6-field for sub-minute) |
 
 ### Partitions
 
@@ -210,21 +210,57 @@ barca plan <file.py> [file.py ...]         Emit execution plan as JSON
 barca list <file.py> [file.py ...]         List all definitions with deps
 barca history [--limit N]                    Show recent run history
 barca stats <target> <file.py> ...         Show timing/cache stats for an asset
-barca serve [file.py ...] [--port N]       Run the HTTP API server
+barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
 barca --help                               Show help
 ```
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 
+## Scheduling
+
+Barca doubles as a plain **task scheduler**. Decorate a function with a cron
+`Schedule` and leave `barca serve` running — each job fires on its own tick. No
+external cron, no YAML, no daemon service to install.
+
+```python
+# job.py
+from barca import task, Schedule
+
+@task(freshness=Schedule("*/10 * * * *"))
+def refresh() -> None:
+    ...  # hit an API, rebuild a file, send a report — a task always re-runs
+
+@task(freshness=Schedule("*/15 * * * * *"))   # 6-field cron → every 15 seconds
+def heartbeat() -> None:
+    ...
+```
+
+```bash
+barca serve job.py
+```
+
+Standard 5-field cron (`minute hour day-of-month month day-of-week`) and a 6-field
+form with a leading **seconds** field are both supported — the scheduler evaluates
+at 1-second resolution. It's timezone-aware, fires once on restart to catch up a
+missed tick, skips a tick if the previous run is still going, and exposes live
+status at `GET /schedule`. Inspect the schedule any time with `barca list job.py`.
+
+See the [Scheduling guide](https://barca.sh/scheduling/) for the full story
+(timezones, catch-up, keeping it alive under systemd). A minimal example lives in
+[`examples/scheduler`](examples/scheduler).
+
 ## Server
 
 `barca serve` starts a long-running HTTP server that exposes the orchestrator as a
 JSON API — for triggering runs programmatically, polling status, and (in the future)
-a web UI. It binds to `127.0.0.1` by default (local only, no auth).
+a web UI. It also runs the built-in cron scheduler above. It binds to `127.0.0.1`
+by default (local only, no auth).
 
 ```bash
 barca serve pipeline.py --port 8274      # default port 8274
 barca serve pipeline.py --watch          # dev mode: re-parse DAG on file change
+barca serve pipeline.py --no-schedule    # HTTP API only, don't fire scheduled jobs
+barca serve pipeline.py --timezone utc   # evaluate cron in UTC (default: local)
 ```
 
 Runs are async: `POST` returns a `run_id` immediately, then you poll `/status/{run_id}`.

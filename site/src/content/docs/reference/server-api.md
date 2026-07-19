@@ -132,10 +132,11 @@ GET /plan              → { total_steps, phases: [{ reason, streams: [{ stream_
 to turn it off.
 
 At startup the server enumerates every node whose freshness is `Schedule(cron)`, parses
-each 5-field cron expression, and logs the schedule (invalid or empty cron strings are
-logged and skipped, not fatal). A background task then wakes at each minute boundary and,
-for every job whose cron matches the current minute, triggers a run through the same path
-as `POST /run` / `POST /run/{target}`:
+each cron expression (standard 5-field, or 6-field with a leading seconds field for
+sub-minute schedules), and logs the schedule (invalid or empty cron strings are logged and
+skipped, not fatal). A background task then wakes at each second boundary and, for every
+job whose cron matches the current second, triggers a run through the same path as
+`POST /run` / `POST /run/{target}`:
 
 - **Assets and sensors** are materialized via the `get` path.
 - **Tasks** are executed via the `run` path.
@@ -158,7 +159,7 @@ Behavior:
   DB lock. A scheduled job never overlaps *itself*: if its previous run is still
   pending/running when the next tick arrives, that tick is skipped.
 - **Reload.** Under `--watch`, editing a source file re-reads the schedule live (within a
-  minute). Without `--watch` the job set is fixed for the process lifetime.
+  second). Without `--watch` the job set is fixed for the process lifetime.
 
 ### `GET /schedule`
 

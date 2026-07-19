@@ -253,7 +253,14 @@ Marks a function as unsafe — it references globals, performs I/O, or otherwise
 ## Schedule
 
 ```python
-Schedule("0 5 * * *")   # cron expression
+Schedule("0 5 * * *")       # 5-field cron — daily at 05:00
+Schedule("*/15 * * * * *")  # 6-field cron — every 15 seconds
 ```
 
 Constructs a schedule freshness value. Use inside `freshness=` on any decorator.
+
+Accepts standard **5-field** cron (`minute hour day-of-month month day-of-week`) and a
+**6-field** form with a leading seconds field for sub-minute schedules. The scheduler
+(`barca serve`) evaluates at 1-second resolution; a 5-field expression has its seconds
+pinned to `0`, so it fires once per matching minute. The year field is not supported. See
+the [Scheduling guide](/scheduling/) for the full model.
