@@ -149,6 +149,18 @@ class TestLoadCollectedArtifacts:
         with pytest.raises(FileNotFoundError, match="missing.json"):
             _load_collected_artifacts(artifacts)
 
+    def test_missing_artifact_message_names_param_without_doubling(self, tmp_path):
+        # Regression test: an earlier version wrapped _load_collected_artifacts'
+        # own "Input artifact not found: ..." in another "not found" at the
+        # call site, producing a doubled "not found ... not found" message.
+        # With `param=`, the full message is raised once, at the source.
+        missing_path = str(tmp_path / "missing.json")
+        with pytest.raises(FileNotFoundError) as exc_info:
+            _load_collected_artifacts([{"path": missing_path, "format": "json"}], param="reports")
+        message = str(exc_info.value)
+        assert message == f"Input artifact for parameter 'reports' not found: {missing_path}"
+        assert message.count("not found") == 1
+
     def test_cache_misses_load_concurrently(self, tmp_path, monkeypatch):
         # Each artifact's deserialize takes ~50ms. Sequential loading of 8
         # would take ~400ms; a thread pool should collapse this toward the

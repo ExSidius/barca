@@ -265,7 +265,7 @@ def _load_artifact(path, lru, fmt=None):
 _COLLECT_IO_MAX_WORKERS = 8
 
 
-def _load_collected_artifacts(artifacts, lru=None):
+def _load_collected_artifacts(artifacts, lru=None, *, param=None):
     """Load every artifact of a collect() fan-in param, in order.
 
     Tier-1 LRU lookups happen up front on the calling thread (cheap,
@@ -273,6 +273,11 @@ def _load_collected_artifacts(artifacts, lru=None):
     worker threads). Only genuine cache misses — the actual blocking I/O —
     are dispatched to the thread pool; results are written back to the LRU
     on the calling thread as they arrive.
+
+    `param` (the destination parameter name, when known) is folded into a
+    missing-artifact error at the point it's raised, matching
+    `_load_artifact`'s message shape — the caller doesn't need to catch and
+    rewrap.
     """
     results = [None] * len(artifacts)
     to_fetch = []
@@ -290,6 +295,8 @@ def _load_collected_artifacts(artifacts, lru=None):
         _, artifact = item
         path = artifact["path"]
         if not _storage.exists(path):
+            if param is not None:
+                raise FileNotFoundError(f"Input artifact for parameter '{param}' not found: {path}")
             raise FileNotFoundError(f"Input artifact not found: {path}")
         fmt = artifact.get("format") or _EXT_FORMATS.get(_storage.suffix(path), "json")
         return deserialize(path, fmt)
@@ -596,12 +603,9 @@ def _run_daemon_step(step, modules, art_dir, lru):
             # deserialized into a list — matches batch mode's _resolve_input.
             # Cache misses load concurrently (see _load_collected_artifacts).
             if isinstance(value, dict) and value.get("_collected"):
-                try:
-                    kwargs[param] = _load_collected_artifacts(value.get("artifacts", []), lru)
-                except FileNotFoundError as e:
-                    raise FileNotFoundError(
-                        f"Input artifact for parameter '{param}' not found: {e}"
-                    ) from e
+                kwargs[param] = _load_collected_artifacts(
+                    value.get("artifacts", []), lru, param=param
+                )
                 continue
             if not value:
                 continue
