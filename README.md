@@ -4,11 +4,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/recursia-io/barca/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/recursia-io/barca/ci.yml?branch=main&style=flat-square&label=CI" /></a>
+  <a href="https://github.com/ExSidius/barca/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ExSidius/barca/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <a href="https://pypi.org/project/barca/"><img alt="PyPI" src="https://img.shields.io/pypi/v/barca?style=flat-square&color=3572A5" /></a>
   <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.12-3572A5?style=flat-square" />
   <img alt="Rust" src="https://img.shields.io/badge/rust-2024_edition-dea584?style=flat-square" />
-  <a href="https://github.com/recursia-io/barca/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/recursia-io/barca?style=flat-square" /></a>
+  <a href="https://github.com/ExSidius/barca/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/ExSidius/barca?style=flat-square" /></a>
 </p>
 
 ---
@@ -376,7 +376,7 @@ pyproject.toml              Maturin build config
 ## Development
 
 ```bash
-git clone https://github.com/recursia-io/barca.git
+git clone https://github.com/ExSidius/barca.git
 cd barca
 
 # Build
