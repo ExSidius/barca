@@ -1257,6 +1257,9 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
+    // Dotted module names in `file_sources` that are `__init__.py` packages,
+    // as opposed to regular submodules — needed to resolve relative imports.
+    let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for path in &paths {
         let source = fs::read_to_string(path)
@@ -1273,7 +1276,7 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
         if let Some(parent) = path.parent() {
             // Scan subdirectories FIRST — packages (__init__.py) take precedence
             // over same-named sibling .py files, matching Python's import semantics.
-            scan_subdirectories(parent, parent, &mut file_sources);
+            scan_subdirectories(parent, parent, &mut file_sources, &mut packages);
             // Then scan sibling .py files (flat) — or_insert_with is a no-op if
             // a package with the same name was already registered above.
             if let Ok(entries) = std::fs::read_dir(parent) {
@@ -1318,13 +1321,18 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
             cached_defs.get(s)
         });
         if let Some(defs) = defs {
-            node.cone_hash =
-                crate::cone::cone_hash_from_defs(defs, &node.function_name, &file_sources);
+            node.cone_hash = crate::cone::cone_hash_from_defs(
+                defs,
+                &node.function_name,
+                &file_sources,
+                &packages,
+            );
         }
     }
 
     // Free source text memory before execution starts.
     drop(file_sources);
+    drop(packages);
 
     resolve_dynamic_partitions(&mut all_nodes, python);
 
@@ -1338,6 +1346,7 @@ fn scan_subdirectories(
     dir: &std::path::Path,
     root: &std::path::Path,
     file_sources: &mut HashMap<String, String>,
+    packages: &mut std::collections::HashSet<String>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1368,6 +1377,7 @@ fn scan_subdirectories(
                     .unwrap_or(&ep)
                     .to_string_lossy()
                     .replace(['/', '\\'], ".");
+                packages.insert(module_path.clone());
                 file_sources.entry(module_path).or_insert_with(|| content);
             }
             // Scan .py files in the subdirectory.
@@ -1390,7 +1400,7 @@ fn scan_subdirectories(
                 }
             }
             // Recurse into deeper subdirectories.
-            scan_subdirectories(&ep, root, file_sources);
+            scan_subdirectories(&ep, root, file_sources, packages);
         }
     }
 }
