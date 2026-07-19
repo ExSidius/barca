@@ -1220,7 +1220,7 @@ pub async fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, Ba
 fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
-    let mut file_sources: HashMap<String, String> = HashMap::new();
+    let mut file_sources: HashMap<String, crate::cone::ModuleSource> = HashMap::new();
 
     for path in &paths {
         let source = fs::read_to_string(path)
@@ -1233,7 +1233,17 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        file_sources.insert(stem, source.clone());
+        let is_package = path
+            .file_name()
+            .map(|n| n == "__init__.py")
+            .unwrap_or(false);
+        file_sources.insert(
+            stem,
+            crate::cone::ModuleSource {
+                content: source.clone(),
+                is_package,
+            },
+        );
         if let Some(parent) = path.parent() {
             // Scan subdirectories FIRST — packages (__init__.py) take precedence
             // over same-named sibling .py files, matching Python's import semantics.
@@ -1249,11 +1259,16 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
                             .unwrap_or_default()
                             .to_string_lossy()
                             .to_string();
+                        let e_is_package =
+                            ep.file_name().map(|n| n == "__init__.py").unwrap_or(false);
                         if let std::collections::hash_map::Entry::Vacant(e) =
                             file_sources.entry(estem)
                             && let Ok(content) = fs::read_to_string(&ep)
                         {
-                            e.insert(content);
+                            e.insert(crate::cone::ModuleSource {
+                                content,
+                                is_package: e_is_package,
+                            });
                         }
                     }
                 }
@@ -1266,7 +1281,10 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
     // This avoids re-parsing the same file for every node (O(n) parses instead of O(n²)).
     let mut cached_defs: HashMap<String, HashMap<String, crate::cone::ModuleDef>> = HashMap::new();
     for (key, src) in &file_sources {
-        cached_defs.insert(key.clone(), crate::cone::collect_module_definitions(src));
+        cached_defs.insert(
+            key.clone(),
+            crate::cone::collect_module_definitions(&src.content),
+        );
     }
 
     for node in &mut all_nodes {
@@ -1301,7 +1319,7 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
 fn scan_subdirectories(
     dir: &std::path::Path,
     root: &std::path::Path,
-    file_sources: &mut HashMap<String, String>,
+    file_sources: &mut HashMap<String, crate::cone::ModuleSource>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1332,7 +1350,12 @@ fn scan_subdirectories(
                     .unwrap_or(&ep)
                     .to_string_lossy()
                     .replace(['/', '\\'], ".");
-                file_sources.entry(module_path).or_insert_with(|| content);
+                file_sources
+                    .entry(module_path)
+                    .or_insert_with(|| crate::cone::ModuleSource {
+                        content,
+                        is_package: true,
+                    });
             }
             // Scan .py files in the subdirectory.
             if let Ok(sub_entries) = std::fs::read_dir(&ep) {
@@ -1349,7 +1372,12 @@ fn scan_subdirectories(
                             .replace(['/', '\\'], ".")
                             .trim_end_matches(".py")
                             .to_string();
-                        file_sources.entry(module_path).or_insert_with(|| content);
+                        file_sources.entry(module_path).or_insert_with(|| {
+                            crate::cone::ModuleSource {
+                                content,
+                                is_package: false,
+                            }
+                        });
                     }
                 }
             }

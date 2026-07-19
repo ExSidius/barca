@@ -28,7 +28,7 @@ pub fn cone_hash(source: &str, function_name: &str) -> String {
 pub fn cone_hash_with_imports(
     source: &str,
     function_name: &str,
-    other_sources: &HashMap<String, String>,
+    other_sources: &HashMap<String, ModuleSource>,
 ) -> String {
     let defs = collect_module_definitions(source);
     cone_hash_from_defs(&defs, function_name, other_sources)
@@ -39,7 +39,7 @@ pub fn cone_hash_with_imports(
 pub fn cone_hash_from_defs(
     defs: &HashMap<String, ModuleDef>,
     function_name: &str,
-    other_sources: &HashMap<String, String>,
+    other_sources: &HashMap<String, ModuleSource>,
 ) -> String {
     let Some(target) = defs.get(function_name) else {
         return String::new();
@@ -122,6 +122,15 @@ pub fn cone_hash_from_defs(
 
 // ─── Internal types ──────────────────────────────────────────────────────────
 
+/// A cross-file-importable module's source, plus whether it's a package
+/// (`__init__.py`) — determines how relative imports (`from .x`, `from ..x`)
+/// resolve when tracing into it (see `resolve_relative_module`).
+#[derive(Clone)]
+pub struct ModuleSource {
+    pub content: String,
+    pub is_package: bool,
+}
+
 pub enum ModuleDef {
     Function {
         source_text: String,
@@ -139,7 +148,7 @@ pub enum ModuleDef {
 fn resolve_import(
     module: &str,
     name: &str,
-    other_sources: &HashMap<String, String>,
+    other_sources: &HashMap<String, ModuleSource>,
     visited: &mut HashSet<String>,
     cone_parts: &mut Vec<(String, String)>,
     depth: usize,
@@ -154,7 +163,11 @@ fn resolve_import(
         return;
     };
 
-    let imported_defs = collect_module_definitions_with_context(module_source, Some(module));
+    let imported_defs = collect_module_definitions_with_context(
+        &module_source.content,
+        Some(module),
+        module_source.is_package,
+    );
     let Some(imported_def) = imported_defs.get(name) else {
         cone_parts.push((name.to_string(), format!("import:{module}:{name}")));
         return;
@@ -221,13 +234,42 @@ fn resolve_import(
 
 // ─── Module definition collection ────────────────────────────────────────────
 
+/// Resolve a relative import's target module, following Python's semantics:
+/// `level` dots climb from the *current module's package* — which is the
+/// module's own dotted name if it's a package's `__init__.py`, or one level
+/// up (its name minus the last segment) if it's a regular submodule. Each
+/// additional level beyond the first climbs one more segment. See issue #63.
+fn resolve_relative_module(
+    module_name: &str,
+    is_package: bool,
+    level: u32,
+    raw_module: &str,
+) -> String {
+    let mut segments: Vec<&str> = module_name.split('.').collect();
+    if !is_package {
+        segments.pop();
+    }
+    let climb = (level - 1) as usize;
+    let new_len = segments.len().saturating_sub(climb);
+    segments.truncate(new_len);
+    let base = segments.join(".");
+    if raw_module.is_empty() {
+        base
+    } else if base.is_empty() {
+        raw_module.to_string()
+    } else {
+        format!("{base}.{raw_module}")
+    }
+}
+
 pub fn collect_module_definitions(source: &str) -> HashMap<String, ModuleDef> {
-    collect_module_definitions_with_context(source, None)
+    collect_module_definitions_with_context(source, None, false)
 }
 
 fn collect_module_definitions_with_context(
     source: &str,
     parent_module: Option<&str>,
+    is_package: bool,
 ) -> HashMap<String, ModuleDef> {
     let Ok(parsed) = parse_module(source) else {
         return HashMap::new();
@@ -300,11 +342,7 @@ fn collect_module_definitions_with_context(
                 // becomes `parent_module.core` when we know the parent.
                 let module_name = if import.level > 0 {
                     if let Some(parent) = parent_module {
-                        if raw_module.is_empty() {
-                            parent.to_string()
-                        } else {
-                            format!("{parent}.{raw_module}")
-                        }
+                        resolve_relative_module(parent, is_package, import.level, &raw_module)
                     } else {
                         raw_module
                     }
@@ -737,5 +775,158 @@ def my_asset():
         let h1 = cone_hash(src, "my_asset");
         let h2 = cone_hash(src, "my_asset");
         assert_eq!(h1, h2);
+    }
+
+    // ─── Relative import resolution (issue #63) ────────────────────────────
+
+    #[test]
+    fn resolve_relative_module_package_level_1() {
+        assert_eq!(
+            resolve_relative_module("mylib", true, 1, "core"),
+            "mylib.core"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_module_submodule_level_1_uses_containing_package() {
+        // Regression test for issue #63: a regular submodule's own dotted name
+        // must be stripped before appending — the bug appended raw_module to
+        // the submodule's own name (`mylib.core.util`) instead of its
+        // containing package (`mylib.util`).
+        assert_eq!(
+            resolve_relative_module("mylib.core", false, 1, "util"),
+            "mylib.util"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_module_submodule_level_2_climbs_to_grandparent() {
+        assert_eq!(
+            resolve_relative_module("pkg.sub.core", false, 2, "util"),
+            "pkg.util"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_module_package_level_2_climbs_from_the_package_itself() {
+        assert_eq!(
+            resolve_relative_module("pkg.sub", true, 2, "util"),
+            "pkg.util"
+        );
+    }
+
+    #[test]
+    fn resolve_relative_module_bare_dot_import_refers_to_containing_package() {
+        // `from . import x` inside a regular submodule refers to its own package.
+        assert_eq!(resolve_relative_module("mylib.core", false, 1, ""), "mylib");
+        // `from . import x` inside a package's __init__.py refers to itself.
+        assert_eq!(resolve_relative_module("mylib", true, 1, ""), "mylib");
+    }
+
+    #[test]
+    fn resolve_relative_module_climb_beyond_top_level_degrades_to_bare_name() {
+        // Climbing past the top-level package is an ImportError in real Python;
+        // we degrade gracefully to the bare name rather than panicking.
+        assert_eq!(resolve_relative_module("mylib", true, 2, "foo"), "foo");
+    }
+
+    #[test]
+    fn relative_import_in_regular_submodule_resolves_to_sibling_not_self() {
+        // End-to-end: `pkg/sub.py` re-exporting `from .util import h` must
+        // resolve to `pkg.util`, so a change to `h`'s body invalidates the
+        // cone hash of an asset that (transitively, through the re-export)
+        // uses it — matching the coverage `test_relative_import_in_init` in
+        // python/tests/test_cross_file.py already has for `__init__.py`.
+        let top_source = r#"
+from pkg.sub import h
+
+def my_asset():
+    return h()
+"#;
+        let mut other_sources = HashMap::new();
+        other_sources.insert(
+            "pkg.sub".to_string(),
+            ModuleSource {
+                content: "from .util import h\n".to_string(),
+                is_package: false,
+            },
+        );
+        other_sources.insert(
+            "pkg.util".to_string(),
+            ModuleSource {
+                content: "def h():\n    return 1\n".to_string(),
+                is_package: false,
+            },
+        );
+
+        let h1 = cone_hash_with_imports(top_source, "my_asset", &other_sources);
+
+        let mut other_sources2 = other_sources.clone();
+        other_sources2.insert(
+            "pkg.util".to_string(),
+            ModuleSource {
+                content: "def h():\n    return 999\n".to_string(),
+                is_package: false,
+            },
+        );
+        let h2 = cone_hash_with_imports(top_source, "my_asset", &other_sources2);
+
+        assert_ne!(
+            h1, h2,
+            "change behind relative import in a regular submodule must invalidate the cone hash"
+        );
+    }
+
+    #[test]
+    fn relative_import_level_2_climbs_two_packages() {
+        // `from ..util import h` (level=2) inside `pkg.sub.core` must resolve
+        // to `pkg.util` (grandparent package), not `pkg.sub.util` (what a
+        // level=1-only implementation would wrongly produce).
+        let top_source = r#"
+from pkg.sub.core import h
+
+def my_asset():
+    return h()
+"#;
+        let mut other_sources = HashMap::new();
+        other_sources.insert(
+            "pkg.sub.core".to_string(),
+            ModuleSource {
+                content: "from ..util import h\n".to_string(),
+                is_package: false,
+            },
+        );
+        other_sources.insert(
+            "pkg.util".to_string(),
+            ModuleSource {
+                content: "def h():\n    return 1\n".to_string(),
+                is_package: false,
+            },
+        );
+        // A decoy at the level=1 (wrong) location — must not be the one used.
+        other_sources.insert(
+            "pkg.sub.util".to_string(),
+            ModuleSource {
+                content: "def h():\n    return -1\n".to_string(),
+                is_package: false,
+            },
+        );
+
+        let h1 = cone_hash_with_imports(top_source, "my_asset", &other_sources);
+
+        let mut other_sources2 = other_sources.clone();
+        other_sources2.insert(
+            "pkg.util".to_string(),
+            ModuleSource {
+                content: "def h():\n    return 999\n".to_string(),
+                is_package: false,
+            },
+        );
+        let h2 = cone_hash_with_imports(top_source, "my_asset", &other_sources2);
+
+        assert_ne!(
+            h1, h2,
+            "level=2 relative import must resolve to the grandparent package"
+        );
     }
 }
