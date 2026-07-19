@@ -50,6 +50,12 @@ pub struct ItemSpec {
     /// Original step.inputs mapping: param_name → upstream_node_id.
     /// Used at dispatch time to resolve in-phase upstream artifacts.
     pub upstream_inputs: HashMap<String, String>,
+    /// Fan-in (`collect()`) params resolved cross-phase: param_name → every
+    /// partition artifact of the upstream base id, sorted by path for
+    /// determinism (mirrors `dispatch::build_provided_inputs`). Kept separate
+    /// from `dag_inputs` (which is one artifact path per param) because a
+    /// collected param resolves to a *list* of artifacts.
+    pub collected_inputs: HashMap<String, Vec<crate::dispatch::OutputRef>>,
     pub kind: String,
     pub is_dynamic: bool,
 }
@@ -70,6 +76,7 @@ impl ItemSpec {
             sinks: step.sinks.clone(),
             run_hash: step.run_hashes.get(&step.step_id.display()).cloned(),
             upstream_inputs: step.inputs.clone(),
+            collected_inputs: HashMap::new(),
             kind: format!("{:?}", step.kind).to_lowercase(),
             is_dynamic: false,
         }
@@ -507,13 +514,16 @@ impl Coordinator {
                     let mut spec = ItemSpec::from_step(step);
                     for (param_name, upstream_id) in &step.inputs {
                         if let Some(pi) = provided.get(upstream_id) {
-                            let path = match pi {
-                                crate::dispatch::ProvidedInput::Single(oref) => oref.path.clone(),
-                                crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                    orefs.first().map(|o| o.path.clone()).unwrap_or_default()
+                            match pi {
+                                crate::dispatch::ProvidedInput::Single(oref) => {
+                                    spec.dag_inputs
+                                        .insert(param_name.clone(), oref.path.clone());
                                 }
-                            };
-                            spec.dag_inputs.insert(param_name.clone(), path);
+                                crate::dispatch::ProvidedInput::Collected(orefs) => {
+                                    spec.collected_inputs
+                                        .insert(param_name.clone(), orefs.clone());
+                                }
+                            }
                         }
                     }
 
@@ -572,22 +582,20 @@ impl Coordinator {
                             continue;
                         }
                         let aligned_id = pk.display_id(upstream_id);
-                        if let Some(pi) = provided.get(&aligned_id) {
-                            let path = match pi {
-                                crate::dispatch::ProvidedInput::Single(oref) => oref.path.clone(),
-                                crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                    orefs.first().map(|o| o.path.clone()).unwrap_or_default()
+                        if let Some(pi) = provided
+                            .get(&aligned_id)
+                            .or_else(|| provided.get(upstream_id))
+                        {
+                            match pi {
+                                crate::dispatch::ProvidedInput::Single(oref) => {
+                                    spec.dag_inputs
+                                        .insert(param_name.clone(), oref.path.clone());
                                 }
-                            };
-                            spec.dag_inputs.insert(param_name.clone(), path);
-                        } else if let Some(pi) = provided.get(upstream_id) {
-                            let path = match pi {
-                                crate::dispatch::ProvidedInput::Single(oref) => oref.path.clone(),
                                 crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                    orefs.first().map(|o| o.path.clone()).unwrap_or_default()
+                                    spec.collected_inputs
+                                        .insert(param_name.clone(), orefs.clone());
                                 }
-                            };
-                            spec.dag_inputs.insert(param_name.clone(), path);
+                            }
                         }
                         // Update upstream_inputs to point to partition-aligned IDs
                         // for in-phase resolution at dispatch time.
@@ -759,6 +767,7 @@ mod tests {
             sinks: Vec::new(),
             run_hash: None,
             upstream_inputs: HashMap::new(),
+            collected_inputs: HashMap::new(),
             kind: "asset".to_string(),
             is_dynamic: false,
         }
@@ -1341,5 +1350,80 @@ mod tests {
                  stream order must not affect partition-aligned dependency wiring"
             );
         }
+    }
+
+    /// Regression test for #93: a `collect()` consumer's cross-phase fan-in
+    /// input must resolve to *every* partition artifact, not just the first
+    /// (`ProvidedInput::Collected(orefs).first()` silently truncated the list
+    /// to one partition's value). Since #97's planner fix, a collect()
+    /// consumer always lands in a phase after its producer, so this is the
+    /// only path fan-in resolution takes — `provided` is exactly what
+    /// `dispatch::build_provided_inputs` hands `load_phase` for a prior
+    /// phase's completed outputs.
+    #[test]
+    fn load_phase_delivers_full_collected_list_cross_phase() {
+        use crate::StepId;
+        use crate::dispatch::{OutputRef, ProvidedInput};
+        use crate::planner::{Phase, PhaseReason, StreamStep, WorkerStream};
+
+        let step = StreamStep {
+            step_id: StepId::unpartitioned("f:sink"),
+            kind: crate::NodeKind::Asset,
+            function_name: std::sync::Arc::from("sink"),
+            source_file: std::sync::Arc::from("f"),
+            inputs: HashMap::from([("data".to_string(), "f:source".to_string())]),
+            pending_partitions: HashMap::new(),
+            serializer: None,
+            sinks: vec![],
+            run_hashes: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            partition_keys: vec![],
+        };
+        let phase = Phase {
+            reason: PhaseReason::FanIn {
+                node_id: "f:sink".to_string(),
+            },
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![step],
+            }],
+        };
+
+        let oref_a = OutputRef {
+            path: "f--source_key_a.json".to_string(),
+            format: "json".to_string(),
+            size_bytes: 10,
+            elapsed_seconds: None,
+        };
+        let oref_b = OutputRef {
+            path: "f--source_key_b.json".to_string(),
+            format: "json".to_string(),
+            size_bytes: 12,
+            elapsed_seconds: None,
+        };
+        let provided = HashMap::from([(
+            "f:source".to_string(),
+            ProvidedInput::Collected(vec![oref_a.clone(), oref_b.clone()]),
+        )]);
+
+        let mut c = Coordinator::new();
+        let loaded = c.load_phase(&phase, &provided);
+        assert_eq!(loaded, 1);
+
+        let item = c
+            .items
+            .values()
+            .find(|it| it.step_id.display() == "f:sink")
+            .unwrap();
+        assert!(
+            !item.spec.dag_inputs.contains_key("data"),
+            "a collected param must not be truncated into dag_inputs as a single path"
+        );
+        assert_eq!(
+            item.spec.collected_inputs.get("data"),
+            Some(&vec![oref_a, oref_b])
+        );
     }
 }

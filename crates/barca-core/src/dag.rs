@@ -246,16 +246,22 @@ impl Dag {
             .collect()
     }
 
-    /// Get upstream node IDs, excluding PartitionSource edges.
+    /// Get upstream node IDs, excluding PartitionSource and Collect edges.
     /// Used by the planner for chain detection — partition source deps should
-    /// force phase breaks, not chain bundling (and pass no data).
+    /// force phase breaks, not chain bundling (and pass no data). Collect
+    /// (fan-in) deps must also force a phase break: a `collect()` consumer
+    /// has to wait for *every* partition of its upstream to finish, which a
+    /// fused single-succ/single-pred chain cannot guarantee (see #97).
     pub fn execution_upstream(&self, id: &str) -> Vec<&str> {
         let Some(&idx) = self.index.get(id) else {
             return vec![];
         };
         let mut result = Vec::new();
         for edge in self.graph.edges_directed(idx, Direction::Incoming) {
-            if !matches!(*edge.weight(), EdgeKind::PartitionSource) {
+            if !matches!(
+                *edge.weight(),
+                EdgeKind::PartitionSource | EdgeKind::Collect
+            ) {
                 let source_idx = edge.source();
                 result.push(self.graph[source_idx].id.as_str());
             }
@@ -263,14 +269,17 @@ impl Dag {
         result
     }
 
-    /// Get downstream node IDs, excluding PartitionSource edges.
+    /// Get downstream node IDs, excluding PartitionSource and Collect edges.
     pub fn execution_downstream(&self, id: &str) -> Vec<&str> {
         let Some(&idx) = self.index.get(id) else {
             return vec![];
         };
         let mut result = Vec::new();
         for edge in self.graph.edges_directed(idx, Direction::Outgoing) {
-            if !matches!(*edge.weight(), EdgeKind::PartitionSource) {
+            if !matches!(
+                *edge.weight(),
+                EdgeKind::PartitionSource | EdgeKind::Collect
+            ) {
                 let target_idx = edge.target();
                 result.push(self.graph[target_idx].id.as_str());
             }

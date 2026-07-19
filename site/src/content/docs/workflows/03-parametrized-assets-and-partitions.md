@@ -447,14 +447,7 @@ For `partitions_from(...)`, the partition set is resolved lazily at refresh/run 
 
 ## collect(asset)
 
-`collect(asset)` aggregates all partitions of a partitioned asset into a single dict, allowing a non-partitioned downstream asset to consume all partition outputs at once.
-
-:::caution[Known issue]
-On the current implementation, the planner can schedule a `collect()`-consuming asset into the
-same phase as the still-running partition producers instead of a phase gated on their
-completion, so the consumer runs before its inputs exist and fails with a `TypeError`. Tracked
-in [ExSidius/barca#97](https://github.com/ExSidius/barca/issues/97) — not yet fixed.
-:::
+`collect(asset)` aggregates all partitions of a partitioned asset into a single list, allowing a non-partitioned downstream asset to consume all partition outputs at once. The planner schedules a `collect()`-consuming asset into a phase gated on the completion of every partition of its upstream (a `FanIn` phase) — it never runs before its inputs exist.
 
 ```python
 from barca import asset, partitions_from, collect
@@ -468,11 +461,11 @@ def fetch_prices(ticker: str) -> dict[str, str]:
     return {"ticker": ticker, "price": str(len(ticker) * 100)}
 
 @asset(inputs={"reports": collect(fetch_prices)})
-def aggregate(reports: dict[tuple[str, ...], dict[str, str]]) -> dict:
+def aggregate(reports: list[dict[str, str]]) -> dict:
     return {"total": len(reports)}
 ```
 
-Output type: `dict[tuple[str, ...], OutputType]`. Partition keys are always tuples. Single-dimension example: `("AAPL",)`. Multi-dimension example: `("2024-01", "US")`. Downstream assets always unpack tuples for a consistent interface regardless of partition dimensions.
+Output type: `list[OutputType]` — one entry per partition, order not guaranteed to match declaration order. `collect()` does not expose partition keys to the downstream asset directly; if you need the key alongside the value, have the partitioned asset include it in its own return value (as `fetch_prices` does above by returning `{"ticker": ticker, ...}`).
 
 If any partition has failed, `collect` blocks entirely — the downstream asset does not run until all partitions succeed.
 

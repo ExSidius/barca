@@ -9,12 +9,14 @@ import contextlib
 import shutil
 import sqlite3
 import textwrap
+import time
 from pathlib import Path
 
 import pytest
 
 import barca
-from barca._worker import _ArtifactLRU, _peak_rss_bytes
+from barca._artifacts import serialize
+from barca._worker import _ArtifactLRU, _load_collected_artifacts, _peak_rss_bytes
 
 
 @pytest.fixture(autouse=True)
@@ -98,6 +100,94 @@ class TestArtifactLRU:
         assert lru.get("/a") is None
 
 
+class TestLoadCollectedArtifacts:
+    """`_load_collected_artifacts` — the concurrent loader for a collect()
+    fan-in param's artifact list (see #93's follow-up: sequential loading of
+    N partition artifacts was needlessly slow for I/O-bound reads)."""
+
+    def _write_artifacts(self, tmp_path, values):
+        """Write each value to its own json artifact, return the refs in order."""
+        artifacts = []
+        for i, value in enumerate(values):
+            path = tmp_path / f"a{i}.json"
+            serialize(value, path, "json")
+            artifacts.append({"path": str(path), "format": "json"})
+        return artifacts
+
+    def test_empty_list_returns_empty(self):
+        assert _load_collected_artifacts([]) == []
+
+    def test_loads_values_in_declared_order(self, tmp_path):
+        # The thread pool's completion order is not guaranteed to match
+        # submission order — the result list must still match `artifacts`'
+        # declared order regardless of which thread finishes first.
+        values = [{"n": i} for i in range(10)]
+        artifacts = self._write_artifacts(tmp_path, values)
+        result = _load_collected_artifacts(artifacts)
+        assert result == values
+
+    def test_populates_lru_on_miss(self, tmp_path):
+        lru = _ArtifactLRU()
+        artifacts = self._write_artifacts(tmp_path, [{"n": 1}, {"n": 2}])
+        _load_collected_artifacts(artifacts, lru)
+        assert lru.get(artifacts[0]["path"]) == {"n": 1}
+        assert lru.get(artifacts[1]["path"]) == {"n": 2}
+
+    def test_lru_hit_skips_storage_entirely(self, tmp_path):
+        # Path that was never written to disk — a storage read would raise
+        # FileNotFoundError. An LRU hit must return the cached value without
+        # ever touching storage.
+        lru = _ArtifactLRU()
+        ghost_path = str(tmp_path / "never_written.json")
+        lru.put(ghost_path, {"cached": True})
+        result = _load_collected_artifacts([{"path": ghost_path, "format": "json"}], lru)
+        assert result == [{"cached": True}]
+
+    def test_missing_artifact_raises_file_not_found(self, tmp_path):
+        artifacts = self._write_artifacts(tmp_path, [{"n": 1}])
+        artifacts.append({"path": str(tmp_path / "missing.json"), "format": "json"})
+        with pytest.raises(FileNotFoundError, match="missing.json"):
+            _load_collected_artifacts(artifacts)
+
+    def test_missing_artifact_message_names_param_without_doubling(self, tmp_path):
+        # Regression test: an earlier version wrapped _load_collected_artifacts'
+        # own "Input artifact not found: ..." in another "not found" at the
+        # call site, producing a doubled "not found ... not found" message.
+        # With `param=`, the full message is raised once, at the source.
+        missing_path = str(tmp_path / "missing.json")
+        with pytest.raises(FileNotFoundError) as exc_info:
+            _load_collected_artifacts([{"path": missing_path, "format": "json"}], param="reports")
+        message = str(exc_info.value)
+        assert message == f"Input artifact for parameter 'reports' not found: {missing_path}"
+        assert message.count("not found") == 1
+
+    def test_cache_misses_load_concurrently(self, tmp_path, monkeypatch):
+        # Each artifact's deserialize takes ~50ms. Sequential loading of 8
+        # would take ~400ms; a thread pool should collapse this toward the
+        # single-artifact cost. Generous upper bound to avoid CI flakiness
+        # while still clearly failing if concurrency regresses to sequential.
+        import barca._worker as worker_mod
+
+        real_deserialize = worker_mod.deserialize
+
+        def _slow_deserialize(path, fmt):
+            time.sleep(0.05)
+            return real_deserialize(path, fmt)
+
+        monkeypatch.setattr(worker_mod, "deserialize", _slow_deserialize)
+
+        artifacts = self._write_artifacts(tmp_path, [{"n": i} for i in range(8)])
+        t0 = time.perf_counter()
+        result = _load_collected_artifacts(artifacts)
+        elapsed = time.perf_counter() - t0
+
+        assert result == [{"n": i} for i in range(8)]
+        assert elapsed < 0.05 * 8 * 0.5, (
+            f"took {elapsed:.3f}s — expected well under the sequential bound "
+            "(8 * 50ms), concurrency may have regressed"
+        )
+
+
 # ─── Integration: timing + estimates persisted through a real run ───────────
 
 
@@ -166,9 +256,8 @@ class TestManyTinyPartitions:
     def test_fan_out_completes_correctly(self, tmp_path):
         """Batch-pulled tiny partitions must all materialize exactly once.
 
-        (Fan-in via collect() is exercised elsewhere and still xfail in the
-        get path — this guards the lease/batch machinery: no partition lost,
-        none run twice.)
+        (Fan-in via collect() is exercised in test_reliability.py — this
+        guards the lease/batch machinery: no partition lost, none run twice.)
         """
         f = write_module(
             tmp_path,
@@ -223,7 +312,9 @@ class TestManyTinyPartitions:
         # The estimator must reflect the cost split: heavy partitions carry
         # larger estimates than tiny ones.
         est = dict(
-            _query("SELECT node_id, estimate_seconds FROM cost_estimates WHERE node_id LIKE '%:work[%'")
+            _query(
+                "SELECT node_id, estimate_seconds FROM cost_estimates WHERE node_id LIKE '%:work[%'"
+            )
         )
         assert len(est) == 12
         heavy = [v for k, v in est.items() if int(k.split("p")[-1].rstrip("]")) % 2 == 1]
