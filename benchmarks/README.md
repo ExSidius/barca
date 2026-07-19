@@ -200,6 +200,26 @@ worker count is read once, at server startup, from the environment.
 | `parallel_tasks` | N (param) | `parallel()` runtime dispatch — SIGSTOP/SIGCONT, temp workers |
 | `resilience_pileup` | 18 | Failure/retry behavior — one flaky chain shouldn't stall healthy work |
 
+### Scheduler / daemon
+
+The odd one out: not a `hyperfine` cold-start measurement but a comparison of the
+long-running **cron scheduler daemons** (`barca serve` vs `dagster dev` vs
+`prefect .serve()`). See [`scheduler_overhead/README.md`](scheduler_overhead/README.md).
+
+| Benchmark | What it tests |
+|---|---|
+| `scheduler_overhead` | Trigger latency (fair, pinned to 1-minute cron), idle-daemon memory footprint, and minimum achievable cadence — **barca's 1-second / 6-field sub-minute cron vs Dagster's & Prefect's 1-minute floor** |
+
+**Methodology note.** Latency is measured with a 1-minute cron (`* * * * *`) —
+the finest cadence all three frameworks share — so it is apples-to-apples;
+Dagster (daemon eval ~30s) and Prefect (runner poll ~10–15s) land up to one poll
+interval after the tick regardless of workload. Barca's ability to schedule
+*sub-minute* (6-field cron, 1-second resolution), which the other two cannot
+express at all, is reported on its own "minimum cadence" axis rather than folded
+into the latency comparison. This benchmark is **slow** — it waits on real minute
+boundaries (~`(FIRES+1)` min per framework) — and starts real daemons rather than
+one-shot processes.
+
 ## Running benchmarks
 
 ```bash
