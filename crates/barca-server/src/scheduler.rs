@@ -389,6 +389,9 @@ pub async fn run_scheduler(state: AppState) {
 
         let now = zone.now();
         let mut fired_any = false;
+        // NOTE: benchmarks/scheduler_overhead/barca/run.sh's CI smoke greps stderr for
+        // "scheduled run.*:probe" to count ticks independent of worker execution — keep
+        // that substring ("scheduled run", plus the job id) if this wording changes.
         for action in plan_tick(&now, &jobs, &last_handle, |h| is_in_flight(&state, h)) {
             match action {
                 TickAction::Skip { job, handle } => eprintln!(
@@ -561,7 +564,10 @@ mod tests {
         let jobs = jobs_from_summaries(vec![summary("f.py:tick", NodeKind::Task, "*/5 * * * * *")]);
         assert_eq!(due_jobs(&at_s(5, 0, 0), &jobs).len(), 1, ":00 fires");
         assert_eq!(due_jobs(&at_s(5, 0, 5), &jobs).len(), 1, ":05 fires");
-        assert!(due_jobs(&at_s(5, 0, 3), &jobs).is_empty(), ":03 does not fire");
+        assert!(
+            due_jobs(&at_s(5, 0, 3), &jobs).is_empty(),
+            ":03 does not fire"
+        );
     }
 
     // ─── catch-up detection ────────────────────────────────────────────────

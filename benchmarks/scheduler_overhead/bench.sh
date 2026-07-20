@@ -79,8 +79,12 @@ run_latency() {
     python3 - "$label" "$stats" >> "$RESULTS_MD" <<'PY'
 import json, sys
 label, stats = sys.argv[1], json.loads(sys.argv[2])
-print(f"| {label} | fires={stats['fires']} min={stats['min_s']}s "
-      f"median={stats['median_s']}s p95={stats['p95_s']}s max={stats['max_s']}s |")
+
+def fmt(v):
+    return "n/a" if v is None else f"{v}s"
+
+print(f"| {label} | fires={stats['fires']} min={fmt(stats['min_s'])} "
+      f"median={fmt(stats['median_s'])} p95={fmt(stats['p95_s'])} max={fmt(stats['max_s'])} |")
 PY
 }
 
