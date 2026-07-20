@@ -43,6 +43,13 @@ bench_daemon_mem_peak() {
     )
 
     if [[ "$kind" == v1 ]]; then peak_file="$cg/memory.max_usage_in_bytes"; else peak_file="$cg/memory.peak"; fi
+    if [[ ! -f "$peak_file" ]]; then
+        # Child cgroup exists but has no memory controller (parent's
+        # subtree_control lacks +memory) — report unavailable, not a bogus 0 MB.
+        printf '  %-28s memory measurement unavailable (cgroup lacks %s)\n' "$label:" "$(basename "$peak_file")"
+        sleep 1; rmdir "$cg" 2>/dev/null || true
+        return
+    fi
     peak_bytes="$(cat "$peak_file" 2>/dev/null || echo 0)"
     sleep 1                      # let the kill drain the cgroup before rmdir
     rmdir "$cg" 2>/dev/null || true
