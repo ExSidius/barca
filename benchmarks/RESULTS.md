@@ -154,6 +154,11 @@ already-restricted outer container, which Docker Desktop's container doesn't exp
 reporting "memory measurement unavailable" per its documented graceful-degradation path
 rather than a misleading number.
 
+**Since fixed (2026-07-20):** the harness now runs the container `--privileged` and the
+entrypoint delegates the cgroup v2 memory controller at boot, which makes the cgroup
+peak-memory path work under Docker Desktop — first exercised by the scheduler-overhead
+pass below. A future full-suite re-run would fill this table too.
+
 ### Notes
 
 - **The worker-pool shutdown fix** (`crates/barca-core/src/io_loop.rs`,
@@ -426,6 +431,76 @@ showing up a second way — see Notes.
     unit test plus `tests/integration/test_partitions.sh`, both wired into CI
     along with `tests/integration/test_benchmark_examples.sh` (runs every
     benchmark's barca side as a correctness smoke test on every PR).
+
+## Scheduler overhead (daemon mode)
+
+Unlike every table above (one-shot cold start), `scheduler_overhead` compares the
+long-running **cron scheduler daemons**: `barca serve` vs `dagster dev` vs
+`prefect .serve()`. See [`scheduler_overhead/README.md`](scheduler_overhead/README.md)
+for the harness and fairness rationale.
+
+Ran 2026-07-20 via `benchmarks/docker/bench.sh scheduler_overhead`: Docker
+Desktop's Linux VM on an Apple Silicon Mac (M4 Max host), container `arm64`,
+enforced `--cpuset-cpus=0-3 --memory=4g` — the same environment class as the
+2026-07-17 full-suite pass above. Defaults: 3 fire-boundaries sampled per
+framework (the observation window spans up to 5 minute-boundaries including
+boot slack, hence 4–5 recorded fires), 60s idle window, 20s cadence window.
+Unlike the 2026-07-17 pass, **peak memory worked this time**: the harness now
+runs the container `--privileged` and delegates the cgroup v2 memory
+controller at boot (see `benchmarks/docker/bench.sh` / `entrypoint.sh`) —
+without that, Docker mounts `/sys/fs/cgroup` read-only and the measurement
+falls back to "unavailable", which is exactly what the 2026-07-17 pass hit.
+Caveat: the host was shared with unrelated running containers during this
+pass; that adds CPU noise, but the effects measured here (seconds-scale poll
+floors, hundreds-of-MB footprint gaps) are far above that noise floor.
+
+Three dimensions:
+
+1. **Trigger latency** — measured at a **1-minute cron** (`* * * * *`), the finest
+   cadence all three share, so it is apples-to-apples. Expectation from the
+   architecture: barca's ≤1s tick loop vs Dagster's ~30s daemon-eval interval and
+   Prefect's ~10–15s runner poll (each floors how soon a fire can follow the tick).
+2. **Idle footprint** — peak memory of the daemon holding 10 idle jobs. This is
+   the closest head-to-head axis: barca is a single Rust process (workers spawned
+   only on fire), Dagster runs a webserver + code server + schedule daemon, and
+   Prefect's `.serve()` runs its own ephemeral API in-process.
+3. **Minimum cadence** — **barca schedules sub-minute (6-field cron, 1-second
+   resolution); Dagster and Prefect cannot express any cron finer than 1 minute.**
+   Barca fires ~10× in a 20s window where the other two fire 0–1×.
+
+| Dimension | barca | dagster | prefect |
+|---|---|---|---|
+| Trigger latency (median, 1-min cron) | **0.062s** | 4.929s | 3.698s |
+| Idle footprint (peak MB, 10 jobs) | **7.9 MB** | 473.7 MB | 315.7 MB |
+| Minimum cadence | **1 second** | 60 seconds | 60 seconds |
+
+Full trigger-latency distribution (seconds past the minute boundary):
+
+| framework | fires | min | median | p95 | max |
+|---|---:|---:|---:|---:|---:|
+| barca serve | 5 | 0.061s | **0.062s** | 0.218s | 0.218s |
+| dagster dev | 4 | 1.782s | 4.929s | 5.882s | 5.882s |
+| prefect serve | 5 | 1.402s | 3.698s | 5.52s | 5.52s |
+
+Reading the results:
+
+- **Latency**: barca's per-second tick loop fires ~60ms after the minute
+  boundary, with worst case ~220ms. Dagster and Prefect land 1.4–5.9s late —
+  better than their documented worst-case poll intervals (~30s daemon eval /
+  ~10–15s runner poll) would allow in the worst case, but 20–80× barca's
+  median. Dagster also recorded one fewer fire in the same window (4 vs 5):
+  its first minute-boundary passed during daemon boot before the schedule was
+  being evaluated.
+- **Idle footprint**: barca's daemon holding 10 registered schedules is a
+  single idle Rust process — **7.9 MB** peak over boot + 60s idle (workers
+  only spawn when something fires; these jobs never fire). Dagster boots a
+  webserver + code server + schedule daemon (473.7 MB), Prefect an in-process
+  ephemeral API (315.7 MB) — a ~40–60× gap, and the closest thing this
+  benchmark has to a pure head-to-head axis since nothing is executing.
+- **Cadence**: barca's `*/2 * * * * *` fired exactly 10× in the 20s window, as
+  scheduled. This axis is a capability difference, not a race — Dagster and
+  Prefect cannot express any cron finer than 1 minute (see the fairness notes
+  in the README).
 
 ## Methodology
 

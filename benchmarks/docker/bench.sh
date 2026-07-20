@@ -7,8 +7,9 @@
 # the native benchmarks/<name>/bench.sh path).
 #
 # Usage:
-#   benchmarks/docker/bench.sh                    # all 20 benchmarks
+#   benchmarks/docker/bench.sh                    # all 21 benchmarks
 #   benchmarks/docker/bench.sh trivial chain_100   # a subset
+#   benchmarks/docker/bench.sh scheduler_overhead  # the daemon/scheduler one (slow)
 #
 # Override the resource ceiling with:
 #   BARCA_BENCH_CORES=8   # pinned core count (default: 4, same convention
@@ -46,7 +47,19 @@ echo ""
 # cached layer from a previous run.
 docker build -f "$SCRIPT_DIR/Dockerfile" -t "$IMAGE_TAG" "$REPO_ROOT"
 
+# SYS_ADMIN + an explicit rw bind-mount of /sys/fs/cgroup (narrower than
+# --privileged) are needed solely for the opt-in peak-memory measurement
+# (BARCA_BENCH_MEMORY=1): by default Docker mounts /sys/fs/cgroup read-only,
+# so the harness can't create the child cgroups it reads memory.peak from
+# (the 2026-07-17 RESULTS.md pass documented exactly this gap). --privileged
+# would also grant full device access and every other capability, which this
+# harness never needs — SYS_ADMIN is the one capability cgroup delegation
+# actually requires. The entrypoint delegates the memory controller at boot
+# (see entrypoint.sh); --cpuset-cpus/--memory ceilings are enforced by the
+# parent cgroup either way.
 docker run --rm \
+    --cap-add SYS_ADMIN \
+    -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
     --cpuset-cpus="$CPUSET" \
     --memory="$BARCA_BENCH_MEM" \
     -v "$OUT_DIR:/out" \

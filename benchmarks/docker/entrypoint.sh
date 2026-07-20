@@ -13,6 +13,24 @@
 
 set -u
 
+# Delegate the cgroup v2 memory controller so benchmarks/lib's cgroup-based
+# peak-memory measurement works inside the container (requires the host-side
+# bench.sh's --privileged, which mounts /sys/fs/cgroup read-write). A child
+# cgroup only gets a memory.peak file if "+memory" is enabled in its parent's
+# cgroup.subtree_control, and that write is only allowed once the root cgroup
+# has no member processes — so move ourselves into an init leaf first. All
+# guarded: on failure the harness falls back to its documented
+# "memory measurement unavailable" path instead of breaking timed runs.
+if [[ -f /sys/fs/cgroup/cgroup.controllers ]] \
+    && grep -qw memory /sys/fs/cgroup/cgroup.controllers \
+    && mkdir -p /sys/fs/cgroup/init 2>/dev/null; then
+    while read -r p; do
+        echo "$p" > /sys/fs/cgroup/init/cgroup.procs 2>/dev/null || true
+    done < /sys/fs/cgroup/cgroup.procs
+    echo +memory > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null \
+        || echo "warning: could not delegate cgroup memory controller — peak-memory will be unavailable" >&2
+fi
+
 ALL_BENCHMARKS=(
     trivial
     chain_100
@@ -34,6 +52,7 @@ ALL_BENCHMARKS=(
     spaceflights
     wide_join
     wide_layers
+    scheduler_overhead
 )
 
 if [[ $# -gt 0 ]]; then
