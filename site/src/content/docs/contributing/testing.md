@@ -57,7 +57,7 @@ separate test files.
 ### Shell integration (`tests/integration/`, CI only)
 
 `test_cli.sh`, `test_cache.sh`, `test_cache_gaps.sh`, `test_cache_fuzz.sh`, `test_env.sh`,
-`test_remote_state.sh` — exercised in `.github/workflows/ci.yml` against a `maturin build
+`test_remote_state.sh` — exercised in `.depot/workflows/ci.yml` against a `maturin build
 --release` wheel. A separate CI job (`backends`) runs the full Python suite, including the
 state-backend conformance tests, against local object-store emulators (MinIO, fake-gcs-server,
 Azurite) — no cloud credentials required.

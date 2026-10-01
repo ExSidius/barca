@@ -6,7 +6,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -64,7 +64,7 @@ jobs:
     # against local object-store emulators (no cloud credentials). MinIO covers
     # the S3 API — and therefore Cloudflare R2's code path — fake-gcs-server
     # covers GCS generation-match, Azurite covers Azure ETag If-Match.
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
