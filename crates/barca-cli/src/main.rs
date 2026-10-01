@@ -40,12 +40,13 @@ Examples:
   barca get total pipeline.py              # one target and only its upstream cone
   barca get total pipeline.py other.py     # target defined across several files
   barca get total pipeline.py --no-cache   # recompute everything in that cone
+  barca get total pipeline.py --dry-run    # what would run vs come from cache; changes nothing
   barca get total pipeline.py -o value     # just the value, pretty-printed
   barca get total pipeline.py --agent      # plain progress lines on stderr
   barca get total pipeline.py --env dev    # separate cache and state per environment
 
 Output: one JSON line on stdout with run_id, steps_executed (0 = all cached), phases and
-final_output. For parquet/pickle assets final_output is a pointer,
+final_output, and `steps`: what happened to each step (ran or cached, and why). For parquet/pickle assets final_output is a pointer,
 {\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
 loads the value for you.
 Targets must be assets; use `barca run` for tasks.
@@ -57,6 +58,7 @@ Examples:
   barca run deploy pipeline.py --refresh fetch,clean   # also re-materialize these upstream assets
   barca run deploy pipeline.py --refresh-all           # re-materialize every upstream asset
   barca run deploy pipeline.py --no-cache              # same as --refresh-all
+  barca run deploy pipeline.py --dry-run --refresh fetch   # preview: which steps run, which are cached
 
 --refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs only
 the assets you name: assets downstream of them stay cached unless you list them too (barca prints
@@ -155,6 +157,10 @@ enum Cli {
         /// Skip cache — execute everything fresh
         #[arg(long)]
         no_cache: bool,
+        /// Show what this command would do (each step cached or will-run, and why) without
+        /// running or writing anything
+        #[arg(long)]
+        dry_run: bool,
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
@@ -181,6 +187,10 @@ enum Cli {
         /// Force re-materialize ALL upstream assets in the task's cone
         #[arg(long, alias = "no-cache")]
         refresh_all: bool,
+        /// Show what this command would do (each step cached or will-run, and why) without
+        /// running or writing anything
+        #[arg(long)]
+        dry_run: bool,
         /// Output format
         #[arg(short, long, default_value = "json")]
         output: OutputMode,
@@ -396,6 +406,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             args,
             output,
             no_cache,
+            dry_run,
             agent,
             env,
         } => {
@@ -416,6 +427,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 &python,
                 output,
                 no_cache,
+                dry_run,
                 agent,
             )
             .await
@@ -424,6 +436,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             args,
             refresh,
             refresh_all,
+            dry_run,
             output,
             agent,
             env,
@@ -453,6 +466,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 files,
                 &python,
                 policy,
+                dry_run,
                 output,
                 agent,
             )
@@ -500,10 +514,18 @@ async fn get_cmd(
     python: &PathBuf,
     mode: OutputMode,
     no_cache: bool,
+    dry_run: bool,
     agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    if dry_run {
+        let policy = barca_core::commands::CachePolicy::CacheAware;
+        return explain_cmd(
+            &cfg, target, &file_args, python, policy, no_cache, "get", mode,
+        )
+        .await;
+    }
     let result = barca_core::commands::get(
         &cfg,
         target.as_deref(),
@@ -526,6 +548,7 @@ async fn get_cmd(
                     "steps_executed": result.steps_executed,
                     "phases": result.phases,
                     "final_output": final_output,
+                    "steps": &result.steps,
                 })
             );
         }
@@ -564,11 +587,25 @@ async fn run_cmd(
     files: Vec<PathBuf>,
     python: &PathBuf,
     policy: barca_core::commands::CachePolicy,
+    dry_run: bool,
     mode: OutputMode,
     agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    if dry_run {
+        return explain_cmd(
+            &cfg,
+            Some(target),
+            &file_args,
+            python,
+            policy,
+            false,
+            "run",
+            mode,
+        )
+        .await;
+    }
     let result = barca_core::commands::run(
         &cfg,
         &target,
@@ -591,6 +628,7 @@ async fn run_cmd(
                     "steps_executed": result.steps_executed,
                     "phases": result.phases,
                     "final_output": final_output,
+                    "steps": &result.steps,
                 })
             );
         }
@@ -616,6 +654,92 @@ async fn run_cmd(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn explain_cmd(
+    cfg: &barca_core::config::ResolvedConfig,
+    target: Option<String>,
+    file_args: &[String],
+    python: &PathBuf,
+    policy: barca_core::commands::CachePolicy,
+    no_cache: bool,
+    label: &str,
+    mode: OutputMode,
+) -> Result<(), barca_core::BarcaError> {
+    let result = barca_core::commands::explain(
+        cfg,
+        target.as_deref(),
+        file_args,
+        python,
+        policy,
+        no_cache,
+        label,
+    )
+    .await?;
+    match mode {
+        OutputMode::Json => println!("{}", serde_json::to_string(&result).unwrap()),
+        OutputMode::Value => println!("{}", serde_json::to_string_pretty(&result.steps).unwrap()),
+        OutputMode::Pretty => {
+            println!(
+                "Dry run: barca {label}{} (nothing executed, nothing written)\n",
+                result
+                    .target
+                    .as_deref()
+                    .map(|t| format!(" {t}"))
+                    .unwrap_or_default()
+            );
+            print_step_table(&result.steps, true);
+            println!(
+                "\n{} will run, {} cached, {} unknown",
+                result.summary.will_run, result.summary.cached, result.summary.unknown
+            );
+        }
+    }
+    Ok(())
+}
+
+/// STATUS / WHY / STEP table for dry runs and (in `-o pretty`) real runs.
+fn print_step_table(steps: &[barca_core::commands::StepReport], dry: bool) {
+    let rows: Vec<(String, String, &str)> = steps
+        .iter()
+        .map(|s| {
+            let verdict = s.action.as_deref().or(s.status.as_deref()).unwrap_or("?");
+            let label = match (dry, verdict) {
+                (true, "run") => "will run",
+                (_, v) => v,
+            };
+            let why = match (&s.partitions, &s.detail) {
+                (Some(p), _) if verdict == "partial" => format!(
+                    "{} of {} keys cached; will run: {}",
+                    p.cached,
+                    p.total,
+                    p.will_run_keys.join(", ")
+                ),
+                (Some(p), Some(d)) => format!("{} keys; {d}", p.total),
+                (None, Some(d)) => d.clone(),
+                (Some(p), None) => format!("{} keys cached", p.total),
+                (None, None) => "-".to_string(),
+            };
+            (label.to_string(), why, s.id.as_str())
+        })
+        .collect();
+    let w_status = rows.iter().map(|r| r.0.len()).max().unwrap_or(6).max(6);
+    let w_why = rows
+        .iter()
+        .map(|r| r.1.len())
+        .max()
+        .unwrap_or(3)
+        .clamp(3, 70);
+    println!("{:<w_status$}  {:<w_why$}  STEP", "STATUS", "WHY");
+    for (label, why, id) in &rows {
+        println!("{label:<w_status$}  {why:<w_why$}  {id}");
+    }
+    for s in steps {
+        if let Some(w) = &s.warning {
+            println!("\n  ! {w}");
+        }
+    }
 }
 
 async fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {

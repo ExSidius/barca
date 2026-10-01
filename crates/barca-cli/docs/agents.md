@@ -19,7 +19,8 @@ echo $?
 ```
 
 `get`/`run` JSON fields: `run_id`, `elapsed_seconds`, `steps_executed` (0 means everything was
-a cache hit), `phases`, `final_output`. `final_output` is the value for json artifacts and
+a cache hit), `phases`, `steps` (what happened to each step: `status` ran/cached/partial and why),
+`final_output`. `final_output` is the value for json artifacts and
 `{"_barca_artifact": {"path", "format", "size_bytes"}}` for parquet and pickle
 (`barca docs types`).
 
@@ -51,6 +52,13 @@ line has appeared for much longer than your slowest step, the process is genuine
 - An unknown name is an error (exit 1) listing the valid upstream assets.
 
 ## Inspect before you run
+
+Preview any `get`/`run` with `--dry-run`: it says which steps would run, which come from cache,
+and why, and writes nothing (`barca docs cache`):
+
+```bash
+barca run report pipeline.py --dry-run --refresh src
+```
 
 ```bash
 barca list pipeline.py --json       # every node: id, kind, freshness, inputs

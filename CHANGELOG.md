@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- `--dry-run` on `barca get` and `barca run`: reports, for the exact command and flags, which
+  steps are served from cache and which will run and why (`cached` / `run` / `partial` /
+  `unknown`), without executing or writing anything. Real runs now report the same per step in a
+  `steps` array (and `[barca] step:<id> cached` in `--agent` mode). The dry run and the real run
+  share one decision function, and tests check that the predicted `will_run` equals the real
+  run's `steps_executed`.
 - `barca docs`: a manual compiled into the binary (concepts, output formats, caching, tasks,
   partitions, scheduling, runnable examples, conventions for scripts and AI agents). Every
   command's `--help` now ends with runnable examples, and `list`, `history` and `stats` take
