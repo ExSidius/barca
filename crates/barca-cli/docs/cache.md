@@ -47,6 +47,54 @@ content-addressed, so they can be shared between machines when remote state is c
   To push fresh data through a chain, name the whole chain (`--refresh src,mid`) or use
   `--refresh-all`.
 
+## Seeing what will happen: `--dry-run`
+
+`barca get` and `barca run` take `--dry-run`. It reports, for exactly that command and flags, which
+steps would be served from cache and which would run, and why. It executes nothing and writes
+nothing: no `.barca` directory is created and no run is recorded.
+
+```bash
+barca run report pipeline.py --dry-run                 # JSON on one line
+barca run report pipeline.py --dry-run -o pretty       # a table for humans
+barca run report pipeline.py --dry-run --refresh src   # preview a refresh before doing it
+barca get total pipeline.py --dry-run --no-cache
+```
+
+```json
+{"dry_run": true, "command": "run", "target": "report",
+ "steps": [{"id": "pipeline.py:src", "kind": "asset", "action": "cached",
+            "run_hash": "…", "artifact": ".barca/artifacts/…"},
+           {"id": "pipeline.py:report", "kind": "task", "action": "run",
+            "reason": "task", "detail": "tasks always re-run"}],
+ "summary": {"will_run": 1, "cached": 1, "unknown": 0}}
+```
+
+Each step has an `action`:
+
+| `action` | Meaning |
+|---|---|
+| `cached` | Served from the cache (`artifact` is the file). |
+| `run` | Will execute; `reason` says why (below). |
+| `partial` | A partitioned asset where some keys are cached; `partitions` lists the counts and the keys that will run. |
+| `unknown` | Cannot be known without running: a dynamic partition (`partitions_from`) whose source has to run first to produce its keys, and anything that depends on it. |
+
+`reason` is one of `task` and `sensor` (always run), `no_cache` (`--no-cache`), `refresh` (named in
+`--refresh`), `refresh_all`, or `not_materialized` (no cached result for this code and these
+inputs: never run, or the code or an upstream changed). A cached step downstream of a refreshed
+asset carries a `warning` (see the refresh notes above). `summary` counts steps, one per partition
+key.
+
+A dry run makes the same decisions a real run makes (it calls the same code), and the test suite
+checks that `will_run` equals the real run's `steps_executed` across cold, warm, `--refresh` and
+`--refresh-all` runs.
+
+## What a run reports
+
+A real `barca get` / `barca run` returns the same per-step information in a `steps` array, with a
+`status` of `ran`, `cached` or `partial` (and the same `reason` / `warning`). In `--agent` mode a
+cached step also prints `[barca] step:<id> cached` on stderr, so a log shows what was served from
+cache as well as what ran. `barca history --json` and `barca stats` show the same over time.
+
 ## Concurrent runs
 
 Several barca processes can run in one project at once (parallel scripts or agents, `barca serve`
