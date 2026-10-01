@@ -40,6 +40,13 @@ fn fmt_eta(secs: f64) -> String {
     }
 }
 
+/// The progress total, grown to cover steps the plan did not count (the children a `parallel()`
+/// call fans out to complete as extra steps). Keeps `completed <= total` for the counters and
+/// the ETA subtraction.
+fn reconcile_total(total_steps: usize, completed_steps: usize) -> usize {
+    total_steps.max(completed_steps)
+}
+
 /// Total schedulable steps in a phase: 1 per unpartitioned step, `partition_keys.len()`
 /// for late-expanded ones. Used to keep the live progress-bar total in sync with
 /// `dispatch::expand_pending_partitions`, which turns a single planned
@@ -661,13 +668,22 @@ async fn execute(
                     elapsed_so_far += e;
                 }
                 completed_steps += 1;
+                // parallel() children complete as extra steps the plan didn't count: grow the
+                // total so the counters and the ETA never run past it.
+                let grown = reconcile_total(total_steps, completed_steps);
+                if grown != total_steps {
+                    total_steps = grown;
+                    if let Some(ref bar) = pb {
+                        bar.set_length(total_steps as u64);
+                    }
+                }
                 if let Some(ref bar) = pb {
                     bar.set_position(completed_steps as u64);
                     let remaining = if total_estimated > 0.0 {
                         (total_estimated - elapsed_so_far).max(0.0)
                     } else if completed_steps > 0 {
                         let avg = elapsed_so_far / completed_steps as f64;
-                        avg * (total_steps - completed_steps) as f64
+                        avg * total_steps.saturating_sub(completed_steps) as f64
                     } else {
                         0.0
                     };
@@ -1470,5 +1486,25 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
             node.partitions
                 .insert(dim, crate::model::PartitionSpec::Static { values });
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::reconcile_total;
+
+    #[test]
+    fn total_grows_to_cover_steps_the_plan_did_not_count() {
+        // parallel() children complete as extra steps beyond the plan.
+        assert_eq!(reconcile_total(2, 4), 4);
+        assert_eq!(reconcile_total(4, 2), 4);
+        assert_eq!(reconcile_total(3, 3), 3);
+        assert_eq!(reconcile_total(0, 0), 0);
+    }
+
+    #[test]
+    fn remaining_never_underflows() {
+        // The ETA math subtracts usizes; this used to panic in debug and wrap in release.
+        assert_eq!(2usize.saturating_sub(4), 0);
     }
 }
