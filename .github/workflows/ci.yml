@@ -88,7 +88,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9100:9000 \
             -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            minio/minio server /data
+            bitnamilegacy/minio:2025.5.24
           docker run -d --name fake-gcs -p 9200:4443 \
             fsouza/fake-gcs-server -scheme http -port 4443 \
             -public-host localhost:9200 -external-url http://localhost:9200
