@@ -77,19 +77,33 @@ or read the `path` yourself (`duckdb.sql("select * from '<path>'")`).
   generators). Return data, not handles.
 - A duckdb relation is executed when the step ends, so any connection it uses must still be
   alive when the step returns.
-- **DuckDB connections.** Barca loads duckdb inputs with `duckdb.read_parquet`, so they live on
-  duckdb's process-wide *default* connection, the same one the module-level `duckdb.sql(...)`
-  and `duckdb.read_parquet(...)` use inside your step. Stay on those and inputs, joins and SQL
-  over input names all work together. Relations from different connections cannot be
-  combined: if your step creates its own `duckdb.connect()`, mixing its relations with an
-  input fails with `Cannot combine LEFT and RIGHT relations of different connections!` (or
-  `... not suitable for replacement scan`), and `con.register("x", input)` fails the same way.
-  If you need your own connection, copy the input across with
+- **DuckDB connections.** Barca owns one DuckDB connection per worker process: duckdb's default
+  connection, the same one `duckdb.sql(...)` and `duckdb.read_parquet(...)` use. Inputs
+  annotated `duckdb.DuckDBPyRelation` are loaded on it and also bound as **views named after
+  their parameters** for the duration of the step (dropped after the result is written), so
+  `duckdb.sql("select * from orders")` works anywhere, helper modules included, with no bind
+  code of your own. Configure the connection once per worker process at import time with
+  `barca.duckdb_connection()`: extensions, credentials, `SET` options, macros:
+
+```python
+import barca
+
+barca.duckdb_connection().execute("SET threads = 4")   # runs once per worker process
+```
+
+- Stay on that connection. If a step opens its own `duckdb.connect()`, its relations cannot be
+  combined with inputs (`Cannot combine LEFT and RIGHT relations of different connections!`),
+  and `con.register("x", input)` fails the same way. Barca recognizes these DuckDB errors
+  (including querying a bound input by name from another connection, which DuckDB reports as
+  `Table with name ... does not exist`) and appends a `barca:` note to the step failure that
+  says what happened and what to do. If you must, copy the input across with
   `con.register("x", input.arrow())` (the data is loaded into memory). A relation does not
-  expose its file path, so you cannot re-read the parquet file yourself.
-- Default-connection state (temp views, `SET` options, attached databases) can outlive a
-  step, because a worker process runs several steps. Prefer stateless SQL, and clean up
-  anything you create (`drop view if exists ...`).
+  expose its file path.
+- Do not `register` on barca's connection an Arrow table that came from a query on that same
+  connection: it hangs (duckdb 1.5.6). Use the relation directly, or `create_view`.
+- Anything you create on the connection (tables, macros, `SET` options) lives as long as the
+  worker process, which runs several steps; barca only cleans up the views it binds for inputs.
+  Prefer stateless SQL and `drop` what you create.
 - Everything is materialized between steps. To cache several results from one computation,
   define several assets or return the one you want cached.
 

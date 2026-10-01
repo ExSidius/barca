@@ -19,7 +19,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from barca import _storage
+from barca import _duckdb, _storage
 from barca._artifacts import (
     artifact_path,
     clean_staging,
@@ -589,6 +589,10 @@ def _run_daemon_step(step, modules, art_dir, lru):
     t0 = time.perf_counter()
     c0 = time.process_time()
 
+    # Views bound for duckdb-typed inputs. They must outlive materialization: a returned
+    # relation is lazy and may still reference them when it is written to parquet.
+    bound_views: list[str] = []
+
     try:
         source = str(Path(step["source_file"]).resolve())
         if source not in modules:
@@ -628,6 +632,8 @@ def _run_daemon_step(step, modules, art_dir, lru):
                 raise FileNotFoundError(
                     f"Input artifact for parameter '{param}' not found: {value}"
                 ) from None
+
+        bound_views = _duckdb.bind_inputs(kwargs, param_types)
 
         timeout = step.get("timeout_seconds", 0)
         if d_args:
@@ -682,14 +688,21 @@ def _run_daemon_step(step, modules, art_dir, lru):
         # swallow them; genuine socket death surfaces when the emit below
         # fails, and that propagates to the caller.)
         wall = time.perf_counter() - t0
+        message = str(exc)
+        note = _duckdb.explain_error(exc, bound_views)
+        if note:
+            message = f"{message}\n\n{note}"
         _runtime.emit_step_error(
             node_id=node_id,
             error_type=type(exc).__name__,
-            message=str(exc),
+            message=message,
             traceback=_user_traceback(exc),
             elapsed=wall,
         )
         return False
+
+    finally:
+        _duckdb.unbind_inputs(bound_views)
 
 
 def run_daemon():
