@@ -26,10 +26,6 @@ jobs:
             maturin-target: x86_64
             name: linux-x86_64
           - os: depot-macos-15
-            target: x86_64-apple-darwin
-            maturin-target: x86_64
-            name: macos-x86_64
-          - os: depot-macos-15
             target: aarch64-apple-darwin
             maturin-target: aarch64
             name: macos-arm64
