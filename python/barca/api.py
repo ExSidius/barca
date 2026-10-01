@@ -125,19 +125,22 @@ def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
 def run(
     target: str,
     *files: str,
-    burst: list[str] | None = None,
+    refresh: list[str] | None = None,
+    refresh_all: bool = False,
 ) -> Any:
-    """Run a task (and its cone), bursting upstream asset caches.
+    """Run a task (and its cone). The task always re-runs.
 
-    Tasks always re-run. By default every upstream asset is force-rerun; pass
-    ``burst=["asset_name", ...]`` to re-run only those assets while the rest
-    stay cached.
+    Upstream assets are served from cache when fresh (same as ``get``). Pass
+    ``refresh=["asset_name", ...]`` to force re-materialize only those assets,
+    or ``refresh_all=True`` to refresh every upstream asset.
 
     Returns the deserialized value of the target task directly (or ``None``).
     """
     args: list[str] = ["run", target, *files]
-    if burst is not None and len(burst) > 0:
-        args += ["--burst", ",".join(burst)]
+    if refresh_all:
+        args.append("--refresh-all")
+    elif refresh:
+        args += ["--refresh", ",".join(refresh)]
     result = _exec(args)
     output = result.get("final_output")
     if output is not None:

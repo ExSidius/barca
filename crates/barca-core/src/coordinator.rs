@@ -42,9 +42,24 @@ pub struct ItemSpec {
     pub retries: u32,
     pub retry_backoff_seconds: f64,
     pub serializer: Option<String>,
+    /// Sink outputs from stacked `@sink(...)` decorators.
+    pub sinks: Vec<crate::model::SinkDecl>,
+    /// Content-addressing run hash for this item's artifact (None → legacy
+    /// node-id-keyed layout, e.g. parallel() children).
+    pub run_hash: Option<String>,
     /// Original step.inputs mapping: param_name → upstream_node_id.
     /// Used at dispatch time to resolve in-phase upstream artifacts.
     pub upstream_inputs: HashMap<String, String>,
+    /// Fan-in (`collect()`) params resolved cross-phase: param_name → every
+    /// partition artifact of the upstream base id, sorted by path for
+    /// determinism (mirrors `dispatch::build_provided_inputs`). Kept separate
+    /// from `dag_inputs` (which is one artifact path per param) because a
+    /// collected param resolves to a *list* of artifacts.
+    pub collected_inputs: HashMap<String, Vec<crate::dispatch::OutputRef>>,
+    /// Parameter frame types from function annotations.
+    pub param_types: HashMap<String, crate::model::ValueType>,
+    /// Return frame type from the function's return annotation.
+    pub return_type: Option<crate::model::ValueType>,
     pub kind: String,
     pub is_dynamic: bool,
 }
@@ -62,11 +77,31 @@ impl ItemSpec {
             retries: step.retries,
             retry_backoff_seconds: step.retry_backoff_seconds,
             serializer: step.serializer.as_ref().map(|s| s.to_string()),
+            sinks: step.sinks.clone(),
+            run_hash: step.run_hashes.get(&step.step_id.display()).cloned(),
             upstream_inputs: step.inputs.clone(),
+            collected_inputs: HashMap::new(),
+            param_types: step.param_types.clone(),
+            return_type: step.return_type,
             kind: format!("{:?}", step.kind).to_lowercase(),
             is_dynamic: false,
         }
     }
+}
+
+// ─── Failure handling ─────────────────────────────────────────────────────────
+
+/// What `on_item_failed` decided. `RetryAfter` items are parked in
+/// `waiting_retry` — the caller owns the timer and must call `requeue()`
+/// once the backoff elapses.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FailureAction {
+    /// Re-queued immediately (no backoff configured).
+    RetryNow,
+    /// Parked for backoff; schedule `requeue(item_id)` after this delay.
+    RetryAfter(std::time::Duration),
+    /// Retry budget exhausted — permanently failed, dependents cascaded.
+    Failed,
 }
 
 // ─── Item ─────────────────────────────────────────────────────────────────────
@@ -110,6 +145,8 @@ pub struct Coordinator {
     failed: HashMap<ItemId, String>,
     /// Skipped items (upstream data dep failed).
     skipped: HashSet<ItemId>,
+    /// Items parked for retry backoff — not ready until requeue() is called.
+    waiting_retry: HashSet<ItemId>,
     /// Output artifacts from completed items.
     outputs: HashMap<ItemId, serde_json::Value>,
     /// Parallel groups.
@@ -132,6 +169,7 @@ impl Coordinator {
             done: HashSet::new(),
             failed: HashMap::new(),
             skipped: HashSet::new(),
+            waiting_retry: HashSet::new(),
             outputs: HashMap::new(),
             groups: HashMap::new(),
             next_item_id: 0,
@@ -142,9 +180,32 @@ impl Coordinator {
     /// Add an item. If all deps satisfied, push to ready queue.
     /// If has unsatisfied deps, add to pending.
     pub fn add_item(&mut self, step_id: crate::StepId, spec: ItemSpec, deps: Vec<Dep>) -> ItemId {
+        let id = self.reserve_item_id();
+        self.finalize_item(id, step_id, spec, deps);
+        id
+    }
+
+    /// Reserve an [`ItemId`] without creating the item yet. Lets a caller
+    /// register an item's id (e.g. in a lookup table other items' deps will
+    /// resolve against) before that item's own deps are known — see
+    /// [`Coordinator::load_phase`]'s two-pass construction.
+    fn reserve_item_id(&mut self) -> ItemId {
         let id = ItemId(self.next_item_id);
         self.next_item_id += 1;
+        id
+    }
 
+    /// Create the item for a previously [`reserve_item_id`](Self::reserve_item_id)'d
+    /// id: inserts it, registers dependents, and places it on the ready or
+    /// pending queue. This is `add_item`'s body, split out so `load_phase` can
+    /// reserve every id up front and only then resolve deps.
+    fn finalize_item(
+        &mut self,
+        id: ItemId,
+        step_id: crate::StepId,
+        spec: ItemSpec,
+        deps: Vec<Dep>,
+    ) {
         let item = Item {
             id,
             step_id,
@@ -190,22 +251,53 @@ impl Coordinator {
         } else {
             self.pending.insert(id, unsatisfied);
         }
-
-        id
     }
 
     // ─── Scheduling ────────────────────────────────────────────────────────
 
     /// Pop the next ready item. Returns None if nothing is ready.
+    /// `attempts` counts dispatches, so it is incremented here.
     pub fn next_ready(&mut self) -> Option<ItemId> {
         let id = self.ready.pop_front()?;
         self.executing.insert(id);
+        if let Some(item) = self.items.get_mut(&id) {
+            item.attempts += 1;
+        }
         Some(id)
+    }
+
+    /// Move an item parked by a `RetryAfter` decision back to the ready queue.
+    pub fn requeue(&mut self, item_id: ItemId) {
+        if self.waiting_retry.remove(&item_id) {
+            self.ready.push_back(item_id);
+        }
+    }
+
+    /// Return a leased-but-never-started item to the front of the ready queue.
+    ///
+    /// Batch pulls lease several items per worker; when the worker dies (or is
+    /// killed after a step error) only the in-flight item failed — the
+    /// unstarted remainder goes back for another worker, and the dispatch that
+    /// never happened doesn't consume retry budget.
+    pub fn return_leased(&mut self, item_id: ItemId) {
+        if self.executing.remove(&item_id) {
+            if let Some(item) = self.items.get_mut(&item_id) {
+                item.attempts = item.attempts.saturating_sub(1);
+            }
+            self.ready.push_front(item_id);
+        }
     }
 
     /// How many items are ready to be assigned.
     pub fn ready_count(&self) -> usize {
         self.ready.len()
+    }
+
+    /// How many items still have work ahead of them (ready now or blocked on
+    /// upstreams). Note: batch sizing uses `ready_count` (the pull-eligible
+    /// pool), not this — blocked items mustn't inflate a batch.
+    pub fn remaining_count(&self) -> usize {
+        self.ready.len() + self.pending.len() + self.waiting_retry.len()
     }
 
     // ─── Event handlers ───────────────────────────────────────────────────
@@ -226,15 +318,21 @@ impl Coordinator {
     }
 
     /// Mark an item as failed. Retries if budget remains, else cascades.
-    pub fn on_item_failed(&mut self, item_id: ItemId, error: String) {
+    /// Backoff delay grows linearly: `retry_backoff_seconds * attempts`.
+    pub fn on_item_failed(&mut self, item_id: ItemId, error: String) -> FailureAction {
         self.executing.remove(&item_id);
 
         let item = self.items.get_mut(&item_id).unwrap();
-        item.attempts += 1;
 
         if item.attempts < item.spec.retries {
-            // Retry: push back to ready queue
-            self.ready.push_back(item_id);
+            let backoff = item.spec.retry_backoff_seconds * item.attempts as f64;
+            if backoff > 0.0 {
+                self.waiting_retry.insert(item_id);
+                FailureAction::RetryAfter(std::time::Duration::from_secs_f64(backoff))
+            } else {
+                self.ready.push_back(item_id);
+                FailureAction::RetryNow
+            }
         } else {
             // Permanent failure
             self.failed.insert(item_id, error);
@@ -245,6 +343,7 @@ impl Coordinator {
             }
 
             self.cascade_failure(item_id);
+            FailureAction::Failed
         }
     }
 
@@ -308,28 +407,98 @@ impl Coordinator {
     /// Resolves in-phase dependencies and fills dag_inputs from provided inputs.
     /// Partitioned steps are expanded: one item per partition key.
     /// Returns the number of items added.
+    ///
+    /// Two passes, deliberately: pass 1 reserves every item's [`ItemId`] and
+    /// registers it in `node_to_item` *before* pass 2 resolves any
+    /// dependency. A single interleaved pass would resolve a step's
+    /// dependencies against whatever's been registered so far — correct only
+    /// if producers always precede their consumers in stream order. That
+    /// holds for the planner's initial phases, but not for phases rebuilt by
+    /// `dispatch::expand_pending_partitions` (dynamic `partitions_from`
+    /// partitions): its load-balancing bin-packing distributes partition-key
+    /// chunks across streams by size alone, with no awareness of cross-step
+    /// data dependencies, so a consumer's chunk can land in a stream
+    /// processed before its producer's. With two passes, resolution order no
+    /// longer depends on stream order at all.
     pub fn load_phase(
         &mut self,
         phase: &crate::planner::Phase,
         provided: &HashMap<String, crate::dispatch::ProvidedInput>,
     ) -> usize {
-        let mut count = 0;
-        let mut node_to_item: HashMap<String, ItemId> = HashMap::new();
-        // For partitioned steps, track all items for a given base node so
-        // downstream partitioned steps can find their partition-aligned upstream.
-        let mut base_to_partition_items: HashMap<
-            String,
-            Vec<(crate::model::PartitionKey, ItemId)>,
-        > = HashMap::new();
+        enum Pending<'p> {
+            Plain {
+                step: &'p crate::planner::StreamStep,
+                step_id: crate::StepId,
+                item_id: ItemId,
+                prev_items: Vec<ItemId>,
+            },
+            Partition {
+                step: &'p crate::planner::StreamStep,
+                pk: &'p crate::model::PartitionKey,
+                partition_step_id: crate::StepId,
+                item_id: ItemId,
+                prev_items: Vec<ItemId>,
+            },
+        }
 
+        let mut node_to_item: HashMap<String, ItemId> = HashMap::new();
+        let mut pending: Vec<Pending> = Vec::new();
+
+        // Pass 1: reserve ids and register every display id this phase will
+        // produce. Within-stream ordering chains (`prev_items`) only ever
+        // reference the immediately preceding step in the same stream, which
+        // has already been reserved by this point in the walk — they don't
+        // need a second pass.
         for stream in &phase.streams {
             let mut prev_items: Vec<ItemId> = Vec::new();
             for step in &stream.steps {
                 if step.partition_keys.is_empty() {
-                    // Non-partitioned step: single item
                     let step_id = step.step_id.clone();
                     let display_id = step_id.display();
+                    let item_id = self.reserve_item_id();
+                    node_to_item.insert(display_id, item_id);
+                    pending.push(Pending::Plain {
+                        step,
+                        step_id,
+                        item_id,
+                        prev_items: prev_items.clone(),
+                    });
+                    prev_items = vec![item_id];
+                } else {
+                    let mut partition_item_ids: Vec<ItemId> = Vec::new();
 
+                    for pk in &step.partition_keys {
+                        let partition_step_id =
+                            crate::StepId::new(step.step_id.base.clone(), pk.clone());
+                        let partition_display = partition_step_id.display();
+                        let item_id = self.reserve_item_id();
+                        node_to_item.insert(partition_display, item_id);
+                        partition_item_ids.push(item_id);
+                        pending.push(Pending::Partition {
+                            step,
+                            pk,
+                            partition_step_id,
+                            item_id,
+                            prev_items: prev_items.clone(),
+                        });
+                    }
+
+                    prev_items = partition_item_ids;
+                }
+            }
+        }
+
+        // Pass 2: every id this phase will create is now in `node_to_item`,
+        // so dependency resolution no longer depends on visit order.
+        let count = pending.len();
+        for p in pending {
+            match p {
+                Pending::Plain {
+                    step,
+                    step_id,
+                    item_id,
+                    prev_items,
+                } => {
                     let mut deps = Vec::new();
                     for upstream_id in step.inputs.values() {
                         if let Some(&upstream_item) = node_to_item.get(upstream_id) {
@@ -351,118 +520,99 @@ impl Coordinator {
                     let mut spec = ItemSpec::from_step(step);
                     for (param_name, upstream_id) in &step.inputs {
                         if let Some(pi) = provided.get(upstream_id) {
-                            let path = match pi {
-                                crate::dispatch::ProvidedInput::Single(oref) => oref.path.clone(),
-                                crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                    orefs.first().map(|o| o.path.clone()).unwrap_or_default()
+                            match pi {
+                                crate::dispatch::ProvidedInput::Single(oref) => {
+                                    spec.dag_inputs
+                                        .insert(param_name.clone(), oref.path.clone());
                                 }
-                            };
-                            spec.dag_inputs.insert(param_name.clone(), path);
+                                crate::dispatch::ProvidedInput::Collected(orefs) => {
+                                    spec.collected_inputs
+                                        .insert(param_name.clone(), orefs.clone());
+                                }
+                            }
                         }
                     }
 
-                    let item_id = self.add_item(step_id, spec, deps);
-                    node_to_item.insert(display_id, item_id);
-                    prev_items = vec![item_id];
-                    count += 1;
-                } else {
-                    // Partitioned step: one item per partition key
-                    let base_id = step.step_id.base_id().to_string();
-                    let mut partition_item_ids: Vec<ItemId> = Vec::new();
-
-                    for pk in &step.partition_keys {
-                        let partition_step_id =
-                            crate::StepId::new(step.step_id.base.clone(), pk.clone());
-                        let partition_display = partition_step_id.display();
-
-                        let mut deps = Vec::new();
-                        // Resolve partition-aligned upstream dependencies
-                        for (param_name, upstream_id) in &step.inputs {
-                            if param_name.starts_with('_') {
-                                continue;
-                            }
-                            // Try partition-aligned first: upstream_id[pk]
-                            let aligned_id = pk.display_id(upstream_id);
-                            if let Some(&upstream_item) = node_to_item.get(&aligned_id) {
-                                deps.push(Dep {
-                                    upstream: upstream_item,
-                                    kind: DepKind::Data,
-                                });
-                            } else if let Some(&upstream_item) = node_to_item.get(upstream_id) {
-                                deps.push(Dep {
-                                    upstream: upstream_item,
-                                    kind: DepKind::Data,
-                                });
-                            }
+                    self.finalize_item(item_id, step_id, spec, deps);
+                }
+                Pending::Partition {
+                    step,
+                    pk,
+                    partition_step_id,
+                    item_id,
+                    prev_items,
+                } => {
+                    let partition_display = partition_step_id.display();
+                    let mut deps = Vec::new();
+                    // Resolve partition-aligned upstream dependencies
+                    for (param_name, upstream_id) in &step.inputs {
+                        if param_name.starts_with('_') {
+                            continue;
                         }
-                        // Chain ordering from previous step's partitions
-                        for &p in &prev_items {
-                            if !deps.iter().any(|d| d.upstream == p) {
-                                deps.push(Dep {
-                                    upstream: p,
-                                    kind: DepKind::Ordering,
-                                });
-                            }
+                        // Try partition-aligned first: upstream_id[pk]
+                        let aligned_id = pk.display_id(upstream_id);
+                        if let Some(&upstream_item) = node_to_item.get(&aligned_id) {
+                            deps.push(Dep {
+                                upstream: upstream_item,
+                                kind: DepKind::Data,
+                            });
+                        } else if let Some(&upstream_item) = node_to_item.get(upstream_id) {
+                            deps.push(Dep {
+                                upstream: upstream_item,
+                                kind: DepKind::Data,
+                            });
                         }
-
-                        let mut spec = ItemSpec::from_step(step);
-                        // Add partition values as direct_kwargs so they're
-                        // injected into the function call.
-                        for (k, v) in &pk.0 {
-                            spec.direct_kwargs
-                                .insert(k.clone(), serde_json::Value::String(v.clone()));
+                    }
+                    // Chain ordering from previous step's partitions
+                    for &p in &prev_items {
+                        if !deps.iter().any(|d| d.upstream == p) {
+                            deps.push(Dep {
+                                upstream: p,
+                                kind: DepKind::Ordering,
+                            });
                         }
-                        // Fill dag_inputs from provided (cross-phase) or
-                        // rely on in-phase resolution at dispatch time via upstream_inputs.
-                        for (param_name, upstream_id) in &step.inputs {
-                            if param_name.starts_with('_') {
-                                continue;
-                            }
-                            let aligned_id = pk.display_id(upstream_id);
-                            if let Some(pi) = provided.get(&aligned_id) {
-                                let path = match pi {
-                                    crate::dispatch::ProvidedInput::Single(oref) => {
-                                        oref.path.clone()
-                                    }
-                                    crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                        orefs.first().map(|o| o.path.clone()).unwrap_or_default()
-                                    }
-                                };
-                                spec.dag_inputs.insert(param_name.clone(), path);
-                            } else if let Some(pi) = provided.get(upstream_id) {
-                                let path = match pi {
-                                    crate::dispatch::ProvidedInput::Single(oref) => {
-                                        oref.path.clone()
-                                    }
-                                    crate::dispatch::ProvidedInput::Collected(orefs) => {
-                                        orefs.first().map(|o| o.path.clone()).unwrap_or_default()
-                                    }
-                                };
-                                spec.dag_inputs.insert(param_name.clone(), path);
-                            }
-                            // Update upstream_inputs to point to partition-aligned IDs
-                            // for in-phase resolution at dispatch time.
-                            spec.upstream_inputs.insert(param_name.clone(), aligned_id);
-                        }
-
-                        let item_id = self.add_item(partition_step_id, spec, deps);
-                        node_to_item.insert(partition_display, item_id);
-                        partition_item_ids.push(item_id);
-                        count += 1;
                     }
 
-                    base_to_partition_items.insert(
-                        base_id,
-                        step.partition_keys
-                            .iter()
-                            .zip(partition_item_ids.iter())
-                            .map(|(pk, &id)| (pk.clone(), id))
-                            .collect(),
-                    );
-                    prev_items = partition_item_ids;
+                    let mut spec = ItemSpec::from_step(step);
+                    spec.run_hash = step.run_hashes.get(&partition_display).cloned();
+                    // Add partition values as direct_kwargs so they're
+                    // injected into the function call.
+                    for (k, v) in &pk.0 {
+                        spec.direct_kwargs
+                            .insert(k.clone(), serde_json::Value::String(v.clone()));
+                    }
+                    // Fill dag_inputs from provided (cross-phase) or
+                    // rely on in-phase resolution at dispatch time via upstream_inputs.
+                    for (param_name, upstream_id) in &step.inputs {
+                        if param_name.starts_with('_') {
+                            continue;
+                        }
+                        let aligned_id = pk.display_id(upstream_id);
+                        if let Some(pi) = provided
+                            .get(&aligned_id)
+                            .or_else(|| provided.get(upstream_id))
+                        {
+                            match pi {
+                                crate::dispatch::ProvidedInput::Single(oref) => {
+                                    spec.dag_inputs
+                                        .insert(param_name.clone(), oref.path.clone());
+                                }
+                                crate::dispatch::ProvidedInput::Collected(orefs) => {
+                                    spec.collected_inputs
+                                        .insert(param_name.clone(), orefs.clone());
+                                }
+                            }
+                        }
+                        // Update upstream_inputs to point to partition-aligned IDs
+                        // for in-phase resolution at dispatch time.
+                        spec.upstream_inputs.insert(param_name.clone(), aligned_id);
+                    }
+
+                    self.finalize_item(item_id, partition_step_id, spec, deps);
                 }
             }
         }
+
         count
     }
 
@@ -620,7 +770,12 @@ mod tests {
             retries: 1,
             retry_backoff_seconds: 0.0,
             serializer: None,
+            sinks: Vec::new(),
+            run_hash: None,
             upstream_inputs: HashMap::new(),
+            collected_inputs: HashMap::new(),
+            param_types: HashMap::new(),
+            return_type: None,
             kind: "asset".to_string(),
             is_dynamic: false,
         }
@@ -808,9 +963,135 @@ mod tests {
         let mut c = Coordinator::new();
         let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]); // retries=1 → no retry
         c.next_ready();
-        c.on_item_failed(a, "boom".into());
+        assert_eq!(c.on_item_failed(a, "boom".into()), FailureAction::Failed);
         assert_eq!(c.failed_items().len(), 1);
         assert!(c.is_finished());
+    }
+
+    #[test]
+    fn attempts_count_dispatches() {
+        let mut c = Coordinator::new();
+        let mut s = spec("a");
+        s.retries = 3;
+        let a = c.add_item(dummy_step_id("a"), s, vec![]);
+
+        c.next_ready();
+        assert_eq!(c.item(a).attempts, 1);
+        assert_eq!(
+            c.on_item_failed(a, "fail 1".into()),
+            FailureAction::RetryNow
+        );
+        c.next_ready();
+        assert_eq!(c.item(a).attempts, 2);
+        assert_eq!(
+            c.on_item_failed(a, "fail 2".into()),
+            FailureAction::RetryNow
+        );
+        c.next_ready();
+        assert_eq!(c.item(a).attempts, 3);
+        // A success after two failures records 3 total attempts.
+        c.on_item_completed(a);
+        assert_eq!(c.item(a).attempts, 3);
+        assert!(c.is_finished());
+    }
+
+    #[test]
+    fn backoff_parks_item_until_requeue() {
+        let mut c = Coordinator::new();
+        let mut s = spec("a");
+        s.retries = 3;
+        s.retry_backoff_seconds = 0.2;
+        let a = c.add_item(dummy_step_id("a"), s, vec![]);
+
+        c.next_ready();
+        // delay = backoff * attempt: 0.2 * 1 after the first failure.
+        assert_eq!(
+            c.on_item_failed(a, "fail 1".into()),
+            FailureAction::RetryAfter(std::time::Duration::from_secs_f64(0.2)),
+        );
+        // Parked: not ready, not finished, until the caller requeues.
+        assert_eq!(c.ready_count(), 0);
+        assert!(!c.is_finished());
+        c.requeue(a);
+        assert_eq!(c.next_ready(), Some(a));
+
+        // Second failure: delay = 0.2 * 2.
+        assert_eq!(
+            c.on_item_failed(a, "fail 2".into()),
+            FailureAction::RetryAfter(std::time::Duration::from_secs_f64(0.4)),
+        );
+        c.requeue(a);
+        assert_eq!(c.next_ready(), Some(a));
+
+        // Third failure exhausts the budget regardless of backoff.
+        assert_eq!(c.on_item_failed(a, "fail 3".into()), FailureAction::Failed);
+        assert!(c.is_finished());
+    }
+
+    #[test]
+    fn return_leased_restores_queue_front_and_refunds_attempt() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        let b = c.add_item(dummy_step_id("b"), spec("b"), vec![]);
+
+        // Lease both (a batch of two), as a worker pull would.
+        assert_eq!(c.next_ready(), Some(a));
+        assert_eq!(c.next_ready(), Some(b));
+        assert_eq!(c.item(b).attempts, 1);
+
+        // Worker dies mid-batch: `b` was never started — return it.
+        c.return_leased(b);
+        assert_eq!(c.item(b).attempts, 0, "unstarted dispatch must be refunded");
+        // It comes back at the front, ahead of anything queued later.
+        let d = c.add_item(dummy_step_id("d"), spec("d"), vec![]);
+        assert_eq!(c.next_ready(), Some(b));
+        assert_eq!(c.next_ready(), Some(d));
+        c.on_item_completed(a);
+        c.on_item_completed(b);
+        c.on_item_completed(d);
+        assert!(c.is_finished());
+    }
+
+    #[test]
+    fn return_leased_of_unleased_item_is_noop() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        c.return_leased(a); // never leased — must not duplicate or underflow
+        assert_eq!(c.ready_count(), 1);
+        assert_eq!(c.next_ready(), Some(a));
+        assert_eq!(c.next_ready(), None);
+        assert_eq!(c.item(a).attempts, 1);
+    }
+
+    #[test]
+    fn remaining_count_tracks_ready_and_pending() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        let _b = c.add_item(
+            dummy_step_id("b"),
+            spec("b"),
+            vec![Dep {
+                upstream: a,
+                kind: DepKind::Data,
+            }],
+        );
+        assert_eq!(c.remaining_count(), 2);
+        c.next_ready();
+        assert_eq!(c.remaining_count(), 1); // a leased, b pending
+        c.on_item_completed(a);
+        assert_eq!(c.remaining_count(), 1); // b now ready
+        c.next_ready();
+        assert_eq!(c.remaining_count(), 0);
+    }
+
+    #[test]
+    fn requeue_of_unparked_item_is_noop() {
+        let mut c = Coordinator::new();
+        let a = c.add_item(dummy_step_id("a"), spec("a"), vec![]);
+        c.requeue(a); // a is in ready (never parked) — must not duplicate
+        assert_eq!(c.ready_count(), 1);
+        assert_eq!(c.next_ready(), Some(a));
+        assert_eq!(c.next_ready(), None);
     }
 
     #[test]
@@ -915,5 +1196,248 @@ mod tests {
             }
         }
         assert_eq!(count, 10_000);
+    }
+
+    #[test]
+    fn load_phase_assigns_run_hashes_per_item_and_partition() {
+        use crate::planner::{Phase, PhaseReason, StreamStep, WorkerStream};
+        use crate::{PartitionKey, StepId};
+
+        let pk_a = PartitionKey::from(HashMap::from([("t".to_string(), "A".to_string())]));
+        let pk_b = PartitionKey::from(HashMap::from([("t".to_string(), "B".to_string())]));
+
+        let mut plain_hashes = HashMap::new();
+        plain_hashes.insert("f:plain".to_string(), "hash-plain".to_string());
+        let mut part_hashes = HashMap::new();
+        part_hashes.insert("f:part[t=A]".to_string(), "hash-a".to_string());
+        part_hashes.insert("f:part[t=B]".to_string(), "hash-b".to_string());
+
+        let mk = |name: &str, hashes: HashMap<String, String>, pks: Vec<PartitionKey>| StreamStep {
+            step_id: StepId::unpartitioned(name),
+            kind: crate::NodeKind::Asset,
+            function_name: std::sync::Arc::from(name.rsplit(':').next().unwrap()),
+            source_file: std::sync::Arc::from("f"),
+            inputs: HashMap::new(),
+            pending_partitions: HashMap::new(),
+            serializer: None,
+            sinks: vec![],
+            run_hashes: hashes,
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            partition_keys: pks,
+            param_types: HashMap::new(),
+            return_type: None,
+        };
+
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![
+                    mk("f:plain", plain_hashes, vec![]),
+                    mk("f:part", part_hashes, vec![pk_a, pk_b]),
+                ],
+            }],
+        };
+
+        let mut c = Coordinator::new();
+        let loaded = c.load_phase(&phase, &HashMap::new());
+        assert_eq!(loaded, 3);
+
+        let mut seen: Vec<(String, Option<String>)> = Vec::new();
+        while let Some(id) = c.next_ready() {
+            let item = c.item(id);
+            seen.push((item.step_id.display(), item.spec.run_hash.clone()));
+            c.on_item_completed(id);
+        }
+        seen.sort();
+        assert_eq!(
+            seen,
+            vec![
+                ("f:part[t=A]".to_string(), Some("hash-a".to_string())),
+                ("f:part[t=B]".to_string(), Some("hash-b".to_string())),
+                ("f:plain".to_string(), Some("hash-plain".to_string())),
+            ]
+        );
+    }
+
+    /// Regression test for a bug where a partitioned consumer's data dependency
+    /// on its partitioned producer is silently dropped when the producer's
+    /// partition instance is loaded into the coordinator *after* the
+    /// consumer's — which is exactly what `dispatch::expand_pending_partitions`'s
+    /// load-balancing bin-packing can produce for dynamic (`partitions_from`)
+    /// partitions, since it distributes partition-key chunks across streams by
+    /// size alone, with no awareness of cross-step data dependencies.
+    ///
+    /// `load_phase` wires each partitioned item's deps by looking up its
+    /// upstream in `node_to_item`, which is only populated for items already
+    /// visited by the `for stream { for step { .. } }` walk — so stream order
+    /// must never matter for correctness, only for scheduling. This phase
+    /// deliberately interleaves `fetch`/`enrich` partition instances across
+    /// streams so that two of the three `enrich` instances are loaded *before*
+    /// the `fetch` instance they depend on.
+    #[test]
+    fn load_phase_wires_partition_aligned_deps_regardless_of_stream_order() {
+        use crate::planner::{Phase, PhaseReason, StreamStep, WorkerStream};
+        use crate::{PartitionKey, StepId};
+
+        let pk = |k: &str| PartitionKey::from(HashMap::from([("t".to_string(), k.to_string())]));
+
+        let mk = |name: &str, inputs: HashMap<String, String>, pks: Vec<PartitionKey>| StreamStep {
+            step_id: StepId::unpartitioned(name),
+            kind: crate::NodeKind::Asset,
+            function_name: std::sync::Arc::from(name.rsplit(':').next().unwrap()),
+            source_file: std::sync::Arc::from("f"),
+            inputs,
+            pending_partitions: HashMap::new(),
+            serializer: None,
+            sinks: vec![],
+            run_hashes: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            partition_keys: pks,
+            param_types: HashMap::new(),
+            return_type: None,
+        };
+
+        let no_inputs = HashMap::new();
+        let enrich_inputs = HashMap::from([("data".to_string(), "f:fetch".to_string())]);
+
+        // Interleaved like a real bin-packing result: enrich[B] and enrich[C]
+        // are loaded in streams that precede the stream loading fetch[B] and
+        // fetch[C] respectively. Only enrich[A] follows fetch[A].
+        let phase = Phase {
+            reason: PhaseReason::Initial,
+            streams: vec![
+                WorkerStream {
+                    stream_id: "w0".to_string(),
+                    steps: vec![
+                        mk("f:fetch", no_inputs.clone(), vec![pk("A")]),
+                        mk("f:enrich", enrich_inputs.clone(), vec![pk("B")]),
+                    ],
+                },
+                WorkerStream {
+                    stream_id: "w1".to_string(),
+                    steps: vec![
+                        mk("f:fetch", no_inputs.clone(), vec![pk("B")]),
+                        mk("f:enrich", enrich_inputs.clone(), vec![pk("C")]),
+                    ],
+                },
+                WorkerStream {
+                    stream_id: "w2".to_string(),
+                    steps: vec![
+                        mk("f:fetch", no_inputs, vec![pk("C")]),
+                        mk("f:enrich", enrich_inputs, vec![pk("A")]),
+                    ],
+                },
+            ],
+        };
+
+        let mut c = Coordinator::new();
+        let loaded = c.load_phase(&phase, &HashMap::new());
+        assert_eq!(loaded, 6);
+
+        for k in ["A", "B", "C"] {
+            let fetch_id = format!("f:fetch[t={k}]");
+            let enrich_id = format!("f:enrich[t={k}]");
+            let fetch_item = c
+                .items
+                .values()
+                .find(|it| it.step_id.display() == fetch_id)
+                .unwrap_or_else(|| panic!("{fetch_id} not loaded"));
+            let enrich_item = c
+                .items
+                .values()
+                .find(|it| it.step_id.display() == enrich_id)
+                .unwrap_or_else(|| panic!("{enrich_id} not loaded"));
+
+            assert!(
+                enrich_item
+                    .deps
+                    .iter()
+                    .any(|d| d.upstream == fetch_item.id && d.kind == DepKind::Data),
+                "{enrich_id} is missing its Data dependency on {fetch_id} — \
+                 stream order must not affect partition-aligned dependency wiring"
+            );
+        }
+    }
+
+    /// Regression test for #93: a `collect()` consumer's cross-phase fan-in
+    /// input must resolve to *every* partition artifact, not just the first
+    /// (`ProvidedInput::Collected(orefs).first()` silently truncated the list
+    /// to one partition's value). Since #97's planner fix, a collect()
+    /// consumer always lands in a phase after its producer, so this is the
+    /// only path fan-in resolution takes — `provided` is exactly what
+    /// `dispatch::build_provided_inputs` hands `load_phase` for a prior
+    /// phase's completed outputs.
+    #[test]
+    fn load_phase_delivers_full_collected_list_cross_phase() {
+        use crate::StepId;
+        use crate::dispatch::{OutputRef, ProvidedInput};
+        use crate::planner::{Phase, PhaseReason, StreamStep, WorkerStream};
+
+        let step = StreamStep {
+            step_id: StepId::unpartitioned("f:sink"),
+            kind: crate::NodeKind::Asset,
+            function_name: std::sync::Arc::from("sink"),
+            source_file: std::sync::Arc::from("f"),
+            inputs: HashMap::from([("data".to_string(), "f:source".to_string())]),
+            pending_partitions: HashMap::new(),
+            serializer: None,
+            sinks: vec![],
+            run_hashes: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            partition_keys: vec![],
+            param_types: HashMap::new(),
+            return_type: None,
+        };
+        let phase = Phase {
+            reason: PhaseReason::FanIn {
+                node_id: "f:sink".to_string(),
+            },
+            streams: vec![WorkerStream {
+                stream_id: "w0".to_string(),
+                steps: vec![step],
+            }],
+        };
+
+        let oref_a = OutputRef {
+            path: "f--source_key_a.json".to_string(),
+            format: "json".to_string(),
+            size_bytes: 10,
+            elapsed_seconds: None,
+        };
+        let oref_b = OutputRef {
+            path: "f--source_key_b.json".to_string(),
+            format: "json".to_string(),
+            size_bytes: 12,
+            elapsed_seconds: None,
+        };
+        let provided = HashMap::from([(
+            "f:source".to_string(),
+            ProvidedInput::Collected(vec![oref_a.clone(), oref_b.clone()]),
+        )]);
+
+        let mut c = Coordinator::new();
+        let loaded = c.load_phase(&phase, &provided);
+        assert_eq!(loaded, 1);
+
+        let item = c
+            .items
+            .values()
+            .find(|it| it.step_id.display() == "f:sink")
+            .unwrap();
+        assert!(
+            !item.spec.dag_inputs.contains_key("data"),
+            "a collected param must not be truncated into dag_inputs as a single path"
+        );
+        assert_eq!(
+            item.spec.collected_inputs.get("data"),
+            Some(&vec![oref_a, oref_b])
+        );
     }
 }

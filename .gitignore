@@ -10,13 +10,14 @@ build/
 
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 *.pdb
 
-# Environments
+# Environments (`.venv` without the slash also catches venv symlinks,
+# e.g. benchmark dirs pointing at a shared framework venv)
 .env
 .envrc
+.venv
 .venv/
 
 # Barca runtime state
@@ -47,8 +48,7 @@ Thumbs.db
 .pytest_cache/
 
 # Benchmark auto-generated hyperfine output (per-benchmark dir)
-benchmarks/trivial/results.md
-benchmarks/chain_100/results.md
+benchmarks/*/results.md
 
-# MkDocs
-site/
+# Docker benchmark harness output (raw logs extracted from the container)
+benchmarks/docker/out/

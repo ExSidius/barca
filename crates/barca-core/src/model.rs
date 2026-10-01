@@ -8,6 +8,7 @@
 //! - `SmallVec<[T; N]>` for small collections (inputs, sinks — usually ≤4 items, stays on stack)
 //! - `String` everywhere else (ruff's AST already gives us owned Strings; no point converting)
 
+use croner::parser::{CronParser, Seconds, Year};
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
@@ -56,10 +57,51 @@ impl Freshness {
     }
 }
 
-/// A validated 5-field cron expression.
+/// A validated cron expression. Accepts standard 5-field, minute-granular cron
+/// (`minute hour dom month dow`) and 6-field cron with a leading seconds field
+/// (`0/5 * * * * *` — every 5 seconds). Barca's scheduler evaluates at 1-second
+/// resolution: a 6-field expression fires at its seconds cadence, while a 5-field
+/// expression pins seconds to `0` and fires once per matching minute.
+//
+// Keep `*/` out of this doc comment: ts-rs copies it into a JSDoc block in the
+// generated UI bindings, where `*/` would terminate the comment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct CronExpr(pub String);
+
+impl CronExpr {
+    /// Parse a cron string under Barca's uniform field policy: seconds are
+    /// OPTIONAL (5-field minute-granular, or 6-field with a leading seconds
+    /// field) and the year field is disallowed. This is the single source of
+    /// truth for the cron grammar — validation, the scheduler, and the
+    /// `/schedule` handler all parse through here, so they can never disagree on
+    /// what a valid schedule is. (The 5-field-only restriction from issue #109
+    /// was widened to allow seconds once the scheduler gained sub-minute ticks;
+    /// an omitted seconds field is pinned to `0`, so 5-field crons are unchanged.)
+    ///
+    /// Returns a human-readable reason on failure.
+    pub fn parse(s: &str) -> Result<croner::Cron, String> {
+        CronParser::builder()
+            .seconds(Seconds::Optional)
+            .year(Year::Disallowed)
+            .build()
+            .parse(s.trim())
+            .map_err(|e| e.to_string())
+    }
+
+    /// Parse this expression's stored string. Convenience over [`CronExpr::parse`].
+    pub fn parsed(&self) -> Result<croner::Cron, String> {
+        Self::parse(&self.0)
+    }
+
+    /// Validate a cron string without retaining the parsed schedule. Delegates to
+    /// [`CronExpr::parse`] so validation and execution share one grammar.
+    ///
+    /// Returns a human-readable reason on failure.
+    pub fn validate(s: &str) -> Result<(), String> {
+        Self::parse(s).map(|_| ())
+    }
+}
 
 // ─── Partition specification ─────────────────────────────────────────────────
 
@@ -228,6 +270,30 @@ impl fmt::Display for StepId {
     }
 }
 
+// ─── Value types (from function annotations) ─────────────────────────────────
+
+/// Tabular value type declared on a function parameter or return annotation.
+/// When absent on a parameter, workers default to pandas for parquet reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueType {
+    Pandas,
+    Polars,
+    PyArrow,
+    DuckDB,
+}
+
+impl ValueType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValueType::Pandas => "pandas",
+            ValueType::Polars => "polars",
+            ValueType::PyArrow => "pyarrow",
+            ValueType::DuckDB => "duckdb",
+        }
+    }
+}
+
 // ─── Input references ────────────────────────────────────────────────────────
 
 /// A declared input to a node — maps a function parameter to an upstream node.
@@ -340,6 +406,10 @@ pub struct ExtractedNode {
     pub cone_hash: String,
     /// Explicit artifact serializer override from `@asset(serializer="parquet")`.
     pub artifact_serializer: Option<SerializerKind>,
+    /// Parameter types from function annotations (param → frame loader).
+    pub param_types: HashMap<String, ValueType>,
+    /// Return type from the function's return annotation (frame writer/loader).
+    pub return_type: Option<ValueType>,
     /// Parallel calls found in this task's function body.
     /// Only populated for `@task` nodes. Empty for assets/sensors.
     pub parallel_calls: Vec<ParallelCall>,

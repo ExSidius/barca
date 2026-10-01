@@ -1,14 +1,22 @@
 //! Shared server state and in-memory run tracking.
 
+use barca_core::CancellationToken;
 use barca_core::RunEvent;
 use barca_core::commands::{AssetSummary, GetResult, PlanResult};
 use dashmap::DashMap;
 use serde::Serialize;
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
-use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::broadcast;
+use tokio::sync::{Semaphore, broadcast};
+
+/// How many runs may execute concurrently by default (one per available core).
+fn default_run_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
 
 /// Configuration for a `barca serve` instance. Built by the CLI and handed to
 /// [`crate::serve`].
@@ -23,8 +31,16 @@ pub struct ServeConfig {
     /// Dev-mode hot reload: re-parse the DAG when source files change.
     /// Off by default; has no effect on the production serving path.
     pub watch: bool,
+    /// Whether the cron scheduler fires `Schedule(...)` assets. On by default;
+    /// disabled with `barca serve --no-schedule`.
+    pub schedule: bool,
+    /// Timezone cron expressions are evaluated in: `local` (default), `utc`, or
+    /// an IANA name like `America/New_York`. Set via `--timezone`.
+    pub timezone: String,
     /// Python interpreter used for execution (and dynamic-partition resolution).
     pub python: PathBuf,
+    /// Resolved barca configuration (environment, DB path, artifact root, state).
+    pub resolved: barca_core::config::ResolvedConfig,
 }
 
 /// Lifecycle of an async run tracked by the server.
@@ -40,6 +56,8 @@ pub enum RunStatus {
     Complete,
     /// Finished with an error.
     Failed,
+    /// Stopped mid-flight via `DELETE /run/{id}` or server shutdown.
+    Cancelled,
 }
 
 /// In-memory record of a single run. The server-side `handle` is the polling id
@@ -58,6 +76,11 @@ pub struct RunState {
     pub started_at: f64,
     /// Unix epoch seconds when the run finished (success or failure).
     pub finished_at: Option<f64>,
+    /// Cancels this run's execution future. `DELETE /run/{id}` triggers it;
+    /// the run task observes it, terminates workers, and marks the run
+    /// cancelled. Not part of the JSON status payload.
+    #[serde(skip)]
+    pub cancel: CancellationToken,
 }
 
 /// Cached static-analysis results, invalidated by the file watcher in `--watch`
@@ -111,6 +134,23 @@ impl RunChannel {
     }
 }
 
+/// Durable, mutable view of one scheduled job, published by the scheduler and
+/// read by `GET /schedule`. The volatile bits (next fire time, live run status)
+/// are computed at request time from `cron` and `last_handle`.
+#[derive(Clone, Debug, Serialize)]
+pub struct JobStatus {
+    /// Full node id (the run target).
+    pub id: String,
+    /// The node's cron expression.
+    pub cron: String,
+    /// Node kind (asset / sensor / task).
+    pub kind: barca_core::NodeKind,
+    /// Last time the scheduler fired this job (unix epoch seconds), if ever.
+    pub last_fired: Option<i64>,
+    /// Handle of the most recent run the scheduler triggered for this job.
+    pub last_handle: Option<String>,
+}
+
 /// Cloneable application state shared across all axum handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -119,19 +159,36 @@ pub struct AppState {
     pub cache: Arc<RwLock<DagCache>>,
     /// Live event channels per run handle (logs + step/run lifecycle).
     pub events: Arc<DashMap<String, RunChannel>>,
-    /// Serializes run execution so only one pipeline executes at a time,
-    /// preventing concurrent DB writes from racing on the shared metadata.db.
-    pub run_mutex: Arc<AsyncMutex<()>>,
+    /// Bounds how many runs execute concurrently. Runs execute Python in
+    /// parallel; the shared metadata.db is kept race-free by a process-wide DB
+    /// lock in `barca-core`, not by serializing whole runs.
+    pub run_slots: Arc<Semaphore>,
+    /// Total permits in `run_slots` — lets shutdown wait for in-flight runs by
+    /// re-acquiring every permit.
+    pub run_slot_count: usize,
+    /// Cancelled on graceful shutdown; every run token is a child of this, so
+    /// Ctrl-C stops in-flight runs (workers terminated, runs marked cancelled).
+    pub shutdown: CancellationToken,
+    /// Live scheduler view, published by the scheduler and read by `GET /schedule`.
+    pub schedule: Arc<RwLock<Vec<JobStatus>>>,
+    /// Bumped by the `--watch` file watcher on every DAG invalidation, so the
+    /// scheduler can re-read its job set without a restart.
+    pub dag_generation: Arc<AtomicU64>,
 }
 
 impl AppState {
     pub fn new(config: ServeConfig) -> Self {
+        let run_slot_count = default_run_concurrency();
         Self {
             config: Arc::new(config),
             runs: Arc::new(DashMap::new()),
             cache: Arc::new(RwLock::new(DagCache::default())),
             events: Arc::new(DashMap::new()),
-            run_mutex: Arc::new(AsyncMutex::new(())),
+            run_slots: Arc::new(Semaphore::new(run_slot_count)),
+            run_slot_count,
+            shutdown: CancellationToken::new(),
+            schedule: Arc::new(RwLock::new(Vec::new())),
+            dag_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }

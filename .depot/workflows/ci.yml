@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: depot-ubuntu-latest
+    env:
+      # Build artifacts and pip downloads live on a Depot cache disk: a real
+      # filesystem that persists between runs (no upload/download step, and
+      # incremental compiles survive Cargo.lock changes). Each job uses its own
+      # subdirectory so the two jobs never write the same files concurrently.
+      CARGO_TARGET_DIR: /mnt/cache/test/target
+      PIP_CACHE_DIR: /mnt/cache/test/pip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Mount cache disk
+        uses: depot/cache-mount@v1
+        with:
+          name: barca-ci-cache
+          path: /mnt/cache
+
+      - name: Prepare cache dirs
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" 2>/dev/null \
+            || { sudo mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" && sudo chown -R "$(id -u):$(id -g)" /mnt/cache/test; }
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run unit tests
+        run: cargo test
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install maturin and build
+        run: |
+          pip install maturin
+          rm -rf "$CARGO_TARGET_DIR/wheels"
+          maturin build --release
+          pip install "$CARGO_TARGET_DIR"/wheels/*.whl
+
+      - name: Run integration tests
+        run: |
+          bash tests/integration/test_cli.sh
+          bash tests/integration/test_cache.sh
+          bash tests/integration/test_cache_gaps.sh
+          bash tests/integration/test_cache_fuzz.sh
+          bash tests/integration/test_env.sh
+          bash tests/integration/test_remote_state.sh
+          bash tests/integration/test_partitions.sh
+
+      - name: Run benchmark examples as integration smoke tests
+        run: |
+          # benchmarks/*/barca/run.sh hardcode $REPO_ROOT/.venv/bin/barca, matching
+          # the local dev convention (`maturin develop --release` installs there) —
+          # link it to the wheel-installed barca from the build step above instead
+          # of building a second copy.
+          mkdir -p .venv/bin
+          ln -sf "$(command -v barca)" .venv/bin/barca
+          pip install scikit-learn  # only benchmarks/spaceflights needs this
+          pip install pandas pyarrow  # only benchmarks/etl_duckdb_dataframes needs this
+          bash tests/integration/test_benchmark_examples.sh
+
+  backends:
+    # Full Python suite, including the state-backend conformance suite that runs
+    # against local object-store emulators (no cloud credentials). MinIO covers
+    # the S3 API — and therefore Cloudflare R2's code path — fake-gcs-server
+    # covers GCS generation-match, Azurite covers Azure ETag If-Match.
+    runs-on: depot-ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: /mnt/cache/backends/target
+      PIP_CACHE_DIR: /mnt/cache/backends/pip
+    steps:
+      - uses: actions/checkout@v4
+
+      # Start the emulators first: `docker run -d` returns after pulling, and the
+      # pulls then overlap with the (much longer) Rust build below instead of
+      # waiting behind it.
+      - name: Start object-store emulators
+        run: |
+          docker run -d --name minio -p 9100:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            bitnamilegacy/minio:2025.5.24
+          docker run -d --name fake-gcs -p 9200:4443 \
+            fsouza/fake-gcs-server -scheme http -port 4443 \
+            -public-host localhost:9200 -external-url http://localhost:9200
+          docker run -d --name azurite -p 9210:10000 \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+
+      - name: Mount cache disk
+        uses: depot/cache-mount@v1
+        with:
+          name: barca-ci-cache
+          path: /mnt/cache
+
+      - name: Prepare cache dirs
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" 2>/dev/null \
+            || { sudo mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" && sudo chown -R "$(id -u):$(id -g)" /mnt/cache/backends; }
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build barca and install test extras
+        run: |
+          pip install maturin
+          rm -rf "$CARGO_TARGET_DIR/wheels"
+          maturin build --release
+          WHEEL=$(ls "$CARGO_TARGET_DIR"/wheels/*.whl)
+          pip install "${WHEEL}[test]"
+
+      - name: Wait for emulators
+        run: |
+          for i in $(seq 1 60); do curl -sf http://localhost:9100/minio/health/live && break; sleep 1; done
+          for i in $(seq 1 60); do curl -sf http://localhost:9200/storage/v1/b >/dev/null && break; sleep 1; done
+          for i in $(seq 1 60); do curl -s http://localhost:9210/devstoreaccount1 >/dev/null && break; sleep 1; done
+
+      - name: Run full Python suite (incl. backend conformance)
+        env:
+          BARCA_TEST_S3_ENDPOINT: http://localhost:9100
+          BARCA_TEST_GCS_ENDPOINT: http://localhost:9200
+          BARCA_TEST_AZURITE_HOST: 127.0.0.1:9210
+        run: pytest python/tests -q

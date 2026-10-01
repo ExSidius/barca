@@ -15,13 +15,27 @@ enum OutputMode {
 }
 
 #[derive(Parser)]
-#[command(name = "barca", about = "Invisible asset orchestrator", version)]
+#[command(
+    name = "barca",
+    about = "Invisible asset orchestrator",
+    long_about = "Barca runs Python asset graphs with content-addressed caching.\n\
+                  Every asset output is fully materialized to an artifact file at step \
+                  boundaries (json, pickle, or parquet) — that persistence is the cache \
+                  checkpoint. Downstream steps read those artifacts back; type annotations \
+                  on parameters select the parquet reader (pandas, polars, etc.) but do \
+                  not skip materialization.",
+    version
+)]
 enum Cli {
     /// Get asset value(s) — cache-aware, runs only the needed subgraph
     ///
     /// If the first positional arg ends in .py, all args are treated as files
     /// (no target — gets all assets). Otherwise, the first arg is the target
     /// asset name and the rest are files.
+    ///
+    /// Each completed step writes a fully materialized artifact (never a lazy in-memory
+    /// handle). If one computation should produce several cacheable outputs, define
+    /// multiple assets or split the work inside a single step before returning.
     Get {
         /// [TARGET] file.py [file.py ...] — target is optional
         #[arg(required = true)]
@@ -35,37 +49,53 @@ enum Cli {
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
-    /// Run a task (and its cone) — always re-runs, bursting upstream asset caches
+    /// Run a task and its dependency cone — the task always re-runs
     ///
-    /// Like `get`, but for task-style workflows: tasks always execute, and by
-    /// default every upstream asset is force-rerun. Use `--burst` to re-run only
-    /// selected assets while the rest stay cached.
+    /// The task always re-runs. Upstream assets are served from cache when fresh
+    /// (same as `barca get`). Use `--refresh` to force re-materialize specific
+    /// upstream assets, or `--refresh-all` / `--no-cache` to refresh the entire
+    /// upstream cone.
     Run {
         /// TARGET file.py [file.py ...] — target task is required
         #[arg(required = true)]
         args: Vec<String>,
-        /// Comma-separated asset names to force-rerun. Omit to burst ALL upstream assets.
-        #[arg(long, value_delimiter = ',')]
-        burst: Option<Vec<String>>,
+        /// Comma-separated upstream asset names to force re-materialize
+        #[arg(long, value_delimiter = ',', conflicts_with = "refresh_all")]
+        refresh: Option<Vec<String>>,
+        /// Force re-materialize ALL upstream assets in the task's cone
+        #[arg(long, alias = "no-cache")]
+        refresh_all: bool,
         /// Output format
         #[arg(short, long, default_value = "json")]
         output: OutputMode,
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Parse source files and emit the execution plan as JSON
     Plan {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Environment name (accepted for symmetry; planning uses no state)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Show recent run history
     History {
         /// Number of recent runs to show
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Show execution statistics for an asset
     Stats {
@@ -74,6 +104,9 @@ enum Cli {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// Run a long-running HTTP server exposing the orchestrator as a JSON API
     ///
@@ -89,8 +122,19 @@ enum Cli {
         /// Dev mode: re-parse the DAG when source files change
         #[arg(long)]
         watch: bool,
+        /// Disable the cron scheduler (Schedule(...) assets will not auto-fire)
+        #[arg(long)]
+        no_schedule: bool,
+        /// Timezone for cron evaluation: local (default), utc, or an IANA name
+        #[arg(long, default_value = "local")]
+        timezone: String,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
     },
     /// List all discovered definitions (assets, tasks, sensors) with their deps
+    ///
+    /// Scheduled definitions also show their next fire time in local time.
     List {
         /// Python source files containing definitions
         #[arg(required = true)]
@@ -132,14 +176,53 @@ fn main() {
             Cli::parse() // re-parse to show proper clap error
         }
     });
+
+    // Version needs no runtime — answer before paying for thread spawns.
+    if let Cli::Version = cli {
+        println!("barca {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    // The one runtime for the whole process — barca-core is async-native and
+    // runs on whatever runtime the caller provides.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|e| {
+            eprintln!("failed to create runtime: {e}");
+            std::process::exit(1);
+        });
+    let result = rt.block_on(run_cli(cli));
+
+    if let Err(e) = result {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+}
+
+/// A token that cancels on Ctrl-C, so an interrupted run terminates its
+/// workers and is recorded as `cancelled` instead of lingering as `running`.
+fn cancel_on_ctrl_c() -> barca_core::CancellationToken {
+    let cancel = barca_core::CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            c.cancel();
+        }
+    });
+    cancel
+}
+
+async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
     let python = barca_core::commands::find_python();
 
-    let result = match cli {
+    match cli {
         Cli::Get {
             args,
             output,
             no_cache,
             agent,
+            env,
         } => {
             let (target, files) = split_target_files(args);
             if files.is_empty() && target.is_none() {
@@ -150,48 +233,87 @@ fn main() {
                 eprintln!("error: no .py files provided\n\nUsage: barca get [TARGET] <FILES>...");
                 std::process::exit(1);
             }
-            get_cmd(target, files, &python, output, no_cache, agent)
+            get_cmd(
+                env.as_deref(),
+                target,
+                files,
+                &python,
+                output,
+                no_cache,
+                agent,
+            )
+            .await
         }
         Cli::Run {
             args,
-            burst,
+            refresh,
+            refresh_all,
             output,
             agent,
+            env,
         } => {
             let (target, files) = split_target_files(args);
             let Some(target) = target else {
                 eprintln!(
-                    "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                    "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
                 );
                 std::process::exit(1);
             };
             if files.is_empty() {
                 eprintln!(
-                    "error: no .py files provided\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                    "error: no .py files provided\n\nUsage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
                 );
                 std::process::exit(1);
             }
-            run_cmd(target, files, &python, burst, output, agent)
+            let policy = match (refresh_all, refresh) {
+                (true, _) => barca_core::commands::CachePolicy::RefreshAll,
+                (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective(names),
+                (false, None) => barca_core::commands::CachePolicy::CacheAware,
+            };
+            run_cmd(
+                env.as_deref(),
+                target,
+                files,
+                &python,
+                policy,
+                output,
+                agent,
+            )
+            .await
         }
-        Cli::Plan { files } => plan_cmd(files, &python),
-        Cli::History { limit } => history_cmd(limit),
-        Cli::Stats { target, files } => stats_cmd(target, files, &python),
-        Cli::List { files } => list_cmd(files, &python),
-        Cli::Serve { files, port, watch } => serve_cmd(files, port, watch, &python),
-        Cli::Version => {
-            println!("barca {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+        Cli::Plan { files, env: _ } => plan_cmd(files, &python).await,
+        Cli::History { limit, env } => history_cmd(env.as_deref(), limit).await,
+        Cli::Stats { target, files, env } => {
+            stats_cmd(env.as_deref(), target, files, &python).await
         }
-    };
-
-    if let Err(e) = result {
-        eprintln!("{e}");
-        std::process::exit(1);
+        Cli::List { files } => list_cmd(files, &python).await,
+        Cli::Serve {
+            files,
+            port,
+            watch,
+            no_schedule,
+            timezone,
+            env,
+        } => {
+            serve_cmd(
+                env.as_deref(),
+                files,
+                port,
+                watch,
+                !no_schedule,
+                timezone,
+                &python,
+            )
+            .await
+        }
+        // Answered in main() before the runtime is built — never reaches here.
+        Cli::Version => unreachable!("version is handled before runtime construction"),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn get_cmd(
+async fn get_cmd(
+    env: Option<&str>,
     target: Option<String>,
     files: Vec<PathBuf>,
     python: &PathBuf,
@@ -199,8 +321,18 @@ fn get_cmd(
     no_cache: bool,
     agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::get(target.as_deref(), &file_args, python, no_cache, agent)?;
+    let result = barca_core::commands::get(
+        &cfg,
+        target.as_deref(),
+        &file_args,
+        python,
+        no_cache,
+        agent,
+        cancel_on_ctrl_c(),
+    )
+    .await?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -244,16 +376,28 @@ fn get_cmd(
     Ok(())
 }
 
-fn run_cmd(
+#[allow(clippy::too_many_arguments)]
+async fn run_cmd(
+    env: Option<&str>,
     target: String,
     files: Vec<PathBuf>,
     python: &PathBuf,
-    burst: Option<Vec<String>>,
+    policy: barca_core::commands::CachePolicy,
     mode: OutputMode,
     agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::run(&target, &file_args, python, burst, agent)?;
+    let result = barca_core::commands::run(
+        &cfg,
+        &target,
+        &file_args,
+        python,
+        policy,
+        agent,
+        cancel_on_ctrl_c(),
+    )
+    .await?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -293,69 +437,131 @@ fn run_cmd(
     Ok(())
 }
 
-fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
+async fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let result = barca_core::commands::plan(&file_args, python)?;
+    let result = barca_core::commands::plan(&file_args, python).await?;
     println!("{}", serde_json::to_string_pretty(&result).unwrap());
     Ok(())
 }
 
-fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
+async fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let assets = barca_core::commands::list_assets(&file_args, python)?;
+    let assets = barca_core::commands::list_assets(&file_args, python).await?;
     if assets.is_empty() {
         println!("No definitions found.");
         return Ok(());
     }
+
+    // Next fire times for scheduled definitions (empty when nothing is scheduled,
+    // so the NEXT FIRE column only appears when it carries information).
+    let next_fires: std::collections::HashMap<String, String> =
+        barca_server::describe_schedule(&file_args, python)
+            .await
+            .into_iter()
+            .filter_map(|j| j.next_fire_local.map(|t| (j.id, t)))
+            .collect();
+    let has_schedule = !next_fires.is_empty();
+
+    // Render each row's cells up front so column widths fit the actual content.
+    let rows: Vec<(&str, String, String, &str, String)> = assets
+        .iter()
+        .map(|a| {
+            let kind = serde_json::to_value(&a.kind)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", a.kind).to_lowercase());
+            let freshness = serde_json::to_value(&a.freshness)
+                .ok()
+                .and_then(|v| {
+                    let ty = v.get("type")?.as_str()?;
+                    if ty == "Schedule" {
+                        let cron = v.get("value").and_then(|c| c.as_str()).unwrap_or("?");
+                        Some(format!("cron: {cron}"))
+                    } else {
+                        Some(ty.to_lowercase())
+                    }
+                })
+                .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
+            let next = next_fires.get(&a.id).map(String::as_str).unwrap_or("-");
+            let deps = if a.inputs.is_empty() {
+                "-".to_string()
+            } else {
+                a.inputs.join(", ")
+            };
+            (a.id.as_str(), kind, freshness, next, deps)
+        })
+        .collect();
+
     let max_name = assets.iter().map(|a| a.id.len()).max().unwrap_or(4).max(4);
-    let max_kind = 6; // "sensor" is the longest
-    println!(
-        "{:<wn$}  {:<wk$}  {:<10}  {}",
-        "NAME",
-        "KIND",
-        "FRESHNESS",
-        "DEPS",
-        wn = max_name,
-        wk = max_kind,
-    );
-    println!("{}", "-".repeat(max_name + max_kind + 20));
-    for a in &assets {
-        let kind = serde_json::to_value(&a.kind)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{:?}", a.kind).to_lowercase());
-        let freshness = serde_json::to_value(&a.freshness)
-            .ok()
-            .and_then(|v| {
-                let ty = v.get("type")?.as_str()?;
-                if ty == "Schedule" {
-                    let cron = v.get("value").and_then(|c| c.as_str()).unwrap_or("?");
-                    Some(format!("cron: {cron}"))
-                } else {
-                    Some(ty.to_lowercase())
-                }
-            })
-            .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
-        let deps = if a.inputs.is_empty() {
-            "-".to_string()
-        } else {
-            a.inputs.join(", ")
-        };
+    let max_kind = rows.iter().map(|r| r.1.len()).max().unwrap_or(4).max(4);
+    let max_fresh = rows.iter().map(|r| r.2.len()).max().unwrap_or(9).max(9); // "FRESHNESS"
+    let max_next = rows.iter().map(|r| r.3.len()).max().unwrap_or(9).max(9); // "NEXT FIRE"
+
+    if has_schedule {
         println!(
-            "{:<wn$}  {:<wk$}  {:<10}  {}",
-            a.id,
-            kind,
-            freshness,
-            deps,
+            "{:<wn$}  {:<wk$}  {:<ws$}  {:<wf$}  {}",
+            "NAME",
+            "KIND",
+            "FRESHNESS",
+            "NEXT FIRE",
+            "DEPS",
             wn = max_name,
             wk = max_kind,
+            ws = max_fresh,
+            wf = max_next,
         );
+        println!(
+            "{}",
+            "-".repeat(max_name + max_kind + max_fresh + max_next + 12)
+        );
+    } else {
+        println!(
+            "{:<wn$}  {:<wk$}  {:<ws$}  {}",
+            "NAME",
+            "KIND",
+            "FRESHNESS",
+            "DEPS",
+            wn = max_name,
+            wk = max_kind,
+            ws = max_fresh,
+        );
+        println!("{}", "-".repeat(max_name + max_kind + max_fresh + 10));
+    }
+
+    for row in &rows {
+        let (id, kind, freshness, next, deps) = row;
+        if has_schedule {
+            println!(
+                "{:<wn$}  {:<wk$}  {:<ws$}  {:<wf$}  {}",
+                id,
+                kind,
+                freshness,
+                next,
+                deps,
+                wn = max_name,
+                wk = max_kind,
+                ws = max_fresh,
+                wf = max_next,
+            );
+        } else {
+            println!(
+                "{:<wn$}  {:<wk$}  {:<ws$}  {}",
+                id,
+                kind,
+                freshness,
+                deps,
+                wn = max_name,
+                wk = max_kind,
+                ws = max_fresh,
+            );
+        }
     }
     Ok(())
 }
 
-fn history_cmd(limit: usize) -> Result<(), barca_core::BarcaError> {
-    let runs = barca_core::commands::history(limit)?;
+async fn history_cmd(env: Option<&str>, limit: usize) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
+    let runs = barca_core::commands::history(&cfg, limit).await?;
     if runs.is_empty() {
         println!("No run history found.");
         return Ok(());
@@ -385,13 +591,15 @@ fn history_cmd(limit: usize) -> Result<(), barca_core::BarcaError> {
     Ok(())
 }
 
-fn stats_cmd(
+async fn stats_cmd(
+    env: Option<&str>,
     target: String,
     files: Vec<PathBuf>,
     python: &PathBuf,
 ) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let stats = barca_core::commands::stats(&target, &file_args, python)?;
+    let stats = barca_core::commands::stats(&cfg, &target, &file_args, python).await?;
     let fmt = |v: Option<f64>| v.map(|e| format!("{:.3}s", e)).unwrap_or("-".to_string());
     println!("Asset: {}", stats.node_id);
     println!("Total materializations: {}", stats.total_runs);
@@ -429,20 +637,37 @@ fn stats_cmd(
     Ok(())
 }
 
-fn serve_cmd(
+#[allow(clippy::too_many_arguments)]
+async fn serve_cmd(
+    env: Option<&str>,
     files: Vec<PathBuf>,
     port: u16,
     watch: bool,
+    schedule: bool,
+    timezone: String,
     python: &std::path::Path,
 ) -> Result<(), barca_core::BarcaError> {
+    let resolved = barca_core::config::resolve(env)?;
+    if resolved.state == barca_core::config::StateMode::Optimistic && resolved.state_uri.is_some() {
+        return Err(barca_core::BarcaError::Other(
+            "barca serve does not support shared remote state yet — set state = \"off\" \
+             in barca.toml (or BARCA_STATE=off) to serve with a local metadata DB"
+                .to_string(),
+        ));
+    }
     let config = barca_server::ServeConfig {
         files: files.iter().map(|p| p.display().to_string()).collect(),
         host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         port,
         watch,
+        schedule,
+        timezone,
         python: python.to_path_buf(),
+        resolved,
     };
-    barca_server::serve(config).map_err(|e| barca_core::BarcaError::Other(e.to_string()))
+    barca_server::serve(config)
+        .await
+        .map_err(|e| barca_core::BarcaError::Other(e.to_string()))
 }
 
 /// Read an artifact for display: inline JSON values, show metadata for binary formats.

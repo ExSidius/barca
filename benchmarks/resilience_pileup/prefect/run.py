@@ -121,7 +121,7 @@ def pileup_flow():
 
 
 if __name__ == "__main__":
-    t0 = time.perf_counter()
+    _t0 = time.perf_counter()
     pileup_flow()
-    elapsed = time.perf_counter() - t0
+    elapsed = time.perf_counter() - _t0
     print(json.dumps({"elapsed_seconds": round(elapsed, 6), "steps_executed": 18}, indent=2))

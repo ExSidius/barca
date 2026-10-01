@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::model::{
     CronExpr, DeclaredInput, ExtractedNode, Freshness, NodeKind, NodeRef, ParallelCall,
-    PartitionSpec, PartitionValue, SerializerKind, SinkDecl,
+    PartitionSpec, PartitionValue, SerializerKind, SinkDecl, ValueType,
 };
 
 /// Error from parsing a Python source file.
@@ -19,6 +19,14 @@ use crate::model::{
 pub enum ParseError {
     #[error("syntax error in {file}: {message}")]
     SyntaxError { file: String, message: String },
+
+    #[error("{file}: {function}: invalid Schedule cron {cron:?} — {reason}")]
+    InvalidCron {
+        file: String,
+        function: String,
+        cron: String,
+        reason: String,
+    },
 }
 
 /// Parse a Python source file and extract all barca-decorated nodes.
@@ -36,7 +44,7 @@ pub fn extract_nodes(source: &str, file_path: &str) -> Result<Vec<ExtractedNode>
 
     for stmt in &module.body {
         if let Stmt::FunctionDef(func) = stmt
-            && let Some(extracted) = try_extract_function(func, file_path, source)
+            && let Some(extracted) = try_extract_function(func, file_path, source)?
         {
             // Cone hash computed later in build_dag with cached module definitions.
             nodes.push(extracted);
@@ -50,7 +58,7 @@ fn try_extract_function(
     func: &ast::StmtFunctionDef,
     file_path: &str,
     source: &str,
-) -> Option<ExtractedNode> {
+) -> Result<Option<ExtractedNode>, ParseError> {
     let mut kind = None;
     let mut keywords: Vec<&Keyword> = Vec::new();
     let mut sinks: SmallVec<[SinkDecl; 2]> = SmallVec::new();
@@ -76,9 +84,12 @@ fn try_extract_function(
         }
     }
 
-    let kind = kind?;
+    let Some(kind) = kind else {
+        return Ok(None);
+    };
 
-    let freshness = extract_freshness(&keywords).unwrap_or(Freshness::default_for(kind));
+    let freshness = extract_freshness(&keywords, file_path, func.name.as_str())?
+        .unwrap_or(Freshness::default_for(kind));
     let inputs = extract_inputs(&keywords);
     let partitions = extract_partitions(&keywords, source);
     let explicit_name = extract_string_kwarg(&keywords, "name");
@@ -98,12 +109,13 @@ fn try_extract_function(
     } else {
         Vec::new()
     };
+    let (param_types, return_type) = extract_type_annotations(func);
 
     let start = func.range().start().to_usize();
     let end = func.range().end().to_usize();
     let source_text = source[start..end].to_string();
 
-    Some(ExtractedNode {
+    Ok(Some(ExtractedNode {
         kind,
         function_name: func.name.to_string(),
         explicit_name,
@@ -122,8 +134,84 @@ fn try_extract_function(
         source_text,
         cone_hash: String::new(), // computed after extraction in extract_nodes()
         artifact_serializer,
+        param_types,
+        return_type,
         parallel_calls,
-    })
+    }))
+}
+
+/// Extract parameter and return types from function annotations.
+fn extract_type_annotations(
+    func: &ast::StmtFunctionDef,
+) -> (HashMap<String, ValueType>, Option<ValueType>) {
+    let mut param_types = HashMap::new();
+    let params = &func.parameters;
+
+    for arg in params
+        .posonlyargs
+        .iter()
+        .chain(&params.args)
+        .chain(&params.kwonlyargs)
+    {
+        if let Some(vt) = arg.annotation().and_then(parse_value_type_expr) {
+            param_types.insert(arg.name().id.to_string(), vt);
+        }
+    }
+
+    let return_type = func.returns.as_deref().and_then(parse_value_type_expr);
+
+    (param_types, return_type)
+}
+
+/// Map a type annotation expression to a supported [`ValueType`].
+fn parse_value_type_expr(expr: &Expr) -> Option<ValueType> {
+    match expr {
+        Expr::StringLiteral(s) => parse_type_path(&s.value.to_string()),
+        Expr::Subscript(sub) => {
+            // list[pl.DataFrame] from collect() fan-in params.
+            if is_list_annotation(sub.value.as_ref()) {
+                parse_value_type_expr(&sub.slice)
+            } else {
+                None
+            }
+        }
+        Expr::Attribute(attr) => {
+            let module = expr_to_name(attr.value.as_ref())?;
+            parse_type_path(&format!("{module}.{}", attr.attr))
+        }
+        Expr::Name(name) => parse_type_path(&name.id),
+        _ => None,
+    }
+}
+
+fn is_list_annotation(expr: &Expr) -> bool {
+    matches!(expr, Expr::Name(n) if n.id.as_str() == "list")
+}
+
+fn expr_to_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_type_path(path: &str) -> Option<ValueType> {
+    let path = path.trim();
+    let (module, name) = match path.rsplit_once('.') {
+        Some((m, n)) => (m, n),
+        None => ("", path),
+    };
+    classify_type(module, name)
+}
+
+fn classify_type(module: &str, name: &str) -> Option<ValueType> {
+    match (module, name) {
+        ("pl" | "polars", "DataFrame" | "LazyFrame") => Some(ValueType::Polars),
+        ("pd" | "pandas", "DataFrame") => Some(ValueType::Pandas),
+        ("pyarrow", "Table") => Some(ValueType::PyArrow),
+        ("duckdb", "DuckDBPyRelation") => Some(ValueType::DuckDB),
+        _ => None,
+    }
 }
 
 fn is_unsafe_decorator(expr: &Expr) -> bool {
@@ -196,13 +284,17 @@ fn match_node_decorator(expr: &Expr) -> Option<(NodeKind, Vec<&Keyword>)> {
     }
 }
 
-fn extract_freshness(keywords: &[&Keyword]) -> Option<Freshness> {
+fn extract_freshness(
+    keywords: &[&Keyword],
+    file_path: &str,
+    function_name: &str,
+) -> Result<Option<Freshness>, ParseError> {
     for kw in keywords {
         let Some(ref ident) = kw.arg else { continue };
         if ident.as_str() != "freshness" {
             continue;
         }
-        return Some(match &kw.value {
+        let freshness = match &kw.value {
             Expr::Call(call) => match call.func.as_ref() {
                 Expr::Name(n) => match n.id.as_str() {
                     "Always" => Freshness::Always,
@@ -214,21 +306,30 @@ fn extract_freshness(keywords: &[&Keyword]) -> Option<Freshness> {
                             .first()
                             .and_then(extract_string_literal)
                             .unwrap_or_default();
+                        if let Err(reason) = CronExpr::validate(&cron) {
+                            return Err(ParseError::InvalidCron {
+                                file: file_path.to_string(),
+                                function: function_name.to_string(),
+                                cron,
+                                reason,
+                            });
+                        }
                         Freshness::Schedule(CronExpr(cron))
                     }
-                    _ => return None,
+                    _ => return Ok(None),
                 },
-                _ => return None,
+                _ => return Ok(None),
             },
             Expr::Name(n) => match n.id.as_str() {
                 "Always" => Freshness::Always,
                 "Manual" => Freshness::Manual,
-                _ => return None,
+                _ => return Ok(None),
             },
-            _ => return None,
-        });
+            _ => return Ok(None),
+        };
+        return Ok(Some(freshness));
     }
-    None
+    Ok(None)
 }
 
 fn extract_inputs(keywords: &[&Keyword]) -> SmallVec<[DeclaredInput; 4]> {
@@ -759,6 +860,39 @@ def my_task(data):
             Freshness::Schedule(CronExpr("*/5 * * * *".into()))
         );
         assert_eq!(nodes[1].kind, NodeKind::Task);
+    }
+
+    #[test]
+    fn type_annotations_extracted_from_signature() {
+        use crate::model::ValueType;
+
+        let src = r#"
+from barca import asset
+
+@asset()
+def raw() -> pl.DataFrame:
+    ...
+
+@asset(inputs={"orders": raw, "meta": raw})
+def stg(orders: pl.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+    ...
+
+@asset(inputs={"parts": raw})
+def collected(parts: list[pl.DataFrame]) -> pl.DataFrame:
+    ...
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes.len(), 3);
+
+        assert_eq!(nodes[0].return_type, Some(ValueType::Polars));
+        assert!(nodes[0].param_types.is_empty());
+
+        assert_eq!(nodes[1].return_type, Some(ValueType::Pandas));
+        assert_eq!(nodes[1].param_types.get("orders"), Some(&ValueType::Polars));
+        assert_eq!(nodes[1].param_types.get("meta"), Some(&ValueType::Pandas));
+
+        assert_eq!(nodes[2].return_type, Some(ValueType::Polars));
+        assert_eq!(nodes[2].param_types.get("parts"), Some(&ValueType::Polars));
     }
 
     #[test]

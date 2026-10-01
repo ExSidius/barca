@@ -139,6 +139,59 @@ def daily_job(): pass
     );
 }
 
+#[test]
+fn freshness_schedule_accepts_6_field_seconds_cron() {
+    // Sub-minute support (widening issue #109): a 6-field cron with a leading
+    // seconds field is now valid — the scheduler evaluates at 1-second
+    // resolution — and round-trips as-is.
+    let src = r#"
+from barca import asset, Schedule
+
+@asset(freshness=Schedule("*/30 * * * * *"))
+def every_30s(): pass
+"#;
+    let nodes = extract_nodes(src, "pipeline.py").unwrap();
+    assert_eq!(
+        nodes[0].freshness,
+        Freshness::Schedule(CronExpr("*/30 * * * * *".into()))
+    );
+}
+
+#[test]
+fn freshness_schedule_rejects_7_field_year_cron() {
+    // The seconds field was allowed, but the year field is still disallowed —
+    // proves the grammar widened for seconds only, not everything.
+    let src = r#"
+from barca import asset, Schedule
+
+@asset(freshness=Schedule("0 0 5 * * * 2026"))
+def with_year(): pass
+"#;
+    assert!(extract_nodes(src, "pipeline.py").is_err());
+}
+
+#[test]
+fn freshness_schedule_rejects_malformed_cron() {
+    let src = r#"
+from barca import asset, Schedule
+
+@asset(freshness=Schedule("not a cron"))
+def daily_job(): pass
+"#;
+    assert!(extract_nodes(src, "test.py").is_err());
+}
+
+#[test]
+fn freshness_schedule_rejects_empty_cron() {
+    let src = r#"
+from barca import asset, Schedule
+
+@asset(freshness=Schedule(""))
+def daily_job(): pass
+"#;
+    assert!(extract_nodes(src, "test.py").is_err());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // 3. Input declarations — aliasing and references
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -31,15 +31,20 @@ pub fn cone_hash_with_imports(
     other_sources: &HashMap<String, String>,
 ) -> String {
     let defs = collect_module_definitions(source);
-    cone_hash_from_defs(&defs, function_name, other_sources)
+    cone_hash_from_defs(&defs, function_name, other_sources, &HashSet::new())
 }
 
 /// Cone hash from pre-parsed module definitions. Avoids re-parsing the source
 /// when computing hashes for multiple functions in the same file.
+///
+/// `packages` is the set of dotted module names in `other_sources` that are
+/// `__init__.py` packages (as opposed to regular submodules) — needed to
+/// resolve relative imports correctly (see `resolve_import`).
 pub fn cone_hash_from_defs(
     defs: &HashMap<String, ModuleDef>,
     function_name: &str,
     other_sources: &HashMap<String, String>,
+    packages: &HashSet<String>,
 ) -> String {
     let Some(target) = defs.get(function_name) else {
         return String::new();
@@ -96,6 +101,7 @@ pub fn cone_hash_from_defs(
                     module,
                     &name,
                     other_sources,
+                    packages,
                     &mut visited,
                     &mut cone_parts,
                     0, // depth limit to prevent infinite loops
@@ -140,6 +146,7 @@ fn resolve_import(
     module: &str,
     name: &str,
     other_sources: &HashMap<String, String>,
+    packages: &HashSet<String>,
     visited: &mut HashSet<String>,
     cone_parts: &mut Vec<(String, String)>,
     depth: usize,
@@ -154,7 +161,17 @@ fn resolve_import(
         return;
     };
 
-    let imported_defs = collect_module_definitions_with_context(module_source, Some(module));
+    // The package a relative import inside `module` resolves against: for an
+    // `__init__.py` package, that's the module's own dotted name; for a
+    // regular submodule (`pkg.sub`), it's one level up (`pkg`).
+    let own_package = if packages.contains(module) {
+        Some(module.to_string())
+    } else {
+        module.rsplit_once('.').map(|(pkg, _)| pkg.to_string())
+    };
+
+    let imported_defs =
+        collect_module_definitions_with_context(module_source, own_package.as_deref());
     let Some(imported_def) = imported_defs.get(name) else {
         cone_parts.push((name.to_string(), format!("import:{module}:{name}")));
         return;
@@ -181,25 +198,44 @@ fn resolve_import(
                 if !visited.insert(dep_key.clone()) {
                     continue;
                 }
-                if let Some(
-                    ModuleDef::Function {
-                        source_text,
-                        references,
-                    }
-                    | ModuleDef::Assignment {
-                        source_text,
-                        references,
-                    },
-                ) = imported_defs.get(&dep)
-                {
-                    cone_parts.push((dep_key, source_text.clone()));
-                    for r in references {
-                        if !visited.contains(&format!("{module}:{r}"))
-                            && imported_defs.contains_key(r.as_str())
-                        {
-                            bfs_queue.push(r.clone());
+                match imported_defs.get(&dep) {
+                    Some(
+                        ModuleDef::Function {
+                            source_text,
+                            references,
+                        }
+                        | ModuleDef::Assignment {
+                            source_text,
+                            references,
+                        },
+                    ) => {
+                        cone_parts.push((dep_key, source_text.clone()));
+                        for r in references {
+                            if !visited.contains(&format!("{module}:{r}"))
+                                && imported_defs.contains_key(r.as_str())
+                            {
+                                bfs_queue.push(r.clone());
+                            }
                         }
                     }
+                    Some(ModuleDef::Import {
+                        module: next_module,
+                    }) => {
+                        // `dep` is itself imported from a third file — resolve
+                        // it there instead of silently dropping it, or a
+                        // change to its actual definition would never
+                        // invalidate the cache.
+                        resolve_import(
+                            next_module,
+                            &dep,
+                            other_sources,
+                            packages,
+                            visited,
+                            cone_parts,
+                            depth + 1,
+                        );
+                    }
+                    None => {}
                 }
             }
         }
@@ -211,6 +247,7 @@ fn resolve_import(
                 next_module,
                 name,
                 other_sources,
+                packages,
                 visited,
                 cone_parts,
                 depth + 1,
@@ -225,9 +262,23 @@ pub fn collect_module_definitions(source: &str) -> HashMap<String, ModuleDef> {
     collect_module_definitions_with_context(source, None)
 }
 
+/// Walks `levels_up` package levels above `package` (e.g. `levels_up=1` on
+/// `"pkg.sub"` yields `"pkg"`). Returns `None` if there aren't enough levels
+/// (e.g. `from ... import x` inside a module that isn't nested that deep).
+fn package_ancestor(package: &str, levels_up: usize) -> Option<String> {
+    let mut current = package;
+    for _ in 0..levels_up {
+        current = current.rsplit_once('.')?.0;
+    }
+    Some(current.to_string())
+}
+
 fn collect_module_definitions_with_context(
     source: &str,
-    parent_module: Option<&str>,
+    // The package this module resolves relative imports against: for an
+    // `__init__.py`, its own dotted name; for a regular submodule, its
+    // parent package. `None` for the entry file (no cross-file context).
+    own_package: Option<&str>,
 ) -> HashMap<String, ModuleDef> {
     let Ok(parsed) = parse_module(source) else {
         return HashMap::new();
@@ -296,17 +347,16 @@ fn collect_module_definitions_with_context(
                     .as_ref()
                     .map(|m| m.to_string())
                     .unwrap_or_default();
-                // Resolve relative imports: `from .core import x` with level=1
-                // becomes `parent_module.core` when we know the parent.
+                // Resolve relative imports: `from .core import x` (level=1)
+                // resolves against `own_package`; each extra leading dot
+                // (level=2, 3, ...) walks one more package level up.
                 let module_name = if import.level > 0 {
-                    if let Some(parent) = parent_module {
-                        if raw_module.is_empty() {
-                            parent.to_string()
-                        } else {
-                            format!("{parent}.{raw_module}")
-                        }
-                    } else {
-                        raw_module
+                    match own_package.and_then(|pkg| {
+                        package_ancestor(pkg, (import.level as usize).saturating_sub(1))
+                    }) {
+                        Some(base) if raw_module.is_empty() => base,
+                        Some(base) => format!("{base}.{raw_module}"),
+                        None => raw_module,
                     }
                 } else {
                     raw_module
@@ -737,5 +787,143 @@ def my_asset():
         let h1 = cone_hash(src, "my_asset");
         let h2 = cone_hash(src, "my_asset");
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn test_package_ancestor() {
+        assert_eq!(package_ancestor("mylib", 0), Some("mylib".to_string()));
+        assert_eq!(
+            package_ancestor("mylib.core", 0),
+            Some("mylib.core".to_string())
+        );
+        assert_eq!(package_ancestor("mylib.core", 1), Some("mylib".to_string()));
+        assert_eq!(
+            package_ancestor("mylib.sub.core", 1),
+            Some("mylib.sub".to_string())
+        );
+        assert_eq!(
+            package_ancestor("mylib.sub.core", 2),
+            Some("mylib".to_string())
+        );
+        // Not enough segments to walk that many levels up.
+        assert_eq!(package_ancestor("mylib", 1), None);
+    }
+
+    #[test]
+    fn test_relative_import_in_regular_submodule_resolves_to_parent_package() {
+        // mylib/core.py: `from .util import h` re-exports `h`. `core.py` is a
+        // regular submodule (not in `packages`), so its relative import must
+        // resolve against its *parent* package `mylib`, giving `mylib.util` —
+        // not `mylib.core.util` (the pre-fix bug, using core's own name).
+        let entry_src = "from mylib.core import h\n\ndef my_asset():\n    return h()\n";
+        let core_src = "from .util import h\n";
+        let util_src_v1 = "def h():\n    return 1\n";
+        let util_src_v2 = "def h():\n    return 999\n";
+
+        let mut other_sources = HashMap::new();
+        other_sources.insert("mylib.core".to_string(), core_src.to_string());
+        other_sources.insert("mylib.util".to_string(), util_src_v1.to_string());
+
+        let mut packages = HashSet::new();
+        packages.insert("mylib".to_string());
+
+        let defs = collect_module_definitions(entry_src);
+        let h1 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &packages);
+
+        // If `.util` had wrongly resolved to `mylib.core.util`, this lookup
+        // would miss `other_sources` entirely and the cone hash would stay
+        // constant regardless of `h`'s actual source.
+        other_sources.insert("mylib.util".to_string(), util_src_v2.to_string());
+        let h2 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &packages);
+
+        assert_ne!(
+            h1, h2,
+            "relative import in a regular submodule must resolve against its parent package"
+        );
+    }
+
+    #[test]
+    fn test_relative_import_level_two_walks_two_package_levels_up() {
+        // mylib/sub/core.py: `from ..util import h` (level=2) must walk two
+        // package levels up from its own package `mylib.sub` to `mylib`.
+        let entry_src = "from mylib.sub.core import h\n\ndef my_asset():\n    return h()\n";
+        let core_src = "from ..util import h\n";
+        let util_src_v1 = "def h():\n    return 1\n";
+        let util_src_v2 = "def h():\n    return 999\n";
+
+        let mut other_sources = HashMap::new();
+        other_sources.insert("mylib.sub.core".to_string(), core_src.to_string());
+        other_sources.insert("mylib.util".to_string(), util_src_v1.to_string());
+
+        let mut packages = HashSet::new();
+        packages.insert("mylib".to_string());
+        packages.insert("mylib.sub".to_string());
+
+        let defs = collect_module_definitions(entry_src);
+        let h1 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &packages);
+
+        other_sources.insert("mylib.util".to_string(), util_src_v2.to_string());
+        let h2 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &packages);
+
+        assert_ne!(
+            h1, h2,
+            "level=2 relative import must walk two package levels up from the submodule's own package"
+        );
+    }
+
+    #[test]
+    fn test_relative_import_in_init_still_resolves_against_own_name() {
+        // Regression: `__init__.py`'s own dotted name IS the package, so
+        // `from .core import x` inside `mylib/__init__.py` must still
+        // resolve to `mylib.core` (own_package == module's own name here).
+        let entry_src = "from mylib import transform\n\ndef my_asset():\n    return transform(1)\n";
+        let init_src = "from .core import transform\n";
+        let core_src_v1 = "def transform(x):\n    return x * 2\n";
+        let core_src_v2 = "def transform(x):\n    return x * 99\n";
+
+        let mut other_sources = HashMap::new();
+        other_sources.insert("mylib".to_string(), init_src.to_string());
+        other_sources.insert("mylib.core".to_string(), core_src_v1.to_string());
+
+        let mut packages = HashSet::new();
+        packages.insert("mylib".to_string());
+
+        let defs = collect_module_definitions(entry_src);
+        let h1 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &packages);
+
+        other_sources.insert("mylib.core".to_string(), core_src_v2.to_string());
+        let h2 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &packages);
+
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn test_transitive_dep_that_is_itself_a_cross_file_import_is_tracked() {
+        // mylib.core:helper() calls h(), which mylib.core imports from a
+        // *third* file, mylib.util. The inner BFS that traces helper's
+        // transitive deps used to only follow Function/Assignment defs and
+        // silently drop `h` (an Import def), so changes to `h`'s real
+        // definition in util.py were never detected — a silent stale-cache
+        // bug, not specific to relative imports (plain absolute imports
+        // reproduce it identically).
+        let entry_src = "from mylib.core import helper\n\ndef my_asset():\n    return helper()\n";
+        let core_src = "from mylib.util import h\n\ndef helper():\n    return h()\n";
+        let util_src_v1 = "def h():\n    return 1\n";
+        let util_src_v2 = "def h():\n    return 999\n";
+
+        let mut other_sources = HashMap::new();
+        other_sources.insert("mylib.core".to_string(), core_src.to_string());
+        other_sources.insert("mylib.util".to_string(), util_src_v1.to_string());
+
+        let defs = collect_module_definitions(entry_src);
+        let h1 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &HashSet::new());
+
+        other_sources.insert("mylib.util".to_string(), util_src_v2.to_string());
+        let h2 = cone_hash_from_defs(&defs, "my_asset", &other_sources, &HashSet::new());
+
+        assert_ne!(
+            h1, h2,
+            "a helper's transitive dependency that is itself a cross-file import must be tracked"
+        );
     }
 }

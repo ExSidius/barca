@@ -3,10 +3,16 @@ Each (step, ticker) pair is a separate task, mirroring barca's partitioned chain
 
 import hashlib
 import json
+import os
 import time
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
 
 TICKERS = [f"T{i:03d}" for i in range(50)]
+
+# Matches barca's pool_size and dagster's max_concurrent for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 
 # --- Step 1: fetch (50 tasks) ---
@@ -52,15 +58,17 @@ def _make_score(i, ticker):
 score_tasks = [_make_score(i, t) for i, t in enumerate(TICKERS)]
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=BENCH_WORKERS))
 def partitioned_chain_flow():
-    results = []
+    # Each ticker's 3-step chain is independent of every other ticker's chain
+    # (parallel across tickers), but sequential within a chain.
+    futures = []
     for i in range(len(TICKERS)):
-        fetched = fetch_tasks[i]()
-        normalized = normalize_tasks[i](fetched)
-        scored = score_tasks[i](normalized)
-        results.append(scored)
-    return results
+        fetched = fetch_tasks[i].submit()
+        normalized = normalize_tasks[i].submit(fetched)
+        scored = score_tasks[i].submit(normalized)
+        futures.append(scored)
+    return [f.result() for f in futures]
 
 
 if __name__ == "__main__":

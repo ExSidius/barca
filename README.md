@@ -4,11 +4,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/recursia-io/barca/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/recursia-io/barca/ci.yml?branch=main&style=flat-square&label=CI" /></a>
+  <a href="https://github.com/ExSidius/barca/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ExSidius/barca/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <a href="https://pypi.org/project/barca/"><img alt="PyPI" src="https://img.shields.io/pypi/v/barca?style=flat-square&color=3572A5" /></a>
   <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.12-3572A5?style=flat-square" />
   <img alt="Rust" src="https://img.shields.io/badge/rust-2024_edition-dea584?style=flat-square" />
-  <a href="https://github.com/recursia-io/barca/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/recursia-io/barca?style=flat-square" /></a>
+  <a href="https://github.com/ExSidius/barca/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/ExSidius/barca?style=flat-square" /></a>
 </p>
 
 ---
@@ -183,7 +183,7 @@ def my_data() -> dict:
 |--------|----------|
 | `Always` | Auto-materializes whenever stale (default for `@asset` and `@task`) |
 | `Manual` | Only runs on explicit refresh |
-| `Schedule("0 5 * * *")` | Cron expression |
+| `Schedule("0 5 * * *")` | Cron expression (5-field, or 6-field for sub-minute) |
 
 ### Partitions
 
@@ -210,35 +210,72 @@ barca plan <file.py> [file.py ...]         Emit execution plan as JSON
 barca list <file.py> [file.py ...]         List all definitions with deps
 barca history [--limit N]                    Show recent run history
 barca stats <target> <file.py> ...         Show timing/cache stats for an asset
-barca serve [file.py ...] [--port N]       Run the HTTP API server
+barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
 barca --help                               Show help
 ```
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 
+## Scheduling
+
+Barca doubles as a plain **task scheduler**. Decorate a function with a cron
+`Schedule` and leave `barca serve` running — each job fires on its own tick. No
+external cron, no YAML, no daemon service to install.
+
+```python
+# job.py
+from barca import task, Schedule
+
+@task(freshness=Schedule("*/10 * * * *"))
+def refresh() -> None:
+    ...  # hit an API, rebuild a file, send a report — a task always re-runs
+
+@task(freshness=Schedule("*/15 * * * * *"))   # 6-field cron → every 15 seconds
+def heartbeat() -> None:
+    ...
+```
+
+```bash
+barca serve job.py
+```
+
+Standard 5-field cron (`minute hour day-of-month month day-of-week`) and a 6-field
+form with a leading **seconds** field are both supported — the scheduler evaluates
+at 1-second resolution. It's timezone-aware, fires once on restart to catch up a
+missed tick, skips a tick if the previous run is still going, and exposes live
+status at `GET /schedule`. Inspect the schedule any time with `barca list job.py`.
+
+See the [Scheduling guide](https://barca.sh/scheduling/) for the full story
+(timezones, catch-up, keeping it alive under systemd). A minimal example lives in
+[`examples/scheduler`](examples/scheduler).
+
 ## Server
 
 `barca serve` starts a long-running HTTP server that exposes the orchestrator as a
 JSON API — for triggering runs programmatically, polling status, and (in the future)
-a web UI. It binds to `127.0.0.1` by default (local only, no auth).
+a web UI. It also runs the built-in cron scheduler above. It binds to `127.0.0.1`
+by default (local only, no auth).
 
 ```bash
 barca serve pipeline.py --port 8274      # default port 8274
 barca serve pipeline.py --watch          # dev mode: re-parse DAG on file change
+barca serve pipeline.py --no-schedule    # HTTP API only, don't fire scheduled jobs
+barca serve pipeline.py --timezone utc   # evaluate cron in UTC (default: local)
 ```
 
 Runs are async: `POST` returns a `run_id` immediately, then you poll `/status/{run_id}`.
 
 ```bash
-curl localhost:8274/health                       # {"status":"ok","version":"0.2.1"}
+curl localhost:8274/health                       # {"status":"ok","version":"0.8.0"}
 curl localhost:8274/assets                       # list assets + deps
 curl localhost:8274/plan                          # execution plan JSON
 curl -XPOST localhost:8274/run                    # → {"run_id":"…"}; poll /status/<id>
 curl -XPOST localhost:8274/get/summary            # run a single target
 curl localhost:8274/status/<run_id>               # poll run status + result
+curl -XDELETE localhost:8274/run/<run_id>         # cancel an in-flight run
 ```
 
-See [docs/server-api.md](docs/server-api.md) for the full endpoint reference.
+See the [Server API reference](https://barca.sh/reference/server-api/) for the full endpoint reference.
 
 ## Python API
 
@@ -258,7 +295,7 @@ plan = barca.plan("pipeline.py")
 print(plan["total_steps"])  # 2
 ```
 
-All output formats work transparently: dicts, lists, sets, DataFrames, and arbitrary Python objects are serialized as JSON, pickle, or parquet and deserialized automatically.
+All output formats work transparently: dicts, lists, sets, DataFrames, and arbitrary Python objects are serialized as JSON, pickle, or parquet and deserialized automatically. Every asset is **fully materialized** to an artifact file at step boundaries — that persistence is the cache checkpoint. Type annotations on parameters (e.g. `pl.DataFrame`) select the parquet reader; they do not skip materialization.
 
 ### `barca plan` -- inspect without running
 
@@ -322,22 +359,12 @@ Barca's total overhead (parse + plan + spawn + persist) is **38ms**. Dagster nee
 
 ### Benchmark suite
 
-The `benchmarks/` directory contains 12 scenarios covering a range of DAG topologies and workloads:
-
-| Benchmark | Assets | Topology | What it tests |
-|-----------|--------|----------|--------------|
-| `trivial` | 1 | single node | Pure framework overhead |
-| `chain_100` | 100 | linear chain | Sequential dependency resolution |
-| `fan_out_500` | 500 | flat (independent) | Wide parallelism, process spawning |
-| `fan_out_500_50ms` | 500 | flat + 50ms sleep | Parallelism under I/O latency |
-| `deep_diamond` | 18 | diamond (5-wide, 6-deep) | Fan-out/fan-in patterns |
-| `wide_layers` | varies | parallel layers | Tier-based parallel execution |
-| `large_payloads` | varies | varied | JSON serialization overhead |
-| `map_reduce` | varies | map-reduce | Scatter-gather pattern |
-| `mixed_io_cpu` | varies | varied | Mixed I/O and CPU workloads |
-| `multi_file_discovery` | varies | multi-file | Cross-file asset discovery |
-| `iris_pipeline` | varies | diamond | ML pipeline (iris dataset) |
-| `spaceflights` | 10 | diamond (3-wide, 6-deep) | Full ML pipeline (Kedro-style) |
+The `benchmarks/` directory covers a wide range of DAG topologies and workloads —
+overhead/scaling, DAG shapes, real workloads (ETL, ML pipelines), partitioned
+runs, and dynamic dispatch/resilience — each with equivalent Dagster and Prefect
+implementations for apples-to-apples comparison. See
+[`benchmarks/README.md`](benchmarks/README.md) for the full topology tables and
+[`benchmarks/RESULTS.md`](benchmarks/RESULTS.md) for current results.
 
 Run any benchmark:
 
@@ -345,8 +372,6 @@ Run any benchmark:
 cd benchmarks/trivial
 ./bench.sh 10    # 10 measured runs
 ```
-
-Each benchmark includes equivalent Dagster and Prefect implementations for apples-to-apples comparison.
 
 ## Architecture
 
@@ -387,7 +412,7 @@ pyproject.toml              Maturin build config
 ## Development
 
 ```bash
-git clone https://github.com/recursia-io/barca.git
+git clone https://github.com/ExSidius/barca.git
 cd barca
 
 # Build
@@ -404,7 +429,7 @@ barca plan examples/basic_app/example_project/assets.py
 
 ## Project status
 
-Barca is in active development. The core pipeline (parse -> DAG -> plan -> execute -> persist) is working and benchmarked. See the [guide](./docs/guide.md) for a walkthrough.
+Barca is in active development. The core pipeline (parse -> DAG -> plan -> execute -> persist) is working and benchmarked. See the [guide](https://barca.sh/guide/) for a walkthrough.
 
 ## License
 

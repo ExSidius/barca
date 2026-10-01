@@ -1,6 +1,6 @@
 [package]
 name = "barca-core"
-version = "0.2.1"
+version = "0.8.0"
 edition = "2024"
 description = "Core library — models, parsing, DAG, execution planning, hashing, dispatch, caching"
 
@@ -13,13 +13,16 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 sha2 = "0.10"
+croner = "3.0.1"
 smallvec = { version = "1.13", features = ["serde"] }
 tempfile = "3"
 turso = { version = "0.7.0-pre.5", default-features = false }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process"] }
+tokio-util = "0.7"
 futures = "0.3"
 indicatif = "0.18.4"
 libc = "0.2"
+toml = { workspace = true }
 # Optional: TypeScript binding generation (enable with --features ts). Kept out
 # of the production binary; used only to regenerate ui/src/lib/generated/.
 ts-rs = { version = "12", optional = true }

@@ -194,7 +194,8 @@ SENSOR_VAL=$(final "$OUTPUT" | python3 -c "import json,sys; print(json.load(sys.
 # ─── Test: help works ────────────────────────────────────────────────────────
 echo "=== Help ==="
 
-$BARCA --help 2>&1 | grep -q "Invisible asset orchestrator" && pass "barca --help works" || fail "no help"
+$BARCA -h 2>&1 | grep -q "Invisible asset orchestrator" && pass "barca -h works" || fail "no short help"
+$BARCA --help 2>&1 | grep -q "fully materialized" && pass "barca --help works" || fail "no help"
 $BARCA get --help 2>&1 | grep -q "cache-aware" && pass "barca get --help works" || fail "no get help"
 
 # ─── Summary ─────────────────────────────────────────────────────────────────

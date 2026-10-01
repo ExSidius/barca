@@ -3,4 +3,4 @@
 /**
  * Lifecycle of an async run tracked by the server.
  */
-export type RunStatus = "pending" | "running" | "complete" | "failed";
+export type RunStatus = "pending" | "running" | "complete" | "failed" | "cancelled";

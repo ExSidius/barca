@@ -4,19 +4,35 @@ Supports three formats:
   - json:    dicts, lists, primitives (stdlib json)
   - pickle:  arbitrary Python objects (stdlib pickle, protocol 5)
   - parquet: pandas/polars DataFrames (requires pyarrow)
+
+Destinations may be local paths or remote URIs (abfss://, s3://, gs://, ...
+— see barca._storage). Every write is staged through a local temp file and
+then finalized with an atomic os.replace (local) or a chunked upload
+(remote), so serialized payloads are never buffered fully in memory and a
+crash mid-write never leaves a partial artifact at the destination.
 """
 
 import json
+import os
 import pickle
 import re
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from barca import _storage
 
 _FORMAT_EXTENSIONS = {
     "json": ".json",
     "pickle": ".pkl",
     "parquet": ".parquet",
 }
+
+# Staging area for remote uploads/downloads. Deliberately on project disk
+# rather than the system tempdir: /tmp is commonly tmpfs on Linux, which
+# would put multi-hundred-MB payloads back in RAM.
+_STAGING_DIR = ".barca/staging"
 
 
 def detect_format(value: Any, explicit: str | None = None) -> str:
@@ -47,6 +63,28 @@ def detect_format(value: Any, explicit: str | None = None) -> str:
     return "pickle"
 
 
+def resolve_format(value: Any, fmt: str) -> str:
+    """Downgrade parquet to pickle when the value has no parquet writer.
+
+    Must be called before computing the artifact path so the extension,
+    the receipt, and the bytes on disk all agree.
+    """
+    if fmt != "parquet":
+        return fmt
+    module = type(value).__module__ or ""
+    if module.startswith("polars") or hasattr(value, "to_parquet"):
+        return fmt
+
+    import sys
+
+    print(
+        f"[barca] Warning: parquet format requested but value is "
+        f"{type(value).__name__}, falling back to pickle",
+        file=sys.stderr,
+    )
+    return "pickle"
+
+
 def _is_json_serializable(value: Any) -> bool:
     """Check if a value can be losslessly serialized as JSON."""
     try:
@@ -56,28 +94,82 @@ def _is_json_serializable(value: Any) -> bool:
         return False
 
 
-def serialize(value: Any, path: Path | str, fmt: str) -> int:
-    """Write value to path in the given format. Returns size in bytes."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    if fmt == "json":
-        data = json.dumps(value).encode()
-        path.write_bytes(data)
-        return len(data)
-
-    if fmt == "pickle":
-        with open(path, "wb") as f:
-            pickle.dump(value, f, protocol=5)
-        return path.stat().st_size
-
-    if fmt == "parquet":
-        return _serialize_parquet(value, path)
-
-    raise ValueError(f"Unknown format: {fmt}")
+def _staging_dir() -> Path:
+    d = Path(_STAGING_DIR)
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-def _serialize_parquet(value: Any, path: Path) -> int:
+def clean_staging() -> None:
+    """Best-effort removal of stale temp files left by crashed workers."""
+    d = Path(_STAGING_DIR)
+    if not d.is_dir():
+        return
+    for tmp in d.glob("*.tmp"):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def _make_temp(directory: Path, prefix: str = "stage-") -> Path:
+    fd, name = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+    os.close(fd)
+    return Path(name)
+
+
+@contextmanager
+def _staged_write(dest: "Path | str"):
+    """Yield a local temp path to write into; finalize to dest on success.
+
+    Local dest: temp file in the destination directory (guarantees same
+    filesystem), atomic os.replace on success. Remote dest: temp file in
+    .barca/staging/, chunked upload on success. Either way the temp file is
+    removed on failure and the destination is never left partially written.
+    """
+    if _storage.is_remote(dest):
+        tmp = _make_temp(_staging_dir())
+        try:
+            yield tmp
+            _storage.put_file(tmp, str(dest))
+        finally:
+            tmp.unlink(missing_ok=True)
+    else:
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _make_temp(dest.parent, prefix=f".{dest.name}.")
+        try:
+            yield tmp
+            os.replace(tmp, dest)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+
+
+def serialize(value: Any, path: "Path | str", fmt: str) -> int:
+    """Write value to path (local or remote URI) in the given format.
+
+    Returns size in bytes. The caller is responsible for having resolved
+    the format first (see resolve_format) so path and fmt agree.
+    """
+    if fmt not in ("json", "pickle", "parquet"):
+        raise ValueError(f"Unknown format: {fmt}")
+
+    size = 0
+    with _staged_write(path) as tmp:
+        if fmt == "json":
+            with open(tmp, "w") as f:
+                json.dump(value, f)
+        elif fmt == "pickle":
+            with open(tmp, "wb") as f:
+                pickle.dump(value, f, protocol=5)
+        else:
+            _write_parquet(value, tmp)
+        size = tmp.stat().st_size
+    return size
+
+
+def _write_parquet(value: Any, path: Path) -> None:
     """Write a DataFrame to parquet. Handles pandas, polars, and polars LazyFrame."""
     type_name = type(value).__name__
     module = type(value).__module__ or ""
@@ -86,32 +178,35 @@ def _serialize_parquet(value: Any, path: Path) -> int:
         if type_name == "LazyFrame":
             value = value.collect()
         value.write_parquet(str(path))
-        return path.stat().st_size
+        return
 
-    if module.startswith("pandas"):
-        value.to_parquet(str(path))
-        return path.stat().st_size
-
-    # Fallback: try pandas-style API, then pickle with warning.
     if hasattr(value, "to_parquet"):
         value.to_parquet(str(path))
-        return path.stat().st_size
+        return
 
-    import sys
-
-    print(
-        f"[barca] Warning: parquet format requested but value is {type_name}, falling back to pickle",
-        file=sys.stderr,
+    raise TypeError(
+        f"parquet format requires a DataFrame, got {type_name} "
+        "(use resolve_format() to downgrade to pickle first)"
     )
-    with open(path.with_suffix(".pkl"), "wb") as f:
-        pickle.dump(value, f, protocol=5)
-    return path.with_suffix(".pkl").stat().st_size
 
 
-def deserialize(path: Path | str, fmt: str) -> Any:
-    """Read an artifact from path using the given format."""
-    path = Path(path)
+def deserialize(path: "Path | str", fmt: str, *, frame_type: str | None = None) -> Any:
+    """Read an artifact from a local path or remote URI using the given format.
 
+    ``frame_type`` selects the parquet reader when ``fmt == "parquet"``.
+    Supported values: ``pandas`` (default), ``polars``, ``pyarrow``, ``duckdb``.
+    """
+    if _storage.is_remote(path):
+        tmp = _make_temp(_staging_dir(), prefix="fetch-")
+        try:
+            _storage.get_file(str(path), tmp)
+            return _deserialize_local(tmp, fmt, frame_type=frame_type)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return _deserialize_local(Path(path), fmt, frame_type=frame_type)
+
+
+def _deserialize_local(path: Path, fmt: str, *, frame_type: str | None = None) -> Any:
     if fmt == "json":
         with open(path) as f:
             return json.load(f)
@@ -121,29 +216,35 @@ def deserialize(path: Path | str, fmt: str) -> Any:
             return pickle.load(f)
 
     if fmt == "parquet":
-        return _deserialize_parquet(path)
+        return _deserialize_parquet(path, frame_type=frame_type or "pandas")
 
     raise ValueError(f"Unknown format: {fmt}")
 
 
-def _deserialize_parquet(path: Path) -> Any:
-    """Read a parquet file. Prefers pandas if available, then polars."""
-    try:
-        import pandas as pd
-
-        return pd.read_parquet(str(path))
-    except ImportError:
-        pass
-
-    try:
+def _deserialize_parquet(path: Path, *, frame_type: str = "pandas") -> Any:
+    """Read a parquet file with the loader matching the declared frame type."""
+    if frame_type == "polars":
         import polars as pl
 
         return pl.read_parquet(str(path))
-    except ImportError:
-        pass
 
-    raise ImportError(
-        "Reading parquet requires pandas or polars. Install one: pip install pandas pyarrow"
+    if frame_type == "pyarrow":
+        import pyarrow.parquet as pq
+
+        return pq.read_table(str(path))
+
+    if frame_type == "duckdb":
+        import duckdb  # ty: ignore[unresolved-import]
+
+        return duckdb.read_parquet(str(path))
+
+    if frame_type == "pandas":
+        import pandas as pd
+
+        return pd.read_parquet(str(path))
+
+    raise ValueError(
+        f"Unknown frame type {frame_type!r} (supported: pandas, polars, pyarrow, duckdb)"
     )
 
 
@@ -163,7 +264,21 @@ def safe_node_id(node_id: str) -> str:
     return s
 
 
-def artifact_path(artifact_dir: Path | str, node_id: str, fmt: str) -> Path:
-    """Compute the deterministic artifact path for a node + format."""
+def artifact_path(
+    artifact_dir: "Path | str", node_id: str, fmt: str, run_hash: "str | None" = None
+) -> "Path | str":
+    """Compute the deterministic artifact path for a node + format.
+
+    With a run_hash the artifact is content-addressed —
+    ``{dir}/{safe_node_id}/{run_hash}{ext}`` — so objects are immutable and
+    cache hits transfer across machines. Without one (older coordinators,
+    parallel() children, batch mode) the legacy node-id-keyed layout is used.
+
+    Returns a Path for a local artifact_dir, or a URI string when
+    artifact_dir is a remote prefix (e.g. BARCA_ARTIFACT_URI).
+    """
     ext = _FORMAT_EXTENSIONS.get(fmt, f".{fmt}")
-    return Path(artifact_dir) / f"{safe_node_id(node_id)}{ext}"
+    if run_hash:
+        subdir = _storage.join(artifact_dir, safe_node_id(node_id))
+        return _storage.join(subdir, f"{run_hash}{ext}")
+    return _storage.join(artifact_dir, f"{safe_node_id(node_id)}{ext}")

@@ -50,8 +50,8 @@ pyproject.toml          ← Maturin build config (binary + Python stubs in one w
 
 ### Dependencies
 
-- **Rust**: ruff_python_parser (AST), petgraph (DAG), turso (DB), serde/serde_json, sha2
-- **Python**: no runtime dependencies (stdlib only; pyarrow optional for parquet)
+- **Rust**: ruff_python_parser (AST), petgraph (DAG), turso (DB), serde/serde_json, sha2, toml (barca.toml config)
+- **Python**: no runtime dependencies (stdlib only; pyarrow optional for parquet; fsspec + adlfs/s3fs/gcsfs optional for remote artifact storage via the `azure`/`s3`/`gcs`/`remote` extras)
 - **Build**: maturin (packages Rust binary + Python stubs into one wheel)
 
 ## Commands
@@ -81,13 +81,19 @@ benchmarks/chain_100/bench.sh 5   # (coming soon)
 4. **Single install** — `uv add barca` gives users everything
 5. **Turso for persistence** — Rust owns the DB; Python has no DB access
 6. **Artifact-based data passing** — serialized files (json/pickle/parquet) between worker batches
+7. **Content-addressed artifacts** — `{artifacts}/{node}/{run_hash}{ext}`; shared remote state pulls/pushes the metadata DB as a blob (see site/src/content/docs/reference/config.mdx and site/src/content/docs/reference/remote-storage.md, published at https://barca.sh/reference/config/ and https://barca.sh/reference/remote-storage/)
 
 ## Git workflow
 
+Trunk-based: `main` is the integration branch — always green, but not necessarily
+released. Merging to main never publishes anything; only pushing a `v*` tag does.
+
 - **Always use worktrees** for local development work
-- **Release branches**: `v<major>.<minor>.<patch>` off main — no descriptive suffix
-- **Topic branches**: one per issue, branched off main, PRed into the release branch
-- **Release**: the version branch is PRed to main when ready; tagging triggers the release workflow
+- **Topic branches**: one per issue, branched off main, PRed straight into main
+- **Release**: when ready to ship, cut a short-lived release branch
+  `v<major>.<minor>.<patch>` off main (no descriptive suffix) containing only the
+  version bump; PR it into main, then tag the merge commit — the tag triggers the
+  release workflow (wheels, GitHub Release, PyPI)
 
 ## Commit messages
 

@@ -1,6 +1,11 @@
 import hashlib
+import os
 import random
 from dagster import asset, AssetIn, Definitions, define_asset_job, multiprocess_executor
+
+# Matches barca's pool_size and prefect's max_workers for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 
 @asset
@@ -434,6 +439,6 @@ ALL_ASSETS = [
 job = define_asset_job(
     "partitioned_etl_job",
     selection="*",
-    executor_def=multiprocess_executor.configured({"max_concurrent": 16}),
+    executor_def=multiprocess_executor.configured({"max_concurrent": BENCH_WORKERS}),
 )
 defs = Definitions(assets=ALL_ASSETS, jobs=[job])

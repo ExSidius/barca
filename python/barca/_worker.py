@@ -14,12 +14,30 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from barca._artifacts import artifact_path, deserialize, detect_format, serialize
+from barca import _storage
+from barca._artifacts import (
+    artifact_path,
+    clean_staging,
+    deserialize,
+    detect_format,
+    resolve_format,
+    safe_node_id,
+    serialize,
+)
+
+_EXT_FORMATS = {
+    ".json": "json",
+    ".pkl": "pickle",
+    ".pickle": "pickle",
+    ".parquet": "parquet",
+}
 
 
 class _LineEmitter(io.TextIOBase):
@@ -61,6 +79,100 @@ class _LineEmitter(io.TextIOBase):
             self._buf = ""
 
 
+def _peak_rss_bytes() -> int:
+    """Peak RSS of this process in bytes (0 if unavailable).
+
+    `ru_maxrss` is kilobytes on Linux and bytes on macOS.
+    """
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if sys.platform == "darwin":
+            return int(peak)
+        return int(peak) * 1024
+    except Exception:
+        return 0
+
+
+# Local artifacts above this size skip the tier-1 cache: the deepcopy that
+# guards against mutation would cost more than the disk read it saves.
+# Remote artifacts always cache — skipping a network fetch beats any copy.
+_LRU_MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+
+
+def _lru_cacheable(path: str, size_bytes=None) -> bool:
+    # Remote first: skipping a network fetch beats any copy, whatever the size.
+    if _storage.is_remote(path):
+        return True
+    if size_bytes is not None:
+        return size_bytes <= _LRU_MAX_ARTIFACT_BYTES
+    try:
+        return os.path.getsize(path) <= _LRU_MAX_ARTIFACT_BYTES
+    except OSError:
+        return False
+
+
+class _ArtifactLRU:
+    """Tier-1 read-through cache: deserialized artifacts hot in this process.
+
+    Keyed by (path, frame_type) — paths are content-addressed
+    ({node}/{run_hash}{ext}), so a path uniquely identifies content and
+    invalidation is automatic (changed input → changed hash → new path → miss).
+    Frame type is part of the key so a polars consumer never hits a cached pandas
+    materialization of the same path.
+    Values are returned as deep copies so a task mutating its input can never
+    poison a later task's view; if a value can't be deep-copied, the entry is
+    dropped and the caller falls through to the store (tier 2). Pure
+    luck-optimization: always safe to miss, never persisted, never gates
+    correctness.
+    """
+
+    def __init__(self, max_entries: int = 16):
+        from collections import OrderedDict
+
+        self._entries: "OrderedDict[tuple[str, str], object]" = OrderedDict()
+        self._max = max_entries
+
+    @staticmethod
+    def _key(path: str, frame_type: str | None) -> tuple[str, str]:
+        return (path, frame_type or "pandas")
+
+    def get(self, path: str, frame_type: str | None = None):
+        """Return a safe copy of the cached value, or None on miss."""
+        key = self._key(path, frame_type)
+        if key not in self._entries:
+            return None
+        import copy
+
+        self._entries.move_to_end(key)
+        try:
+            return copy.deepcopy(self._entries[key])
+        except Exception:
+            del self._entries[key]
+            return None
+
+    def put(self, path: str, value, frame_type: str | None = None) -> None:
+        import copy
+
+        key = self._key(path, frame_type)
+        try:
+            self._entries[key] = copy.deepcopy(value)
+        except Exception:
+            return
+        self._entries.move_to_end(key)
+        while len(self._entries) > self._max:
+            self._entries.popitem(last=False)
+
+
+def _default_artifact_dir() -> str:
+    """Artifact store root: BARCA_ARTIFACT_URI if set, else local .barca/artifacts."""
+    uri = os.environ.get("BARCA_ARTIFACT_URI")
+    if uri:
+        return uri
+    return str(Path(".barca/artifacts").resolve())
+
+
 _PROTOCOL_VERSION = 2
 _use_socket = False
 
@@ -88,6 +200,25 @@ def _emit(msg_type, **fields):
     print(f"BARCA:{_PROTOCOL_VERSION}:{payload}", file=sys.stderr, flush=True)
 
 
+def _user_traceback(exc) -> str:
+    """Format the traceback with barca-internal frames stripped.
+
+    Keeps only frames from user code so surfaced errors point at the user's
+    file/line, never at _worker.py plumbing. Returns "" when every frame is
+    internal (e.g. a TypeError raised by the fn(**kwargs) call itself) — the
+    caller always leads with "ErrorType: message", which carries the detail.
+    """
+    barca_dir = str(Path(__file__).resolve().parent)
+    frames = [
+        f
+        for f in traceback.extract_tb(exc.__traceback__)
+        if not str(Path(f.filename).resolve()).startswith(barca_dir)
+    ]
+    if not frames:
+        return ""
+    return "".join(traceback.format_list(frames)).rstrip("\n")
+
+
 def _emit_error(node_id, exc, elapsed=0.0):
     """Emit a structured failure for a single step. Rust owns the retry decision."""
     _emit(
@@ -95,7 +226,7 @@ def _emit_error(node_id, exc, elapsed=0.0):
         node_id=node_id,
         error_type=type(exc).__name__,
         message=str(exc),
-        traceback=traceback.format_exc(),
+        traceback=_user_traceback(exc),
         elapsed=elapsed,
     )
 
@@ -145,17 +276,87 @@ def _run_with_timeout(fn, kwargs, timeout_seconds):
     return result
 
 
-def _resolve_input(raw_value):
+def _resolve_input(raw_value, *, frame_type=None):
     """Resolve a provided input: artifact ref → deserialized value, else raw.
 
     For collected (fan-in) inputs, deserializes each partition artifact into a list.
     """
     if isinstance(raw_value, dict):
         if raw_value.get("_collected") and "artifacts" in raw_value:
-            return [deserialize(a["path"], a["format"]) for a in raw_value["artifacts"]]
+            return _load_collected_artifacts(raw_value["artifacts"], frame_type=frame_type)
         if "path" in raw_value and "format" in raw_value:
-            return deserialize(raw_value["path"], raw_value["format"])
+            return deserialize(raw_value["path"], raw_value["format"], frame_type=frame_type)
     return raw_value
+
+
+def _load_artifact(path, lru, fmt=None, *, frame_type=None):
+    """Resolve one artifact path to its deserialized value via the tier-1 LRU
+    cache, falling through to the artifact store on miss."""
+    hot = lru.get(path, frame_type)
+    if hot is not None:
+        return hot
+    if not _storage.exists(path):
+        raise FileNotFoundError(f"Input artifact not found: {path}")
+    if fmt is None:
+        fmt = _EXT_FORMATS.get(_storage.suffix(path), "json")
+    value = deserialize(path, fmt, frame_type=frame_type)
+    if _lru_cacheable(path):
+        lru.put(path, value, frame_type)
+    return value
+
+
+# Fan-in (collect()) reads are I/O-bound (local disk or a remote fsspec
+# fetch-to-temp-file), so worker threads spend most of their time blocked
+# with the GIL released — a thread pool collapses wall time toward the
+# slowest single artifact instead of their sum. Capped rather than one
+# thread per artifact so a 10k-partition collect() doesn't open 10k files
+# at once.
+_COLLECT_IO_MAX_WORKERS = 8
+
+
+def _load_collected_artifacts(artifacts, lru=None, *, param=None, frame_type=None):
+    """Load every artifact of a collect() fan-in param, in order.
+
+    Tier-1 LRU lookups happen up front on the calling thread (cheap,
+    in-memory — `_ArtifactLRU` isn't safe for concurrent mutation from
+    worker threads). Only genuine cache misses — the actual blocking I/O —
+    are dispatched to the thread pool; results are written back to the LRU
+    on the calling thread as they arrive.
+
+    `param` (the destination parameter name, when known) is folded into a
+    missing-artifact error at the point it's raised, matching
+    `_load_artifact`'s message shape — the caller doesn't need to catch and
+    rewrap.
+    """
+    results = [None] * len(artifacts)
+    to_fetch = []
+    for i, artifact in enumerate(artifacts):
+        hot = lru.get(artifact["path"], frame_type) if lru is not None else None
+        if hot is not None:
+            results[i] = hot
+        else:
+            to_fetch.append((i, artifact))
+
+    if not to_fetch:
+        return results
+
+    def _fetch(item):
+        _, artifact = item
+        path = artifact["path"]
+        if not _storage.exists(path):
+            if param is not None:
+                raise FileNotFoundError(f"Input artifact for parameter '{param}' not found: {path}")
+            raise FileNotFoundError(f"Input artifact not found: {path}")
+        fmt = artifact.get("format") or _EXT_FORMATS.get(_storage.suffix(path), "json")
+        return deserialize(path, fmt, frame_type=frame_type)
+
+    with ThreadPoolExecutor(max_workers=min(len(to_fetch), _COLLECT_IO_MAX_WORKERS)) as ex:
+        for (i, artifact), value in zip(to_fetch, ex.map(_fetch, to_fetch)):
+            results[i] = value
+            if lru is not None and _lru_cacheable(artifact["path"]):
+                lru.put(artifact["path"], value, frame_type)
+
+    return results
 
 
 def _execute(fn, kwargs, step):
@@ -174,18 +375,92 @@ def _execute(fn, kwargs, step):
     return result, elapsed
 
 
-def _materialize(result, node_id, art_dir, step, elapsed):
-    """Serialize a result to its artifact and emit a `result` protocol message."""
+def _sink_dest(path: str, node_id: str, base_node_id: str) -> str:
+    """Sink destination path, with a partition suffix injected before the
+    extension for partitioned assets so partitions don't clobber each other
+    (e.g. out.parquet → out_ticker_AAPL.parquet)."""
+    if node_id == base_node_id or not node_id.startswith(base_node_id):
+        return path
+    part = safe_node_id(node_id[len(base_node_id) :])
+    ext = _storage.suffix(path)
+    if ext:
+        return path[: -len(ext)] + part + ext
+    return path + part
+
+
+def _write_sinks(result, step, node_id, primary_fmt):
+    """Write each @sink declared on the step. Error-isolated: a sink failure
+    never fails the parent asset — it is logged and reported in the outcome."""
+    outcomes = []
+    base_id = step.get("node_id", node_id)
+    for sink in step.get("sinks") or []:
+        dest = sink.get("path", "")
+        try:
+            fmt = sink.get("serializer") or _EXT_FORMATS.get(_storage.suffix(dest)) or primary_fmt
+            if fmt not in ("json", "pickle", "parquet"):
+                raise ValueError(
+                    f"sink serializer '{fmt}' is not supported yet "
+                    "(supported: json, pickle, parquet)"
+                )
+            fmt = resolve_format(result, fmt)
+            dest = _sink_dest(dest, node_id, base_id)
+            size = serialize(result, dest, fmt)
+            outcomes.append({"path": str(dest), "status": "ok", "size_bytes": size})
+        except Exception as exc:
+            print(
+                f"[barca] SINK FAILED: {node_id} -> {dest}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            outcomes.append(
+                {
+                    "path": str(dest),
+                    "status": "error",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return outcomes
+
+
+def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=False, timing=None):
+    """Serialize a result to its artifact and emit a `result` protocol message.
+
+    `timing` (cpu_seconds, max_rss_bytes) rides on the artifact dict — the
+    completion message does triple duty: closes the lease, carries the output
+    ref, and feeds the coordinator's cost estimator. `elapsed`/`timing` as
+    passed in cover only the step function's own execution; this adds the
+    serialization time measured here on top, so a step's true cost — what the
+    cost model, `barca stats`, and `barca history` all see — isn't
+    systematically undercounted for large payloads (serialization can be the
+    majority of a step's real wall time and was previously invisible).
+    """
     explicit_fmt = step.get("serializer")
-    fmt = detect_format(result, explicit=explicit_fmt)
-    path = artifact_path(art_dir, node_id, fmt)
+    fmt = resolve_format(result, detect_format(result, explicit=explicit_fmt))
+    # Content-addressed layout when the coordinator supplies a run hash.
+    # Batch mode's legacy partitioned loop reuses the step-level hash only for
+    # unpartitioned steps (a per-step hash is wrong per-partition; the daemon
+    # path gets a per-item hash from Rust and batch mode is test-only).
+    run_hash = step.get("run_hash") if node_id == step.get("node_id") else None
+    path = artifact_path(art_dir, node_id, fmt, run_hash)
+    _ser_wall0 = time.perf_counter()
+    _ser_cpu0 = time.process_time()
     size = serialize(result, path, fmt)
-    _emit(
-        "result",
-        node_id=node_id,
-        artifact={"path": str(path), "format": fmt, "size_bytes": size},
-        elapsed=elapsed,
-    )
+    elapsed += time.perf_counter() - _ser_wall0
+    if timing and timing.get("cpu_seconds") is not None:
+        timing = {
+            **timing,
+            "cpu_seconds": timing["cpu_seconds"] + (time.process_time() - _ser_cpu0),
+        }
+    artifact = {"path": str(path), "format": fmt, "size_bytes": size}
+    if elapsed_in_artifact:
+        artifact["elapsed_seconds"] = elapsed
+    if timing:
+        artifact.update(timing)
+    sink_outcomes = _write_sinks(result, step, node_id, fmt)
+    if sink_outcomes:
+        artifact["sinks"] = sink_outcomes
+    _emit("result", node_id=node_id, artifact=artifact, elapsed=elapsed)
+    return artifact
 
 
 def run_batch(batch):
@@ -196,10 +471,11 @@ def run_batch(batch):
     # independent chains bundled in the same batch finish even when one fails.
     unavailable = set()
 
-    # Artifact directory for writing outputs.
-    art_dir = batch.get("artifact_dir")
-    if art_dir:
+    # Artifact directory for writing outputs (local path or remote URI).
+    art_dir = batch.get("artifact_dir") or os.environ.get("BARCA_ARTIFACT_URI")
+    if art_dir and not _storage.is_remote(art_dir):
         Path(art_dir).mkdir(parents=True, exist_ok=True)
+    clean_staging()
 
     # Pre-load provided inputs (cross-phase values injected by Rust).
     # Values may be artifact references — resolve them lazily when accessed.
@@ -340,6 +616,130 @@ def run_batch(batch):
             _materialize(result, node_id, art_dir, step, elapsed)
 
 
+def _run_daemon_step(step, modules, art_dir, lru):
+    """Execute one step in daemon mode and emit its result or error.
+
+    Returns True on success, False on step failure. Socket errors raised while
+    emitting propagate to the caller (the connection is gone — exit the loop).
+    Per-task self-timing: CPU time (`process_time`, the truest measure of
+    work), wall time, and peak RSS ride back on the completion message.
+    """
+    from barca import _runtime
+
+    node_id = step.get("node_id", "unknown")
+    t0 = time.perf_counter()
+    c0 = time.process_time()
+
+    try:
+        source = str(Path(step["source_file"]).resolve())
+        if source not in modules:
+            modules[source] = load_module(source)
+        fn = getattr(modules[source], step["function_name"])
+
+        # Direct args/kwargs from parallel() dispatch.
+        d_args = step.get("direct_args", [])
+        d_kwargs = step.get("direct_kwargs", {})
+
+        # Resolve dag_inputs as function arguments.
+        inputs = step.get("inputs", {})
+        param_types = step.get("param_types") or {}
+        kwargs = dict(d_kwargs) if d_kwargs else {}
+        for param, value in inputs.items():
+            frame_type = param_types.get(param)
+            # Skip ordering-only deps (underscore-prefixed params carry no data).
+            if param.startswith("_"):
+                kwargs[param] = None
+                continue
+            # Fan-in (collect()): every partition artifact of the upstream,
+            # deserialized into a list — matches batch mode's _resolve_input.
+            # Cache misses load concurrently (see _load_collected_artifacts).
+            if isinstance(value, dict) and value.get("_collected"):
+                kwargs[param] = _load_collected_artifacts(
+                    value.get("artifacts", []),
+                    lru,
+                    param=param,
+                    frame_type=frame_type,
+                )
+                continue
+            if not value:
+                continue
+            try:
+                kwargs[param] = _load_artifact(value, lru, frame_type=frame_type)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"Input artifact for parameter '{param}' not found: {value}"
+                ) from None
+
+        timeout = step.get("timeout_seconds", 0)
+        # Capture user stdout and stream it live, line by line.
+        emitter = _LineEmitter(node_id)
+        with contextlib.redirect_stdout(emitter):
+            try:
+                if d_args:
+                    if timeout and timeout > 0:
+                        result = _run_with_timeout(lambda: fn(*d_args, **kwargs), {}, timeout)
+                    else:
+                        result = fn(*d_args, **kwargs)
+                else:
+                    if timeout and timeout > 0:
+                        result = _run_with_timeout(lambda: fn(**kwargs), {}, timeout)
+                    else:
+                        result = fn(**kwargs)
+            finally:
+                # Emit any trailing partial line, even if the step raised.
+                emitter.flush()
+
+        wall = time.perf_counter() - t0
+        cpu = time.process_time() - c0
+
+        # Sensors return (updated: bool, data) tuples — unpack for downstream.
+        if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
+            _updated, result = result
+
+        # Convert ParallelError instances so results are JSON-serializable.
+        from barca import ParallelError
+
+        def _make_serializable(v):
+            if isinstance(v, ParallelError):
+                return v.to_dict()
+            if isinstance(v, list):
+                return [_make_serializable(x) for x in v]
+            return v
+
+        result = _make_serializable(result)
+
+        # Serialize result to artifact (and write any declared sinks).
+        artifact = _materialize(
+            result,
+            node_id,
+            art_dir,
+            step,
+            wall,
+            elapsed_in_artifact=True,
+            timing={"cpu_seconds": cpu, "max_rss_bytes": _peak_rss_bytes()},
+        )
+        # A downstream step in this worker may consume what we just produced.
+        if _lru_cacheable(artifact["path"], artifact.get("size_bytes")):
+            lru.put(artifact["path"], result)
+        return True
+
+    except BaseException as exc:
+        # Any failure inside the step — including TimeoutError and OSError
+        # from user code — is a step error. (TimeoutError and the socket
+        # errors are OSError subclasses, so a socket-error catch here would
+        # swallow them; genuine socket death surfaces when the emit below
+        # fails, and that propagates to the caller.)
+        wall = time.perf_counter() - t0
+        _runtime.emit_step_error(
+            node_id=node_id,
+            error_type=type(exc).__name__,
+            message=str(exc),
+            traceback=_user_traceback(exc),
+            elapsed=wall,
+        )
+        return False
+
+
 def run_daemon():
     """Daemon mode: read execute commands from socket, run each step, send results."""
     global _use_socket
@@ -351,18 +751,31 @@ def run_daemon():
         sys.exit(1)
     _use_socket = True
 
-    # Install SIGTERM handler so graceful_kill triggers a clean exit
-    # (flushes stdio, runs atexit) instead of the default immediate termination.
+    # Install SIGTERM handler so graceful_kill flushes buffered progress output
+    # before the process goes away. Exit via os._exit, not sys.exit(0): a
+    # SystemExit raised from the handler while the interpreter is already
+    # shutting down is uncatchable, and Python prints it as a noisy
+    # "Exception ignored in: _on_sigterm ... SystemExit: 0" on stderr — which
+    # then leaks into surfaced worker errors (reliably on Linux). os._exit
+    # cannot raise, so that noise is impossible.
     import signal
 
     def _on_sigterm(_signum, _frame):
-        sys.exit(0)
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
     modules = {}
-    art_dir = str(Path(".barca/artifacts").resolve())
-    Path(art_dir).mkdir(parents=True, exist_ok=True)
+    lru = _ArtifactLRU()
+    art_dir = _default_artifact_dir()
+    if not _storage.is_remote(art_dir):
+        Path(art_dir).mkdir(parents=True, exist_ok=True)
+    clean_staging()
 
     while True:
         try:
@@ -375,104 +788,24 @@ def run_daemon():
         if msg.get("type") == "done":
             break
 
-        if msg.get("type") != "execute":
+        # Batch pull: K steps per round-trip. The lease closes per-step as
+        # each result message goes back; a failure stops the batch (the
+        # coordinator kills this worker for a fresh interpreter and re-queues
+        # the unstarted remainder).
+        if msg.get("type") == "execute_batch":
+            steps = msg.get("steps", [])
+        elif msg.get("type") == "execute":
+            steps = [msg.get("step", {})]
+        else:
             continue
 
-        step = msg.get("step", {})
-        node_id = step.get("node_id", "unknown")
-        t0 = time.time()
-
         try:
-            source = str(Path(step["source_file"]).resolve())
-            if source not in modules:
-                modules[source] = load_module(source)
-            fn = getattr(modules[source], step["function_name"])
-
-            # Direct args/kwargs from parallel() dispatch.
-            d_args = step.get("direct_args", [])
-            d_kwargs = step.get("direct_kwargs", {})
-
-            # Resolve dag_inputs as function arguments.
-            inputs = step.get("inputs", {})
-            kwargs = dict(d_kwargs) if d_kwargs else {}
-            for param, artifact_path_str in inputs.items():
-                # Skip ordering-only deps (underscore-prefixed params carry no data).
-                if param.startswith("_"):
-                    kwargs[param] = None
-                    continue
-                if artifact_path_str and Path(artifact_path_str).exists():
-                    # Infer format from file extension
-                    ext = Path(artifact_path_str).suffix.lstrip(".")
-                    fmt = {"json": "json", "pkl": "pickle", "parquet": "parquet"}.get(ext, "json")
-                    kwargs[param] = deserialize(artifact_path_str, fmt)
-
-            timeout = step.get("timeout_seconds", 0)
-            # Capture user stdout and stream it live, line by line.
-            emitter = _LineEmitter(node_id)
-            with contextlib.redirect_stdout(emitter):
-                if d_args:
-                    if timeout and timeout > 0:
-                        result = _run_with_timeout(lambda: fn(*d_args, **kwargs), {}, timeout)
-                    else:
-                        result = fn(*d_args, **kwargs)
-                else:
-                    if timeout and timeout > 0:
-                        result = _run_with_timeout(lambda: fn(**kwargs), {}, timeout)
-                    else:
-                        result = fn(**kwargs)
-                emitter.flush()
-
-            elapsed = time.time() - t0
-
-            # Sensors return (updated: bool, data) tuples — unpack for downstream.
-            if step.get("kind") == "sensor" and isinstance(result, tuple) and len(result) == 2:
-                _updated, result = result
-
-            # Convert ParallelError instances so results are JSON-serializable.
-            from barca import ParallelError
-
-            def _make_serializable(v):
-                if isinstance(v, ParallelError):
-                    return v.to_dict()
-                if isinstance(v, list):
-                    return [_make_serializable(x) for x in v]
-                return v
-
-            result = _make_serializable(result)
-
-            # Serialize result to artifact.
-            serializer = step.get("serializer")
-            fmt = serializer if serializer else detect_format(result)
-            out_path = artifact_path(art_dir, node_id, fmt)
-            serialize(result, out_path, fmt)
-            size = Path(out_path).stat().st_size
-
-            _runtime.emit_step_completed(
-                node_id,
-                {
-                    "path": str(out_path),
-                    "format": fmt,
-                    "size_bytes": size,
-                    "elapsed_seconds": elapsed,
-                },
-            )
-
+            for step in steps:
+                if not _run_daemon_step(step, modules, art_dir, lru):
+                    break
         except (BrokenPipeError, ConnectionResetError, OSError):
             # Socket was closed (e.g. replacement worker killed) — exit cleanly.
             break
-        except BaseException as exc:
-            elapsed = time.time() - t0
-            tb = traceback.format_exc()
-            try:
-                _runtime.emit_step_error(
-                    node_id=node_id,
-                    error_type=type(exc).__name__,
-                    message=str(exc),
-                    traceback=tb,
-                    elapsed=elapsed,
-                )
-            except (BrokenPipeError, ConnectionResetError, OSError):
-                break
 
     _runtime.disconnect()
 

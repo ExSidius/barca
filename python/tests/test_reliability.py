@@ -132,7 +132,68 @@ class TestTimeout:
 
 
 class TestFanInCache:
-    @pytest.mark.xfail(reason="collect() fan-in not fully working in get path yet")
+    def test_collect_fan_in_delivers_full_partition_list(self, tmp_path):
+        """Regression test for #97/#93: a collect()-consuming asset must run
+        only after *every* partition of its upstream has materialized, and
+        must receive the full list — not crash with a missing-argument
+        TypeError, and not silently see just one partition's value."""
+        f = write_module(
+            tmp_path,
+            "fanin.py",
+            """
+            from barca import asset, partitions, collect
+
+            @asset(partitions={"key": partitions(["a", "b", "c"])})
+            def source(key):
+                return {"key": key, "v": 1}
+
+            @asset(inputs={"data": collect(source)})
+            def sink(data):
+                return {"count": len(data), "keys": sorted(d["key"] for d in data)}
+        """,
+        )
+        result = barca.get("sink", f)
+        assert result == {"count": 3, "keys": ["a", "b", "c"]}
+
+    def test_collect_fan_in_with_dynamic_partitions_from(self, tmp_path):
+        """Regression test for a second manifestation of #97 found while
+        fixing it: a collect()-consuming asset downstream of a
+        `partitions_from(...)`-partitioned producer (partition universe
+        resolved at dispatch time, not plan time) was getting silently folded
+        into the still-pending producer's phase by the planner's single-stream
+        phase merge, landing in the same "runs before its data exists" bug as
+        the static-partitions case — just via phase merging instead of chain
+        fusion. This is the exact shape documented in
+        workflows/03-parametrized-assets-and-partitions.md's collect() example."""
+        f = write_module(
+            tmp_path,
+            "fanin_dynamic.py",
+            """
+            from barca import asset, partitions_from, collect
+
+            @asset()
+            def tickers():
+                return ["AAPL", "MSFT", "GOOG"]
+
+            @asset(partitions={"ticker": partitions_from(tickers)})
+            def fetch_prices(ticker):
+                return {"ticker": ticker}
+
+            @asset(inputs={"reports": collect(fetch_prices)})
+            def aggregate(reports):
+                return {"total": len(reports)}
+        """,
+        )
+        result = barca.get("aggregate", f)
+        assert result == {"total": 3}
+
+    @pytest.mark.xfail(
+        reason="collect() fan-in delivery is fixed (#97/#93), but partitioned "
+        "steps skip cache-check entirely (commands.rs: 'Partitioned steps with "
+        "partition_keys skip cache for now') — a separate, still-open gap. "
+        "See test_collect_fan_in_delivers_full_partition_list for the "
+        "delivery-correctness regression coverage."
+    )
     def test_partitioned_upstream_change_invalidates_collector(self, tmp_path):
         """Changing a partitioned upstream should invalidate the collect() consumer."""
         f = write_module(

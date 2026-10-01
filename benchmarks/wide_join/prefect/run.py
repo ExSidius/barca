@@ -1,10 +1,16 @@
 """Prefect: wide join — 10 independent dimension tables -> 1 denormalized fact table."""
 
 import json
+import os
 import random
 import time
 
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
+
+# Matches barca's pool_size and dagster's max_concurrent for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 
 @task
@@ -151,19 +157,19 @@ def fact_table(
     }
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=BENCH_WORKERS))
 def wide_join_flow():
     # Dimension tables (parallel)
-    users = dim_users()
-    products = dim_products()
-    stores = dim_stores()
-    regions = dim_regions()
-    campaigns = dim_campaigns()
-    channels = dim_channels()
-    devices = dim_devices()
-    categories = dim_categories()
-    suppliers = dim_suppliers()
-    currencies = dim_currencies()
+    users = dim_users.submit()
+    products = dim_products.submit()
+    stores = dim_stores.submit()
+    regions = dim_regions.submit()
+    campaigns = dim_campaigns.submit()
+    channels = dim_channels.submit()
+    devices = dim_devices.submit()
+    categories = dim_categories.submit()
+    suppliers = dim_suppliers.submit()
+    currencies = dim_currencies.submit()
 
     # Fact table (fan-in)
     result = fact_table(

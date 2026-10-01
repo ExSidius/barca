@@ -7,7 +7,7 @@ parses these statically from source without importing.
 
 from __future__ import annotations
 
-__version__ = "0.2.1"
+__version__ = "0.8.0"
 
 __all__ = [
     "asset",
@@ -31,6 +31,8 @@ __all__ = [
     "history",
     "stats",
     "BarcaError",
+    "Client",
+    "Run",
 ]
 
 # ─── Freshness markers ───────────────────────────────────────────────────────
@@ -54,13 +56,32 @@ class Schedule:
 # ─── Decorators ───────────────────────────────────────────────────────────────
 
 
-def asset(fn=None, *, serializer=None, retries=1, retry_backoff=0.0, **kwargs):
+def asset(
+    fn=None,
+    *,
+    name=None,
+    inputs=None,
+    partitions=None,
+    serializer=None,
+    freshness=Always,
+    timeout_seconds=300,
+    retries=1,
+    retry_backoff=0.0,
+    description=None,
+    tags=None,
+    **kwargs,
+):
     """Declare a cached asset node.
+
+    `freshness` controls when the asset is kept up to date — `Always` (default),
+    `Manual`, or `Schedule("<cron>")`. The Rust binary reads it statically; a
+    `Schedule` fires under `barca serve` (see the Scheduling guide).
 
     `retries` is the total number of attempts on failure (1 = no retry).
     `retry_backoff` is the base delay in seconds between attempts (delay grows
-    linearly: `retry_backoff * attempt`). Both are read statically by the Rust
-    binary, which owns the retry loop; this stub stays a no-op.
+    linearly: `retry_backoff * attempt`). All parameters are read statically by
+    the Rust binary; this stub stays a no-op — they exist for IDE autocomplete
+    and type checking.
     """
     if fn is not None:
         return fn
@@ -71,10 +92,23 @@ def asset(fn=None, *, serializer=None, retries=1, retry_backoff=0.0, **kwargs):
     return decorator
 
 
-def sensor(fn=None, *, retries=1, retry_backoff=0.0, **kwargs):
+def sensor(
+    fn=None,
+    *,
+    name=None,
+    freshness=Manual,
+    timeout_seconds=300,
+    retries=1,
+    retry_backoff=0.0,
+    description=None,
+    tags=None,
+    **kwargs,
+):
     """Declare a sensor node (observes external state).
 
-    See `asset` for `retries` / `retry_backoff` semantics.
+    Sensors must use `Manual` or `Schedule(...)` freshness — `Always` is not
+    valid for a sensor (its polling cadence must be declared explicitly). See
+    `asset` for `retries` / `retry_backoff` semantics.
     """
     if fn is not None:
         return fn
@@ -85,7 +119,19 @@ def sensor(fn=None, *, retries=1, retry_backoff=0.0, **kwargs):
     return decorator
 
 
-def task(fn=None, *, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
+def task(
+    fn=None,
+    *,
+    name=None,
+    inputs=None,
+    freshness=Always,
+    timeout_seconds=300,
+    retries=1,
+    retry_backoff=0.0,
+    description=None,
+    tags=None,
+    **kwargs,
+):
     """Declare a task node (always re-runs; never cached).
 
     Tasks model workflow-management steps — deploys, notifications, migrations,
@@ -93,7 +139,9 @@ def task(fn=None, *, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
     may appear anywhere in the graph and may depend on assets, sensors, or other
     tasks, but must not be an input to an asset or sensor.
 
-    See `asset` for `retries` / `retry_backoff` semantics.
+    A `@task(freshness=Schedule("<cron>"))` is the simplest way to run something
+    on a timer: leave `barca serve` running and it fires on each cron tick (see
+    the Scheduling guide). See `asset` for `retries` / `retry_backoff` semantics.
     """
     if fn is not None:
         return fn
@@ -104,8 +152,13 @@ def task(fn=None, *, inputs=None, retries=1, retry_backoff=0.0, **kwargs):
     return decorator
 
 
-def sink(path: str, **kwargs):
-    """Declare a sink output (stacked on @asset)."""
+def sink(path: str, serializer: str | None = None, **kwargs):
+    """Declare a sink output (stacked on @asset).
+
+    path may be local or a remote URI (abfss://, s3://, gs://). serializer
+    overrides the format ("json", "pickle", "parquet"); it defaults to the
+    path extension, then the parent asset's artifact format.
+    """
 
     def decorator(f):
         return f
@@ -225,3 +278,4 @@ def parallel_map(fn, items, **kwargs):
 # ─── Python API ──────────────────────────────────────────────────────────────
 
 from barca.api import BarcaError, get, history, plan, run, stats  # noqa: E402
+from barca.client import Client, Run  # noqa: E402

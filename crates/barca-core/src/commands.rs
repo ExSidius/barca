@@ -1,4 +1,9 @@
 //! Engine commands — get, plan, history, stats. Return typed results; callers handle display.
+//!
+//! Every command is an `async fn` that runs on the caller's runtime: the CLI
+//! builds one runtime in `main()`, the server `.await`s these directly. No
+//! runtime is ever constructed in this crate; genuinely blocking work (source
+//! parsing, dynamic-partition subprocesses) runs via `spawn_blocking`.
 
 use crate::BarcaError;
 use crate::cache;
@@ -8,6 +13,7 @@ use crate::dispatch;
 use crate::dispatch::OutputRef;
 use crate::parse::extract_nodes;
 use crate::planner::{self, ExecutionPlan, Phase, ResourceConfig};
+use crate::state_sync;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
@@ -16,6 +22,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio_util::sync::CancellationToken;
 use turso::Builder;
 
 /// Format seconds as a fixed-width time string for progress display.
@@ -32,6 +39,25 @@ fn fmt_eta(secs: f64) -> String {
         let d = s / 86400;
         format!("{d:>2}d {:02}h  ", (s % 86400) / 3600)
     }
+}
+
+/// Total schedulable steps in a phase: 1 per unpartitioned step, `partition_keys.len()`
+/// for late-expanded ones. Used to keep the live progress-bar total in sync with
+/// `dispatch::expand_pending_partitions`, which turns a single planned
+/// (`partitions_from`) step into its real per-key count only at dispatch time.
+fn phase_step_count(phase: &Phase) -> usize {
+    phase
+        .streams
+        .iter()
+        .flat_map(|s| &s.steps)
+        .map(|st| {
+            if st.partition_keys.is_empty() {
+                1
+            } else {
+                st.partition_keys.len()
+            }
+        })
+        .sum()
 }
 
 // ─── Result types ────────────────────────────────────────────────────────────
@@ -101,7 +127,18 @@ pub fn find_python() -> PathBuf {
     PathBuf::from("python3")
 }
 
+/// Worker pool size: `BARCA_POOL_SIZE` overrides auto-detection when set to a
+/// positive integer. Lets benchmark harnesses (and anyone else) pin the pool
+/// to a fixed core count instead of whatever `available_parallelism()` reports
+/// on the current machine.
 fn default_pool_size() -> usize {
+    if let Some(n) = env::var("BARCA_POOL_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+    {
+        return n;
+    }
     std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -114,36 +151,55 @@ fn default_pool_size() -> usize {
 pub enum CachePolicy {
     /// Normal cache-aware behavior — reuse fresh asset artifacts (`barca get`).
     CacheAware,
-    /// Force-rerun every asset in the target's cone (`barca run`, default).
-    BurstAll,
+    /// Force-rerun every asset in the target's cone
+    /// (`barca run <task> --refresh-all` / `--no-cache`).
+    RefreshAll,
     /// Force-rerun only the named assets; all others stay cache-aware
-    /// (`barca run <task> --burst a,b`). A name matches when it equals the
+    /// (`barca run <task> --refresh a,b`). A name matches when it equals the
     /// node's base id exactly, or matches the trailing `:name` segment.
-    BurstSelective(Vec<String>),
+    RefreshSelective(Vec<String>),
 }
 
 /// `barca get` — cache-aware execution of an asset (or all assets).
-pub fn get(
+/// Cancelling `cancel` stops the run mid-flight: workers are terminated,
+/// partial results are persisted, and the run row is marked `cancelled`.
+pub async fn get(
+    cfg: &crate::config::ResolvedConfig,
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
     no_cache: bool,
     agent_mode: bool,
+    cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
-    get_streaming(target_name, file_args, python, no_cache, agent_mode, None)
+    get_streaming(
+        cfg,
+        target_name,
+        file_args,
+        python,
+        no_cache,
+        agent_mode,
+        cancel,
+        None,
+    )
+    .await
 }
 
-/// Like [`get`] but streams live [`RunEvent`]s to `event_tx` as the run
+/// Like [`get`] but streams live [`crate::RunEvent`]s to `event_tx` as the run
 /// progresses (logs, step completion). Logs are persisted to the DB regardless.
-pub fn get_streaming(
+#[allow(clippy::too_many_arguments)]
+pub async fn get_streaming(
+    cfg: &crate::config::ResolvedConfig,
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
     no_cache: bool,
     agent_mode: bool,
+    cancel: CancellationToken,
     event_tx: Option<UnboundedSender<crate::RunEvent>>,
 ) -> Result<GetResult, BarcaError> {
     execute(
+        cfg,
         target_name,
         file_args,
         python,
@@ -151,36 +207,50 @@ pub fn get_streaming(
         agent_mode,
         CachePolicy::CacheAware,
         "get",
+        cancel,
         event_tx,
     )
+    .await
 }
 
-/// `barca run` — execute a task (and its cone), bursting upstream asset caches.
-/// `burst == None` bursts all upstream assets; `Some(names)` bursts only those.
-pub fn run(
+/// `barca run` — execute a task (and its cone). The task always re-runs;
+/// upstream assets follow `policy` (`CacheAware` by default, like `barca get`).
+pub async fn run(
+    cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
-    burst: Option<Vec<String>>,
+    policy: CachePolicy,
     agent_mode: bool,
+    cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
-    run_streaming(target_name, file_args, python, burst, agent_mode, None)
+    run_streaming(
+        cfg,
+        target_name,
+        file_args,
+        python,
+        policy,
+        agent_mode,
+        cancel,
+        None,
+    )
+    .await
 }
 
-/// Like [`run`] but streams live [`RunEvent`]s to `event_tx`.
-pub fn run_streaming(
+/// Like [`run`] but streams live [`crate::RunEvent`]s to `event_tx`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_streaming(
+    cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
-    burst: Option<Vec<String>>,
+    policy: CachePolicy,
     agent_mode: bool,
+    cancel: CancellationToken,
     event_tx: Option<UnboundedSender<crate::RunEvent>>,
 ) -> Result<GetResult, BarcaError> {
-    let policy = match burst {
-        None => CachePolicy::BurstAll,
-        Some(names) => CachePolicy::BurstSelective(names),
-    };
     execute(
+        cfg,
         Some(target_name),
         file_args,
         python,
@@ -188,12 +258,15 @@ pub fn run_streaming(
         agent_mode,
         policy,
         "run",
+        cancel,
         event_tx,
     )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute(
+async fn execute(
+    cfg: &crate::config::ResolvedConfig,
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
@@ -201,12 +274,31 @@ fn execute(
     agent_mode: bool,
     policy: CachePolicy,
     command_label: &str,
+    cancel: CancellationToken,
     event_tx: Option<UnboundedSender<crate::RunEvent>>,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
+    // BARCA_TRACE_TIMING=1: emit a millisecond-resolution waterfall of every
+    // major checkpoint in this run to stderr (DAG parse, planning, DB setup,
+    // per-phase cache-check/dispatch/shutdown, persist_run — plus per-worker
+    // spawn and per-step dispatch/completion timestamps from io_loop.rs).
+    // One `env::var` check per call site; free when unset. Written to track
+    // down where wall-clock time actually goes on a slow run — e.g. it's how
+    // a real ~1.3s of JSON serialization on a couple of heavy assets was
+    // found to be invisible to barca's own per-step timing (see the fix to
+    // `_materialize`'s timer placement in python/barca/_worker.py).
+    let trace_on = std::env::var("BARCA_TRACE_TIMING").is_ok();
+    macro_rules! trace_point {
+        ($($arg:tt)*) => {
+            if trace_on {
+                eprintln!("[trace] {:>8.1}ms  {}", t0.elapsed().as_secs_f64() * 1000.0, format!($($arg)*));
+            }
+        };
+    }
     let run_id = db::generate_run_id();
 
-    let dag = build_dag(file_args, python)?;
+    let dag = build_dag(file_args, python).await?;
+    trace_point!("dag_built");
 
     // Resolve target: if Some, find it and extract subgraph; if None, use full DAG.
     let target_id: Option<String> = match target_name {
@@ -252,47 +344,75 @@ fn execute(
     } else {
         full_plan
     };
+    trace_point!("planned");
 
-    let db_path = db::ensure_db_dir()?;
-    db::init_db_sync(&db_path)?;
+    db::ensure_env_dirs(&cfg.env)?;
+    let db_path = cfg.db_path.clone();
 
-    db::create_run_sync(
+    // Shared remote state: pull the metadata DB before opening it, so cache
+    // checks below see every machine's materializations. Pull failure is a
+    // hard error — silently diverging local runs are worse than stopping.
+    let state_sync_on =
+        cfg.state == crate::config::StateMode::Optimistic && cfg.state_uri.is_some();
+    let mut state_token = if state_sync_on {
+        Some(state_sync::pull_state(python, cfg).await?)
+    } else {
+        None
+    };
+    trace_point!("state_sync_pull (enabled={state_sync_on})");
+
+    db::init_db(&db_path).await?;
+    trace_point!("db_init");
+
+    db::create_run(
         &db_path,
         &run_id,
         command_label,
         &file_args.join(" "),
         target_name,
         Some(exec_plan.total_steps),
-    )?;
+    )
+    .await?;
+    trace_point!("db_create_run");
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| BarcaError::Db(format!("failed to create runtime: {e}")))?;
+    // Measured-cost model: seed from persisted estimates so batch sizing is
+    // pre-warmed — the cold-start probe is paid once ever per stable node,
+    // not once per run.
+    let mut cost_model = crate::cost::CostModel::new();
+    cost_model.seed(db::load_cost_estimates(&db_path).await?);
+    trace_point!("cost_model_seeded");
 
-    let db = rt.block_on(async {
+    let db = {
+        let _g = db::db_guard().await;
         Builder::new_local(&db_path)
             .build()
             .await
             .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
-    })?;
+    }?;
     let conn = db
         .connect()
         .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+    trace_point!("db_connect");
 
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut cached_run_hashes: HashMap<String, String> = HashMap::new();
+    let mut run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     // Captured user stdout (node_id, line), persisted to the DB after the run.
     let mut logs_buffer: Vec<(String, String)> = Vec::new();
+    // Sink outcomes (JSON) per node, accumulated across phases for the DB.
+    let mut all_sinks: HashMap<String, String> = HashMap::new();
+    // Per-node self-timing (cpu_seconds, max_rss_bytes) reported by workers.
+    let mut all_timings: HashMap<String, (Option<f64>, Option<u64>)> = HashMap::new();
     // Permanently-failed steps + attempt counts, accumulated across phases for the DB.
     let mut all_failures: Vec<dispatch::StepFailure> = Vec::new();
-    let all_attempts: HashMap<String, u32> = HashMap::new();
+    let mut all_attempts: HashMap<String, u32> = HashMap::new();
     let mut steps_executed = 0;
 
-    // Progress bar setup.
-    let total_steps = exec_plan.total_steps;
+    // Progress bar setup. `total_steps` starts as the plan-time estimate and
+    // grows as dynamic (`partitions_from`) phases expand at dispatch time —
+    // see the `phase_step_count` reconciliation below.
+    let mut total_steps = exec_plan.total_steps;
     // Collect unpartitioned node_ids for exact ETA lookup.
     let unpartitioned_node_ids: Vec<String> = exec_plan
         .phases
@@ -311,9 +431,14 @@ fn execute(
         .filter(|st| !st.partition_keys.is_empty())
         .map(|st| st.step_id.base_id().to_string())
         .collect();
-    let avg_times = db::get_avg_elapsed_sync(&db_path, &unpartitioned_node_ids)?;
+    let avg_times = db::get_avg_elapsed(&db_path, &unpartitioned_node_ids).await?;
     let partitioned_avg_times =
-        db::get_avg_elapsed_for_partitioned_sync(&db_path, &partitioned_base_ids)?;
+        db::get_avg_elapsed_for_partitioned(&db_path, &partitioned_base_ids).await?;
+    trace_point!(
+        "eta_queries ({} unpartitioned, {} partitioned base ids)",
+        unpartitioned_node_ids.len(),
+        partitioned_base_ids.len()
+    );
     let total_estimated: f64 = unpartitioned_node_ids
         .iter()
         .filter_map(|nid| avg_times.get(nid))
@@ -356,9 +481,47 @@ fn execute(
         None
     };
 
-    for phase in &exec_plan.phases {
+    // Persistent worker pool: one pool for the whole run, shared across
+    // phases so workers keep their interpreter (and imported user modules)
+    // warm between phases.
+    let io_config = crate::io_loop::IoConfig {
+        python: python.clone(),
+        pool_size,
+        run_id: run_id.clone(),
+        artifact_root: cfg.artifact_root.clone(),
+        storage_options_json: cfg.storage_options_json.clone(),
+    };
+    let mut pool = crate::io_loop::WorkerPool::start(io_config).map_err(BarcaError::Other)?;
+    trace_point!("pool_started");
+
+    for (phase_idx, phase) in exec_plan.phases.iter().enumerate() {
+        // Stop scheduling new phases once cancelled; partial results from
+        // completed phases are persisted below.
+        if cancel.is_cancelled() {
+            if phase_error.is_none() {
+                phase_error = Some("run cancelled".to_string());
+            }
+            break;
+        }
+        trace_point!("phase{phase_idx}_start");
+
         let expanded_phase = dispatch::expand_pending_partitions(phase, &all_outputs, pool_size);
         let phase_ref = expanded_phase.as_ref().unwrap_or(phase);
+
+        // Dynamic partitions (`partitions_from`) are a single placeholder step
+        // in the plan-time count but expand to their real per-key count here —
+        // reconcile `total_steps` so the ETA math below can't underflow and
+        // the printed summary reflects what actually ran.
+        if expanded_phase.is_some() {
+            let expanded_count = phase_step_count(phase_ref);
+            let planned_count = phase_step_count(phase);
+            if expanded_count > planned_count {
+                total_steps += expanded_count - planned_count;
+                if let Some(ref bar) = pb {
+                    bar.set_length(total_steps as u64);
+                }
+            }
+        }
 
         let mut uncached_streams: Vec<crate::planner::WorkerStream> = Vec::new();
 
@@ -369,6 +532,43 @@ fn execute(
                 let base_id = step.step_id.base_id();
                 let display_id = step.step_id.display();
                 let base_node = dag.get_node(base_id);
+                let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
+
+                // Compute run hashes for EVERY step (including sensors, tasks,
+                // refreshed and partitioned steps that never cache-check): they
+                // content-address the artifacts and key persistence. Steps are
+                // visited in stream order, so in-phase upstream hashes are
+                // already present when a consumer is hashed — check-time and
+                // persist-time hashes are therefore identical.
+                let mut step = step.clone();
+                if step.partition_keys.is_empty() {
+                    let partition_key = if step.step_id.partition.is_empty() {
+                        None
+                    } else {
+                        Some(step.step_id.partition.suffix())
+                    };
+                    let run_h = cache::compute_run_hash(
+                        def_hash,
+                        partition_key.as_deref(),
+                        step.inputs.values(),
+                        &run_hashes,
+                    );
+                    run_hashes.insert(display_id.clone(), run_h.clone());
+                    step.run_hashes.insert(display_id.clone(), run_h);
+                } else {
+                    for pk in &step.partition_keys {
+                        let pdisplay = pk.display_id(&step.step_id.base);
+                        let run_h = cache::compute_run_hash(
+                            def_hash,
+                            Some(&pk.suffix()),
+                            step.inputs.values(),
+                            &run_hashes,
+                        );
+                        run_hashes.insert(pdisplay.clone(), run_h.clone());
+                        step.run_hashes.insert(pdisplay, run_h);
+                    }
+                }
+                let step = &step;
 
                 // Sensors and tasks always re-run — never cached.
                 if base_node.is_some_and(|n| {
@@ -384,21 +584,21 @@ fn execute(
                     continue;
                 }
 
-                // Burst policy (`barca run`): force-rerun assets in/named by the
-                // burst set, bypassing the cache. Tasks/sensors already re-ran above.
-                let bursted = match &policy {
+                // Refresh policy (`barca run`): force-rerun assets in/named by the
+                // refresh set, bypassing the cache. Tasks/sensors already re-ran above.
+                let refreshed = match &policy {
                     CachePolicy::CacheAware => false,
-                    CachePolicy::BurstAll => {
+                    CachePolicy::RefreshAll => {
                         base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
                     }
-                    CachePolicy::BurstSelective(names) => {
+                    CachePolicy::RefreshSelective(names) => {
                         base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
                             && names.iter().any(|name| {
                                 base_id == name || base_id.ends_with(&format!(":{name}"))
                             })
                     }
                 };
-                if bursted {
+                if refreshed {
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -410,21 +610,14 @@ fn execute(
                     continue;
                 }
 
-                let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
-                let partition_key = if step.step_id.partition.is_empty() {
-                    None
-                } else {
-                    Some(step.step_id.partition.suffix())
-                };
+                let run_h = step
+                    .run_hashes
+                    .get(&display_id)
+                    .cloned()
+                    .expect("unpartitioned step has a precomputed run hash");
 
-                let run_h = cache::compute_run_hash(
-                    def_hash,
-                    partition_key.as_deref(),
-                    step.inputs.values(),
-                    &cached_run_hashes,
-                );
-
-                let cached = rt.block_on(async {
+                let cached = {
+                    let _g = db::db_guard().await;
                     let mut rows = conn
                         .query(
                             "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
@@ -440,12 +633,11 @@ fn execute(
                             elapsed_seconds: None,
                         })
                     })
-                });
+                };
 
                 if let Some(oref) = cached {
                     all_outputs.insert(display_id.clone(), oref);
-                    cached_node_ids.insert(display_id.clone());
-                    cached_run_hashes.insert(display_id, run_h);
+                    cached_node_ids.insert(display_id);
                 } else {
                     uncached_steps.push(step.clone());
                 }
@@ -458,6 +650,8 @@ fn execute(
                 });
             }
         }
+
+        trace_point!("phase{phase_idx}_cache_check_done");
 
         if uncached_streams.is_empty() {
             continue;
@@ -504,6 +698,26 @@ fn execute(
         // Progress callback — update bar as each step completes.
         let on_step_cb: crate::io_loop::StepCallback<'_> =
             Box::new(|node_id: &str, artifact: &serde_json::Value| {
+                // Sink failures never fail the asset — surface them prominently.
+                if let Some(sinks) = artifact.get("sinks").and_then(|v| v.as_array()) {
+                    for s in sinks {
+                        if s.get("status").and_then(|v| v.as_str()) == Some("error") {
+                            let msg = format!(
+                                "[barca] SINK FAILED: {} -> {}: {}",
+                                node_id,
+                                s.get("path").and_then(|v| v.as_str()).unwrap_or("?"),
+                                s.get("error")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown error"),
+                            );
+                            if let Some(ref bar) = pb {
+                                bar.println(&msg);
+                            } else {
+                                eprintln!("{msg}");
+                            }
+                        }
+                    }
+                }
                 let elapsed_s = artifact.get("elapsed_seconds").and_then(|v| v.as_f64());
                 if let Some(e) = elapsed_s {
                     elapsed_so_far += e;
@@ -540,40 +754,33 @@ fn execute(
         // Event sink — buffer log lines for DB persistence, and forward every
         // event live to the caller's channel (the HTTP server) if present.
         let event_tx_phase = event_tx.clone();
-        let on_event_cb: crate::io_loop::EventCallback<'_> = Box::new(|ev: crate::RunEvent| {
-            if let crate::RunEvent::Log {
-                ref node_id,
-                ref line,
-            } = ev
-            {
-                logs_buffer.push((node_id.clone(), line.clone()));
-            }
-            if let Some(ref tx) = event_tx_phase {
-                let _ = tx.send(ev);
-            }
-        });
+        let logs_sink = &mut logs_buffer;
+        let on_event_cb: crate::io_loop::EventCallback<'_> =
+            Box::new(move |ev: crate::RunEvent| {
+                if let crate::RunEvent::Log {
+                    ref node_id,
+                    ref line,
+                } = ev
+                {
+                    logs_sink.push((node_id.clone(), line.clone()));
+                }
+                if let Some(ref tx) = event_tx_phase {
+                    let _ = tx.send(ev);
+                }
+            });
 
-        // Run the coordinator via io_loop
-        let io_config = crate::io_loop::IoConfig {
-            python: python.clone(),
-            pool_size,
-            run_id: run_id.clone(),
-        };
-
-        // Use a multi-thread runtime for io_loop — the current_thread runtime (used
-        // for Turso DB) doesn't drive spawned tasks concurrently enough for the
-        // worker I/O task pattern.
-        let io_rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| BarcaError::Other(format!("failed to create io runtime: {e}")))?;
-        let phase_err = io_rt.block_on(crate::io_loop::run(
-            &mut coord,
-            &io_config,
-            Some(on_step_cb),
-            Some(on_event_cb),
-        ));
-        drop(io_rt);
+        // Drive this phase against the persistent pool. The cost model both
+        // sizes the batch pulls and absorbs the timings coming back.
+        let phase_err = pool
+            .run_phase(
+                &mut coord,
+                &mut cost_model,
+                Some(on_step_cb),
+                Some(on_event_cb),
+                &cancel,
+            )
+            .await;
+        trace_point!("phase{phase_idx}_run_phase_done");
         if let Err(e) = phase_err {
             if phase_error.is_none() {
                 phase_error = Some(e);
@@ -583,7 +790,14 @@ fn execute(
         // Collect results from coordinator
         let mut phase_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
         for (&item_id, artifact_val) in coord.outputs() {
-            let node_id = coord.item(item_id).step_id.display();
+            let item = coord.item(item_id);
+            let node_id = item.step_id.display();
+            // Attempts made for this item (dispatch count), keyed by base node
+            // id — how the success-row INSERT looks it up.
+            all_attempts.insert(
+                crate::StepId::parse(&node_id).base_id().to_string(),
+                item.attempts,
+            );
             let oref = dispatch::OutputRef {
                 path: artifact_val
                     .get("path")
@@ -601,6 +815,19 @@ fn execute(
                     .unwrap_or(0),
                 elapsed_seconds: artifact_val.get("elapsed_seconds").and_then(|v| v.as_f64()),
             };
+            if let Some(sinks) = artifact_val.get("sinks").and_then(|v| v.as_array())
+                && !sinks.is_empty()
+            {
+                all_sinks.insert(
+                    node_id.clone(),
+                    serde_json::Value::from(sinks.clone()).to_string(),
+                );
+            }
+            let cpu = artifact_val.get("cpu_seconds").and_then(|v| v.as_f64());
+            let rss = artifact_val.get("max_rss_bytes").and_then(|v| v.as_u64());
+            if cpu.is_some() || rss.is_some() {
+                all_timings.insert(node_id.clone(), (cpu, rss));
+            }
             phase_outputs.insert(node_id, oref);
         }
 
@@ -636,44 +863,14 @@ fn execute(
             }
         }
 
-        let step_order: Vec<String> = filtered_phase
-            .streams
-            .iter()
-            .flat_map(|s| s.steps.iter().map(|st| st.step_id.display()))
-            .collect();
-        for node_id in step_order {
-            let Some(oref) = phase_outputs.get(&node_id).cloned() else {
-                continue;
-            };
-            let sid = crate::StepId::parse(&node_id);
-            let def_hash = dag
-                .get_node(sid.base_id())
-                .map(|n| n.definition_hash.as_str())
-                .unwrap_or("");
-            let partition_key = if sid.partition.is_empty() {
-                None
-            } else {
-                Some(sid.partition.suffix())
-            };
-
-            let upstream_ids: Vec<String> = dag
-                .get_node(sid.base_id())
-                .map(|n| {
-                    n.resolved_inputs
-                        .values()
-                        .chain(n.resolved_collected.values())
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let run_h = cache::compute_run_hash(
-                def_hash,
-                partition_key.as_deref(),
-                upstream_ids.iter(),
-                &cached_run_hashes,
-            );
-            cached_run_hashes.insert(node_id.clone(), run_h);
-            all_outputs.insert(node_id, oref);
+        // Run hashes were computed pre-dispatch for every plan step (including
+        // per-partition ids), so collection is a filter: coordinator outputs
+        // with a known hash are plan steps; the rest are parallel() children,
+        // which are never persisted.
+        for (node_id, oref) in &phase_outputs {
+            if run_hashes.contains_key(node_id) {
+                all_outputs.insert(node_id.clone(), oref.clone());
+            }
         }
 
         // If this phase had a worker failure, stop after collecting partial results.
@@ -681,6 +878,11 @@ fn execute(
             break;
         }
     }
+
+    // All phases done (or aborted/cancelled) — release the worker pool before
+    // persisting.
+    pool.shutdown().await;
+    trace_point!("pool_shutdown");
 
     // Finish progress bar.
     if let Some(ref bar) = pb {
@@ -700,114 +902,86 @@ fn execute(
         );
     }
 
-    // Persist all executed outputs (including partial results on failure).
-    rt.block_on(async {
-        for (node_id, oref) in &all_outputs {
-            if cached_node_ids.contains(node_id) {
-                continue;
-            }
-            let Some(run_h) = cached_run_hashes.get(node_id) else {
-                continue;
-            };
-            let elapsed_str = oref
-                .elapsed_seconds
-                .map(|e| e.to_string())
-                .unwrap_or_default();
-            let base = crate::StepId::parse(node_id).base_id().to_string();
-            let attempts = all_attempts.get(&base).copied().unwrap_or(1);
-            conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7)",
-                [
-                    node_id.clone(),
-                    run_h.clone(),
-                    oref.path.clone(),
-                    oref.format.clone(),
-                    oref.size_bytes.to_string(),
-                    elapsed_str,
-                    attempts.to_string(),
-                ],
-            )
-            .await
-            .ok();
-        }
-
-        // Persist permanently-failed steps as `status='failed'` rows (artifact
-        // columns NULL). Failed rows are never served as cache hits.
-        // Use all_attempts (exec_attempts) for parity with success rows —
-        // scheduler dispatch counts can overstate for blocked descendants.
-        for failure in &all_failures {
-            let node_id = &failure.node_id;
-            let sid = crate::StepId::parse(node_id);
-            let base = sid.base_id().to_string();
-            let def_hash = dag
-                .get_node(sid.base_id())
-                .map(|n| n.definition_hash.as_str())
-                .unwrap_or("");
-            let partition_key = if sid.partition.is_empty() {
-                None
-            } else {
-                Some(sid.partition.suffix())
-            };
-            let upstream_ids: Vec<String> = dag
-                .get_node(sid.base_id())
-                .map(|n| {
-                    n.resolved_inputs
-                        .values()
-                        .chain(n.resolved_collected.values())
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default();
-            let run_h = cache::compute_run_hash(
-                def_hash,
-                partition_key.as_deref(),
-                upstream_ids.iter(),
-                &cached_run_hashes,
-            );
-            let attempts = all_attempts.get(&base).copied().unwrap_or(failure.error.attempts);
-            conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
-                [
-                    node_id.clone(),
-                    run_h,
-                    failure.error.message.clone(),
-                    failure.error.traceback.clone(),
-                    attempts.to_string(),
-                ],
-            )
-            .await
-            .ok();
-        }
-    });
-
     let steps_cached = cached_node_ids.len();
     let elapsed = t0.elapsed().as_secs_f64();
 
-    // Persist captured stdout. Rust owns persistence — logs land in the DB
-    // regardless of how the run was triggered (CLI or server).
-    let _ = db::insert_logs_sync(&db_path, &run_id, &logs_buffer);
+    // Drop the run-long cache connection before persistence: the state push
+    // checkpoints the WAL, which requires no other open handles on the file.
+    drop(conn);
+    drop(db);
 
-    // Propagate worker error after persisting partial results.
-    if let Some(error) = phase_error {
-        db::finish_run_sync(
-            &db_path,
-            &run_id,
-            "failed",
-            steps_executed,
-            steps_cached,
-            elapsed,
-        )?;
-        return Err(BarcaError::WorkerFailed(error));
-    }
+    let was_cancelled = cancel.is_cancelled();
 
-    db::finish_run_sync(
-        &db_path,
-        &run_id,
-        "success",
+    // Persist all executed outputs (including partial results on failure) —
+    // held in a ledger so a state-push conflict can replay this run's rows
+    // onto a freshly pulled database.
+    let cost_snapshot: Vec<(String, crate::cost::NodeEstimate)> = cost_model
+        .snapshot()
+        .map(|(node_id, est)| (node_id.clone(), *est))
+        .collect();
+    let ledger = RunLedger {
+        run_id: &run_id,
+        status: if was_cancelled {
+            "cancelled"
+        } else if phase_error.is_some() {
+            "failed"
+        } else {
+            "success"
+        },
+        command: command_label,
+        files: file_args.join(" "),
+        target: target_name,
+        steps_total: exec_plan.total_steps,
         steps_executed,
         steps_cached,
         elapsed,
-    )?;
+        all_outputs: &all_outputs,
+        all_failures: &all_failures,
+        all_sinks: &all_sinks,
+        all_attempts: &all_attempts,
+        all_timings: &all_timings,
+        cached_node_ids: &cached_node_ids,
+        run_hashes: &run_hashes,
+        cost_snapshot: &cost_snapshot,
+    };
+    persist_run(&db_path, &ledger).await?;
+    // Persist captured stdout. Rust owns persistence — logs land in the DB
+    // regardless of how the run was triggered (CLI or server).
+    db::insert_logs(&db_path, &run_id, &logs_buffer).await?;
+    trace_point!("persist_run_done");
+
+    // Shared remote state: fold the WAL into the main file and conditionally
+    // upload it. On conflict (another machine pushed first): pull the fresh
+    // database, replay this run's ledger onto it, retry.
+    if state_sync_on {
+        let mut attempt = 0u32;
+        loop {
+            state_sync::checkpoint_truncate(&db_path).await?;
+            match state_sync::push_state(python, cfg, state_token.as_ref().unwrap()).await? {
+                state_sync::PushOutcome::Pushed(_) => break,
+                state_sync::PushOutcome::Conflict => {
+                    if attempt >= cfg.push_retries {
+                        return Err(BarcaError::Other(format!(
+                            "shared state push conflicted {attempt} times — results were                              computed but the shared state was not updated; re-run to retry"
+                        )));
+                    }
+                    attempt += 1;
+                    state_token = Some(state_sync::pull_state(python, cfg).await?);
+                    db::init_db(&db_path).await?;
+                    persist_run(&db_path, &ledger).await?;
+                    db::insert_logs(&db_path, &run_id, &logs_buffer).await?;
+                }
+            }
+        }
+    }
+
+    // Propagate cancellation/worker error after persisting partial results.
+    if was_cancelled {
+        return Err(BarcaError::Cancelled);
+    }
+    if let Some(error) = phase_error {
+        return Err(BarcaError::WorkerFailed(error));
+    }
 
     // Determine final_output: use target if specified, otherwise last planned step.
     let final_output = if let Some(ref tid) = target_id {
@@ -849,10 +1023,159 @@ fn execute(
     })
 }
 
+// ─── run persistence ──────────────────────────────────────────────────────────
+
+/// Everything one run wants written to the metadata DB, held in memory so a
+/// state-push conflict can replay it onto a freshly pulled database.
+struct RunLedger<'a> {
+    run_id: &'a str,
+    status: &'a str,
+    command: &'a str,
+    files: String,
+    target: Option<&'a str>,
+    steps_total: usize,
+    steps_executed: usize,
+    steps_cached: usize,
+    elapsed: f64,
+    all_outputs: &'a HashMap<String, dispatch::OutputRef>,
+    all_failures: &'a [dispatch::StepFailure],
+    all_sinks: &'a HashMap<String, String>,
+    all_attempts: &'a HashMap<String, u32>,
+    /// Per-node worker self-timing: (cpu_seconds, max_rss_bytes).
+    all_timings: &'a HashMap<String, (Option<f64>, Option<u64>)>,
+    cached_node_ids: &'a std::collections::HashSet<String>,
+    run_hashes: &'a HashMap<String, String>,
+    /// Run-end snapshot of the measured-cost EWMA, seeding the next run.
+    cost_snapshot: &'a [(String, crate::cost::NodeEstimate)],
+}
+
+/// Write a run's ledger with a short-lived connection. Idempotent for the run
+/// row (INSERT OR IGNORE + terminal UPDATE) so replays don't duplicate it;
+/// materialization rows are append-only history and re-appended on replay
+/// only against a database that doesn't already contain them.
+async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError> {
+    let _g = db::db_guard().await;
+    let db = Builder::new_local(db_path)
+        .build()
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+    let conn = db
+        .connect()
+        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+
+    conn.execute(
+            "INSERT OR IGNORE INTO runs (run_id, command, files, target, status, steps_total) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+            [
+                l.run_id.to_string(),
+                l.command.to_string(),
+                l.files.clone(),
+                l.target.unwrap_or("").to_string(),
+                l.steps_total.to_string(),
+            ],
+        )
+        .await
+        .ok();
+    conn.execute(
+            "UPDATE runs SET status = ?1, steps_executed = ?2, steps_cached = ?3, elapsed_seconds = ?4, finished_at = datetime('now') WHERE run_id = ?5",
+            [
+                l.status.to_string(),
+                l.steps_executed.to_string(),
+                l.steps_cached.to_string(),
+                l.elapsed.to_string(),
+                l.run_id.to_string(),
+            ],
+        )
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to finish run: {e}")))?;
+
+    for (node_id, oref) in l.all_outputs {
+        if l.cached_node_ids.contains(node_id) {
+            continue;
+        }
+        let Some(run_h) = l.run_hashes.get(node_id) else {
+            continue;
+        };
+        let elapsed_str = oref
+            .elapsed_seconds
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        let base = crate::StepId::parse(node_id).base_id().to_string();
+        let attempts = l.all_attempts.get(&base).copied().unwrap_or(1);
+        let (cpu, rss) = l.all_timings.get(node_id).copied().unwrap_or((None, None));
+        conn.execute(
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json, cpu_seconds, max_rss_bytes) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''), NULLIF(?9, ''), NULLIF(?10, ''))",
+                [
+                    node_id.clone(),
+                    run_h.clone(),
+                    oref.path.clone(),
+                    oref.format.clone(),
+                    oref.size_bytes.to_string(),
+                    elapsed_str,
+                    attempts.to_string(),
+                    l.all_sinks.get(node_id).cloned().unwrap_or_default(),
+                    cpu.map(|c| c.to_string()).unwrap_or_default(),
+                    rss.map(|r| r.to_string()).unwrap_or_default(),
+                ],
+            )
+            .await
+            .ok();
+    }
+
+    // Persist the measured-cost EWMA so the next run starts pre-warmed and
+    // skips the cold-start probe entirely. (Inline — this fn already holds
+    // the process-wide DB guard.)
+    for (node_id, est) in l.cost_snapshot {
+        let base = crate::StepId::parse(node_id).base_id().to_string();
+        conn.execute(
+            "INSERT INTO cost_estimates (node_id, base_id, estimate_seconds, cpu_seconds, max_rss_bytes, samples, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'))
+             ON CONFLICT(node_id) DO UPDATE SET
+                 estimate_seconds = ?3, cpu_seconds = ?4, max_rss_bytes = ?5,
+                 samples = ?6, updated_at = datetime('now')",
+            [
+                node_id.clone(),
+                base,
+                est.estimate_seconds.to_string(),
+                est.cpu_seconds.to_string(),
+                est.max_rss_bytes.to_string(),
+                est.samples.to_string(),
+            ],
+        )
+        .await
+        .ok();
+    }
+
+    // Persist permanently-failed steps as `status='failed'` rows (artifact
+    // columns NULL). Failed rows are never served as cache hits.
+    for failure in l.all_failures {
+        let node_id = &failure.node_id;
+        let base = crate::StepId::parse(node_id).base_id().to_string();
+        let run_h = l.run_hashes.get(node_id).cloned().unwrap_or_default();
+        let attempts = l
+            .all_attempts
+            .get(&base)
+            .copied()
+            .unwrap_or(failure.error.attempts);
+        conn.execute(
+                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
+                [
+                    node_id.clone(),
+                    run_h,
+                    failure.error.message.clone(),
+                    failure.error.traceback.clone(),
+                    attempts.to_string(),
+                ],
+            )
+            .await
+            .ok();
+    }
+    Ok(())
+}
+
 // ─── plan ────────────────────────────────────────────────────────────────────
 
-pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaError> {
-    let dag = build_dag(file_args, python)?;
+pub async fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaError> {
+    let dag = build_dag(file_args, python).await?;
     let config = ResourceConfig {
         pool_size: 10,
         concurrency_groups: HashMap::new(),
@@ -881,20 +1204,24 @@ pub fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, BarcaE
 
 // ─── history ──────────────────────────────────────────────────────────────────
 
-pub fn history(limit: usize) -> Result<Vec<db::RunRecord>, BarcaError> {
-    let db_path = db::ensure_db_dir()?;
-    db::init_db_sync(&db_path)?;
-    db::get_recent_runs_sync(&db_path, limit)
+pub async fn history(
+    cfg: &crate::config::ResolvedConfig,
+    limit: usize,
+) -> Result<Vec<db::RunRecord>, BarcaError> {
+    db::ensure_env_dirs(&cfg.env)?;
+    db::init_db(&cfg.db_path).await?;
+    db::get_recent_runs(&cfg.db_path, limit).await
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────
 
-pub fn stats(
+pub async fn stats(
+    cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
 ) -> Result<db::AssetStats, BarcaError> {
-    let dag = build_dag(file_args, python)?;
+    let dag = build_dag(file_args, python).await?;
 
     let target_id = dag
         .topo_order()
@@ -910,20 +1237,20 @@ pub fn stats(
             BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
         })?;
 
-    let db_path = db::ensure_db_dir()?;
-    db::init_db_sync(&db_path)?;
-    db::get_asset_stats_sync(&db_path, &target_id)
+    db::ensure_env_dirs(&cfg.env)?;
+    db::init_db(&cfg.db_path).await?;
+    db::get_asset_stats(&cfg.db_path, &target_id).await
 }
 
 // ─── list_assets ──────────────────────────────────────────────────────────────
 
 /// Build the DAG and return a summary of every node (id, kind, freshness, inputs).
 /// Pure static analysis — no execution, no DB. Used by the server's `/assets` route.
-pub fn list_assets(
+pub async fn list_assets(
     file_args: &[String],
     python: &PathBuf,
 ) -> Result<Vec<AssetSummary>, BarcaError> {
-    let dag = build_dag(file_args, python)?;
+    let dag = build_dag(file_args, python).await?;
     let summaries = dag
         .topo_order()
         .into_iter()
@@ -1002,10 +1329,24 @@ fn filter_plan_to_subgraph(plan: ExecutionPlan, subgraph_ids: &[&str]) -> Execut
 
 // ─── DAG construction ────────────────────────────────────────────────────────
 
-pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
+/// Build the DAG from source files. The work is genuinely blocking (file I/O,
+/// parsing, and a Python subprocess for dynamic partitions), so it runs on the
+/// blocking pool rather than an async worker thread.
+pub async fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
+    let files = file_args.to_vec();
+    let py = python.clone();
+    tokio::task::spawn_blocking(move || build_dag_blocking(&files, &py))
+        .await
+        .map_err(|e| BarcaError::Other(format!("DAG analysis task failed: {e}")))?
+}
+
+fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
+    // Dotted module names in `file_sources` that are `__init__.py` packages,
+    // as opposed to regular submodules — needed to resolve relative imports.
+    let mut packages: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for path in &paths {
         let source = fs::read_to_string(path)
@@ -1022,7 +1363,7 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
         if let Some(parent) = path.parent() {
             // Scan subdirectories FIRST — packages (__init__.py) take precedence
             // over same-named sibling .py files, matching Python's import semantics.
-            scan_subdirectories(parent, parent, &mut file_sources);
+            scan_subdirectories(parent, parent, &mut file_sources, &mut packages);
             // Then scan sibling .py files (flat) — or_insert_with is a no-op if
             // a package with the same name was already registered above.
             if let Ok(entries) = std::fs::read_dir(parent) {
@@ -1067,13 +1408,18 @@ pub fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaErr
             cached_defs.get(s)
         });
         if let Some(defs) = defs {
-            node.cone_hash =
-                crate::cone::cone_hash_from_defs(defs, &node.function_name, &file_sources);
+            node.cone_hash = crate::cone::cone_hash_from_defs(
+                defs,
+                &node.function_name,
+                &file_sources,
+                &packages,
+            );
         }
     }
 
     // Free source text memory before execution starts.
     drop(file_sources);
+    drop(packages);
 
     resolve_dynamic_partitions(&mut all_nodes, python);
 
@@ -1087,6 +1433,7 @@ fn scan_subdirectories(
     dir: &std::path::Path,
     root: &std::path::Path,
     file_sources: &mut HashMap<String, String>,
+    packages: &mut std::collections::HashSet<String>,
 ) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1117,6 +1464,7 @@ fn scan_subdirectories(
                     .unwrap_or(&ep)
                     .to_string_lossy()
                     .replace(['/', '\\'], ".");
+                packages.insert(module_path.clone());
                 file_sources.entry(module_path).or_insert_with(|| content);
             }
             // Scan .py files in the subdirectory.
@@ -1139,7 +1487,7 @@ fn scan_subdirectories(
                 }
             }
             // Recurse into deeper subdirectories.
-            scan_subdirectories(&ep, root, file_sources);
+            scan_subdirectories(&ep, root, file_sources, packages);
         }
     }
 }

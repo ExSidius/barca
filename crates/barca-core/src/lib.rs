@@ -1,7 +1,9 @@
 pub mod cache;
 pub mod commands;
 pub mod cone;
+pub mod config;
 pub mod coordinator;
+pub mod cost;
 pub mod dag;
 pub mod db;
 pub mod dispatch;
@@ -12,11 +14,15 @@ pub mod model;
 pub mod parse;
 pub mod planner;
 pub mod protocol;
+pub mod state_sync;
 
 pub use dag::Dag;
 pub use events::RunEvent;
 pub use model::*;
 pub use planner::{ExecutionPlan, ResourceConfig, expand_partition_combos};
+/// Re-exported so callers (CLI, server) share one token type without depending
+/// on tokio-util directly.
+pub use tokio_util::sync::CancellationToken;
 
 /// Top-level error type for barca engine operations.
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +41,9 @@ pub enum BarcaError {
 
     #[error("Worker failed: {0}")]
     WorkerFailed(String),
+
+    #[error("run cancelled")]
+    Cancelled,
 
     #[error("Database error: {0}")]
     Db(String),

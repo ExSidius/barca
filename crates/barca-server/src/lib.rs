@@ -6,16 +6,19 @@
 //! same HTTP API as its contract.
 //!
 //! Runs are async: `POST /run` returns a handle immediately and the work happens
-//! in a background task; clients poll `GET /status/{run_id}`. Handlers reach core
-//! through `spawn_blocking`, since the core commands build their own
-//! current-thread runtime internally.
+//! in a background task; clients poll `GET /status/{run_id}` and can cancel via
+//! `DELETE /run/{run_id}`. Core commands are async-native, so handlers `.await`
+//! them directly on the server's runtime — no `spawn_blocking`, and every run
+//! future is genuinely cancellable.
 
 mod error;
 mod handlers;
 mod routes;
+mod scheduler;
 mod state;
 mod watch;
 
+pub use scheduler::{ScheduleInfo, describe_schedule};
 pub use state::ServeConfig;
 
 use state::AppState;
@@ -25,8 +28,6 @@ use state::AppState;
 pub enum ServeError {
     #[error("server I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("failed to build server runtime: {0}")]
-    Runtime(String),
 }
 
 /// Build the API router over a fresh [`AppState`] for the given config.
@@ -37,20 +38,14 @@ pub fn app(config: ServeConfig) -> axum::Router {
     routes::router(AppState::new(config))
 }
 
-/// Start the server: build a multi-thread runtime, bind, and serve until Ctrl-C.
-/// Blocking — intended to be called from the CLI.
-pub fn serve(config: ServeConfig) -> Result<(), ServeError> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| ServeError::Runtime(e.to_string()))?;
-    rt.block_on(serve_async(config))
-}
-
-async fn serve_async(config: ServeConfig) -> Result<(), ServeError> {
+/// Start the server on the caller's runtime: bind and serve until Ctrl-C. On
+/// shutdown, in-flight runs are cancelled (workers terminated, runs marked
+/// cancelled) before returning.
+pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     let addr = std::net::SocketAddr::new(config.host, config.port);
     let n_files = config.files.len();
     let watch = config.watch;
+    let schedule = config.schedule;
 
     let state = AppState::new(config);
 
@@ -60,6 +55,11 @@ async fn serve_async(config: ServeConfig) -> Result<(), ServeError> {
         std::time::Duration::from_secs(300),
         std::time::Duration::from_secs(3600),
     ));
+
+    // Fire `Schedule(...)` assets on their cron ticks (local time). On by default.
+    if schedule {
+        tokio::spawn(scheduler::run_scheduler(state.clone()));
+    }
 
     // Dev-mode hot reload. The watcher must be held for the server's lifetime.
     let _watcher = if watch {
@@ -74,7 +74,7 @@ async fn serve_async(config: ServeConfig) -> Result<(), ServeError> {
         None
     };
 
-    let app = routes::router(state);
+    let app = routes::router(state.clone());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!(
@@ -86,6 +86,16 @@ async fn serve_async(config: ServeConfig) -> Result<(), ServeError> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+
+    // Stop in-flight runs: cancel every run token (they are children of the
+    // shutdown token), then wait — bounded — for the run tasks to terminate
+    // their workers and release their slots.
+    state.shutdown.cancel();
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        state.run_slots.acquire_many(state.run_slot_count as u32),
+    )
+    .await;
     Ok(())
 }
 

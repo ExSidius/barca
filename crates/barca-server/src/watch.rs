@@ -11,6 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// The scheduler observes `AppState.dag_generation` to reload its job set.
+
 /// Minimum interval between cache invalidations (milliseconds).
 const DEBOUNCE_MS: u64 = 250;
 
@@ -18,6 +20,7 @@ const DEBOUNCE_MS: u64 = 250;
 /// The returned `RecommendedWatcher` must be kept alive for watching to continue.
 pub fn spawn(state: AppState) -> notify::Result<RecommendedWatcher> {
     let cache = state.cache.clone();
+    let generation = state.dag_generation.clone();
     let last_invalidation = Arc::new(AtomicU64::new(0));
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
@@ -47,6 +50,8 @@ pub fn spawn(state: AppState) -> notify::Result<RecommendedWatcher> {
             c.assets = None;
             c.plan = None;
         }
+        // Signal the scheduler to re-read its job set on its next tick.
+        generation.fetch_add(1, Ordering::Relaxed);
     })?;
 
     // Watch each file's parent directory (non-recursively). Editors frequently

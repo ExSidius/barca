@@ -3,10 +3,16 @@ Each (step, region) pair is a separate task, mirroring barca's partitioned fan-i
 
 import hashlib
 import json
+import os
 import time
 from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
 
 REGIONS = [f"region_{i:02d}" for i in range(50)]
+
+# Matches barca's pool_size and dagster's max_concurrent for this benchmark run
+# (see benchmarks/lib/env.sh) so no framework gets more/fewer workers than another.
+BENCH_WORKERS = int(os.environ.get("BARCA_BENCH_WORKERS", "16"))
 
 
 # --- Step 1: fetch_metrics (50 tasks) ---
@@ -38,14 +44,15 @@ def _make_enrich(i, region):
 enrich_tasks = [_make_enrich(i, r) for i, r in enumerate(REGIONS)]
 
 
-@flow
+@flow(task_runner=ConcurrentTaskRunner(max_workers=BENCH_WORKERS))
 def partitioned_fan_in_flow():
-    results = []
+    # Each region's fetch+enrich pair is independent of every other region.
+    futures = []
     for i in range(len(REGIONS)):
-        fetched = fetch_tasks[i]()
-        enriched = enrich_tasks[i](fetched)
-        results.append(enriched)
-    return results
+        fetched = fetch_tasks[i].submit()
+        enriched = enrich_tasks[i].submit(fetched)
+        futures.append(enriched)
+    return [f.result() for f in futures]
 
 
 if __name__ == "__main__":

@@ -324,9 +324,12 @@ class TestParallelInvariants:
         t0 = time.time()
         result = barca.run("fan_out_4", f)
         elapsed = time.time() - t0
-        # If sequential: 4 * 0.5 = 2.0s minimum. If parallel: ~0.5s + overhead
-        # Allow generous margin for subprocess startup but must be < sequential time
-        assert elapsed < 1.8, f"Took {elapsed:.2f}s — parallel is not actually parallel!"
+        # If sequential: 4 * 0.5 = 2.0s of sleeps + ~1.2s fixed engine overhead
+        # (binary + DB init, parent freeze/replace, child worker spawn) ≈ 3.2s.
+        # If parallel: ~0.7s parallel section + the same overhead ≈ 1.9-2.1s
+        # measured on a 4-CPU container. 2.6 clears the deterministic parallel
+        # band while staying well under sequential time.
+        assert elapsed < 2.6, f"Took {elapsed:.2f}s — parallel is not actually parallel!"
         assert len(result) == 4
         assert set(result) == {0, 1, 2, 3}
 

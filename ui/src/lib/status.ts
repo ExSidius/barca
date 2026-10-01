@@ -69,6 +69,9 @@ export function runStatusToVisual(status: RunStatus): StatusKind {
     .with('running', () => 'running')
     .with('complete', () => 'success')
     .with('failed', () => 'failed')
+    // Stopped by the operator (DELETE /run/{id}) or server shutdown — inert,
+    // not an error.
+    .with('cancelled', () => 'skipped')
     .exhaustive()
 }
 

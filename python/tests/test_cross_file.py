@@ -169,6 +169,111 @@ class TestRelativeImports:
         r3 = barca.api._exec(["get", "result", asset_file])
         assert r3["steps_executed"] == 1
 
+    def test_relative_import_in_regular_submodule(self, tmp_path):
+        """mylib/core.py re-exporting `from .util import h` must resolve to
+        the sibling `mylib.util`, not `mylib.core.util` (parent_module used
+        to be the submodule's own dotted name instead of its parent
+        package)."""
+        write_file(tmp_path, "mylib/__init__.py", "")
+        write_file(
+            tmp_path,
+            "mylib/util.py",
+            """
+            def h():
+                return 1
+        """,
+        )
+        write_file(
+            tmp_path,
+            "mylib/core.py",
+            """
+            from .util import h
+        """,
+        )
+        asset_file = write_file(
+            tmp_path,
+            "pipeline.py",
+            """
+            from barca import asset
+            from mylib.core import h
+
+            @asset()
+            def result():
+                return {"value": h()}
+        """,
+        )
+
+        r1 = barca.api._exec(["get", "result", asset_file])
+        assert r1["steps_executed"] == 1
+
+        r2 = barca.api._exec(["get", "result", asset_file])
+        assert r2["steps_executed"] == 0
+
+        # Change the sibling module the relative import actually points at.
+        write_file(
+            tmp_path,
+            "mylib/util.py",
+            """
+            def h():
+                return 999
+        """,
+        )
+
+        r3 = barca.api._exec(["get", "result", asset_file])
+        assert r3["steps_executed"] == 1
+
+    def test_relative_import_level_two(self, tmp_path):
+        """mylib/sub/core.py re-exporting `from ..util import h` (level=2)
+        must walk two package levels up to `mylib.util`, distinct from
+        level=1."""
+        write_file(tmp_path, "mylib/__init__.py", "")
+        write_file(tmp_path, "mylib/sub/__init__.py", "")
+        write_file(
+            tmp_path,
+            "mylib/util.py",
+            """
+            def h():
+                return 1
+        """,
+        )
+        write_file(
+            tmp_path,
+            "mylib/sub/core.py",
+            """
+            from ..util import h
+        """,
+        )
+        asset_file = write_file(
+            tmp_path,
+            "pipeline.py",
+            """
+            from barca import asset
+            from mylib.sub.core import h
+
+            @asset()
+            def result():
+                return {"value": h()}
+        """,
+        )
+
+        r1 = barca.api._exec(["get", "result", asset_file])
+        assert r1["steps_executed"] == 1
+
+        r2 = barca.api._exec(["get", "result", asset_file])
+        assert r2["steps_executed"] == 0
+
+        write_file(
+            tmp_path,
+            "mylib/util.py",
+            """
+            def h():
+                return 999
+        """,
+        )
+
+        r3 = barca.api._exec(["get", "result", asset_file])
+        assert r3["steps_executed"] == 1
+
 
 class TestInitReExports:
     """from mypackage import thing where thing is in __init__.py."""
@@ -216,6 +321,65 @@ class TestInitReExports:
             """
             def transform(x):
                 return x * 99
+        """,
+        )
+
+        r3 = barca.api._exec(["get", "result", asset_file])
+        assert r3["steps_executed"] == 1
+
+
+class TestTransitiveCrossFileImports:
+    """A helper's own dependency can be an import from a *third* file — that
+    third file's changes must still invalidate the cache."""
+
+    def test_helper_calling_a_transitively_imported_function(self, tmp_path):
+        """mylib/core.py's `helper()` calls `h()`, which core.py imports from
+        mylib/util.py. Changing util.py must invalidate `result`, even though
+        util.py is two hops away from the entry file's own import."""
+        write_file(
+            tmp_path,
+            "mylib/util.py",
+            """
+            def h():
+                return 1
+        """,
+        )
+        write_file(
+            tmp_path,
+            "mylib/core.py",
+            """
+            from mylib.util import h
+
+            def helper():
+                return h()
+        """,
+        )
+        asset_file = write_file(
+            tmp_path,
+            "pipeline.py",
+            """
+            from barca import asset
+            from mylib.core import helper
+
+            @asset()
+            def result():
+                return {"value": helper()}
+        """,
+        )
+
+        r1 = barca.api._exec(["get", "result", asset_file])
+        assert r1["steps_executed"] == 1
+
+        r2 = barca.api._exec(["get", "result", asset_file])
+        assert r2["steps_executed"] == 0
+
+        # Change the transitively-imported function two hops away.
+        write_file(
+            tmp_path,
+            "mylib/util.py",
+            """
+            def h():
+                return 999
         """,
         )
 

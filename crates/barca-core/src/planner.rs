@@ -67,6 +67,12 @@ pub struct StreamStep {
     pub pending_partitions: HashMap<String, String>,
     /// Explicit artifact serializer from `@asset(serializer="parquet")`.
     pub serializer: Option<Arc<str>>,
+    /// Sink outputs from stacked `@sink(...)` decorators.
+    pub sinks: Vec<crate::model::SinkDecl>,
+    /// Pre-dispatch run hashes: display node id → run_hash (one entry for
+    /// unpartitioned steps, one per partition otherwise). Populated by the
+    /// executor's cache pass; empty in freshly planned steps.
+    pub run_hashes: HashMap<String, String>,
     /// Timeout in seconds for this step's execution.
     pub timeout_seconds: u32,
     /// Total number of attempts on failure (1 = no retry). Rust-side only.
@@ -76,6 +82,10 @@ pub struct StreamStep {
     /// Late-expanded partition keys: workers loop over these internally.
     /// Empty for unpartitioned nodes. Enables 1M+ partitions without 1M structs.
     pub partition_keys: Vec<PartitionKey>,
+    /// Parameter frame types from function annotations (param → loader).
+    pub param_types: HashMap<String, crate::model::ValueType>,
+    /// Return frame type from the function's return annotation.
+    pub return_type: Option<crate::model::ValueType>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -211,20 +221,31 @@ pub fn plan(dag: &Dag, topology: &Topology, config: &ResourceConfig) -> Executio
 /// Merge consecutive phases that each have exactly 1 stream into a single phase.
 /// This avoids spawning a new process for each sequential phase when there's
 /// no parallelism opportunity.
+/// True if any step in the phase has an unresolved dynamic partition source
+/// (`partitions_from`) — its real step count/keys are only known once
+/// `dispatch::expand_pending_partitions` runs at dispatch time.
+fn phase_has_pending(phase: &Phase) -> bool {
+    phase
+        .streams
+        .iter()
+        .any(|s| s.steps.iter().any(|st| !st.pending_partitions.is_empty()))
+}
+
 fn merge_single_stream_phases(phases: Vec<Phase>) -> Vec<Phase> {
     let mut merged: Vec<Phase> = Vec::new();
 
     for phase in phases {
-        // Don't merge if this phase has steps with pending partition resolution.
-        let has_pending = phase
-            .streams
-            .iter()
-            .any(|s| s.steps.iter().any(|st| !st.pending_partitions.is_empty()));
+        // Don't merge if this phase has steps with pending partition resolution,
+        // and don't merge INTO a phase that does either — a step fused into a
+        // still-pending phase would ride along in the same dispatch phase as
+        // partitions that don't exist yet at plan time (see #97: this bit the
+        // same collect()-fan-in bug via a second path, `partitions_from`).
+        let has_pending = phase_has_pending(&phase);
         let can_merge = !has_pending
             && phase.streams.len() == 1
             && merged
                 .last()
-                .is_some_and(|prev: &Phase| prev.streams.len() == 1);
+                .is_some_and(|prev: &Phase| prev.streams.len() == 1 && !phase_has_pending(prev));
 
         if can_merge {
             // Append this phase's single stream's steps to the previous phase's single stream.
@@ -328,10 +349,14 @@ fn build_phases(
                                     inputs: step.inputs.clone(),
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
+                                    sinks: step.sinks.clone(),
+                                    run_hashes: step.run_hashes.clone(),
                                     timeout_seconds: step.timeout_seconds,
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
                                     partition_keys: chunk.to_vec(),
+                                    param_types: step.param_types.clone(),
+                                    return_type: step.return_type,
                                 }]);
                             }
                         }
@@ -365,10 +390,14 @@ fn build_phases(
                                     inputs: step.inputs.clone(),
                                     pending_partitions: step.pending_partitions.clone(),
                                     serializer: step.serializer.clone(),
+                                    sinks: step.sinks.clone(),
+                                    run_hashes: step.run_hashes.clone(),
                                     timeout_seconds: step.timeout_seconds,
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
                                     partition_keys: pks,
+                                    param_types: step.param_types.clone(),
+                                    return_type: step.return_type,
                                 });
                             }
                         }
@@ -411,11 +440,14 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
             .extracted
             .artifact_serializer
             .map(|s| Arc::from(format!("{s:?}").to_lowercase().as_str()));
+        let sinks: Vec<crate::model::SinkDecl> = node.extracted.sinks.to_vec();
         let timeout_seconds = node.extracted.timeout_seconds;
         let retries = node.extracted.retries;
         let retry_backoff_seconds = node.extracted.retry_backoff_seconds;
         let function_name: Arc<str> = Arc::from(node.function_name());
         let source_file: Arc<str> = Arc::from(node.source_file());
+        let param_types = node.extracted.param_types.clone();
+        let return_type = node.extracted.return_type;
 
         if !static_partitions.is_empty() {
             let combos = expand_partition_combos(&static_partitions);
@@ -428,10 +460,14 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: HashMap::new(),
                 serializer,
+                sinks,
+                run_hashes: HashMap::new(),
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
                 partition_keys: pks,
+                param_types: param_types.clone(),
+                return_type,
             });
         } else if !derived_partitions.is_empty() {
             steps.push(StreamStep {
@@ -442,10 +478,14 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: derived_partitions,
                 serializer: serializer.clone(),
+                sinks,
+                run_hashes: HashMap::new(),
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
                 partition_keys: Vec::new(),
+                param_types: param_types.clone(),
+                return_type,
             });
         } else {
             steps.push(StreamStep {
@@ -456,10 +496,14 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 inputs,
                 pending_partitions: HashMap::new(),
                 serializer,
+                sinks,
+                run_hashes: HashMap::new(),
                 timeout_seconds,
                 retries,
                 retry_backoff_seconds,
                 partition_keys: Vec::new(),
+                param_types,
+                return_type,
             });
         }
     }
@@ -653,6 +697,8 @@ mod tests {
                     source_text: String::new(),
                     cone_hash: String::new(),
                     artifact_serializer: None,
+                    param_types: HashMap::new(),
+                    return_type: None,
                     parallel_calls: Vec::new(),
                 }
             })
@@ -683,6 +729,52 @@ mod tests {
     // A chain is a maximal sequence where each node has single pred + succ.
     // Chains are the unit of vertical bundling (one Python process).
     // ═══════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn chain_to_steps_carries_sinks() {
+        let mut extracted = ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: "a".to_string(),
+            explicit_name: None,
+            freshness: Freshness::Always,
+            inputs: SmallVec::new(),
+            partitions: HashMap::new(),
+            sinks: SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: String::new(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
+            parallel_calls: Vec::new(),
+        };
+        extracted.sinks.push(SinkDecl {
+            path: "exports/out.parquet".to_string(),
+            serializer: Some(SerializerKind::Parquet),
+        });
+        extracted.sinks.push(SinkDecl {
+            path: "s3://bucket/model.pkl".to_string(),
+            serializer: None,
+        });
+        let dag = Dag::build(std::slice::from_ref(&extracted)).unwrap();
+        let chain = Chain {
+            nodes: vec!["test.py:a".to_string()],
+        };
+        let steps = chain_to_steps(&dag, &chain);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].sinks.len(), 2);
+        assert_eq!(steps[0].sinks[0].path, "exports/out.parquet");
+        assert_eq!(steps[0].sinks[0].serializer, Some(SerializerKind::Parquet));
+        assert_eq!(steps[0].sinks[1].path, "s3://bucket/model.pkl");
+        assert_eq!(steps[0].sinks[1].serializer, None);
+    }
 
     #[test]
     fn decompose_single_node() {
@@ -1085,6 +1177,8 @@ mod tests {
                 source_text: String::new(),
                 cone_hash: String::new(),
                 artifact_serializer: None,
+                param_types: HashMap::new(),
+                return_type: None,
                 parallel_calls: Vec::new(),
             })
             .collect();
@@ -1224,6 +1318,8 @@ mod tests {
                     source_text: String::new(),
                     cone_hash: String::new(),
                     artifact_serializer: None,
+                    param_types: HashMap::new(),
+                    return_type: None,
                     parallel_calls: Vec::new(),
                 }
             })
@@ -1316,5 +1412,233 @@ mod tests {
         assert_eq!(p.total_steps, 1);
         assert!(p.phases[0].streams[0].steps[0].partition_keys.is_empty());
         assert!(p.phases[0].streams[0].steps[0].step_id.partition.is_empty());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // FAN-IN (collect()) — regression coverage for #97
+    //
+    // A collect()-consuming node must never be chain-fused with its
+    // partitioned producer: fusion would let the consumer run in the same
+    // phase as the still-executing partition chunks (see build_phases'
+    // "unpartitioned steps run in every chunk / as their own late work
+    // unit" handling), racing ahead of data it depends on. It must land in
+    // its own chain, and — via cross-chain deps — a strictly later phase.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    fn build_collect_dag(producer_partitions: &[&str]) -> Dag {
+        let producer = ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: "source".to_string(),
+            explicit_name: None,
+            freshness: Freshness::Always,
+            inputs: SmallVec::new(),
+            partitions: HashMap::from([(
+                "key".to_string(),
+                PartitionSpec::Static {
+                    values: producer_partitions
+                        .iter()
+                        .map(|v| PartitionValue::Str(v.to_string()))
+                        .collect(),
+                },
+            )]),
+            sinks: SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: String::new(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
+            parallel_calls: Vec::new(),
+        };
+        let collector = ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: "sink".to_string(),
+            explicit_name: None,
+            freshness: Freshness::Always,
+            inputs: SmallVec::from_vec(vec![DeclaredInput {
+                param_name: "data".to_string(),
+                upstream: NodeRef::FunctionName("source".to_string()),
+                collected: true,
+            }]),
+            partitions: HashMap::new(),
+            sinks: SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: String::new(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
+            parallel_calls: Vec::new(),
+        };
+        Dag::build(&[producer, collector]).unwrap()
+    }
+
+    #[test]
+    fn decompose_breaks_chain_at_collect_edge() {
+        // source (2 partitions) --collect()--> sink
+        // Even though source has exactly one successor and sink exactly one
+        // predecessor, the Collect edge must not be chain-fused.
+        let dag = build_collect_dag(&["a", "b"]);
+        let topo = decompose(&dag);
+        assert_eq!(topo.chains.len(), 2);
+        for chain in &topo.chains {
+            assert_eq!(chain.nodes.len(), 1);
+        }
+    }
+
+    #[test]
+    fn plan_collect_fan_in_creates_phase_barrier() {
+        // source (2 partitions) --collect()--> sink
+        // Phase 0: source's 2 partition_keys. Phase 1: sink, gated on phase 0.
+        let dag = build_collect_dag(&["a", "b"]);
+        let p = plan_from_dag(&dag, &cfg(10));
+
+        assert_eq!(p.phases.len(), 2);
+        assert_eq!(p.phases[0].reason, PhaseReason::Initial);
+        let phase0_steps: Vec<&StreamStep> =
+            p.phases[0].streams.iter().flat_map(|s| &s.steps).collect();
+        // pool_size=10 with 2 partitions → chunk_size 1 → one StreamStep per key.
+        let phase0_pk_count: usize = phase0_steps.iter().map(|s| s.partition_keys.len()).sum();
+        assert!(
+            phase0_steps
+                .iter()
+                .all(|s| s.step_id.base_id() == "test.py:source")
+        );
+        assert_eq!(phase0_pk_count, 2);
+
+        let phase1_steps: Vec<&StreamStep> =
+            p.phases[1].streams.iter().flat_map(|s| &s.steps).collect();
+        assert_eq!(phase1_steps.len(), 1);
+        assert_eq!(phase1_steps[0].step_id.base_id(), "test.py:sink");
+        assert!(
+            matches!(&p.phases[1].reason, PhaseReason::FanIn { node_id } if node_id == "test.py:sink")
+        );
+    }
+
+    /// Regression test for a second manifestation of #97, found while fixing
+    /// it: `merge_single_stream_phases` only checked whether the phase *being
+    /// merged* had unresolved dynamic partitions (`partitions_from`), not
+    /// whether the phase it would merge *into* did. A collect() consumer of a
+    /// `partitions_from`-partitioned producer is its own single-stream phase
+    /// and would get silently folded into the still-pending producer's phase,
+    /// landing in the exact same "runs before its data exists" bug as the
+    /// static-partition case, just via phase merging instead of chain fusion.
+    #[test]
+    fn plan_dynamic_partition_collect_not_merged_into_pending_phase() {
+        let tickers = ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: "tickers".to_string(),
+            explicit_name: None,
+            freshness: Freshness::Always,
+            inputs: SmallVec::new(),
+            partitions: HashMap::new(),
+            sinks: SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: String::new(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
+            parallel_calls: Vec::new(),
+        };
+        let fetch_prices = ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: "fetch_prices".to_string(),
+            explicit_name: None,
+            freshness: Freshness::Always,
+            inputs: SmallVec::new(),
+            partitions: HashMap::from([(
+                "ticker".to_string(),
+                PartitionSpec::DerivedFrom {
+                    source_ref: NodeRef::FunctionName("tickers".to_string()),
+                },
+            )]),
+            sinks: SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: String::new(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
+            parallel_calls: Vec::new(),
+        };
+        let aggregate = ExtractedNode {
+            kind: NodeKind::Asset,
+            function_name: "aggregate".to_string(),
+            explicit_name: None,
+            freshness: Freshness::Always,
+            inputs: SmallVec::from_vec(vec![DeclaredInput {
+                param_name: "reports".to_string(),
+                upstream: NodeRef::FunctionName("fetch_prices".to_string()),
+                collected: true,
+            }]),
+            partitions: HashMap::new(),
+            sinks: SmallVec::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            description: None,
+            tags: HashMap::new(),
+            is_unsafe: false,
+            source_file: "test.py".to_string(),
+            byte_offset: 0,
+            source_text: String::new(),
+            cone_hash: String::new(),
+            artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
+            parallel_calls: Vec::new(),
+        };
+        let dag = Dag::build(&[tickers, fetch_prices, aggregate]).unwrap();
+        let p = plan_from_dag(&dag, &cfg(10));
+
+        // tickers, fetch_prices (pending), and aggregate must land in three
+        // distinct phases — merging any two would let aggregate dispatch
+        // before fetch_prices' real (dynamically-resolved) partitions exist.
+        assert_eq!(p.phases.len(), 3);
+        let base_ids_in = |phase: &Phase| -> Vec<String> {
+            phase
+                .streams
+                .iter()
+                .flat_map(|s| &s.steps)
+                .map(|st| st.step_id.base_id().to_string())
+                .collect()
+        };
+        assert_eq!(base_ids_in(&p.phases[0]), vec!["test.py:tickers"]);
+        assert_eq!(base_ids_in(&p.phases[1]), vec!["test.py:fetch_prices"]);
+        assert_eq!(base_ids_in(&p.phases[2]), vec!["test.py:aggregate"]);
+        assert!(
+            !p.phases[1].streams[0].steps[0]
+                .pending_partitions
+                .is_empty()
+        );
     }
 }
