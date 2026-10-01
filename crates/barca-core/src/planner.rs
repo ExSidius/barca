@@ -82,6 +82,10 @@ pub struct StreamStep {
     /// Late-expanded partition keys: workers loop over these internally.
     /// Empty for unpartitioned nodes. Enables 1M+ partitions without 1M structs.
     pub partition_keys: Vec<PartitionKey>,
+    /// Parameter frame types from function annotations (param → loader).
+    pub param_types: HashMap<String, crate::model::ValueType>,
+    /// Return frame type from the function's return annotation.
+    pub return_type: Option<crate::model::ValueType>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -351,6 +355,8 @@ fn build_phases(
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
                                     partition_keys: chunk.to_vec(),
+                                    param_types: step.param_types.clone(),
+                                    return_type: step.return_type,
                                 }]);
                             }
                         }
@@ -390,6 +396,8 @@ fn build_phases(
                                     retries: step.retries,
                                     retry_backoff_seconds: step.retry_backoff_seconds,
                                     partition_keys: pks,
+                                    param_types: step.param_types.clone(),
+                                    return_type: step.return_type,
                                 });
                             }
                         }
@@ -438,6 +446,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
         let retry_backoff_seconds = node.extracted.retry_backoff_seconds;
         let function_name: Arc<str> = Arc::from(node.function_name());
         let source_file: Arc<str> = Arc::from(node.source_file());
+        let param_types = node.extracted.param_types.clone();
+        let return_type = node.extracted.return_type;
 
         if !static_partitions.is_empty() {
             let combos = expand_partition_combos(&static_partitions);
@@ -456,6 +466,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 retries,
                 retry_backoff_seconds,
                 partition_keys: pks,
+                param_types: param_types.clone(),
+                return_type,
             });
         } else if !derived_partitions.is_empty() {
             steps.push(StreamStep {
@@ -472,6 +484,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 retries,
                 retry_backoff_seconds,
                 partition_keys: Vec::new(),
+                param_types: param_types.clone(),
+                return_type,
             });
         } else {
             steps.push(StreamStep {
@@ -488,6 +502,8 @@ fn chain_to_steps(dag: &Dag, chain: &Chain) -> Vec<StreamStep> {
                 retries,
                 retry_backoff_seconds,
                 partition_keys: Vec::new(),
+                param_types,
+                return_type,
             });
         }
     }
@@ -681,6 +697,8 @@ mod tests {
                     source_text: String::new(),
                     cone_hash: String::new(),
                     artifact_serializer: None,
+                    param_types: HashMap::new(),
+                    return_type: None,
                     parallel_calls: Vec::new(),
                 }
             })
@@ -733,6 +751,8 @@ mod tests {
             source_text: String::new(),
             cone_hash: String::new(),
             artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
             parallel_calls: Vec::new(),
         };
         extracted.sinks.push(SinkDecl {
@@ -1157,6 +1177,8 @@ mod tests {
                 source_text: String::new(),
                 cone_hash: String::new(),
                 artifact_serializer: None,
+                param_types: HashMap::new(),
+                return_type: None,
                 parallel_calls: Vec::new(),
             })
             .collect();
@@ -1296,6 +1318,8 @@ mod tests {
                     source_text: String::new(),
                     cone_hash: String::new(),
                     artifact_serializer: None,
+                    param_types: HashMap::new(),
+                    return_type: None,
                     parallel_calls: Vec::new(),
                 }
             })
@@ -1429,6 +1453,8 @@ mod tests {
             source_text: String::new(),
             cone_hash: String::new(),
             artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
             parallel_calls: Vec::new(),
         };
         let collector = ExtractedNode {
@@ -1454,6 +1480,8 @@ mod tests {
             source_text: String::new(),
             cone_hash: String::new(),
             artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
             parallel_calls: Vec::new(),
         };
         Dag::build(&[producer, collector]).unwrap()
@@ -1530,6 +1558,8 @@ mod tests {
             source_text: String::new(),
             cone_hash: String::new(),
             artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
             parallel_calls: Vec::new(),
         };
         let fetch_prices = ExtractedNode {
@@ -1556,6 +1586,8 @@ mod tests {
             source_text: String::new(),
             cone_hash: String::new(),
             artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
             parallel_calls: Vec::new(),
         };
         let aggregate = ExtractedNode {
@@ -1581,6 +1613,8 @@ mod tests {
             source_text: String::new(),
             cone_hash: String::new(),
             artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
             parallel_calls: Vec::new(),
         };
         let dag = Dag::build(&[tickers, fetch_prices, aggregate]).unwrap();

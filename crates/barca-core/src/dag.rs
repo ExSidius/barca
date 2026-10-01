@@ -325,6 +325,8 @@ mod tests {
             source_text: "def a(): return 1".to_string(),
             cone_hash: String::new(),
             artifact_serializer: None,
+            param_types: HashMap::new(),
+            return_type: None,
             parallel_calls: Vec::new(),
         }
     }

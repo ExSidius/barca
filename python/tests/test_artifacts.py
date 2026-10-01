@@ -244,19 +244,21 @@ class TestRoundTripParquet:
         result = deserialize(path, "parquet")
         pd.testing.assert_frame_equal(result, df)
 
-    def test_polars_dataframe(self, tmp_path):
+    def test_polars_dataframe_default_reader_is_pandas(self, tmp_path):
         df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
         path = tmp_path / "out.parquet"
         serialize(df, path, "parquet")
         result = deserialize(path, "parquet")
-        # Deserializing parquet without knowing the original library
-        # should return a pandas DataFrame by default (or polars).
-        # We just check the data matches.
-        if isinstance(result, pl.DataFrame):
-            assert result.frame_equal(df)
-        else:
-            expected_pd = df.to_pandas()
-            pd.testing.assert_frame_equal(result, expected_pd)
+        expected_pd = df.to_pandas()
+        pd.testing.assert_frame_equal(result, expected_pd)
+
+    def test_polars_dataframe_with_frame_type(self, tmp_path):
+        df = pl.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        path = tmp_path / "out.parquet"
+        serialize(df, path, "parquet")
+        result = deserialize(path, "parquet", frame_type="polars")
+        assert isinstance(result, pl.DataFrame)
+        assert result.equals(df)
 
     def test_pandas_multiple_dtypes(self, tmp_path):
         df = pd.DataFrame(

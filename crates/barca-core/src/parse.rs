@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use crate::model::{
     CronExpr, DeclaredInput, ExtractedNode, Freshness, NodeKind, NodeRef, ParallelCall,
-    PartitionSpec, PartitionValue, SerializerKind, SinkDecl,
+    PartitionSpec, PartitionValue, SerializerKind, SinkDecl, ValueType,
 };
 
 /// Error from parsing a Python source file.
@@ -109,6 +109,7 @@ fn try_extract_function(
     } else {
         Vec::new()
     };
+    let (param_types, return_type) = extract_type_annotations(func);
 
     let start = func.range().start().to_usize();
     let end = func.range().end().to_usize();
@@ -133,8 +134,84 @@ fn try_extract_function(
         source_text,
         cone_hash: String::new(), // computed after extraction in extract_nodes()
         artifact_serializer,
+        param_types,
+        return_type,
         parallel_calls,
     }))
+}
+
+/// Extract parameter and return types from function annotations.
+fn extract_type_annotations(
+    func: &ast::StmtFunctionDef,
+) -> (HashMap<String, ValueType>, Option<ValueType>) {
+    let mut param_types = HashMap::new();
+    let params = &func.parameters;
+
+    for arg in params
+        .posonlyargs
+        .iter()
+        .chain(&params.args)
+        .chain(&params.kwonlyargs)
+    {
+        if let Some(vt) = arg.annotation().and_then(parse_value_type_expr) {
+            param_types.insert(arg.name().id.to_string(), vt);
+        }
+    }
+
+    let return_type = func.returns.as_deref().and_then(parse_value_type_expr);
+
+    (param_types, return_type)
+}
+
+/// Map a type annotation expression to a supported [`ValueType`].
+fn parse_value_type_expr(expr: &Expr) -> Option<ValueType> {
+    match expr {
+        Expr::StringLiteral(s) => parse_type_path(&s.value.to_string()),
+        Expr::Subscript(sub) => {
+            // list[pl.DataFrame] from collect() fan-in params.
+            if is_list_annotation(sub.value.as_ref()) {
+                parse_value_type_expr(&sub.slice)
+            } else {
+                None
+            }
+        }
+        Expr::Attribute(attr) => {
+            let module = expr_to_name(attr.value.as_ref())?;
+            parse_type_path(&format!("{module}.{}", attr.attr))
+        }
+        Expr::Name(name) => parse_type_path(&name.id),
+        _ => None,
+    }
+}
+
+fn is_list_annotation(expr: &Expr) -> bool {
+    matches!(expr, Expr::Name(n) if n.id.as_str() == "list")
+}
+
+fn expr_to_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Name(n) => Some(n.id.to_string()),
+        _ => None,
+    }
+}
+
+fn parse_type_path(path: &str) -> Option<ValueType> {
+    let path = path.trim();
+    let (module, name) = match path.rsplit_once('.') {
+        Some((m, n)) => (m, n),
+        None => ("", path),
+    };
+    classify_type(module, name)
+}
+
+fn classify_type(module: &str, name: &str) -> Option<ValueType> {
+    match (module, name) {
+        ("pl" | "polars", "DataFrame" | "LazyFrame") => Some(ValueType::Polars),
+        ("pd" | "pandas", "DataFrame") => Some(ValueType::Pandas),
+        ("pyarrow", "Table") => Some(ValueType::PyArrow),
+        ("duckdb", "DuckDBPyRelation") => Some(ValueType::DuckDB),
+        _ => None,
+    }
 }
 
 fn is_unsafe_decorator(expr: &Expr) -> bool {
@@ -783,6 +860,39 @@ def my_task(data):
             Freshness::Schedule(CronExpr("*/5 * * * *".into()))
         );
         assert_eq!(nodes[1].kind, NodeKind::Task);
+    }
+
+    #[test]
+    fn type_annotations_extracted_from_signature() {
+        use crate::model::ValueType;
+
+        let src = r#"
+from barca import asset
+
+@asset()
+def raw() -> pl.DataFrame:
+    ...
+
+@asset(inputs={"orders": raw, "meta": raw})
+def stg(orders: pl.DataFrame, meta: pd.DataFrame) -> pd.DataFrame:
+    ...
+
+@asset(inputs={"parts": raw})
+def collected(parts: list[pl.DataFrame]) -> pl.DataFrame:
+    ...
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes.len(), 3);
+
+        assert_eq!(nodes[0].return_type, Some(ValueType::Polars));
+        assert!(nodes[0].param_types.is_empty());
+
+        assert_eq!(nodes[1].return_type, Some(ValueType::Pandas));
+        assert_eq!(nodes[1].param_types.get("orders"), Some(&ValueType::Polars));
+        assert_eq!(nodes[1].param_types.get("meta"), Some(&ValueType::Pandas));
+
+        assert_eq!(nodes[2].return_type, Some(ValueType::Polars));
+        assert_eq!(nodes[2].param_types.get("parts"), Some(&ValueType::Polars));
     }
 
     #[test]

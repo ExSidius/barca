@@ -75,9 +75,11 @@ def _lru_cacheable(path: str, size_bytes=None) -> bool:
 class _ArtifactLRU:
     """Tier-1 read-through cache: deserialized artifacts hot in this process.
 
-    Keyed by artifact path — paths are content-addressed
+    Keyed by (path, frame_type) — paths are content-addressed
     ({node}/{run_hash}{ext}), so a path uniquely identifies content and
     invalidation is automatic (changed input → changed hash → new path → miss).
+    Frame type is part of the key so a polars consumer never hits a cached pandas
+    materialization of the same path.
     Values are returned as deep copies so a task mutating its input can never
     poison a later task's view; if a value can't be deep-copied, the entry is
     dropped and the caller falls through to the store (tier 2). Pure
@@ -88,30 +90,36 @@ class _ArtifactLRU:
     def __init__(self, max_entries: int = 16):
         from collections import OrderedDict
 
-        self._entries: "OrderedDict[str, object]" = OrderedDict()
+        self._entries: "OrderedDict[tuple[str, str], object]" = OrderedDict()
         self._max = max_entries
 
-    def get(self, path: str):
+    @staticmethod
+    def _key(path: str, frame_type: str | None) -> tuple[str, str]:
+        return (path, frame_type or "pandas")
+
+    def get(self, path: str, frame_type: str | None = None):
         """Return a safe copy of the cached value, or None on miss."""
-        if path not in self._entries:
+        key = self._key(path, frame_type)
+        if key not in self._entries:
             return None
         import copy
 
-        self._entries.move_to_end(path)
+        self._entries.move_to_end(key)
         try:
-            return copy.deepcopy(self._entries[path])
+            return copy.deepcopy(self._entries[key])
         except Exception:
-            del self._entries[path]
+            del self._entries[key]
             return None
 
-    def put(self, path: str, value) -> None:
+    def put(self, path: str, value, frame_type: str | None = None) -> None:
         import copy
 
+        key = self._key(path, frame_type)
         try:
-            self._entries[path] = copy.deepcopy(value)
+            self._entries[key] = copy.deepcopy(value)
         except Exception:
             return
-        self._entries.move_to_end(path)
+        self._entries.move_to_end(key)
         while len(self._entries) > self._max:
             self._entries.popitem(last=False)
 
@@ -227,32 +235,32 @@ def _run_with_timeout(fn, kwargs, timeout_seconds):
     return result
 
 
-def _resolve_input(raw_value):
+def _resolve_input(raw_value, *, frame_type=None):
     """Resolve a provided input: artifact ref → deserialized value, else raw.
 
     For collected (fan-in) inputs, deserializes each partition artifact into a list.
     """
     if isinstance(raw_value, dict):
         if raw_value.get("_collected") and "artifacts" in raw_value:
-            return _load_collected_artifacts(raw_value["artifacts"])
+            return _load_collected_artifacts(raw_value["artifacts"], frame_type=frame_type)
         if "path" in raw_value and "format" in raw_value:
-            return deserialize(raw_value["path"], raw_value["format"])
+            return deserialize(raw_value["path"], raw_value["format"], frame_type=frame_type)
     return raw_value
 
 
-def _load_artifact(path, lru, fmt=None):
+def _load_artifact(path, lru, fmt=None, *, frame_type=None):
     """Resolve one artifact path to its deserialized value via the tier-1 LRU
     cache, falling through to the artifact store on miss."""
-    hot = lru.get(path)
+    hot = lru.get(path, frame_type)
     if hot is not None:
         return hot
     if not _storage.exists(path):
         raise FileNotFoundError(f"Input artifact not found: {path}")
     if fmt is None:
         fmt = _EXT_FORMATS.get(_storage.suffix(path), "json")
-    value = deserialize(path, fmt)
+    value = deserialize(path, fmt, frame_type=frame_type)
     if _lru_cacheable(path):
-        lru.put(path, value)
+        lru.put(path, value, frame_type)
     return value
 
 
@@ -265,7 +273,7 @@ def _load_artifact(path, lru, fmt=None):
 _COLLECT_IO_MAX_WORKERS = 8
 
 
-def _load_collected_artifacts(artifacts, lru=None, *, param=None):
+def _load_collected_artifacts(artifacts, lru=None, *, param=None, frame_type=None):
     """Load every artifact of a collect() fan-in param, in order.
 
     Tier-1 LRU lookups happen up front on the calling thread (cheap,
@@ -282,7 +290,7 @@ def _load_collected_artifacts(artifacts, lru=None, *, param=None):
     results = [None] * len(artifacts)
     to_fetch = []
     for i, artifact in enumerate(artifacts):
-        hot = lru.get(artifact["path"]) if lru is not None else None
+        hot = lru.get(artifact["path"], frame_type) if lru is not None else None
         if hot is not None:
             results[i] = hot
         else:
@@ -299,13 +307,13 @@ def _load_collected_artifacts(artifacts, lru=None, *, param=None):
                 raise FileNotFoundError(f"Input artifact for parameter '{param}' not found: {path}")
             raise FileNotFoundError(f"Input artifact not found: {path}")
         fmt = artifact.get("format") or _EXT_FORMATS.get(_storage.suffix(path), "json")
-        return deserialize(path, fmt)
+        return deserialize(path, fmt, frame_type=frame_type)
 
     with ThreadPoolExecutor(max_workers=min(len(to_fetch), _COLLECT_IO_MAX_WORKERS)) as ex:
         for (i, artifact), value in zip(to_fetch, ex.map(_fetch, to_fetch)):
             results[i] = value
             if lru is not None and _lru_cacheable(artifact["path"]):
-                lru.put(artifact["path"], value)
+                lru.put(artifact["path"], value, frame_type)
 
     return results
 
@@ -593,8 +601,10 @@ def _run_daemon_step(step, modules, art_dir, lru):
 
         # Resolve dag_inputs as function arguments.
         inputs = step.get("inputs", {})
+        param_types = step.get("param_types") or {}
         kwargs = dict(d_kwargs) if d_kwargs else {}
         for param, value in inputs.items():
+            frame_type = param_types.get(param)
             # Skip ordering-only deps (underscore-prefixed params carry no data).
             if param.startswith("_"):
                 kwargs[param] = None
@@ -604,13 +614,16 @@ def _run_daemon_step(step, modules, art_dir, lru):
             # Cache misses load concurrently (see _load_collected_artifacts).
             if isinstance(value, dict) and value.get("_collected"):
                 kwargs[param] = _load_collected_artifacts(
-                    value.get("artifacts", []), lru, param=param
+                    value.get("artifacts", []),
+                    lru,
+                    param=param,
+                    frame_type=frame_type,
                 )
                 continue
             if not value:
                 continue
             try:
-                kwargs[param] = _load_artifact(value, lru)
+                kwargs[param] = _load_artifact(value, lru, frame_type=frame_type)
             except FileNotFoundError:
                 raise FileNotFoundError(
                     f"Input artifact for parameter '{param}' not found: {value}"
