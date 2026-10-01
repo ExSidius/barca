@@ -27,7 +27,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -35,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::coordinator::{Coordinator, FailureAction, GroupId, ItemId, ItemSpec};
 use crate::cost::CostModel;
-use crate::protocol::{CoordinatorMessage, ParallelResult, WorkerMessage};
+use crate::protocol::{CoordinatorMessage, ParallelResult, WorkerMessage, read_frame, write_frame};
 
 // ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -123,14 +122,14 @@ async fn worker_io_task(
 ) {
     loop {
         tokio::select! {
-            result = read_one_message(&mut stream) => {
+            result = read_frame::<_, WorkerMessage>(&mut stream) => {
                 match result {
-                    Ok(msg) => {
+                    Ok(Some(msg)) => {
                         if event_tx.send(IoEvent::Message { worker_id, msg }).await.is_err() {
                             break;
                         }
                     }
-                    Err(_) => {
+                    Ok(None) | Err(_) => {
                         let _ = event_tx.send(IoEvent::Disconnected { worker_id }).await;
                         break;
                     }
@@ -139,7 +138,7 @@ async fn worker_io_task(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(msg) => {
-                        if write_message(&mut stream, &msg).await.is_err() {
+                        if write_frame(&mut stream, &msg).await.is_err() {
                             let _ = event_tx.send(IoEvent::Disconnected { worker_id }).await;
                             break;
                         }
@@ -853,36 +852,6 @@ impl WorkerPool {
             }
         }
     }
-}
-
-// ─── Message I/O ─────────────────────────────────────────────────────────────
-
-async fn read_one_message(stream: &mut UnixStream) -> Result<WorkerMessage, std::io::Error> {
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).await?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 256 * 1024 * 1024 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "message too large",
-        ));
-    }
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
-    serde_json::from_slice(&payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-}
-
-async fn write_message(
-    stream: &mut UnixStream,
-    msg: &impl serde::Serialize,
-) -> Result<(), std::io::Error> {
-    let payload = serde_json::to_vec(msg)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let header = (payload.len() as u32).to_be_bytes();
-    stream.write_all(&header).await?;
-    stream.write_all(&payload).await?;
-    stream.flush().await
 }
 
 // ─── Worker spawning ─────────────────────────────────────────────────────────
