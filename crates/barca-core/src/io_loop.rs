@@ -55,6 +55,10 @@ pub struct IoConfig {
 /// `Send` so the whole run future can be spawned onto a multi-thread runtime.
 pub type StepCallback<'a> = Box<dyn FnMut(&str, &serde_json::Value) + Send + 'a>;
 
+/// Called periodically while steps are running, with `(node_id, seconds running)` for each
+/// step that has been in flight longer than the progress interval.
+pub type RunningHook = Box<dyn FnMut(&[(String, f64)]) + Send + 'static>;
+
 // ─── Worker handle ───────────────────────────────────────────────────────────
 
 struct WorkerHandle {
@@ -63,6 +67,9 @@ struct WorkerHandle {
     _task: JoinHandle<()>,
     /// Items leased to this worker, in execution order (front = in-flight).
     leases: VecDeque<ItemId>,
+    /// When the current front lease became the in-flight item (assignment or the previous
+    /// completion). Drives the "still running" progress report.
+    front_since: std::time::Instant,
 }
 
 // ─── Frozen worker (SIGSTOP'd, waiting for parallel group) ──────────────────
@@ -163,6 +170,10 @@ pub struct WorkerPool {
     next_worker_id: usize,
     trace_start: std::time::Instant,
     trace_on: bool,
+    /// How long a step must run before it is reported as "still running" (0 = never).
+    /// `BARCA_PROGRESS_SECS`, default 15.
+    progress_interval: Duration,
+    running_hook: Option<RunningHook>,
 }
 
 impl WorkerPool {
@@ -184,7 +195,36 @@ impl WorkerPool {
             next_worker_id: 0,
             trace_start: std::time::Instant::now(),
             trace_on: std::env::var("BARCA_TRACE_TIMING").is_ok(),
+            progress_interval: Duration::from_secs(
+                std::env::var("BARCA_PROGRESS_SECS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(15),
+            ),
+            running_hook: None,
         })
+    }
+
+    /// Report steps that stay in flight longer than the progress interval, so a long
+    /// step does not look like a hang.
+    pub fn on_running(&mut self, hook: RunningHook) {
+        self.running_hook = Some(hook);
+    }
+
+    /// `(node_id, seconds)` for every worker's in-flight step older than the interval.
+    fn running_steps(&self, coord: &Coordinator) -> Vec<(String, f64)> {
+        let mut out: Vec<(String, f64)> = self
+            .workers
+            .values()
+            .filter_map(|w| {
+                let &iid = w.leases.front()?;
+                let secs = w.front_since.elapsed();
+                (secs >= self.progress_interval)
+                    .then(|| (coord.item(iid).step_id.display(), secs.as_secs_f64()))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 
     /// Drive one phase's coordinator to completion against the (persistent)
@@ -204,6 +244,15 @@ impl WorkerPool {
             return Err("run cancelled".to_string());
         }
         self.assign_ready(coord, cost).await;
+
+        let mut ticker = if self.running_hook.is_some() && !self.progress_interval.is_zero() {
+            let mut t = tokio::time::interval(self.progress_interval);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t.tick().await; // the first tick fires immediately
+            Some(t)
+        } else {
+            None
+        };
 
         loop {
             if coord.is_finished() {
@@ -225,6 +274,20 @@ impl WorkerPool {
                     Some(e) => e,
                     None => break,
                 },
+                _ = async {
+                    match ticker.as_mut() {
+                        Some(t) => { t.tick().await; }
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let running = self.running_steps(coord);
+                    if !running.is_empty() {
+                        if let Some(hook) = self.running_hook.as_mut() {
+                            hook(&running);
+                        }
+                    }
+                    continue;
+                }
             };
 
             match event {
@@ -541,7 +604,9 @@ impl WorkerPool {
             .leases
             .iter()
             .position(|&iid| coord.item(iid).step_id.display() == node_id)?;
-        handle.leases.remove(pos)
+        let taken = handle.leases.remove(pos);
+        handle.front_since = std::time::Instant::now();
+        taken
     }
 
     /// Return every unstarted lease on a dead/frozen worker to the queue front.
@@ -682,6 +747,7 @@ impl WorkerPool {
                 continue;
             }
             handle.leases = batch.into_iter().collect();
+            handle.front_since = std::time::Instant::now();
         }
     }
 
@@ -778,6 +844,7 @@ impl WorkerPool {
                         _task: fw._task,
                         // Still executing the parent task.
                         leases: VecDeque::from([fw.parent_item]),
+                        front_since: std::time::Instant::now(),
                     },
                 );
                 // Don't increment i — swap_remove moved the last element here
@@ -871,6 +938,7 @@ async fn spawn_worker(
         cmd_tx,
         _task: task,
         leases: VecDeque::new(),
+        front_since: std::time::Instant::now(),
     })
 }
 
@@ -1188,6 +1256,7 @@ mod tests {
                         cmd_tx,
                         _task: tokio::spawn(async {}),
                         leases: VecDeque::new(),
+                        front_since: std::time::Instant::now(),
                     },
                 );
             }
@@ -1222,6 +1291,8 @@ mod tests {
                 next_worker_id: n,
                 trace_start: std::time::Instant::now(),
                 trace_on: false,
+                progress_interval: Duration::ZERO,
+                running_hook: None,
             };
 
             let start = std::time::Instant::now();

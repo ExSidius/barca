@@ -34,6 +34,19 @@ content-addressed, so they can be shared between machines when remote state is c
 `barca run` previously refreshed every upstream asset by default and called the selective flag
 `--burst`. The default is now cache-aware and the flag is `--refresh`.
 
+### Exactly what `--refresh` does
+
+- `--refresh a,b` re-materializes **only** the assets you name. It takes one comma-separated
+  list; `--refresh a b` is an error ("'b' is not a .py file"). A name that is not an upstream
+  asset of the task is an error that lists the valid names, so a typo never silently does nothing.
+- It does **not** rebuild the upstream of what you name. Unnamed assets keep serving from cache.
+- It does **not** invalidate assets *downstream* of what you name. Run hashes cover definitions
+  and upstream hashes, not output contents, so a cached downstream asset still matches and the
+  refreshed data never reaches it. Barca prints
+  `warning: 'mid' was served from cache but depends on refreshed 'src' ...` when this happens.
+  To push fresh data through a chain, name the whole chain (`--refresh src,mid`) or use
+  `--refresh-all`.
+
 ## Concurrent runs
 
 Several barca processes can run in one project at once (parallel scripts or agents, `barca serve`

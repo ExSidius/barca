@@ -58,6 +58,9 @@ Examples:
   barca run deploy pipeline.py --refresh-all           # re-materialize every upstream asset
   barca run deploy pipeline.py --no-cache              # same as --refresh-all
 
+--refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs only
+the assets you name: assets downstream of them stay cached unless you list them too (barca prints
+a warning when that happens). A name that is not an upstream asset is an error.
 The target must be a task; use `barca get` for assets.
 More: barca docs tasks, barca docs cache";
 
@@ -170,7 +173,9 @@ enum Cli {
         /// TARGET file.py [file.py ...] — target task is required
         #[arg(required = true)]
         args: Vec<String>,
-        /// Comma-separated upstream asset names to force re-materialize
+        /// Upstream assets to force re-materialize, as ONE comma-separated list
+        /// (`--refresh a,b`, not `--refresh a b`). Assets downstream of them stay cached
+        /// unless also listed; barca warns when that happens
         #[arg(long, value_delimiter = ',', conflicts_with = "refresh_all")]
         refresh: Option<Vec<String>>,
         /// Force re-materialize ALL upstream assets in the task's cone
@@ -280,6 +285,25 @@ enum Cli {
     Version,
 }
 
+/// Reject file arguments that are not `.py` files, with a hint for the most common mistake:
+/// passing several assets to `--refresh` separated by spaces instead of commas.
+fn check_py_files(files: &[PathBuf], refresh: Option<&[String]>) {
+    let Some(bad) = files.iter().find(|f| !f.to_string_lossy().ends_with(".py")) else {
+        return;
+    };
+    let bad = bad.to_string_lossy();
+    eprintln!("error: '{bad}' is not a .py file.");
+    if let Some(names) = refresh {
+        let mut all: Vec<String> = names.to_vec();
+        all.push(bad.to_string());
+        eprintln!(
+            "\nIf you meant to refresh several assets, join them with commas: --refresh {}",
+            all.join(",")
+        );
+    }
+    std::process::exit(1);
+}
+
 /// Split the raw positional args into (optional target, files).
 /// If the first arg ends in `.py`, all args are files (no target).
 /// Otherwise, the first arg is the target and the rest are files.
@@ -376,6 +400,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             env,
         } => {
             let (target, files) = split_target_files(args);
+            check_py_files(&files, None);
             if files.is_empty() && target.is_none() {
                 eprintln!("error: no files provided\n\nUsage: barca get [TARGET] <FILES>...");
                 std::process::exit(1);
@@ -404,6 +429,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             env,
         } => {
             let (target, files) = split_target_files(args);
+            check_py_files(&files, refresh.as_deref());
             let Some(target) = target else {
                 eprintln!(
                     "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
