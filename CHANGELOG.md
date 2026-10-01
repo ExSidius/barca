@@ -14,6 +14,17 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- `barca docs`: a manual compiled into the binary (concepts, output formats, caching, tasks,
+  partitions, scheduling, runnable examples, conventions for scripts and AI agents). Every
+  command's `--help` now ends with runnable examples, and `list`, `history` and `stats` take
+  `--json`. Docs, help examples and JSON output are now part of the feature workflow
+  (see CLAUDE.md); tests execute the manual's examples.
+- DuckDB: steps returning a `DuckDBPyRelation` or a pyarrow `Table` are written as parquet
+  without `serializer="parquet"` (a relation used to crash with "cannot pickle", a Table was
+  silently pickled). Barca now owns one DuckDB connection per worker process and binds every
+  duckdb-typed input as a view named after its parameter for the step, so SQL by name works
+  in helpers without bind code; `barca.duckdb_connection()` exposes the connection for
+  one-time configuration (extensions, credentials, settings).
 - Sub-minute cron scheduling: `Schedule(...)` now accepts a 6-field cron with a
   leading seconds field (e.g. `*/15 * * * * *` — every 15 seconds); the `barca serve`
   scheduler evaluates at 1-second resolution. 5-field crons are unchanged (seconds

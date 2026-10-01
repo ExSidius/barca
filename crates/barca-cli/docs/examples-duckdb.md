@@ -64,10 +64,10 @@ barca get top_region pipeline.py
 What to notice:
 
 - The first four assets are written as `.parquet`; `top_region` returns a dict and is `.json`.
-- Each parameter name is also the table name inside the SQL: DuckDB resolves `orders`,
-  `customers`, `enriched` and `rev` from the Python variables of the same name. This works
-  because inputs and `duckdb.sql(...)` share duckdb's default connection; a step that opens
-  its own `duckdb.connect()` cannot mix its relations with inputs (see `barca docs types`).
+- Each parameter name is also a view name for the duration of the step: `orders`, `customers`,
+  `enriched` and `rev` resolve in SQL even inside helper functions that never see the Python
+  variable. Inputs and `duckdb.sql(...)` share one connection; configure it with
+  `barca.duckdb_connection()` and see `barca docs types` for the rules.
 - `revenue` is cast to `double`: DuckDB decimals come back as Python `Decimal`, which is not
   JSON-serializable, so a dict holding one would be pickled instead of stored as JSON.
 - The final JSON has `"final_output": {"region": "EMEA", ...}`. To see a parquet step instead,
