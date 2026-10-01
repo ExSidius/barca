@@ -40,6 +40,15 @@ All notable changes to this project will be documented in this file.
   with the metadata DB pushed/pulled as a blob.
 - Minimal standalone scheduler example under `examples/scheduler`.
 
+### Bug Fixes
+
+- Concurrent barca processes in one project no longer fail with `Failed locking file
+  '.barca/metadata.db'. File is locked by another process`. Turso opens the DB
+  single-process (its multi-process mode is experimental), and `barca get`/`run` held the DB
+  open for the whole run. Barca now holds a short cross-process lock (`.barca/metadata.db.lock`)
+  only while it reads or writes the DB and releases it while your Python runs, so processes
+  queue instead of failing.
+
 ### Refactor
 
 - Async-native core: the async runtime is owned by the caller, with cancellable runs.

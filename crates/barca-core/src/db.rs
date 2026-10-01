@@ -192,10 +192,38 @@ fn db_open_error(detail: impl std::fmt::Display) -> BarcaError {
     BarcaError::Db(msg)
 }
 
+/// A short-lived handle for one phase's cache lookups. It holds the in-process guard
+/// *and* the cross-process lock for as long as it lives, so open it for the lookups
+/// and drop it before any step runs: another barca process can then use the DB while
+/// this run executes Python. (Fields drop in order: connection, database + file lock,
+/// then the in-process guard.)
+pub struct CacheReader {
+    conn: turso::Connection,
+    _handle: DbHandle,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl CacheReader {
+    pub async fn open(db_path: &str) -> Result<Self, BarcaError> {
+        // Same order as every other helper: in-process guard first, then the file lock.
+        let guard = db_guard().await;
+        let (handle, conn) = open_conn(db_path).await?;
+        Ok(Self {
+            conn,
+            _handle: handle,
+            _guard: guard,
+        })
+    }
+
+    pub fn conn(&self) -> &turso::Connection {
+        &self.conn
+    }
+}
+
 /// Open the database at `db_path` and connect. Callers must hold [`db_guard`]
 /// for the duration of their work on the returned connection; the returned
 /// handle holds the cross-process lock until it is dropped.
-async fn open_conn(db_path: &str) -> Result<(DbHandle, turso::Connection), BarcaError> {
+pub(crate) async fn open_conn(db_path: &str) -> Result<(DbHandle, turso::Connection), BarcaError> {
     let lock = acquire_file_lock(db_path, DB_FILE_LOCK_WAIT).await?;
     let db = Builder::new_local(db_path)
         .build()

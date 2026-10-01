@@ -17,7 +17,6 @@ use crate::BarcaError;
 use crate::config::ResolvedConfig;
 use std::path::Path;
 use tokio::process::Command;
-use turso::Builder;
 
 /// Opaque concurrency token for the remote state blob (etag / generation /
 /// sha256, depending on backend). `None` means the remote object is absent.
@@ -121,13 +120,7 @@ pub async fn push_state(
 pub async fn checkpoint_truncate(db_path: &str) -> Result<(), BarcaError> {
     {
         let _g = crate::db::db_guard().await;
-        let db = Builder::new_local(db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("checkpoint: failed to open DB: {e}")))?;
-        let conn = db
-            .connect()
-            .map_err(|e| BarcaError::Db(format!("checkpoint: failed to connect: {e}")))?;
+        let (_db, conn) = crate::db::open_conn(db_path).await?;
         // The pragma returns a (busy, log_pages, checkpointed_pages) row — use
         // query and drain it.
         let mut rows = conn
@@ -171,6 +164,7 @@ fn _path_exists(p: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use turso::Builder;
 
     async fn open_and_count(db_path: &str, table: &str) -> u64 {
         let db = Builder::new_local(db_path).build().await.unwrap();

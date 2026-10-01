@@ -23,6 +23,11 @@ a cache hit), `phases`, `final_output`. `final_output` is the value for json art
 `{"_barca_artifact": {"path", "format", "size_bytes"}}` for parquet and pickle
 (`barca docs types`).
 
+## Parallel runs
+
+It is safe to run several `barca` commands in one project at the same time: they queue briefly
+on the metadata DB (see `barca docs cache`) instead of failing with a lock error.
+
 ## Inspect before you run
 
 ```bash
