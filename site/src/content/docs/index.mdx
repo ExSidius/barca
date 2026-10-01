@@ -59,8 +59,8 @@ uv add barca
 		so unchanged assets never re-run.
 	</Card>
 	<Card title="Artifact-based data passing" icon="seti:db">
-		Results move between worker batches as serialized files — json, pickle, or
-		parquet — detected and handled automatically.
+		Each step fully materializes its output to a cache artifact (json, pickle, or
+		parquet). Downstream steps read those files back — never in-process lazy handles.
 	</Card>
 	<Card title="Built-in scheduler" icon="setting">
 		`barca serve` runs your `@task`s on a cron tick — down to the second — with

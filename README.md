@@ -295,7 +295,7 @@ plan = barca.plan("pipeline.py")
 print(plan["total_steps"])  # 2
 ```
 
-All output formats work transparently: dicts, lists, sets, DataFrames, and arbitrary Python objects are serialized as JSON, pickle, or parquet and deserialized automatically.
+All output formats work transparently: dicts, lists, sets, DataFrames, and arbitrary Python objects are serialized as JSON, pickle, or parquet and deserialized automatically. Every asset is **fully materialized** to an artifact file at step boundaries — that persistence is the cache checkpoint. Type annotations on parameters (e.g. `pl.DataFrame`) select the parquet reader; they do not skip materialization.
 
 ### `barca plan` -- inspect without running
 

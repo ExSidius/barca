@@ -45,6 +45,31 @@ def daily_report() -> dict:
 
 `Manual` freshness blocks downstream `Always` assets from auto-updating — a downstream asset cannot be fresher than its most-upstream `Manual` dependency.
 
+### Type annotations and materialization
+
+Parameter and return type hints are optional and do not change the decorator API. When present,
+they tell barca which parquet **reader** or **writer** to use on step boundaries — for example
+`orders: pl.DataFrame` deserializes with polars instead of defaulting to pandas.
+
+**Every asset output is still fully materialized** to an artifact file at the end of the step.
+Barca does not keep lazy polars `LazyFrame`s or duckdb relations alive across workers; the
+artifact on disk is the cache checkpoint. If you materialize an asset, you get a durable,
+content-addressed file that any downstream step (or machine) can hit.
+
+To run one efficient computation and cache multiple results, define multiple `@asset` functions
+that share helpers, or compute everything you need inside a single step before returning.
+
+Supported annotation shapes (statically parsed, no import):
+
+| Annotation | Parquet role |
+|---|---|
+| *(none)* | pandas reader (default) |
+| `pd.DataFrame` / `pandas.DataFrame` | pandas |
+| `pl.DataFrame` / `polars.DataFrame` | polars |
+| `pl.LazyFrame` | polars (materialized on write; read back as `DataFrame`) |
+| `pyarrow.Table` | pyarrow |
+| `duckdb.DuckDBPyRelation` | duckdb (relation on read; materialized on write) |
+
 ## Partitions
 
 ```python
