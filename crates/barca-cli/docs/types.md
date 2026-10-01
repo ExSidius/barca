@@ -93,7 +93,10 @@ barca.duckdb_connection().execute("SET threads = 4")   # runs once per worker pr
 
 - Stay on that connection. If a step opens its own `duckdb.connect()`, its relations cannot be
   combined with inputs (`Cannot combine LEFT and RIGHT relations of different connections!`),
-  and `con.register("x", input)` fails the same way. If you must, copy the input across with
+  and `con.register("x", input)` fails the same way. Barca recognizes these DuckDB errors
+  (including querying a bound input by name from another connection, which DuckDB reports as
+  `Table with name ... does not exist`) and appends a `barca:` note to the step failure that
+  says what happened and what to do. If you must, copy the input across with
   `con.register("x", input.arrow())` (the data is loaded into memory). A relation does not
   expose its file path.
 - Do not `register` on barca's connection an Arrow table that came from a query on that same
