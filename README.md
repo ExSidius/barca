@@ -206,13 +206,19 @@ def prices(ticker: str) -> dict:
 
 ```
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
+barca run <task> <file.py> ...             Run a task (always re-runs) and its cone
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
-barca list <file.py> [file.py ...]         List all definitions with deps
-barca history [--limit N]                    Show recent run history
-barca stats <target> <file.py> ...         Show timing/cache stats for an asset
+barca list <file.py> [--json]              List all definitions with deps
+barca history [--limit N] [--json]         Show recent run history
+barca stats <target> <file.py> [--json]    Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
-barca --help                               Show help
+barca docs [topic] [--all] [--json]        Built-in manual: concepts, formats, examples
+barca --help                               Show help (every command ends with examples)
 ```
+
+`barca docs` is the manual, compiled into the binary: topics for types and output formats,
+caching, tasks, partitions, scheduling, runnable examples, and conventions for scripts and AI
+agents (`barca docs agents`). Results are JSON on stdout, progress and errors on stderr.
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 

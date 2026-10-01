@@ -1,0 +1,29 @@
+# Sinks
+
+`@sink` writes an asset's output to an extra location whenever the asset materializes, for
+example to export a file for another system. It is stacked on top of `@asset`.
+
+```python
+from barca import asset, sink
+
+
+@asset()
+@sink("./exports/banana.json")
+@sink("s3://my-bucket/exports/banana.parquet", serializer="parquet")
+def banana() -> dict:
+    return {"a": 1}
+```
+
+- Paths are local or any fsspec URI (`abfss://`, `s3://`, `gs://`). Remote schemes need the
+  matching extra (`pip install "barca[s3]"`, `[azure]`, `[gcs]`, or `[remote]`).
+- The format comes from `serializer=` (`json`, `pickle`, `parquet`), else the path extension
+  (`.json`, `.pkl`/`.pickle`, `.parquet`), else the parent asset's artifact format.
+- Several `@sink` decorators may be stacked on one asset.
+- Writes are staged and finalized atomically, so a crash never leaves a partial file.
+- Sinks are leaf nodes: no other node may take a sink as an input.
+- A failing sink does **not** fail the parent asset. It is reported on stderr as
+  `[barca] SINK FAILED: ...`; check stderr in automation.
+- For partitioned assets each partition writes its own file with the key inserted before the
+  extension: `out.parquet` becomes `out_region_emea.parquet`.
+
+See also: `barca docs types`, `barca docs partitions`.
