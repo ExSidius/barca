@@ -26,8 +26,8 @@ barca get summary pipeline.py
 What to notice:
 
 - `barca plan` shows one `sales` step per region, then `summary` in its own fan-in phase.
-- The first `get` runs 4 steps. The second runs 3: partitioned steps are not cache-checked
-  yet, so all three `sales` partitions re-run, while `summary` is served from cache.
+- The first `get` runs 4 steps. The second runs 0: every partition and the fan-in are served
+  from cache. Add a region to the list and re-run: only the new partition and `summary` run.
 - Each partition has its own artifact under `.barca/artifacts/`, for example
   `pipeline.py--sales_region_emea/`.
 
