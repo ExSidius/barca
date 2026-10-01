@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, MutexGuard};
 use turso::Builder;
 
@@ -20,10 +21,18 @@ use turso::Builder;
 /// on the file without depending on WAL support. A one-shot CLI run leaves it
 /// uncontended.
 ///
-/// Known limit: this serializes every DB op process-wide and each helper opens
-/// a fresh connection, which becomes the contention point under many
-/// concurrent daemon runs. The Engine extraction (#80) replaces this with a
-/// single owner holding a persistent connection.
+/// This guard only covers one process. Turso's default mode is single-process: it
+/// takes a non-blocking exclusive lock on the DB file, so a second *process*
+/// that overlaps used to fail with "File is locked by another process". Each
+/// open therefore also holds a short cross-process lock (see
+/// [`acquire_file_lock`]) so concurrent barca processes queue instead of fail.
+/// (Turso's `experimental_multiprocess_wal` would allow true concurrent access,
+/// but it is experimental and unsupported on some filesystems.)
+///
+/// Known limit: this serializes every DB op and each helper opens a fresh
+/// connection, which becomes the contention point under many concurrent daemon
+/// runs. The Engine extraction (#80) replaces this with a single owner holding
+/// a persistent connection.
 static DB_LOCK: Mutex<()> = Mutex::const_new(());
 
 /// Acquire the process-wide DB lock. Hold the returned guard only across a
@@ -117,17 +126,119 @@ pub fn ensure_db_dir() -> Result<String, BarcaError> {
     Ok(ensure_env_dirs(crate::config::DEFAULT_ENV)?.db_path)
 }
 
+/// How long one barca process waits for another's DB operation before giving up.
+/// Operations are brief (a few queries), so hitting this means a stuck process.
+const DB_FILE_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// An open database plus the cross-process lock that makes it safe to open. Field
+/// order matters: the database is closed before the lock is released.
+pub struct DbHandle {
+    _db: turso::Database,
+    _lock: fs::File,
+}
+
+/// Take the cross-process lock for `db_path` (a `<db>.lock` file next to it), waiting
+/// up to `wait` for another barca process to finish its operation. The lock is
+/// released when the returned file is dropped (or the process exits or crashes).
+async fn acquire_file_lock(db_path: &str, wait: Duration) -> Result<fs::File, BarcaError> {
+    let lock_path = format!("{db_path}.lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| BarcaError::Db(format!("failed to open lock file {lock_path}: {e}")))?;
+    let deadline = Instant::now() + wait;
+    let mut delay = Duration::from_millis(2);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(fs::TryLockError::WouldBlock) => {}
+            Err(fs::TryLockError::Error(e)) => {
+                return Err(BarcaError::Db(format!("failed to lock {lock_path}: {e}")));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(BarcaError::Db(format!(
+                "timed out after {:.1}s waiting for {lock_path}: another barca process is \
+                 holding the metadata DB (a very long operation, or a stuck process)",
+                wait.as_secs_f32()
+            )));
+        }
+        // Back off with a little jitter so waiters don't wake in lockstep.
+        let jitter = Duration::from_micros(u64::from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() % 2000)
+                .unwrap_or(0),
+        ));
+        tokio::time::sleep(delay + jitter).await;
+        delay = (delay * 2).min(Duration::from_millis(40));
+    }
+}
+
+/// Wrap a Turso open failure, adding a hint when the DB is locked by something that
+/// does not follow barca's own locking.
+fn db_open_error(detail: impl std::fmt::Display) -> BarcaError {
+    let detail = detail.to_string();
+    let mut msg = format!("failed to open DB: {detail}");
+    if detail.contains("locked by another process") {
+        msg.push_str(
+            "\n\nSomething outside barca's own locking has the metadata DB open (a DB \
+             browser, a backup tool, or a barca process from an older version). Close it \
+             and retry.",
+        );
+    }
+    BarcaError::Db(msg)
+}
+
+/// A short-lived handle for one phase's cache lookups. It holds the in-process guard
+/// *and* the cross-process lock for as long as it lives, so open it for the lookups
+/// and drop it before any step runs: another barca process can then use the DB while
+/// this run executes Python. (Fields drop in order: connection, database + file lock,
+/// then the in-process guard.)
+pub struct CacheReader {
+    conn: turso::Connection,
+    _handle: DbHandle,
+    _guard: MutexGuard<'static, ()>,
+}
+
+impl CacheReader {
+    pub async fn open(db_path: &str) -> Result<Self, BarcaError> {
+        // Same order as every other helper: in-process guard first, then the file lock.
+        let guard = db_guard().await;
+        let (handle, conn) = open_conn(db_path).await?;
+        Ok(Self {
+            conn,
+            _handle: handle,
+            _guard: guard,
+        })
+    }
+
+    pub fn conn(&self) -> &turso::Connection {
+        &self.conn
+    }
+}
+
 /// Open the database at `db_path` and connect. Callers must hold [`db_guard`]
-/// for the duration of their work on the returned connection.
-async fn open_conn(db_path: &str) -> Result<(turso::Database, turso::Connection), BarcaError> {
+/// for the duration of their work on the returned connection; the returned
+/// handle holds the cross-process lock until it is dropped.
+pub(crate) async fn open_conn(db_path: &str) -> Result<(DbHandle, turso::Connection), BarcaError> {
+    let lock = acquire_file_lock(db_path, DB_FILE_LOCK_WAIT).await?;
     let db = Builder::new_local(db_path)
         .build()
         .await
-        .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
+        .map_err(db_open_error)?;
     let conn = db
         .connect()
         .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-    Ok((db, conn))
+    Ok((
+        DbHandle {
+            _db: db,
+            _lock: lock,
+        },
+        conn,
+    ))
 }
 
 pub async fn init_db(db_path: &str) -> Result<(), BarcaError> {
@@ -1060,5 +1171,69 @@ mod tests {
         assert_eq!(output_ref.path, ".barca/artifacts/test.py--foo.parquet");
         assert_eq!(output_ref.format, "parquet");
         assert_eq!(output_ref.size_bytes, 4096);
+    }
+
+    // ─── Cross-process lock ─────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn file_lock_excludes_a_second_holder_until_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("metadata.db").to_string_lossy().to_string();
+
+        let first = acquire_file_lock(&db_path, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        // A second handle (another process behaves the same) must wait, then give up loudly.
+        let err = acquire_file_lock(&db_path, std::time::Duration::from_millis(150))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("metadata.db.lock"), "{err}");
+        assert!(err.contains("another barca process"), "{err}");
+
+        drop(first);
+        acquire_file_lock(&db_path, std::time::Duration::from_secs(1))
+            .await
+            .expect("lock is free again once the holder drops it");
+    }
+
+    #[tokio::test]
+    async fn file_lock_waiter_proceeds_as_soon_as_the_holder_releases() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("metadata.db").to_string_lossy().to_string();
+
+        let held = acquire_file_lock(&db_path, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let waiter_path = db_path.clone();
+        let waiter = tokio::spawn(async move {
+            let t0 = std::time::Instant::now();
+            acquire_file_lock(&waiter_path, std::time::Duration::from_secs(5))
+                .await
+                .map(|_| t0.elapsed())
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        drop(held);
+        let waited = waiter.await.unwrap().expect("waiter acquires the lock");
+        assert!(
+            waited >= std::time::Duration::from_millis(150),
+            "waited {waited:?}"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "waited {waited:?}"
+        );
+    }
+
+    #[test]
+    fn turso_lock_errors_get_an_actionable_hint() {
+        let hinted = db_open_error(
+            "Locking error: Failed locking file '.barca/metadata.db'. File is locked by another process",
+        )
+        .to_string();
+        assert!(hinted.contains("File is locked by another process"));
+        assert!(hinted.contains("outside barca"), "{hinted}");
+        let other = db_open_error("disk I/O error").to_string();
+        assert!(!other.contains("outside barca"), "{other}");
     }
 }

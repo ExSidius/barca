@@ -22,7 +22,6 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
-use turso::Builder;
 
 /// Format seconds as a fixed-width time string for progress display.
 /// Always 8 chars wide: "   5s   ", " 2m 30s ", " 1h 05m ", "2d 03h  "
@@ -329,18 +328,6 @@ async fn execute(
     cost_model.seed(db::load_cost_estimates(&db_path).await?);
     trace_point!("cost_model_seeded");
 
-    let db = {
-        let _g = db::db_guard().await;
-        Builder::new_local(&db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
-    }?;
-    let conn = db
-        .connect()
-        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-    trace_point!("db_connect");
-
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
@@ -470,6 +457,10 @@ async fn execute(
 
         let mut uncached_streams: Vec<crate::planner::WorkerStream> = Vec::new();
 
+        // Open the DB only for this phase's cache lookups and release it before any step
+        // runs, so other barca processes can use the metadata DB while Python executes.
+        let cache = db::CacheReader::open(&db_path).await?;
+
         for stream in &phase_ref.streams {
             let mut uncached_steps: Vec<crate::planner::StreamStep> = Vec::new();
 
@@ -562,8 +553,8 @@ async fn execute(
                     .expect("unpartitioned step has a precomputed run hash");
 
                 let cached = {
-                    let _g = db::db_guard().await;
-                    let mut rows = conn
+                    let mut rows = cache
+                        .conn()
                         .query(
                             "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
                             [display_id.clone(), run_h.clone()],
@@ -596,6 +587,7 @@ async fn execute(
             }
         }
 
+        drop(cache);
         trace_point!("phase{phase_idx}_cache_check_done");
 
         if uncached_streams.is_empty() {
@@ -837,8 +829,6 @@ async fn execute(
 
     // Drop the run-long cache connection before persistence: the state push
     // checkpoints the WAL, which requires no other open handles on the file.
-    drop(conn);
-    drop(db);
 
     let was_cancelled = cancel.is_cancelled();
 
@@ -981,13 +971,7 @@ struct RunLedger<'a> {
 /// only against a database that doesn't already contain them.
 async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError> {
     let _g = db::db_guard().await;
-    let db = Builder::new_local(db_path)
-        .build()
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-    let conn = db
-        .connect()
-        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+    let (_db, conn) = db::open_conn(db_path).await?;
 
     conn.execute(
             "INSERT OR IGNORE INTO runs (run_id, command, files, target, status, steps_total) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",

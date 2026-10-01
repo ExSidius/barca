@@ -34,6 +34,16 @@ content-addressed, so they can be shared between machines when remote state is c
 `barca run` previously refreshed every upstream asset by default and called the selective flag
 `--burst`. The default is now cache-aware and the flag is `--refresh`.
 
+## Concurrent runs
+
+Several barca processes can run in one project at once (parallel scripts or agents, `barca serve`
+alongside the CLI). The metadata DB is a single-file database that one process opens at a time,
+so each process holds a short lock on it (`.barca/metadata.db.lock`) only while it reads or
+writes, and releases it while your Python runs. Processes queue instead of failing. If a
+process waits more than 60 seconds for the lock you get an error that names the lock file;
+an `... File is locked by another process` error means something outside barca (a DB browser, a
+backup tool, an older barca) has `.barca/metadata.db` open.
+
 ## Environments
 
 `--env <name>` (or `BARCA_ENV`, or `default_env` in `barca.toml`, else `default`) fully
