@@ -85,6 +85,59 @@ def test_standalone_use_outside_a_worker():
     assert barca.duckdb_connection().sql("select 42").fetchone() == (42,)
 
 
+# ─── Loud failure for connection conflicts ────────────────────────────────────
+
+
+def _mixing_error(kind: str, parquet: str) -> Exception:
+    """Provoke the real DuckDB errors a step gets when it opens its own connection."""
+    inp = duckdb.read_parquet(parquet)
+    own = duckdb.connect()
+    try:
+        if kind == "combine":
+            inp.join(own.sql("select 1 as k"), "k").fetchall()
+        elif kind == "register":
+            own.register("x", inp)
+        elif kind == "catalog":
+            inp.create_view("bound_name", replace=True)
+            own.sql("select * from bound_name").fetchall()
+    except Exception as e:  # noqa: BLE001
+        return e
+    finally:
+        own.close()
+        duckdb.execute("drop view if exists bound_name")
+    raise AssertionError(f"{kind} did not raise")
+
+
+def test_explains_relations_from_different_connections(parquet):
+    for kind in ("combine", "register"):
+        note = _duckdb.explain_error(_mixing_error(kind, parquet), [])
+        assert note and "two different connections" in note, kind
+        assert "barca.duckdb_connection()" in note and "barca docs types" in note
+
+
+def test_explains_querying_a_bound_view_from_another_connection(parquet):
+    err = _mixing_error("catalog", parquet)
+    note = _duckdb.explain_error(err, ["bound_name"])
+    assert note and "`bound_name`" in note and "different connection" in note
+    # The same catalog error for a name barca did not bind is just a normal error.
+    assert _duckdb.explain_error(err, ["something_else"]) is None
+
+
+def test_unrelated_errors_are_not_touched(parquet):
+    assert _duckdb.explain_error(ValueError("kaboom"), ["orders"]) is None
+    typo = None
+    try:
+        duckdb.sql("select * from no_such_table_anywhere").fetchall()
+    except duckdb.Error as e:
+        typo = e
+    assert typo is not None and _duckdb.explain_error(typo, ["orders"]) is None
+    # "replacement scan" for a non-relation object is a different problem.
+    not_rel = duckdb.InvalidInputException(
+        'Invalid Input Error: Python Object "d" of type "dict" not suitable for replacement scan.'
+    )
+    assert _duckdb.explain_error(not_rel, []) is None
+
+
 # ─── End to end through the real worker ───────────────────────────────────────
 
 PIPELINE = """
@@ -168,3 +221,57 @@ def test_views_do_not_outlive_the_step(binary, project):
 def test_unannotated_consumer_still_gets_a_pandas_dataframe(binary, project):
     # The relation a step returned must never be handed to the next step in its place.
     assert run_get(binary, project, "as_pandas", "--no-cache")["type"] == "DataFrame"
+
+
+MIXING_PIPELINE = """
+import duckdb
+from barca import asset
+
+
+@asset()
+def base() -> duckdb.DuckDBPyRelation:
+    return duckdb.sql("select * from (values (1, 5.0::double), (2, 7.5::double)) t(order_id, amount)")
+
+
+@asset(inputs={"orders": base})
+def joined_on_own_connection(orders: duckdb.DuckDBPyRelation) -> duckdb.DuckDBPyRelation:
+    own = duckdb.connect()
+    return orders.join(own.sql("select 1 as order_id"), "order_id")
+
+
+def query_on_own_connection():
+    # No Python variable called `orders` exists here: only the view barca bound on ITS connection.
+    return duckdb.connect().sql("select * from orders")
+
+
+@asset(inputs={"orders": base})
+def queried_via_helper(orders: duckdb.DuckDBPyRelation) -> duckdb.DuckDBPyRelation:
+    return query_on_own_connection()
+"""
+
+
+def run_failing(binary: str, cwd: Path, target: str) -> subprocess.CompletedProcess:
+    proc = subprocess.run(
+        [binary, "get", target, "pipeline.py", "--no-cache"],
+        cwd=cwd,
+        env={**os.environ, "BARCA_POOL_SIZE": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 1, f"expected a failure, got exit {proc.returncode}"
+    assert proc.stdout == ""
+    return proc
+
+
+def test_mixing_connections_fails_loudly_with_what_to_do(binary, tmp_path):
+    (tmp_path / "pipeline.py").write_text(MIXING_PIPELINE)
+    err = run_failing(binary, tmp_path, "joined_on_own_connection").stderr
+    assert "different connections" in err  # DuckDB's own message is kept
+    assert "barca: this step used DuckDB relations from two different connections" in err
+    assert "barca.duckdb_connection()" in err and "con.register" in err
+
+
+def test_querying_a_bound_input_from_another_connection_fails_loudly(binary, tmp_path):
+    (tmp_path / "pipeline.py").write_text(MIXING_PIPELINE)
+    err = run_failing(binary, tmp_path, "queried_via_helper").stderr
+    assert "barca: this step queried `orders` on a different connection" in err

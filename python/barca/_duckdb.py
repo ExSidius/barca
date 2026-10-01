@@ -14,6 +14,7 @@ per worker process (extensions, credentials, settings, macros) at import time.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 
@@ -72,3 +73,49 @@ def unbind_inputs(names: list[str]) -> None:
             con.execute(f"drop view if exists {_quote(name)}")
         except Exception:
             pass
+
+
+_MIXED_NOTE = (
+    "barca: this step used DuckDB relations from two different connections.\n"
+    "Barca loads duckdb inputs on one shared connection per worker, the same one that "
+    "duckdb.sql(...) and duckdb.read_parquet(...) use. Stay on those (or on "
+    "barca.duckdb_connection()) instead of opening your own duckdb.connect().\n"
+    'If you need your own connection, copy an input onto it: con.register("name", input.arrow()).\n'
+    "See `barca docs types`."
+)
+
+_MISSING_TABLE = re.compile(r"Table with name (\S+) does not exist")
+
+
+def explain_error(exc: BaseException, bound_views: list[str]) -> str | None:
+    """A plain-language note for the DuckDB errors a step gets from mixing connections.
+
+    DuckDB reports these as ``Cannot combine LEFT and RIGHT relations of different
+    connections!``, ``Python Object ... of type "DuckDBPyRelation" not suitable for replacement
+    scan``, or (when a bound input is queried from another connection and no Python variable of
+    that name is in scope) a misleading ``Table with name X does not exist``. Returns ``None`` for
+    anything else, including a missing table that barca did not bind, which is just a typo.
+    """
+    try:
+        import duckdb  # ty: ignore[unresolved-import]
+    except ImportError:
+        return None
+    if not isinstance(exc, duckdb.Error):
+        return None
+    msg = str(exc)
+    if "different connections" in msg:
+        return _MIXED_NOTE
+    if "not suitable for replacement scan" in msg and "DuckDBPyRelation" in msg:
+        return _MIXED_NOTE
+    missing = _MISSING_TABLE.search(msg)
+    if missing and missing.group(1).strip("\"'") in bound_views:
+        name = missing.group(1).strip("\"'")
+        return (
+            f"barca: this step queried `{name}` on a different connection than the one barca "
+            f"bound it on.\n"
+            f"`{name}` is an input of this step, available as a view on barca's shared "
+            f"connection. Query it with duckdb.sql(...) or barca.duckdb_connection().sql(...), "
+            f'or copy it onto your own connection: con.register("{name}", {name}.arrow()).\n'
+            "See `barca docs types`."
+        )
+    return None

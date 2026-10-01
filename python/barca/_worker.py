@@ -688,10 +688,14 @@ def _run_daemon_step(step, modules, art_dir, lru):
         # swallow them; genuine socket death surfaces when the emit below
         # fails, and that propagates to the caller.)
         wall = time.perf_counter() - t0
+        message = str(exc)
+        note = _duckdb.explain_error(exc, bound_views)
+        if note:
+            message = f"{message}\n\n{note}"
         _runtime.emit_step_error(
             node_id=node_id,
             error_type=type(exc).__name__,
-            message=str(exc),
+            message=message,
             traceback=_user_traceback(exc),
             elapsed=wall,
         )

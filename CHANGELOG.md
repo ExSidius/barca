@@ -24,7 +24,9 @@ All notable changes to this project will be documented in this file.
   silently pickled). Barca now owns one DuckDB connection per worker process and binds every
   duckdb-typed input as a view named after its parameter for the step, so SQL by name works
   in helpers without bind code; `barca.duckdb_connection()` exposes the connection for
-  one-time configuration (extensions, credentials, settings).
+  one-time configuration (extensions, credentials, settings). Steps that mix relations from
+  their own `duckdb.connect()` with inputs still fail, but the failure now carries a `barca:`
+  note explaining the conflict and the fix instead of only DuckDB's cryptic message.
 - Sub-minute cron scheduling: `Schedule(...)` now accepts a 6-field cron with a
   leading seconds field (e.g. `*/15 * * * * *` — every 15 seconds); the `barca serve`
   scheduler evaluates at 1-second resolution. 5-field crons are unchanged (seconds
