@@ -49,4 +49,4 @@ description: Notable changes to barca, release by release.
 - Benchmark suite comparing Barca, Prefect, and Dagster
 - Spaceflights benchmark (10-asset diamond DAG adapted from Kedro)
 
-For the full project changelog (including this site's own history), see [CHANGELOG.md](https://github.com/ExSidius/barca/blob/main/CHANGELOG.md) in the repository root.
+For the full project changelog (including this site's own history), see [CHANGELOG.md](https://github.com/barca-orc/barca/blob/main/CHANGELOG.md) in the repository root.
