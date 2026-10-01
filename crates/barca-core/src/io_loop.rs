@@ -42,11 +42,13 @@ pub struct IoConfig {
     pub python: PathBuf,
     pub pool_size: usize,
     pub run_id: String,
-    /// Artifact store root for this run — a local directory or a remote URI.
-    /// Set explicitly on every worker so env-separated and remote layouts work
+    /// Local artifact directory workers write to and read from. Always local:
+    /// a separate artifact store is synced by `transfer::TransferClient`.
+    /// Set explicitly on every worker so env-separated layouts work
     /// regardless of the coordinator's own environment.
     pub artifact_root: String,
-    /// Merged fsspec storage options (JSON), forwarded to workers.
+    /// Merged fsspec storage options (JSON), forwarded to workers (for remote
+    /// `@sink` destinations).
     pub storage_options_json: Option<String>,
 }
 
@@ -797,20 +799,12 @@ impl WorkerPool {
                                         .unwrap_or("");
                                     let path =
                                         artifact.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                                    // Workers always write locally, so the
+                                    // child's artifact is on this disk.
                                     if fmt == "json" && !path.is_empty() {
-                                        if path.contains("://") {
-                                            eprintln!(
-                                                "[barca] Warning: parallel() result values require \
-                                                 a local artifact store in v1 — artifact '{path}' \
-                                                 is remote; the parent receives null. Unset \
-                                                 BARCA_ARTIFACT_URI to use parallel() results."
-                                            );
-                                            None
-                                        } else {
-                                            std::fs::read_to_string(path)
-                                                .ok()
-                                                .and_then(|s| serde_json::from_str(&s).ok())
-                                        }
+                                        std::fs::read_to_string(path)
+                                            .ok()
+                                            .and_then(|s| serde_json::from_str(&s).ok())
                                     } else {
                                         None
                                     }

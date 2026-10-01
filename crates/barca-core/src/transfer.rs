@@ -97,10 +97,10 @@ pub struct TransferFailure {
     pub message: String,
 }
 
-/// Outcome of [`TransferClient::drain`].
+/// Outcome of [`TransferClient::drain`] / [`TransferClient::await_fetches`].
 #[derive(Debug, Default)]
-pub struct DrainReport {
-    pub uploaded: usize,
+pub struct TransferReport {
+    pub transferred: usize,
     pub bytes: u64,
     pub failures: Vec<TransferFailure>,
 }
@@ -260,20 +260,25 @@ impl TransferClient {
     }
 
     /// Wait for the fetches of `locals` (paths not being fetched are ready).
-    pub async fn await_fetches(&mut self, locals: &[PathBuf]) -> Vec<TransferFailure> {
-        let mut failures = Vec::new();
+    pub async fn await_fetches(&mut self, locals: &[PathBuf]) -> TransferReport {
+        let mut report = TransferReport::default();
         for local in locals {
-            if let Some(p) = self.fetches.remove(local)
-                && let Err(message) = settle(p.rx).await
-            {
-                failures.push(TransferFailure {
+            let Some(p) = self.fetches.remove(local) else {
+                continue;
+            };
+            match settle(p.rx).await {
+                Ok(bytes) => {
+                    report.transferred += 1;
+                    report.bytes += bytes;
+                }
+                Err(message) => report.failures.push(TransferFailure {
                     key: p.key,
                     store: p.store,
                     message,
-                });
+                }),
             }
         }
-        failures
+        report
     }
 
     /// Number of uploads queued since the last drain.
@@ -281,10 +286,9 @@ impl TransferClient {
         self.uploads.len()
     }
 
-    /// Await every queued upload. `progress(done, total)` fires as each settles.
-    pub async fn drain(&mut self, mut progress: impl FnMut(usize, usize)) -> DrainReport {
-        let total = self.uploads.len();
-        let mut report = DrainReport::default();
+    /// Await every upload queued since the last drain.
+    pub async fn drain(&mut self) -> TransferReport {
+        let mut report = TransferReport::default();
         let mut inflight: FuturesUnordered<_> = self
             .uploads
             .drain(..)
@@ -293,12 +297,10 @@ impl TransferClient {
                 (p.key, p.store, r)
             })
             .collect();
-        let mut done = 0;
         while let Some((key, store, r)) = inflight.next().await {
-            done += 1;
             match r {
                 Ok(bytes) => {
-                    report.uploaded += 1;
+                    report.transferred += 1;
                     report.bytes += bytes;
                 }
                 Err(message) => report.failures.push(TransferFailure {
@@ -307,18 +309,8 @@ impl TransferClient {
                     message,
                 }),
             }
-            progress(done, total);
         }
         report
-    }
-
-    /// Keys of queued uploads that have not (yet) completed successfully.
-    /// Non-blocking — used when abandoning transfers on cancellation.
-    pub fn unconfirmed_uploads(&mut self) -> Vec<String> {
-        self.uploads
-            .iter_mut()
-            .filter_map(|p| (!matches!(p.rx.try_recv(), Ok(Ok(_)))).then(|| p.key.clone()))
-            .collect()
     }
 
     /// Finish in-flight transfers and stop the helper.
@@ -336,11 +328,19 @@ impl TransferClient {
         std::fs::remove_file(&self.socket_path).ok();
     }
 
-    /// Stop the helper immediately, abandoning queued transfers.
-    pub async fn abort(mut self) {
+    /// Stop the helper immediately, abandoning queued transfers. Returns the
+    /// keys of uploads not confirmed complete — their artifacts may be
+    /// missing from the store, so they must not be recorded.
+    pub async fn abort(mut self) -> Vec<String> {
+        let unconfirmed = self
+            .uploads
+            .iter_mut()
+            .filter_map(|p| (!matches!(p.rx.try_recv(), Ok(Ok(_)))).then(|| p.key.clone()))
+            .collect();
         let _ = self.child.kill().await;
         self.io_task.abort();
         std::fs::remove_file(&self.socket_path).ok();
+        unconfirmed
     }
 }
 
@@ -593,12 +593,10 @@ for t in threads: t.join()
             );
         }
         assert_eq!(c.pending_uploads(), 6);
-        let mut ticks = Vec::new();
-        let report = within(c.drain(|d, t| ticks.push((d, t)))).await;
+        let report = within(c.drain()).await;
         assert!(report.failures.is_empty(), "{:?}", report.failures);
-        assert_eq!(report.uploaded, 6);
+        assert_eq!(report.transferred, 6);
         assert_eq!(report.bytes, (1..=6).sum::<u64>());
-        assert_eq!(ticks.last(), Some(&(6, 6)));
         assert_eq!(c.pending_uploads(), 0);
         for i in 0..6 {
             assert!(fx.store.join(format!("n{i}/h.json")).exists());
@@ -623,8 +621,8 @@ for t in threads: t.join()
         let bad = fx.write_local("fail/h.json", b"1");
         c.upload("good", &ok).unwrap();
         c.upload("bad", &bad).unwrap();
-        let report = within(c.drain(|_, _| {})).await;
-        assert_eq!(report.uploaded, 1);
+        let report = within(c.drain()).await;
+        assert_eq!(report.transferred, 1);
         assert_eq!(report.failures.len(), 1);
         let f = &report.failures[0];
         assert_eq!(f.key, "bad");
@@ -640,7 +638,9 @@ for t in threads: t.join()
         let mut c = fx.client().await;
         let local = c.fetch("n", &store).unwrap();
         assert_eq!(local, fx.local.join("n/h.json"));
-        let failures = within(c.await_fetches(std::slice::from_ref(&local))).await;
+        let failures = within(c.await_fetches(std::slice::from_ref(&local)))
+            .await
+            .failures;
         assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(std::fs::read(&local).unwrap(), b"{\"v\":1}");
         within(c.shutdown()).await;
@@ -653,7 +653,7 @@ for t in threads: t.join()
         fx.write_local("n/h.json", b"1");
         let mut c = fx.client().await;
         let local = c.fetch("n", &store).unwrap();
-        assert!(within(c.await_fetches(&[local])).await.is_empty());
+        assert!(within(c.await_fetches(&[local])).await.failures.is_empty());
         within(c.shutdown()).await;
         assert_eq!(fx.requests(), vec!["shutdown"]);
     }
@@ -666,7 +666,7 @@ for t in threads: t.join()
         let a = c.fetch("x", &store).unwrap();
         let b = c.fetch("y", &store).unwrap();
         assert_eq!(a, b);
-        assert!(within(c.await_fetches(&[a, b])).await.is_empty());
+        assert!(within(c.await_fetches(&[a, b])).await.failures.is_empty());
         within(c.shutdown()).await;
         assert_eq!(fx.requests(), vec!["get", "shutdown"]);
     }
@@ -685,7 +685,9 @@ for t in threads: t.join()
         let store = fx.write_store("fail/h.json", b"1");
         let mut c = fx.client().await;
         let local = c.fetch("n", &store).unwrap();
-        let failures = within(c.await_fetches(std::slice::from_ref(&local))).await;
+        let failures = within(c.await_fetches(std::slice::from_ref(&local)))
+            .await
+            .failures;
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].key, "n");
         assert!(!local.exists());
@@ -704,7 +706,7 @@ for t in threads: t.join()
         tokio::time::sleep(Duration::from_millis(500)).await;
         let late = fx.write_local("late/h.json", b"1");
         c.upload("late", &late).unwrap();
-        let report = within(c.drain(|_, _| {})).await;
+        let report = within(c.drain()).await;
         let failed: std::collections::HashSet<_> =
             report.failures.iter().map(|f| f.key.as_str()).collect();
         assert!(failed.contains("die"));
@@ -721,7 +723,7 @@ for t in threads: t.join()
     }
 
     #[tokio::test]
-    async fn unconfirmed_uploads_lists_in_flight_and_failed() {
+    async fn abort_returns_uploads_not_confirmed() {
         let fx = Fixture::new();
         let mut c = fx.client().await;
         let fast = fx.write_local("fast/h.json", b"1");
@@ -731,10 +733,23 @@ for t in threads: t.join()
         c.upload("bad", &bad).unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
         c.upload("slow", &slow).unwrap();
-        let mut un = c.unconfirmed_uploads();
+        let mut un = within(c.abort()).await;
         un.sort();
         assert_eq!(un, vec!["bad", "slow"]);
-        within(c.abort()).await;
+    }
+
+    #[tokio::test]
+    async fn drain_after_earlier_drain_only_waits_for_new_uploads() {
+        let fx = Fixture::new();
+        let mut c = fx.client().await;
+        let a = fx.write_local("a/h.json", b"1");
+        c.upload("a", &a).unwrap();
+        assert_eq!(within(c.drain()).await.transferred, 1);
+        let b = fx.write_local("b/h.json", b"22");
+        c.upload("b", &b).unwrap();
+        let r = within(c.drain()).await;
+        assert_eq!((r.transferred, r.bytes), (1, 2));
+        within(c.shutdown()).await;
     }
 
     #[tokio::test]
@@ -789,23 +804,21 @@ for t in threads: t.join()
 
         let local = fx.write_local("m.py__a/h1.json", b"[1,2,3]");
         let store = c.upload("a", &local).unwrap();
-        let report = within(c.drain(|_, _| {})).await;
+        let report = within(c.drain()).await;
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert_eq!(std::fs::read(&store).unwrap(), b"[1,2,3]");
 
         std::fs::remove_file(&local).unwrap();
         let back = c.fetch("a", &store).unwrap();
-        assert!(
-            within(c.await_fetches(std::slice::from_ref(&back)))
-                .await
-                .is_empty()
-        );
+        let fetched = within(c.await_fetches(std::slice::from_ref(&back))).await;
+        assert!(fetched.failures.is_empty());
+        assert_eq!((fetched.transferred, fetched.bytes), (1, 7));
         assert_eq!(std::fs::read(&back).unwrap(), b"[1,2,3]");
 
         let missing = c
             .fetch("gone", &format!("{}/gone/h.json", fx.store.display()))
             .unwrap();
-        let failures = within(c.await_fetches(&[missing])).await;
+        let failures = within(c.await_fetches(&[missing])).await.failures;
         assert_eq!(failures.len(), 1);
         assert!(
             failures[0].message.contains("FileNotFoundError"),
