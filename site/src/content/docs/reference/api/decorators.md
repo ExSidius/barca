@@ -67,8 +67,8 @@ Supported annotation shapes (statically parsed, no import):
 | `pd.DataFrame` / `pandas.DataFrame` | pandas |
 | `pl.DataFrame` / `polars.DataFrame` | polars |
 | `pl.LazyFrame` | polars (materialized on write; read back as `DataFrame`) |
-| `pyarrow.Table` | pyarrow |
-| `duckdb.DuckDBPyRelation` | duckdb (relation on read; materialized on write) |
+| `pyarrow.Table` | pyarrow (written with `pyarrow.parquet`) |
+| `duckdb.DuckDBPyRelation` | duckdb (relation on read; materialized to parquet on write) |
 
 ## Partitions
 

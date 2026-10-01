@@ -118,6 +118,14 @@ class TestDetectFormat:
         lf = pl.LazyFrame({"x": [1, 2, 3]})
         assert detect_format(lf) == "parquet"
 
+    def test_duckdb_relation(self):
+        duckdb = pytest.importorskip("duckdb")
+        assert detect_format(duckdb.sql("select 1 as x")) == "parquet"
+
+    def test_pyarrow_table(self):
+        pa = pytest.importorskip("pyarrow")
+        assert detect_format(pa.table({"x": [1, 2, 3]})) == "parquet"
+
     def test_pandas_series(self):
         # Series are not DataFrames — should go to pickle
         s = pd.Series([1, 2, 3])
@@ -275,6 +283,27 @@ class TestRoundTripParquet:
         result = deserialize(path, "parquet")
         pd.testing.assert_frame_equal(result, df)
 
+    def test_duckdb_relation(self, tmp_path):
+        duckdb = pytest.importorskip("duckdb")
+        rel = duckdb.sql("select * from (values (1, 'a'), (2, 'b')) t(n, s)")
+        path = tmp_path / "out.parquet"
+        serialize(rel, path, "parquet")
+        # Default reader is pandas...
+        df = deserialize(path, "parquet")
+        assert df["n"].tolist() == [1, 2]
+        # ...and frame_type="duckdb" hands back a relation over the parquet file.
+        back = deserialize(path, "parquet", frame_type="duckdb")
+        assert type(back).__name__ == "DuckDBPyRelation"
+        assert back.fetchall() == [(1, "a"), (2, "b")]
+
+    def test_pyarrow_table(self, tmp_path):
+        pa = pytest.importorskip("pyarrow")
+        table = pa.table({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+        path = tmp_path / "out.parquet"
+        serialize(table, path, "parquet")
+        back = deserialize(path, "parquet", frame_type="pyarrow")
+        assert back.equals(table)
+
     def test_polars_lazyframe(self, tmp_path):
         lf = pl.LazyFrame({"a": [1, 2, 3], "b": [4.0, 5.0, 6.0]})
         path = tmp_path / "out.parquet"
@@ -411,6 +440,14 @@ class TestResolveFormat:
     def test_polars_stays_parquet(self):
         assert resolve_format(pl.DataFrame({"x": [1]}), "parquet") == "parquet"
 
+    def test_duckdb_relation_stays_parquet(self):
+        duckdb = pytest.importorskip("duckdb")
+        assert resolve_format(duckdb.sql("select 1 as x"), "parquet") == "parquet"
+
+    def test_pyarrow_table_stays_parquet(self):
+        pa = pytest.importorskip("pyarrow")
+        assert resolve_format(pa.table({"x": [1]}), "parquet") == "parquet"
+
     def test_non_dataframe_downgrades_to_pickle(self, capsys):
         assert resolve_format({"not": "a df"}, "parquet") == "pickle"
         assert "falling back to pickle" in capsys.readouterr().err
@@ -541,3 +578,27 @@ class TestContentAddressedPaths:
         p = artifact_path(tmp_path, "f.py:node", "json", run_hash="cafe01")
         serialize({"x": 1}, p, "json")
         assert deserialize(p, "json") == {"x": 1}
+
+
+class TestFrameLikeOutputsMaterializeAsParquet:
+    """detect → resolve → path → write, the way the worker materializes a step result."""
+
+    def _materialize(self, value, tmp_path):
+        fmt = resolve_format(value, detect_format(value))
+        path = artifact_path(tmp_path, "f.py:node", fmt)
+        serialize(value, path, fmt)
+        return fmt, path
+
+    def test_duckdb_relation_writes_parquet_without_serializer(self, tmp_path):
+        duckdb = pytest.importorskip("duckdb")
+        fmt, path = self._materialize(duckdb.sql("select 42 as answer"), tmp_path)
+        assert fmt == "parquet"
+        assert str(path).endswith(".parquet")
+        assert deserialize(path, fmt)["answer"].tolist() == [42]
+
+    def test_pyarrow_table_writes_parquet_without_serializer(self, tmp_path):
+        pa = pytest.importorskip("pyarrow")
+        fmt, path = self._materialize(pa.table({"x": [1, 2]}), tmp_path)
+        assert fmt == "parquet"
+        assert str(path).endswith(".parquet")
+        assert deserialize(path, fmt, frame_type="pyarrow").num_rows == 2

@@ -45,6 +45,7 @@ test = [
     "pandas",
     "pyarrow",
     "polars",
+    "duckdb",
     "orjson",
     "fsspec",
     "adlfs",
