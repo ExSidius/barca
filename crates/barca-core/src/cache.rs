@@ -41,6 +41,48 @@ pub fn compute_run_hash(
     crate::hash::run_hash(def_hash, partition_key, &hash_refs, None)
 }
 
+/// Compute and record the run hash(es) for one plan step: one entry for an
+/// unpartitioned step, one per partition key otherwise. Each hash is inserted
+/// into both `run_hashes` (so downstream steps can chain off it) and the step's
+/// own `run_hashes`. Callers must visit steps upstream-first.
+///
+/// This is the single definition of a step's cache key — shared by the
+/// executor and the asset-state dry run so the two can never disagree.
+pub fn assign_run_hashes(
+    step: &mut crate::planner::StreamStep,
+    def_hash: &str,
+    run_hashes: &mut HashMap<String, String>,
+) {
+    if step.partition_keys.is_empty() {
+        let display_id = step.step_id.display();
+        let partition_key = if step.step_id.partition.is_empty() {
+            None
+        } else {
+            Some(step.step_id.partition.suffix())
+        };
+        let run_h = compute_run_hash(
+            def_hash,
+            partition_key.as_deref(),
+            step.inputs.values(),
+            run_hashes,
+        );
+        run_hashes.insert(display_id.clone(), run_h.clone());
+        step.run_hashes.insert(display_id, run_h);
+    } else {
+        for pk in &step.partition_keys {
+            let pdisplay = pk.display_id(&step.step_id.base);
+            let run_h = compute_run_hash(
+                def_hash,
+                Some(&pk.suffix()),
+                step.inputs.values(),
+                run_hashes,
+            );
+            run_hashes.insert(pdisplay.clone(), run_h.clone());
+            step.run_hashes.insert(pdisplay, run_h);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -541,33 +541,7 @@ async fn execute(
                 // already present when a consumer is hashed — check-time and
                 // persist-time hashes are therefore identical.
                 let mut step = step.clone();
-                if step.partition_keys.is_empty() {
-                    let partition_key = if step.step_id.partition.is_empty() {
-                        None
-                    } else {
-                        Some(step.step_id.partition.suffix())
-                    };
-                    let run_h = cache::compute_run_hash(
-                        def_hash,
-                        partition_key.as_deref(),
-                        step.inputs.values(),
-                        &run_hashes,
-                    );
-                    run_hashes.insert(display_id.clone(), run_h.clone());
-                    step.run_hashes.insert(display_id.clone(), run_h);
-                } else {
-                    for pk in &step.partition_keys {
-                        let pdisplay = pk.display_id(&step.step_id.base);
-                        let run_h = cache::compute_run_hash(
-                            def_hash,
-                            Some(&pk.suffix()),
-                            step.inputs.values(),
-                            &run_hashes,
-                        );
-                        run_hashes.insert(pdisplay.clone(), run_h.clone());
-                        step.run_hashes.insert(pdisplay, run_h);
-                    }
-                }
+                cache::assign_run_hashes(&mut step, def_hash, &mut run_hashes);
                 let step = &step;
 
                 // Sensors and tasks always re-run — never cached.
