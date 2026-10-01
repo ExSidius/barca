@@ -1,11 +1,9 @@
 # Partitions
 
 Partitions split one asset into independent steps, one per key; the keys run in parallel.
-
-> **Known limitation:** partitioned steps are not cache-checked yet, so every partition
-> re-executes on each `barca get`. Unpartitioned downstream nodes (including a `collect`
-> fan-in) are still served from cache when their inputs' hashes are unchanged. Per-key caching
-> is a TODO in the coordinator.
+Each key is cached on its own: it has its own run hash, so a re-run serves unchanged keys from
+cache and executes only keys with no successful materialization (a new key, or a key whose
+function or upstream changed). A `collect` fan-in re-runs when its set of inputs changes.
 
 ```python
 from barca import asset, partitions, partitions_from, collect

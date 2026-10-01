@@ -42,6 +42,9 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- Partitioned assets are now cached per key. Previously every partition re-executed on each
+  run (a `TODO` in the coordinator); now unchanged keys are served from cache and only new or
+  changed keys run, with the fan-in re-running only when its inputs change.
 - Concurrent barca processes in one project no longer fail with `Failed locking file
   '.barca/metadata.db'. File is locked by another process`. Turso opens the DB
   single-process (its multi-process mode is experimental), and `barca get`/`run` held the DB

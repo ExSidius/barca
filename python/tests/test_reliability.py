@@ -187,13 +187,6 @@ class TestFanInCache:
         result = barca.get("aggregate", f)
         assert result == {"total": 3}
 
-    @pytest.mark.xfail(
-        reason="collect() fan-in delivery is fixed (#97/#93), but partitioned "
-        "steps skip cache-check entirely (commands.rs: 'Partitioned steps with "
-        "partition_keys skip cache for now') — a separate, still-open gap. "
-        "See test_collect_fan_in_delivers_full_partition_list for the "
-        "delivery-correctness regression coverage."
-    )
     def test_partitioned_upstream_change_invalidates_collector(self, tmp_path):
         """Changing a partitioned upstream should invalidate the collect() consumer."""
         f = write_module(

@@ -46,6 +46,30 @@ fn reconcile_total(total_steps: usize, completed_steps: usize) -> usize {
     total_steps.max(completed_steps)
 }
 
+/// The most recent successful materialization of `node_id` with this run hash, if any.
+async fn lookup_cached(
+    cache: &db::CacheReader,
+    node_id: &str,
+    run_hash: &str,
+) -> Option<dispatch::OutputRef> {
+    let mut rows = cache
+        .conn()
+        .query(
+            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
+            [node_id.to_string(), run_hash.to_string()],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().and_then(|row| {
+        Some(dispatch::OutputRef {
+            path: row.get::<String>(0).ok()?,
+            format: row.get::<String>(1).ok()?,
+            size_bytes: row.get::<i64>(2).ok()? as u64,
+            elapsed_seconds: None,
+        })
+    })
+}
+
 /// Total schedulable steps in a phase: 1 per unpartitioned step, `partition_keys.len()`
 /// for late-expanded ones. Used to keep the live progress-bar total in sync with
 /// `dispatch::expand_pending_partitions`, which turns a single planned
@@ -539,10 +563,31 @@ async fn execute(
                     continue;
                 }
 
-                // TODO: Partitioned steps with partition_keys skip cache for now.
-                // To cache-check these, we'd need to verify each partition key individually.
+                // Partitioned steps are checked per key: each partition has its own run hash
+                // (computed above), so keys with a successful materialization are served from
+                // cache and only the missing keys execute.
                 if !step.partition_keys.is_empty() {
-                    uncached_steps.push(step.clone());
+                    let mut missing = Vec::new();
+                    for pk in &step.partition_keys {
+                        let pdisplay = pk.display_id(&step.step_id.base);
+                        let run_h = step
+                            .run_hashes
+                            .get(&pdisplay)
+                            .cloned()
+                            .expect("partitioned step has a precomputed run hash per key");
+                        match lookup_cached(&cache, &pdisplay, &run_h).await {
+                            Some(oref) => {
+                                all_outputs.insert(pdisplay.clone(), oref);
+                                cached_node_ids.insert(pdisplay);
+                            }
+                            None => missing.push(pk.clone()),
+                        }
+                    }
+                    if !missing.is_empty() {
+                        let mut partial = step.clone();
+                        partial.partition_keys = missing;
+                        uncached_steps.push(partial);
+                    }
                     continue;
                 }
 
@@ -552,24 +597,7 @@ async fn execute(
                     .cloned()
                     .expect("unpartitioned step has a precomputed run hash");
 
-                let cached = {
-                    let mut rows = cache
-                        .conn()
-                        .query(
-                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
-                            [display_id.clone(), run_h.clone()],
-                        )
-                        .await
-                        .unwrap();
-                    rows.next().await.unwrap().and_then(|row| {
-                        Some(dispatch::OutputRef {
-                            path: row.get::<String>(0).ok()?,
-                            format: row.get::<String>(1).ok()?,
-                            size_bytes: row.get::<i64>(2).ok()? as u64,
-                            elapsed_seconds: None,
-                        })
-                    })
-                };
+                let cached = lookup_cached(&cache, &display_id, &run_h).await;
 
                 if let Some(oref) = cached {
                     all_outputs.insert(display_id.clone(), oref);

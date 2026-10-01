@@ -7,8 +7,8 @@ and, for partitioned assets, the partition key. If the hash matches a previous s
 materialization, the artifact is reused and the function does not run. Change the function's
 code or any upstream and the hash changes, so only the affected subgraph re-runs.
 
-Tasks and sensors are never served from cache. Partitioned steps are not cache-checked yet,
-so every partition re-runs each time (see `barca docs partitions`).
+Tasks and sensors are never served from cache. Partitioned assets are cached per key (see
+`barca docs partitions`).
 
 ## Where things live
 
