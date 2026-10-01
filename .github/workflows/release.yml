@@ -49,9 +49,12 @@ jobs:
       # post-run `cargo metadata` on the host (sccache is only installed in the
       # manylinux container) so it saved an empty cache, and sccache's own
       # GitHub-cache writes failed on every compile anyway.
+      # rust-cache never re-saves on an exact-key hit, so a bad entry sticks
+      # until the key changes. Bump the `v2` below if a cache ever needs busting
+      # (v1 held an empty Linux cache from the sccache breakage above).
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-v2-${{ matrix.target }}
 
       - uses: actions/setup-python@v5
         with:
