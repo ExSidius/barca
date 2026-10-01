@@ -76,6 +76,11 @@ ls "$TMP"/machine-a/.barca/artifacts/*numbers*/*.json > /dev/null 2>&1 \
     || { echo "FAIL: no local artifact on machine A"; ls -R "$TMP/machine-a/.barca"; exit 1; }
 grep -q "uploaded 2 artifacts" "$TMP/machine-a/stderr-a.log" \
     || { echo "FAIL: no upload summary on A"; cat "$TMP/machine-a/stderr-a.log"; exit 1; }
+grep -q "pushed state" "$TMP/machine-a/stderr-a.log" \
+    || { echo "FAIL: state push not reported on A"; cat "$TMP/machine-a/stderr-a.log"; exit 1; }
+# First run: nothing to pull yet — say so rather than staying silent.
+grep -q "no shared state yet" "$TMP/machine-a/stderr-a.log" \
+    || { echo "FAIL: empty-remote pull not reported on A"; cat "$TMP/machine-a/stderr-a.log"; exit 1; }
 BAD=$(python3 -c "
 import sqlite3
 conn = sqlite3.connect('$STATE_BLOB')
@@ -95,12 +100,17 @@ grep -q '"steps_executed":0' "$TMP/machine-b/result-b.json" \
 grep -q '"sum":6' "$TMP/machine-b/result-b.json" \
     || { echo "FAIL: machine B did not resolve the cached value"; cat "$TMP/machine-b/result-b.json"; exit 1; }
 
+grep -q "pulled state" "$TMP/machine-b/stderr-b.log" \
+    || { echo "FAIL: state pull not reported on B"; cat "$TMP/machine-b/stderr-b.log"; exit 1; }
+
 echo "── machine B fetched only what it read (the final output), uploaded nothing"
 ls "$TMP"/machine-b/.barca/artifacts/*total*/*.json > /dev/null 2>&1 \
     || { echo "FAIL: final output not fetched to B"; ls -R "$TMP/machine-b/.barca"; exit 1; }
 if ls "$TMP"/machine-b/.barca/artifacts/*numbers* > /dev/null 2>&1; then
     echo "FAIL: B fetched an intermediate it never read"; exit 1
 fi
+grep -q "fetched 1 cached artifact" "$TMP/machine-b/stderr-b.log" \
+    || { echo "FAIL: final-output fetch not reported on B"; cat "$TMP/machine-b/stderr-b.log"; exit 1; }
 if grep -q "uploaded" "$TMP/machine-b/stderr-b.log"; then
     echo "FAIL: B re-uploaded cached artifacts"; cat "$TMP/machine-b/stderr-b.log"; exit 1
 fi

@@ -514,6 +514,32 @@ async fn lookup_cached(
     })
 }
 
+/// A spawned task that is aborted if dropped before it is joined, so an early
+/// return never leaves background work running (e.g. a state pull that
+/// would overwrite the local DB after the run gave up).
+struct Background<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T: Send + 'static> Background<T> {
+    fn spawn(fut: impl std::future::Future<Output = T> + Send + 'static) -> Self {
+        Self(Some(tokio::spawn(fut)))
+    }
+
+    async fn join(mut self) -> Result<T, BarcaError> {
+        let handle = self.0.take().expect("joined once");
+        handle
+            .await
+            .map_err(|e| BarcaError::Other(format!("background task failed: {e}")))
+    }
+}
+
+impl<T> Drop for Background<T> {
+    fn drop(&mut self) {
+        if let Some(h) = &self.0 {
+            h.abort();
+        }
+    }
+}
+
 /// How a cache row's artifact is reached on this machine.
 enum CacheHit {
     /// Use the output as recorded.
@@ -624,12 +650,14 @@ struct StoreSync {
 }
 
 impl StoreSync {
-    /// Make the store-backed artifacts among `paths` local. Returns how many
-    /// were fetched and their size, or a message naming what could not be.
+    /// Make the store-backed artifacts among `paths` local, reporting any
+    /// fetch on stderr (through the progress bar when one is live). Errors
+    /// name what could not be fetched.
     async fn ensure_local<'a>(
         &mut self,
         paths: impl IntoIterator<Item = &'a str>,
-    ) -> Result<(usize, u64), String> {
+        pb: Option<&indicatif::ProgressBar>,
+    ) -> Result<(), String> {
         let mut locals = Vec::new();
         for path in paths {
             if let Some((node, store)) = self.fetchable.remove(path)
@@ -639,11 +667,25 @@ impl StoreSync {
             }
         }
         if locals.is_empty() {
-            return Ok((0, 0));
+            return Ok(());
         }
+        let started = Instant::now();
         let report = self.client.await_fetches(&locals).await;
+        if report.transferred > 0 {
+            let msg = format!(
+                "[barca] fetched {} cached artifact{} ({}) in {:.1}s",
+                report.transferred,
+                if report.transferred == 1 { "" } else { "s" },
+                fmt_bytes(report.bytes),
+                started.elapsed().as_secs_f64()
+            );
+            match pb {
+                Some(bar) => bar.println(&msg),
+                None => eprintln!("{msg}"),
+            }
+        }
         if report.failures.is_empty() {
-            return Ok((report.transferred, report.bytes));
+            return Ok(());
         }
         let detail: Vec<String> = report
             .failures
@@ -1080,6 +1122,24 @@ async fn execute(
     }
     let run_id = db::generate_run_id();
 
+    // Start remote I/O first so it overlaps parsing and planning: the shared
+    // state pull (joined just before the metadata DB is opened) and the
+    // artifact transfer helper's startup (joined before workers start).
+    let state_sync_on =
+        cfg.state == crate::config::StateMode::Optimistic && cfg.state_uri.is_some();
+    let pull = state_sync_on.then(|| {
+        let (python, cfg) = (python.clone(), cfg.clone());
+        Background::spawn(async move {
+            let started = Instant::now();
+            let token = state_sync::pull_state(&python, &cfg).await?;
+            Ok::<_, BarcaError>((token, started.elapsed()))
+        })
+    });
+    let transfer_start = cfg.remote_artifacts().then(|| {
+        let (python, cfg, run_id) = (python.clone(), cfg.clone(), run_id.clone());
+        Background::spawn(async move { TransferClient::start(&python, &cfg, &run_id).await })
+    });
+
     let dag = build_dag(file_args, python).await?;
     trace_point!("dag_built");
 
@@ -1106,17 +1166,25 @@ async fn execute(
     db::ensure_env_dirs(&cfg.env)?;
     let db_path = cfg.db_path.clone();
 
-    // Shared remote state: pull the metadata DB before opening it, so cache
-    // checks below see every machine's materializations. Pull failure is a
-    // hard error — silently diverging local runs are worse than stopping.
-    let state_sync_on =
-        cfg.state == crate::config::StateMode::Optimistic && cfg.state_uri.is_some();
-    let mut state_token = if state_sync_on {
-        Some(state_sync::pull_state(python, cfg).await?)
-    } else {
-        None
+    // Shared remote state: the pull must land before the DB is opened, so
+    // cache checks below see every machine's materializations. Pull failure
+    // is a hard error — silently diverging local runs are worse than stopping.
+    let mut state_token = match pull {
+        Some(pull) => {
+            let (token, took) = pull.join().await??;
+            match token.0 {
+                Some(_) => eprintln!(
+                    "[barca] pulled state ({}) in {:.2}s",
+                    fmt_bytes(std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0)),
+                    took.as_secs_f64()
+                ),
+                None => eprintln!("[barca] no shared state yet — this run will create it"),
+            }
+            Some(token)
+        }
+        None => None,
     };
-    trace_point!("state_sync_pull (enabled={state_sync_on})");
+    trace_point!("state_sync_pull_joined (enabled={state_sync_on})");
 
     db::init_db(&db_path).await?;
     trace_point!("db_init");
@@ -1232,8 +1300,8 @@ async fn execute(
     // Separate artifact store: workers still read and write only the local
     // artifact dir; the transfer helper uploads finished artifacts in the
     // background and fetches cache hits recorded by other machines.
-    let mut store: Option<StoreSync> = if cfg.remote_artifacts() {
-        let client = TransferClient::start(python, cfg, &run_id).await?;
+    let mut store: Option<StoreSync> = if let Some(start) = transfer_start {
+        let client = start.join().await??;
         let layout = client.layout().clone();
         Some(StoreSync {
             client,
@@ -1299,7 +1367,10 @@ async fn execute(
                 .into_iter()
                 .map(|o| o.path.clone())
                 .collect();
-            if let Err(e) = s.ensure_local(sources.iter().map(String::as_str)).await {
+            if let Err(e) = s
+                .ensure_local(sources.iter().map(String::as_str), pb.as_ref())
+                .await
+            {
                 transfer_error = Some(e);
                 break;
             }
@@ -1419,25 +1490,12 @@ async fn execute(
                 dispatch::ProvidedInput::Single(o) => std::slice::from_ref(o),
                 dispatch::ProvidedInput::Collected(v) => v.as_slice(),
             });
-            let t_fetch = Instant::now();
-            match s.ensure_local(paths.map(|o| o.path.as_str())).await {
-                Ok((0, _)) => {}
-                Ok((n, bytes)) => {
-                    let msg = format!(
-                        "[barca] fetched {n} cached artifact{} ({}) in {:.1}s",
-                        if n == 1 { "" } else { "s" },
-                        fmt_bytes(bytes),
-                        t_fetch.elapsed().as_secs_f64()
-                    );
-                    match pb {
-                        Some(ref bar) => bar.println(&msg),
-                        None => eprintln!("{msg}"),
-                    }
-                }
-                Err(e) => {
-                    transfer_error = Some(e);
-                    break;
-                }
+            if let Err(e) = s
+                .ensure_local(paths.map(|o| o.path.as_str()), pb.as_ref())
+                .await
+            {
+                transfer_error = Some(e);
+                break;
             }
             trace_point!("phase{phase_idx}_inputs_local");
         }
@@ -1705,7 +1763,7 @@ async fn execute(
             if transfer_error.is_none()
                 && phase_error.is_none()
                 && let Some(ref out) = final_output
-                && let Err(e) = s.ensure_local([out.path.as_str()]).await
+                && let Err(e) = s.ensure_local([out.path.as_str()], None).await
             {
                 transfer_error = Some(e);
             }
@@ -1793,10 +1851,24 @@ async fn execute(
     // database, replay this run's ledger onto it, retry.
     if state_sync_on {
         let mut attempt = 0u32;
+        let t_push = Instant::now();
         loop {
             state_sync::checkpoint_truncate(&db_path).await?;
             match state_sync::push_state(python, cfg, state_token.as_ref().unwrap()).await? {
-                state_sync::PushOutcome::Pushed(_) => break,
+                state_sync::PushOutcome::Pushed(_) => {
+                    eprintln!(
+                        "[barca] pushed state ({}) in {:.2}s{}",
+                        fmt_bytes(std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0)),
+                        t_push.elapsed().as_secs_f64(),
+                        match attempt {
+                            0 => String::new(),
+                            1 => " after 1 conflict retry".to_string(),
+                            n => format!(" after {n} conflict retries"),
+                        }
+                    );
+                    trace_point!("state_sync_pushed (attempts={})", attempt + 1);
+                    break;
+                }
                 state_sync::PushOutcome::Conflict => {
                     if attempt >= cfg.push_retries {
                         return Err(BarcaError::Other(format!(
@@ -2420,6 +2492,25 @@ mod store_tests {
             size_bytes: 3,
             elapsed_seconds: None,
         }
+    }
+
+    #[tokio::test]
+    async fn background_task_is_aborted_when_dropped_unjoined() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let task = Background::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = tx.send(());
+        });
+        drop(task);
+        // Aborting drops the future, and with it the sender.
+        let r = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
+        assert!(matches!(r, Ok(Err(_))), "task kept running after drop");
+    }
+
+    #[tokio::test]
+    async fn background_task_join_returns_its_output() {
+        let task = Background::spawn(async { 7 });
+        assert_eq!(task.join().await.unwrap(), 7);
     }
 
     #[test]
