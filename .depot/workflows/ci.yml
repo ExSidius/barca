@@ -6,21 +6,30 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest
+    env:
+      # Build artifacts and pip downloads live on a Depot cache disk: a real
+      # filesystem that persists between runs (no upload/download step, and
+      # incremental compiles survive Cargo.lock changes). Each job uses its own
+      # subdirectory so the two jobs never write the same files concurrently.
+      CARGO_TARGET_DIR: /mnt/cache/test/target
+      PIP_CACHE_DIR: /mnt/cache/test/pip
     steps:
       - uses: actions/checkout@v4
 
+      - name: Mount cache disk
+        uses: depot/cache-mount@v1
+        with:
+          name: barca-ci-cache
+          path: /mnt/cache
+
+      - name: Prepare cache dirs
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" 2>/dev/null \
+            || { sudo mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" && sudo chown -R "$(id -u):$(id -g)" /mnt/cache/test; }
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run unit tests
         run: cargo test
@@ -33,9 +42,9 @@ jobs:
       - name: Install maturin and build
         run: |
           pip install maturin
-          rm -rf target/wheels
+          rm -rf "$CARGO_TARGET_DIR/wheels"
           maturin build --release
-          pip install target/wheels/*.whl
+          pip install "$CARGO_TARGET_DIR"/wheels/*.whl
 
       - name: Run integration tests
         run: |
@@ -64,9 +73,38 @@ jobs:
     # against local object-store emulators (no cloud credentials). MinIO covers
     # the S3 API — and therefore Cloudflare R2's code path — fake-gcs-server
     # covers GCS generation-match, Azurite covers Azure ETag If-Match.
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: /mnt/cache/backends/target
+      PIP_CACHE_DIR: /mnt/cache/backends/pip
     steps:
       - uses: actions/checkout@v4
+
+      # Start the emulators first: `docker run -d` returns after pulling, and the
+      # pulls then overlap with the (much longer) Rust build below instead of
+      # waiting behind it.
+      - name: Start object-store emulators
+        run: |
+          docker run -d --name minio -p 9100:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            bitnamilegacy/minio:2025.5.24
+          docker run -d --name fake-gcs -p 9200:4443 \
+            fsouza/fake-gcs-server -scheme http -port 4443 \
+            -public-host localhost:9200 -external-url http://localhost:9200
+          docker run -d --name azurite -p 9210:10000 \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+
+      - name: Mount cache disk
+        uses: depot/cache-mount@v1
+        with:
+          name: barca-ci-cache
+          path: /mnt/cache
+
+      - name: Prepare cache dirs
+        run: |
+          mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" 2>/dev/null \
+            || { sudo mkdir -p "$CARGO_TARGET_DIR" "$PIP_CACHE_DIR" && sudo chown -R "$(id -u):$(id -g)" /mnt/cache/backends; }
 
       - name: Install Python
         uses: actions/setup-python@v5
@@ -79,22 +117,10 @@ jobs:
       - name: Build barca and install test extras
         run: |
           pip install maturin
-          rm -rf target/wheels
+          rm -rf "$CARGO_TARGET_DIR/wheels"
           maturin build --release
-          WHEEL=$(ls target/wheels/*.whl)
+          WHEEL=$(ls "$CARGO_TARGET_DIR"/wheels/*.whl)
           pip install "${WHEEL}[test]"
-
-      - name: Start object-store emulators
-        run: |
-          docker run -d --name minio -p 9100:9000 \
-            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-            bitnamilegacy/minio:2025.5.24
-          docker run -d --name fake-gcs -p 9200:4443 \
-            fsouza/fake-gcs-server -scheme http -port 4443 \
-            -public-host localhost:9200 -external-url http://localhost:9200
-          docker run -d --name azurite -p 9210:10000 \
-            mcr.microsoft.com/azure-storage/azurite \
-            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
 
       - name: Wait for emulators
         run: |
