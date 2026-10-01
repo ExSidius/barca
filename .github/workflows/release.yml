@@ -3,6 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # Dry-run the build jobs (no release/publish: those are gated to tags below)
+  # when this workflow changes, or on demand to pre-warm the build cache.
+  pull_request:
+    paths: [".github/workflows/release.yml"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,15 +21,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: depot-ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             maturin-target: x86_64
             name: linux-x86_64
-          - os: macos-latest
+          - os: depot-macos-15
             target: x86_64-apple-darwin
             maturin-target: x86_64
             name: macos-x86_64
-          - os: macos-latest
+          - os: depot-macos-15
             target: aarch64-apple-darwin
             maturin-target: aarch64
             name: macos-arm64
@@ -36,6 +41,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # On Depot runners the GitHub Actions cache API is backed by Depot Cache,
+      # which is not isolated per ref -- so a tag build can restore the cache
+      # saved by the previous tag (GitHub's own cache cannot: each tag is a new
+      # ref). rust-cache restores target/ when Cargo.lock is unchanged; sccache
+      # (below) covers unchanged crates when it changes.
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
@@ -53,6 +63,7 @@ jobs:
           target: ${{ matrix.maturin-target }}
           args: --release --out dist --find-interpreter
           manylinux: auto
+          sccache: true
 
       - name: Package standalone CLI binary
         run: |
@@ -73,7 +84,7 @@ jobs:
           path: barca-${{ matrix.name }}.tar.gz
 
   build-sdist:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -89,8 +100,9 @@ jobs:
           path: dist/
 
   release:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-wheels, build-sdist]
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -128,8 +140,9 @@ jobs:
           body_path: RELEASE_NOTES.md
 
   publish-pypi:
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-wheels, build-sdist]
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
