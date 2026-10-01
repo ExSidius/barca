@@ -31,7 +31,7 @@ drift from what the CLI does.
 
 ```
 barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
-barca run <task> <file.py> [--burst a,b]     Run a task (always re-runs)
+barca run <task> <file.py> [--refresh a,b | --refresh-all]     Run a task (always re-runs)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
 barca history [-l N]                          Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
@@ -52,7 +52,7 @@ barca get pipeline.py --agent         # plain progress lines instead of a progre
 barca get pipeline.py -o value        # print just the final value (also: json | pretty)
 
 barca run deploy pipeline.py                          # run task + bust all upstream caches
-barca run deploy pipeline.py --burst fetch,transform   # only bust named assets
+barca run deploy pipeline.py --refresh fetch,transform   # only re-materialize named assets
 ```
 
 Every command that touches state (`get`, `run`, `plan`, `serve`, `history`, `stats`)
@@ -137,7 +137,7 @@ in [RFC-0001](/rfcs/0001-node-kinds-and-freshness/) (`get` targets assets/sensor
 
 - `barca get` on a target that resolves to a task fails — `get` is for cache-aware
   asset retrieval; use `run` for tasks.
-- `--burst` on `run` is meaningless without `--burst` naming actual upstream assets in
+- `--refresh` on `run` is meaningless without naming actual upstream assets in
   the task's dependency cone; unknown names are a plan-time error.
 
 ## 5. Determinism, Caching & Testing

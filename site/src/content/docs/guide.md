@@ -241,7 +241,7 @@ def write_to_s3(report: dict) -> None:
 
 Both tasks run in the same phase (they're independent of each other) after `daily_report` completes. Use `barca run` to execute tasks.
 
-`barca run` always force-reruns every upstream asset in the task's cone (it "bursts" the cache) -- so `daily_report` re-executes on every `barca run send_slack_notification pipeline.py`, even if it's already cached. Pass `--burst report_name_a,report_name_b` to burst only specific upstream assets and leave the rest cache-aware.
+`barca run` always re-runs the task, but serves upstream assets from cache when they are fresh (same as `barca get`) -- so `daily_report` is reused on `barca run send_slack_notification pipeline.py` if it's already materialized. Pass `--refresh report_name_a,report_name_b` to force re-materialize only specific upstream assets, or `--refresh-all` (alias `--no-cache`) to refresh the whole upstream cone.
 
 ## 7. Partitions
 

@@ -35,16 +35,16 @@ barca run deploy pipeline.py
 - Upstream tasks always re-run.
 - Sensors always re-run.
 
-### Selective re-runs with `--burst`
+### Selective re-runs with `--refresh`
 
-By default, `barca run` uses cached upstream assets when they are fresh. Use `--burst` to force-rerun specific assets:
+By default, `barca run` uses cached upstream assets when they are fresh. Use `--refresh` to force re-materialize specific assets (or `--refresh-all` for all of them):
 
 ```bash
 # Re-train the model, use cached data for everything else.
-barca run deploy --burst trained_model pipeline.py
+barca run deploy --refresh trained_model pipeline.py
 
 # Force-rerun multiple assets.
-barca run deploy --burst raw_data,trained_model pipeline.py
+barca run deploy --refresh raw_data,trained_model pipeline.py
 ```
 
 ## Declaring tasks

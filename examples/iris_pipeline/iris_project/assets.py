@@ -14,7 +14,7 @@ re-run, are never cached, and consume upstream outputs.
 Try it::
 
     barca run notify_team iris_project/assets.py
-    barca run notify_team --burst trained_model iris_project/assets.py
+    barca run notify_team --refresh trained_model iris_project/assets.py
 """
 
 from barca import asset, sink, task

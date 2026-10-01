@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- `barca run` is now cache-aware for upstream assets by default (same as `barca get`);
+  the task itself still always re-runs. Previously every upstream asset was force-rerun.
+  `--burst` is renamed to `--refresh <a,b>`; add `--refresh-all` (alias `--no-cache`) to
+  restore the old default. Python API: `barca.run(..., burst=[...])` is now
+  `refresh=[...]` / `refresh_all=True`.
+
 ### Features
 
 - Sub-minute cron scheduling: `Schedule(...)` now accepts a 6-field cron with a
