@@ -42,6 +42,12 @@ All notable changes to this project will be documented in this file.
 
 ### Bug Fixes
 
+- `--refresh` is no longer easy to misuse: a name that is not an upstream asset is an error that
+  lists the valid names (it used to silently do nothing), `--refresh a b` says to use a comma
+  instead of failing with "No such file", and barca warns when a refresh leaves cached assets
+  downstream of it stale (run hashes cover upstream hashes, not outputs, so they stay cached).
+- A step that runs for 15 s or more is now reported on stderr (`[barca] still running (45s): ...`,
+  `BARCA_PROGRESS_SECS` to tune) in every mode, so a slow step no longer looks hung.
 - Partitioned assets are now cached per key. Previously every partition re-executed on each
   run (a `TODO` in the coordinator); now unchanged keys are served from cache and only new or
   changed keys run, with the fan-in re-running only when its inputs change.

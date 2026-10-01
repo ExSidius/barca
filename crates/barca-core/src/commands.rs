@@ -46,6 +46,68 @@ fn reconcile_total(total_steps: usize, completed_steps: usize) -> usize {
     total_steps.max(completed_steps)
 }
 
+/// Print a note above the progress bar, or to stderr when no bar is visible. A hidden bar
+/// (stderr is not a terminal, as when an agent or CI drives barca) silently swallows
+/// `ProgressBar::println`, which used to make warnings vanish.
+fn note(pb: &Option<indicatif::ProgressBar>, msg: &str) {
+    match pb {
+        Some(bar) if !bar.is_hidden() => bar.println(msg),
+        _ => eprintln!("{msg}"),
+    }
+}
+
+/// Does a `--refresh` name (a function name, or a full `file.py:name` id) identify `node_id`?
+pub(crate) fn refresh_name_matches(node_id: &str, name: &str) -> bool {
+    node_id == name || node_id.ends_with(&format!(":{name}"))
+}
+
+/// The function name of a node id (`pipeline.py:src` -> `src`, `pipeline.py:p[k=v]` -> `p`).
+fn short_name(node_id: &str) -> &str {
+    let base = node_id.split('[').next().unwrap_or(node_id);
+    base.rsplit(':').next().unwrap_or(base)
+}
+
+/// Fail before running anything when `--refresh` names something that is not an upstream
+/// asset of the target: a typo must not be a silent no-op.
+fn validate_refresh_names(
+    dag: &Dag,
+    target_id: Option<&str>,
+    names: &[String],
+) -> Result<(), BarcaError> {
+    let cone: Vec<&str> = match target_id {
+        Some(tid) => dag.subgraph(tid),
+        None => dag.topo_order(),
+    };
+    let assets: Vec<&str> = cone
+        .into_iter()
+        .filter(|id| Some(*id) != target_id)
+        .filter(|id| {
+            dag.get_node(id)
+                .is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+        })
+        .collect();
+    for name in names {
+        if !assets.iter().any(|id| refresh_name_matches(id, name)) {
+            let valid: Vec<&str> = assets.iter().map(|id| short_name(id)).collect();
+            return Err(BarcaError::Other(format!(
+                "--refresh: no upstream asset named '{name}'{}.\n\
+                 Upstream assets you can refresh: {}\n\
+                 Pass several as a comma-separated list: --refresh {}",
+                target_id
+                    .map(|t| format!(" in the cone of '{}'", short_name(t)))
+                    .unwrap_or_default(),
+                if valid.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    valid.join(", ")
+                },
+                valid.iter().take(2).copied().collect::<Vec<_>>().join(","),
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// The most recent successful materialization of `node_id` with this run hash, if any.
 async fn lookup_cached(
     cache: &db::CacheReader,
@@ -316,6 +378,10 @@ async fn execute(
     };
     trace_point!("planned");
 
+    if let CachePolicy::RefreshSelective(names) = &policy {
+        validate_refresh_names(&dag, target_id.as_deref(), names)?;
+    }
+
     db::ensure_env_dirs(&cfg.env)?;
     let db_path = cfg.db_path.clone();
 
@@ -353,6 +419,11 @@ async fn execute(
     trace_point!("cost_model_seeded");
 
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Assets re-materialized by `--refresh` in this run, and cached assets downstream of them.
+    // Run hashes cover definitions and upstream *hashes*, not outputs, so a refresh does not
+    // invalidate downstream caches; say so when that happens.
+    let mut refreshed_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut stale_cached: HashMap<String, String> = HashMap::new();
     let mut run_hashes: HashMap<String, String> = HashMap::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
@@ -448,6 +519,22 @@ async fn execute(
         storage_options_json: cfg.storage_options_json.clone(),
     };
     let mut pool = crate::io_loop::WorkerPool::start(io_config).map_err(BarcaError::Other)?;
+    {
+        // A step that runs for a while must not look hung: report it periodically.
+        let bar = pb.clone();
+        pool.on_running(Box::new(move |running| match &bar {
+            Some(bar) if !bar.is_hidden() => {
+                if let Some((id, secs)) = running.first() {
+                    bar.set_message(format!("{} running {}s", short_name(id), *secs as u64));
+                }
+            }
+            _ => {
+                for (id, secs) in running {
+                    eprintln!("[barca] still running ({}s): {id}", *secs as u64);
+                }
+            }
+        }));
+    }
     trace_point!("pool_started");
 
     for (phase_idx, phase) in exec_plan.phases.iter().enumerate() {
@@ -553,12 +640,11 @@ async fn execute(
                     }
                     CachePolicy::RefreshSelective(names) => {
                         base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
-                            && names.iter().any(|name| {
-                                base_id == name || base_id.ends_with(&format!(":{name}"))
-                            })
+                            && names.iter().any(|name| refresh_name_matches(base_id, name))
                     }
                 };
                 if refreshed {
+                    refreshed_ids.insert(base_id.to_string());
                     uncached_steps.push(step.clone());
                     continue;
                 }
@@ -600,6 +686,25 @@ async fn execute(
                 let cached = lookup_cached(&cache, &display_id, &run_h).await;
 
                 if let Some(oref) = cached {
+                    // Cached, but depends on something refreshed in this run?
+                    let root = step.inputs.values().find_map(|up| {
+                        let up_base = up.split('[').next().unwrap_or(up);
+                        if refreshed_ids.contains(up_base) {
+                            Some(short_name(up_base).to_string())
+                        } else {
+                            stale_cached.get(up_base).cloned()
+                        }
+                    });
+                    if let Some(root) = root {
+                        let msg = format!(
+                            "[barca] warning: '{id}' was served from cache but depends on refreshed '{root}', \
+                             so it does not reflect the refresh. Add it to --refresh (for example --refresh {root},{id}) \
+                             or use --refresh-all.",
+                            id = short_name(&display_id)
+                        );
+                        note(&pb, &msg);
+                        stale_cached.insert(base_id.to_string(), root);
+                    }
                     all_outputs.insert(display_id.clone(), oref);
                     cached_node_ids.insert(display_id);
                 } else {
@@ -675,11 +780,7 @@ async fn execute(
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown error"),
                             );
-                            if let Some(ref bar) = pb {
-                                bar.println(&msg);
-                            } else {
-                                eprintln!("{msg}");
-                            }
+                            note(&pb, &msg);
                         }
                     }
                 }
@@ -1518,5 +1619,19 @@ mod progress_tests {
     fn remaining_never_underflows() {
         // The ETA math subtracts usizes; this used to panic in debug and wrap in release.
         assert_eq!(2usize.saturating_sub(4), 0);
+    }
+}
+
+#[cfg(test)]
+mod refresh_name_tests {
+    use super::refresh_name_matches;
+
+    #[test]
+    fn matches_the_full_id_or_the_function_name() {
+        assert!(refresh_name_matches("pipeline.py:src", "src"));
+        assert!(refresh_name_matches("pipeline.py:src", "pipeline.py:src"));
+        assert!(!refresh_name_matches("pipeline.py:src", "rc"));
+        assert!(!refresh_name_matches("pipeline.py:source", "src"));
+        assert!(!refresh_name_matches("pipeline.py:src", "nope"));
     }
 }

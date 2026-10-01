@@ -47,6 +47,14 @@ Targets on the command line can use the bare function name (`barca get clean pip
 Use `asset_ref("other/file.py:raw")` inside `inputs=` to reference a node in another file
 without importing it.
 
+## Naming
+
+An asset is an ordinary Python function, so its name is an ordinary Python name. If a file
+imports a module (`import carry_forward_registry`) and also defines an asset with the same
+name, the `def` rebinds the name and shadows the module for the rest of the file. Give the
+import an alias (`import carry_forward_registry as cf_registry`) or rename the asset. Barca does
+not warn about this; Python simply uses the later definition.
+
 ## Static analysis
 
 Planning never imports your code. The decorators, `inputs=` and `freshness=` must be written
