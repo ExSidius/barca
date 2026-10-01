@@ -158,6 +158,6 @@ See [Error Handling](/patterns/06-error-handling/) for details on failure propag
 
 ## Worked examples
 
-- [`examples/basic_app`](https://github.com/ExSidius/barca/tree/main/examples/basic_app) --
+- [`examples/basic_app`](https://github.com/barca-orc/barca/tree/main/examples/basic_app) --
   a task consuming an asset (`log_summary`) and an ordering-only chain
   (`migrate` then `warm_cache` then `notify`).

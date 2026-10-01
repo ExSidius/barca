@@ -22,7 +22,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/ExSidius/barca"
+Repository = "https://github.com/barca-orc/barca"
 
 [project.optional-dependencies]
 parquet = ["pyarrow", "pandas"]
