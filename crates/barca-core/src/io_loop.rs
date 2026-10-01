@@ -371,6 +371,8 @@ impl WorkerPool {
                                     run_hash: None,
                                     upstream_inputs: HashMap::new(),
                                     collected_inputs: HashMap::new(),
+                                    param_types: HashMap::new(),
+                                    return_type: None,
                                     kind: "task".to_string(),
                                     is_dynamic: false,
                                 }
@@ -960,6 +962,13 @@ fn build_step_json(item: &crate::coordinator::Item, coord: &Coordinator) -> serd
         "serializer": item.spec.serializer.as_deref(),
         "sinks": item.spec.sinks,
         "run_hash": item.spec.run_hash,
+        "param_types": item
+            .spec
+            .param_types
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_str()))
+            .collect::<HashMap<String, &str>>(),
+        "return_type": item.spec.return_type.map(|t| t.as_str()),
     })
 }
 
@@ -998,6 +1007,8 @@ mod tests {
             ],
             upstream_inputs: HashMap::new(),
             collected_inputs: HashMap::new(),
+            param_types: HashMap::new(),
+            return_type: None,
             kind: "asset".to_string(),
             is_dynamic: false,
         };
@@ -1012,6 +1023,42 @@ mod tests {
             ])
         );
         assert_eq!(step["serializer"], serde_json::json!("parquet"));
+    }
+
+    #[test]
+    fn build_step_json_includes_param_types_from_spec() {
+        use crate::model::ValueType;
+
+        let mut coord = Coordinator::new();
+        let spec = ItemSpec {
+            fn_ref: "f.py:downstream".to_string(),
+            function_name: "downstream".to_string(),
+            source_file: "f.py".to_string(),
+            direct_args: Vec::new(),
+            direct_kwargs: HashMap::new(),
+            dag_inputs: HashMap::new(),
+            timeout_seconds: 300,
+            retries: 1,
+            retry_backoff_seconds: 0.0,
+            serializer: None,
+            sinks: Vec::new(),
+            run_hash: None,
+            upstream_inputs: HashMap::from([("orders".to_string(), "f.py:upstream".to_string())]),
+            collected_inputs: HashMap::new(),
+            param_types: HashMap::from([("orders".to_string(), ValueType::Polars)]),
+            return_type: Some(ValueType::Polars),
+            kind: "asset".to_string(),
+            is_dynamic: false,
+        };
+        let id = coord.add_item(
+            crate::StepId::unpartitioned("f.py:downstream"),
+            spec,
+            Vec::new(),
+        );
+        let step = build_step_json(coord.item(id), &coord);
+
+        assert_eq!(step["param_types"]["orders"], "polars");
+        assert_eq!(step["return_type"], "polars");
     }
 
     #[test]
@@ -1032,6 +1079,8 @@ mod tests {
             run_hash: None,
             upstream_inputs: HashMap::new(),
             collected_inputs: HashMap::new(),
+            param_types: HashMap::new(),
+            return_type: None,
             kind: "asset".to_string(),
             is_dynamic: false,
         };
@@ -1062,6 +1111,8 @@ mod tests {
             run_hash: None,
             upstream_inputs: HashMap::from([("data".to_string(), "f.py:source".to_string())]),
             collected_inputs: HashMap::new(),
+            param_types: HashMap::new(),
+            return_type: None,
             kind: "asset".to_string(),
             is_dynamic: false,
         };

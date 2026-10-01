@@ -56,6 +56,10 @@ pub struct ItemSpec {
     /// from `dag_inputs` (which is one artifact path per param) because a
     /// collected param resolves to a *list* of artifacts.
     pub collected_inputs: HashMap<String, Vec<crate::dispatch::OutputRef>>,
+    /// Parameter frame types from function annotations.
+    pub param_types: HashMap<String, crate::model::ValueType>,
+    /// Return frame type from the function's return annotation.
+    pub return_type: Option<crate::model::ValueType>,
     pub kind: String,
     pub is_dynamic: bool,
 }
@@ -77,6 +81,8 @@ impl ItemSpec {
             run_hash: step.run_hashes.get(&step.step_id.display()).cloned(),
             upstream_inputs: step.inputs.clone(),
             collected_inputs: HashMap::new(),
+            param_types: step.param_types.clone(),
+            return_type: step.return_type,
             kind: format!("{:?}", step.kind).to_lowercase(),
             is_dynamic: false,
         }
@@ -768,6 +774,8 @@ mod tests {
             run_hash: None,
             upstream_inputs: HashMap::new(),
             collected_inputs: HashMap::new(),
+            param_types: HashMap::new(),
+            return_type: None,
             kind: "asset".to_string(),
             is_dynamic: false,
         }
@@ -1218,6 +1226,8 @@ mod tests {
             retries: 1,
             retry_backoff_seconds: 0.0,
             partition_keys: pks,
+            param_types: HashMap::new(),
+            return_type: None,
         };
 
         let phase = Phase {
@@ -1288,6 +1298,8 @@ mod tests {
             retries: 1,
             retry_backoff_seconds: 0.0,
             partition_keys: pks,
+            param_types: HashMap::new(),
+            return_type: None,
         };
 
         let no_inputs = HashMap::new();
@@ -1380,6 +1392,8 @@ mod tests {
             retries: 1,
             retry_backoff_seconds: 0.0,
             partition_keys: vec![],
+            param_types: HashMap::new(),
+            return_type: None,
         };
         let phase = Phase {
             reason: PhaseReason::FanIn {

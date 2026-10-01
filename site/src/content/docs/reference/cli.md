@@ -28,6 +28,13 @@ Shorthand: `barca pipeline.py` is rewritten to `barca get pipeline.py`.
 Execute the computation graph and return asset value(s). Cache-aware — only the needed subgraph
 runs, and unchanged steps are served from cache.
 
+Each completed step **fully materializes** its output to an artifact file under `.barca/artifacts/`
+(json, pickle, or parquet). That write is the cache checkpoint — barca does not pass lazy
+in-memory frames or query plans between workers. Downstream steps read the artifact back;
+parameter type annotations (e.g. `data: pl.DataFrame`) select the parquet *reader* only.
+To cache several outputs from one efficient computation, define multiple assets (or compute
+them in one step and return the value you want cached).
+
 If the first positional argument ends in `.py`, all arguments are treated as files (gets all
 assets, returning the final asset's value). Otherwise the first argument is the target asset name
 and the rest are files.

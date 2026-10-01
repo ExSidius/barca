@@ -190,19 +190,23 @@ def _write_parquet(value: Any, path: Path) -> None:
     )
 
 
-def deserialize(path: "Path | str", fmt: str) -> Any:
-    """Read an artifact from a local path or remote URI using the given format."""
+def deserialize(path: "Path | str", fmt: str, *, frame_type: str | None = None) -> Any:
+    """Read an artifact from a local path or remote URI using the given format.
+
+    ``frame_type`` selects the parquet reader when ``fmt == "parquet"``.
+    Supported values: ``pandas`` (default), ``polars``, ``pyarrow``, ``duckdb``.
+    """
     if _storage.is_remote(path):
         tmp = _make_temp(_staging_dir(), prefix="fetch-")
         try:
             _storage.get_file(str(path), tmp)
-            return _deserialize_local(tmp, fmt)
+            return _deserialize_local(tmp, fmt, frame_type=frame_type)
         finally:
             tmp.unlink(missing_ok=True)
-    return _deserialize_local(Path(path), fmt)
+    return _deserialize_local(Path(path), fmt, frame_type=frame_type)
 
 
-def _deserialize_local(path: Path, fmt: str) -> Any:
+def _deserialize_local(path: Path, fmt: str, *, frame_type: str | None = None) -> Any:
     if fmt == "json":
         with open(path) as f:
             return json.load(f)
@@ -212,29 +216,35 @@ def _deserialize_local(path: Path, fmt: str) -> Any:
             return pickle.load(f)
 
     if fmt == "parquet":
-        return _deserialize_parquet(path)
+        return _deserialize_parquet(path, frame_type=frame_type or "pandas")
 
     raise ValueError(f"Unknown format: {fmt}")
 
 
-def _deserialize_parquet(path: Path) -> Any:
-    """Read a parquet file. Prefers pandas if available, then polars."""
-    try:
-        import pandas as pd
-
-        return pd.read_parquet(str(path))
-    except ImportError:
-        pass
-
-    try:
+def _deserialize_parquet(path: Path, *, frame_type: str = "pandas") -> Any:
+    """Read a parquet file with the loader matching the declared frame type."""
+    if frame_type == "polars":
         import polars as pl
 
         return pl.read_parquet(str(path))
-    except ImportError:
-        pass
 
-    raise ImportError(
-        "Reading parquet requires pandas or polars. Install one: pip install pandas pyarrow"
+    if frame_type == "pyarrow":
+        import pyarrow.parquet as pq
+
+        return pq.read_table(str(path))
+
+    if frame_type == "duckdb":
+        import duckdb  # ty: ignore[unresolved-import]
+
+        return duckdb.read_parquet(str(path))
+
+    if frame_type == "pandas":
+        import pandas as pd
+
+        return pd.read_parquet(str(path))
+
+    raise ValueError(
+        f"Unknown frame type {frame_type!r} (supported: pandas, polars, pyarrow, duckdb)"
     )
 
 

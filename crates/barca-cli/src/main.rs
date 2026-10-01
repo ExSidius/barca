@@ -15,13 +15,27 @@ enum OutputMode {
 }
 
 #[derive(Parser)]
-#[command(name = "barca", about = "Invisible asset orchestrator", version)]
+#[command(
+    name = "barca",
+    about = "Invisible asset orchestrator",
+    long_about = "Barca runs Python asset graphs with content-addressed caching.\n\
+                  Every asset output is fully materialized to an artifact file at step \
+                  boundaries (json, pickle, or parquet) — that persistence is the cache \
+                  checkpoint. Downstream steps read those artifacts back; type annotations \
+                  on parameters select the parquet reader (pandas, polars, etc.) but do \
+                  not skip materialization.",
+    version
+)]
 enum Cli {
     /// Get asset value(s) — cache-aware, runs only the needed subgraph
     ///
     /// If the first positional arg ends in .py, all args are treated as files
     /// (no target — gets all assets). Otherwise, the first arg is the target
     /// asset name and the rest are files.
+    ///
+    /// Each completed step writes a fully materialized artifact (never a lazy in-memory
+    /// handle). If one computation should produce several cacheable outputs, define
+    /// multiple assets or split the work inside a single step before returning.
     Get {
         /// [TARGET] file.py [file.py ...] — target is optional
         #[arg(required = true)]

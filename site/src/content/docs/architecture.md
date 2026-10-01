@@ -126,8 +126,11 @@ A local Turso/libSQL database at `.barca/metadata.db` holds:
   artifact path/format/size and elapsed time.
 - `runs` — per-run history (command, files, target, status, step counts, timing).
 
-Artifacts are written under `.barca/artifacts/`. Data passes between worker batches as serialized
-files (json / pickle / parquet), never in-process.
+Artifacts are written under `.barca/artifacts/`. Data passes between worker batches as **fully
+materialized** serialized files (json / pickle / parquet), never as in-process lazy handles.
+Each step boundary is a cache checkpoint: the artifact bytes on disk are what downstream steps
+(and other machines, in remote mode) read back. Parameter type annotations only select the parquet
+decoder; they do not skip persistence.
 
 ## Design principles
 

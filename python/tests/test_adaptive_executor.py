@@ -170,9 +170,9 @@ class TestLoadCollectedArtifacts:
 
         real_deserialize = worker_mod.deserialize
 
-        def _slow_deserialize(path, fmt):
+        def _slow_deserialize(path, fmt, **kwargs):
             time.sleep(0.05)
-            return real_deserialize(path, fmt)
+            return real_deserialize(path, fmt, **kwargs)
 
         monkeypatch.setattr(worker_mod, "deserialize", _slow_deserialize)
 

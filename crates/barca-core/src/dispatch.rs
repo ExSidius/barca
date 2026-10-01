@@ -148,6 +148,8 @@ pub fn expand_pending_partitions(
                 retries: step.retries,
                 retry_backoff_seconds: step.retry_backoff_seconds,
                 partition_keys: pks,
+                param_types: step.param_types.clone(),
+                return_type: step.return_type,
             });
         }
     }
@@ -179,6 +181,8 @@ pub fn expand_pending_partitions(
                     retries: step.retries,
                     retry_backoff_seconds: step.retry_backoff_seconds,
                     partition_keys: chunk.to_vec(),
+                    param_types: step.param_types.clone(),
+                    return_type: step.return_type,
                 }]);
             }
         }
@@ -346,6 +350,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -380,6 +386,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -416,6 +424,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -452,6 +462,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -514,6 +526,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -561,6 +575,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -610,6 +626,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -663,6 +681,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };
@@ -705,6 +725,8 @@ mod tests {
                     retries: 1,
                     retry_backoff_seconds: 0.0,
                     partition_keys: vec![],
+                    param_types: HashMap::new(),
+                    return_type: None,
                 }],
             }],
         };

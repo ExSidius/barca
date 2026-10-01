@@ -264,6 +264,30 @@ impl fmt::Display for StepId {
     }
 }
 
+// ─── Value types (from function annotations) ─────────────────────────────────
+
+/// Tabular value type declared on a function parameter or return annotation.
+/// When absent on a parameter, workers default to pandas for parquet reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValueType {
+    Pandas,
+    Polars,
+    PyArrow,
+    DuckDB,
+}
+
+impl ValueType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ValueType::Pandas => "pandas",
+            ValueType::Polars => "polars",
+            ValueType::PyArrow => "pyarrow",
+            ValueType::DuckDB => "duckdb",
+        }
+    }
+}
+
 // ─── Input references ────────────────────────────────────────────────────────
 
 /// A declared input to a node — maps a function parameter to an upstream node.
@@ -376,6 +400,10 @@ pub struct ExtractedNode {
     pub cone_hash: String,
     /// Explicit artifact serializer override from `@asset(serializer="parquet")`.
     pub artifact_serializer: Option<SerializerKind>,
+    /// Parameter types from function annotations (param → frame loader).
+    pub param_types: HashMap<String, ValueType>,
+    /// Return type from the function's return annotation (frame writer/loader).
+    pub return_type: Option<ValueType>,
     /// Parallel calls found in this task's function body.
     /// Only populated for `@task` nodes. Empty for assets/sensors.
     pub parallel_calls: Vec<ParallelCall>,
