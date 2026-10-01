@@ -366,8 +366,7 @@ class TestCaching:
         assert result["steps_executed"] == 2
 
     def test_partitioned_cache(self, tmp_path):
-        # Late partition expansion: partitioned steps skip cache for now.
-        # TODO: optimize cache lookups for individual partition keys.
+        # Each partition key is cache-checked on its own run hash.
         f = write_module(
             tmp_path,
             "part.py",
@@ -382,8 +381,7 @@ class TestCaching:
         r1 = barca.api._exec(["get", "fetch", f])
         assert r1["steps_executed"] == 3
         r2 = barca.api._exec(["get", "fetch", f])
-        # Partitioned steps always re-execute (cache optimization deferred).
-        assert r2["steps_executed"] == 3
+        assert r2["steps_executed"] == 0
 
 
 # ─── Format handling ──────────────────────────────────────────────────────────

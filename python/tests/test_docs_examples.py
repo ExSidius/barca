@@ -123,11 +123,8 @@ def test_example_partitions(binary, topics, tmp_path):
     first = result(barca(binary, tmp_path, "get", "summary", "pipeline.py"))
     assert first["steps_executed"] == 4
     assert first["final_output"] == {"regions": 3, "total": 400}
-    # Partitioned steps are not cache-checked yet (TODO in the coordinator), so the three
-    # `sales` partitions re-run while the fan-in is served from cache. If per-partition
-    # caching lands this becomes 0: update the manual (partitions, cache, examples/partitions).
     second = result(barca(binary, tmp_path, "get", "summary", "pipeline.py"))
-    assert second["steps_executed"] == 3
+    assert second["steps_executed"] == 0  # every partition and the fan-in come from cache
     assert (tmp_path / ".barca" / "artifacts" / "pipeline.py--sales_region_emea").is_dir()
 
 
