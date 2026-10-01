@@ -16,6 +16,7 @@ Cargo.toml              ← Rust workspace root
 crates/
   barca-core/           ← Core library: models, parser, DAG, execution planning, hashing
   barca-cli/            ← CLI binary (the `barca` command)
+    docs/               ← The manual: markdown topics embedded in the binary (`barca docs`)
 python/barca/
   __init__.py           ← No-op decorator stubs (identity functions)
   _worker.py            ← Batch worker (invoked by Rust via `python -m barca._worker`)
@@ -82,6 +83,27 @@ benchmarks/chain_100/bench.sh 5   # (coming soon)
 5. **Turso for persistence** — Rust owns the DB; Python has no DB access
 6. **Artifact-based data passing** — serialized files (json/pickle/parquet) between worker batches
 7. **Content-addressed artifacts** — `{artifacts}/{node}/{run_hash}{ext}`; shared remote state pulls/pushes the metadata DB as a blob (see site/src/content/docs/reference/config.mdx and site/src/content/docs/reference/remote-storage.md, published at https://barca.sh/reference/config/ and https://barca.sh/reference/remote-storage/)
+
+## CLI and manual are part of every feature
+
+The CLI must be usable by humans **and** AI agents without leaving the terminal. Any change to a
+command, flag, decorator, output format, or caching behavior ships with all of:
+
+1. **`--help` examples** — the subcommand's `after_help` in `crates/barca-cli/src/main.rs`
+   (runnable `barca ...` example lines; a new flag gets an example).
+2. **The manual** — the matching topic in `crates/barca-cli/docs/*.md`, embedded by
+   `crates/barca-cli/src/docs.rs`. New topics go in `TOPICS` and must be linked from
+   `overview.md` (or `examples.md`). The files live inside the crate so they ship in the sdist.
+3. **Machine-readable output** — results as JSON on stdout (inspection commands take `--json`),
+   progress and errors on stderr, exit codes 0 ok / 1 runtime failure / 2 usage error.
+4. **Site docs** (`site/src/content/docs/`) and the README CLI table.
+
+CI guards these: `cargo test -p barca` parses every `barca ...` line in `--help` examples and
+manual topics against the real CLI, and requires help text on every flag and examples on every
+documented command; `python/tests/test_docs_examples.py` executes the manual's example pipelines
+and asserts what the text claims. Document behavior you have run, and state known limitations
+plainly (e.g. partitioned steps are not cache-checked yet) rather than describing intended
+behavior.
 
 ## Git workflow
 

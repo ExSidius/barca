@@ -1,6 +1,9 @@
 //! Barca CLI — invisible asset orchestrator.
 
+mod docs;
+
 use clap::{Parser, ValueEnum};
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
@@ -14,6 +17,106 @@ enum OutputMode {
     Pretty,
 }
 
+// ─── Help text ────────────────────────────────────────────────────────────────
+//
+// Every command carries runnable examples. The tests at the bottom of this file parse each
+// `barca ...` example line against the real CLI, so these cannot drift from the flags.
+// When you add or change a flag, update the examples here and the matching `barca docs`
+// topic in crates/barca-cli/docs/.
+
+const TOP_HELP: &str = "\
+Quick start:
+  barca list pipeline.py            # discover assets, tasks and their dependencies
+  barca get total pipeline.py       # run only what `total` needs (cached on re-run)
+  barca run deploy pipeline.py      # run a task and its dependency cone
+  barca docs                        # built-in manual: concepts, formats, examples
+
+Output: results are JSON on stdout; progress and errors go to stderr. Exit codes: 0 ok,
+1 runtime failure, 2 usage error. Scripts and AI agents: barca docs agents";
+
+const GET_HELP: &str = "\
+Examples:
+  barca get pipeline.py                    # every asset in the file; prints the last one's value
+  barca get total pipeline.py              # one target and only its upstream cone
+  barca get total pipeline.py other.py     # target defined across several files
+  barca get total pipeline.py --no-cache   # recompute everything in that cone
+  barca get total pipeline.py -o value     # just the value, pretty-printed
+  barca get total pipeline.py --agent      # plain progress lines on stderr
+  barca get total pipeline.py --env dev    # separate cache and state per environment
+
+Output: one JSON line on stdout with run_id, steps_executed (0 = all cached), phases and
+final_output. For parquet/pickle assets final_output is a pointer,
+{\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
+loads the value for you.
+Targets must be assets; use `barca run` for tasks.
+More: barca docs cache, barca docs types, barca docs agents";
+
+const RUN_HELP: &str = "\
+Examples:
+  barca run deploy pipeline.py                         # task runs; upstream assets come from cache
+  barca run deploy pipeline.py --refresh fetch,clean   # also re-materialize these upstream assets
+  barca run deploy pipeline.py --refresh-all           # re-materialize every upstream asset
+  barca run deploy pipeline.py --no-cache              # same as --refresh-all
+
+The target must be a task; use `barca get` for assets.
+More: barca docs tasks, barca docs cache";
+
+const PLAN_HELP: &str = "\
+Examples:
+  barca plan pipeline.py              # phases and steps that would run; nothing executes
+  barca plan pipeline.py other.py     # several files form one DAG
+
+Output: pretty-printed JSON {total_steps, phases: [{reason, streams: [{stream_id, steps}]}]}.
+Planning is static analysis: it never imports your code.
+More: barca docs agents";
+
+const HISTORY_HELP: &str = "\
+Examples:
+  barca history                # last 10 runs as a table
+  barca history -l 25          # last 25
+  barca history --json         # machine-readable array of runs
+  barca history --env dev      # runs recorded in another environment
+
+More: barca docs cache";
+
+const STATS_HELP: &str = "\
+Examples:
+  barca stats total pipeline.py             # timing percentiles and cache hit rate
+  barca stats total pipeline.py --json      # the same as one JSON object
+
+More: barca docs cache";
+
+const SERVE_HELP: &str = "\
+Examples:
+  barca serve pipeline.py                    # HTTP API on 127.0.0.1:8274 plus the scheduler
+  barca serve pipeline.py --port 8400        # custom port
+  barca serve pipeline.py --watch            # dev: re-parse the DAG when files change
+  barca serve pipeline.py --no-schedule      # API only; Schedule(...) nodes do not fire
+  barca serve pipeline.py --timezone utc     # evaluate cron in UTC (default: local)
+
+Binds to localhost with no authentication.
+More: barca docs scheduling";
+
+const LIST_HELP: &str = "\
+Examples:
+  barca list pipeline.py             # table of nodes: kind, freshness, dependencies
+  barca list pipeline.py --json      # array of {id, kind, freshness, inputs, next_fire?}
+  barca list a.py b.py               # several files form one DAG
+
+Run this first to confirm barca discovered your nodes.
+More: barca docs assets, barca docs agents";
+
+const DOCS_HELP: &str = "\
+Examples:
+  barca docs                    # topic index with one-line summaries
+  barca docs types              # one topic as markdown
+  barca docs examples/duckdb    # a runnable example pipeline
+  barca docs --all              # the whole manual in one stream (paste into context)
+  barca docs --json             # topic index as JSON
+  barca docs cache --json       # one topic as JSON {name, summary, content}
+
+Topics are compiled into the binary: offline, and always matching this version.";
+
 #[derive(Parser)]
 #[command(
     name = "barca",
@@ -21,9 +124,11 @@ enum OutputMode {
     long_about = "Barca runs Python asset graphs with content-addressed caching.\n\
                   Every asset output is fully materialized to an artifact file at step \
                   boundaries (json, pickle, or parquet) — that persistence is the cache \
-                  checkpoint. Downstream steps read those artifacts back; type annotations \
-                  on parameters select the parquet reader (pandas, polars, etc.) but do \
-                  not skip materialization.",
+                  checkpoint. pandas/polars DataFrames, pyarrow Tables and duckdb relations \
+                  are written as parquet; parameter type annotations choose how downstream \
+                  steps read it back (pandas by default, or polars, pyarrow, duckdb) but do \
+                  not skip materialization. Run `barca docs` for the manual.",
+    after_help = TOP_HELP,
     version
 )]
 enum Cli {
@@ -36,6 +141,7 @@ enum Cli {
     /// Each completed step writes a fully materialized artifact (never a lazy in-memory
     /// handle). If one computation should produce several cacheable outputs, define
     /// multiple assets or split the work inside a single step before returning.
+    #[command(after_help = GET_HELP)]
     Get {
         /// [TARGET] file.py [file.py ...] — target is optional
         #[arg(required = true)]
@@ -59,6 +165,7 @@ enum Cli {
     /// (same as `barca get`). Use `--refresh` to force re-materialize specific
     /// upstream assets, or `--refresh-all` / `--no-cache` to refresh the entire
     /// upstream cone.
+    #[command(after_help = RUN_HELP)]
     Run {
         /// TARGET file.py [file.py ...] — target task is required
         #[arg(required = true)]
@@ -80,6 +187,7 @@ enum Cli {
         env: Option<String>,
     },
     /// Parse source files and emit the execution plan as JSON
+    #[command(after_help = PLAN_HELP)]
     Plan {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
@@ -89,21 +197,29 @@ enum Cli {
         env: Option<String>,
     },
     /// Show recent run history
+    #[command(after_help = HISTORY_HELP)]
     History {
         /// Number of recent runs to show
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Emit JSON (an array of runs) instead of a table
+        #[arg(long)]
+        json: bool,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
     },
     /// Show execution statistics for an asset
+    #[command(after_help = STATS_HELP)]
     Stats {
         /// Target asset function name
         target: String,
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -112,6 +228,7 @@ enum Cli {
     ///
     /// Binds to 127.0.0.1 (local only, no auth). POST /run and /get trigger
     /// async runs; poll GET /status/<run_id> for results.
+    #[command(after_help = SERVE_HELP)]
     Serve {
         /// Python source files defining the DAG to serve
         #[arg(required = true)]
@@ -135,10 +252,29 @@ enum Cli {
     /// List all discovered definitions (assets, tasks, sensors) with their deps
     ///
     /// Scheduled definitions also show their next fire time in local time.
+    #[command(after_help = LIST_HELP)]
     List {
         /// Python source files containing definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
+        /// Emit JSON (an array of nodes) instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the built-in manual: concepts, output formats, examples, agent conventions
+    ///
+    /// Topics are compiled into the binary, so this works offline and always matches the
+    /// installed version. With no topic it prints an index.
+    #[command(after_help = DOCS_HELP)]
+    Docs {
+        /// Topic to show (omit for the index), e.g. types, cache, examples/duckdb
+        topic: Option<String>,
+        /// Print every topic in one stream
+        #[arg(long, conflicts_with = "topic")]
+        all: bool,
+        /// Emit JSON instead of markdown
+        #[arg(long)]
+        json: bool,
     },
     /// Print version information
     Version,
@@ -180,6 +316,21 @@ fn main() {
     // Version needs no runtime — answer before paying for thread spawns.
     if let Cli::Version = cli {
         println!("barca {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    // The manual is compiled in: no runtime, no Python, no project files needed.
+    if let Cli::Docs { topic, all, json } = &cli {
+        match docs::run(topic.as_deref(), *all, *json) {
+            // Ignore write errors (e.g. a closed pipe from `barca docs --all | head`).
+            Ok(out) => {
+                let _ = std::io::stdout().lock().write_all(out.as_bytes());
+            }
+            Err(msg) => {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
 
@@ -282,11 +433,14 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             .await
         }
         Cli::Plan { files, env: _ } => plan_cmd(files, &python).await,
-        Cli::History { limit, env } => history_cmd(env.as_deref(), limit).await,
-        Cli::Stats { target, files, env } => {
-            stats_cmd(env.as_deref(), target, files, &python).await
-        }
-        Cli::List { files } => list_cmd(files, &python).await,
+        Cli::History { limit, json, env } => history_cmd(env.as_deref(), limit, json).await,
+        Cli::Stats {
+            target,
+            files,
+            json,
+            env,
+        } => stats_cmd(env.as_deref(), target, files, json, &python).await,
+        Cli::List { files, json } => list_cmd(files, json, &python).await,
         Cli::Serve {
             files,
             port,
@@ -308,6 +462,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
         }
         // Answered in main() before the runtime is built — never reaches here.
         Cli::Version => unreachable!("version is handled before runtime construction"),
+        Cli::Docs { .. } => unreachable!("docs is handled before runtime construction"),
     }
 }
 
@@ -444,9 +599,34 @@ async fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_cor
     Ok(())
 }
 
-async fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_core::BarcaError> {
+async fn list_cmd(
+    files: Vec<PathBuf>,
+    json: bool,
+    python: &PathBuf,
+) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let assets = barca_core::commands::list_assets(&file_args, python).await?;
+    if json {
+        // Machine-readable: every node, plus `next_fire` (local time) for scheduled ones.
+        let next_fires: std::collections::HashMap<String, String> =
+            barca_server::describe_schedule(&file_args, python)
+                .await
+                .into_iter()
+                .filter_map(|j| j.next_fire_local.map(|t| (j.id, t)))
+                .collect();
+        let nodes: Vec<serde_json::Value> = assets
+            .iter()
+            .map(|a| {
+                let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
+                if let (Some(obj), Some(t)) = (v.as_object_mut(), next_fires.get(&a.id)) {
+                    obj.insert("next_fire".into(), serde_json::Value::String(t.clone()));
+                }
+                v
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&nodes).unwrap());
+        return Ok(());
+    }
     if assets.is_empty() {
         println!("No definitions found.");
         return Ok(());
@@ -559,9 +739,17 @@ async fn list_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_cor
     Ok(())
 }
 
-async fn history_cmd(env: Option<&str>, limit: usize) -> Result<(), barca_core::BarcaError> {
+async fn history_cmd(
+    env: Option<&str>,
+    limit: usize,
+    json: bool,
+) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let runs = barca_core::commands::history(&cfg, limit).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&runs).unwrap());
+        return Ok(());
+    }
     if runs.is_empty() {
         println!("No run history found.");
         return Ok(());
@@ -595,11 +783,16 @@ async fn stats_cmd(
     env: Option<&str>,
     target: String,
     files: Vec<PathBuf>,
+    json: bool,
     python: &PathBuf,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let stats = barca_core::commands::stats(&cfg, &target, &file_args, python).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+        return Ok(());
+    }
     let fmt = |v: Option<f64>| v.map(|e| format!("{:.3}s", e)).unwrap_or("-".to_string());
     println!("Asset: {}", stats.node_id);
     println!("Total materializations: {}", stats.total_runs);
@@ -690,4 +883,175 @@ fn artifact_metadata(oref: &barca_core::dispatch::OutputRef) -> serde_json::Valu
             "size_bytes": oref.size_bytes,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// Subcommands that must carry runnable examples in their `--help`.
+    const DOCUMENTED: &[&str] = &[
+        "get", "run", "plan", "history", "stats", "serve", "list", "docs",
+    ];
+
+    fn after_help(cmd: &clap::Command) -> String {
+        cmd.get_after_help()
+            .or_else(|| cmd.get_after_long_help())
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+
+    /// `barca ...` command lines found in `text`: indented example lines in help text, or
+    /// lines inside ```bash fences in a docs topic. Trailing `# comments` are stripped.
+    fn command_lines(text: &str, only_in_bash_fences: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut in_bash = false;
+        for line in text.lines() {
+            let t = line.trim();
+            if only_in_bash_fences {
+                if t.starts_with("```") {
+                    in_bash = t == "```bash";
+                    continue;
+                }
+                if !in_bash {
+                    continue;
+                }
+            }
+            if t.starts_with("barca ") {
+                let cmd = t.split(" #").next().unwrap_or(t).trim();
+                out.push(cmd.to_string());
+            }
+        }
+        out
+    }
+
+    fn assert_parses(cmd_line: &str, ctx: &str) {
+        let argv = cmd_line.split_whitespace();
+        match Cli::try_parse_from(argv) {
+            Ok(_) => {}
+            // `--help` / `--version` "fail" with a display error; that is a valid command.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) => {}
+            Err(e) => panic!("{ctx}: `{cmd_line}` does not parse:\n{e}"),
+        }
+    }
+
+    #[test]
+    fn every_documented_subcommand_has_examples_and_a_docs_pointer() {
+        let root = Cli::command();
+        for name in DOCUMENTED {
+            let sub = root
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("missing subcommand {name}"));
+            let help = after_help(sub);
+            assert!(
+                help.contains("Examples:"),
+                "`barca {name} --help` needs an `Examples:` section (after_help)"
+            );
+            assert!(
+                !command_lines(&help, false).is_empty(),
+                "`barca {name} --help` examples need at least one `barca ...` line"
+            );
+        }
+    }
+
+    #[test]
+    fn top_level_help_points_at_the_manual() {
+        let help = after_help(&Cli::command());
+        assert!(
+            help.contains("barca docs"),
+            "top-level --help must mention `barca docs`"
+        );
+        assert!(
+            help.contains("barca docs agents"),
+            "top-level --help must point agents at `barca docs agents`"
+        );
+    }
+
+    #[test]
+    fn every_help_example_parses_against_the_real_cli() {
+        let root = Cli::command();
+        for name in DOCUMENTED {
+            let help = after_help(root.find_subcommand(name).unwrap());
+            for line in command_lines(&help, false) {
+                assert_parses(&line, &format!("`barca {name} --help` example"));
+            }
+        }
+        for line in command_lines(&after_help(&root), false) {
+            assert_parses(&line, "top-level --help example");
+        }
+    }
+
+    #[test]
+    fn every_docs_topic_command_parses_against_the_real_cli() {
+        for t in docs::TOPICS {
+            for line in command_lines(t.body, true) {
+                assert_parses(&line, &format!("docs topic '{}'", t.name));
+            }
+        }
+    }
+
+    #[test]
+    fn docs_pointers_in_help_text_resolve_to_topics() {
+        let root = Cli::command();
+        let mut texts = vec![after_help(&root)];
+        for name in DOCUMENTED {
+            texts.push(after_help(root.find_subcommand(name).unwrap()));
+        }
+        for text in texts {
+            for topic in docs::referenced_topics(&text) {
+                assert!(
+                    docs::find(&topic).is_some(),
+                    "--help mentions unknown `barca docs {topic}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_flag_and_argument_has_help_text() {
+        fn check(cmd: &clap::Command, path: &str) {
+            for arg in cmd.get_arguments() {
+                if arg.is_hide_set() || matches!(arg.get_id().as_str(), "help" | "version") {
+                    continue;
+                }
+                assert!(
+                    arg.get_help().is_some() || arg.get_long_help().is_some(),
+                    "`{path}` argument '{}' has no help text — add a doc comment",
+                    arg.get_id()
+                );
+            }
+            for sub in cmd.get_subcommands() {
+                check(sub, &format!("{path} {}", sub.get_name()));
+            }
+        }
+        check(&Cli::command(), "barca");
+    }
+
+    #[test]
+    fn every_subcommand_has_a_one_line_description() {
+        for sub in Cli::command().get_subcommands() {
+            assert!(
+                sub.get_about().is_some(),
+                "`barca {}` has no description",
+                sub.get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn json_flags_exist_on_inspection_commands() {
+        let root = Cli::command();
+        for name in ["list", "history", "stats", "docs"] {
+            let sub = root.find_subcommand(name).unwrap();
+            assert!(
+                sub.get_arguments().any(|a| a.get_id() == "json"),
+                "`barca {name}` needs a --json flag for machine-readable output"
+            );
+        }
+    }
 }

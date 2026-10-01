@@ -17,6 +17,7 @@ barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an ass
 barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
                                                Run the HTTP API server
 barca list <file.py> [file.py ...]            List discovered definitions and their deps
+barca docs [topic] [--all] [--json]           Built-in manual
 barca version                                 Print version
 barca --help                                  Show help
 ```
@@ -83,6 +84,7 @@ Show recent runs from `.barca/metadata.db` — run id, command, status, step cou
 ```bash
 barca history          # last 10 runs
 barca history -l 25    # last 25
+barca history --json   # machine-readable array of runs
 ```
 
 ## stats
@@ -92,6 +94,7 @@ percentiles (avg / median / p95 / max), cache hit rate, and recent runs.
 
 ```bash
 barca stats summary pipeline.py
+barca stats summary pipeline.py --json   # the same as one JSON object
 ```
 
 ## serve
@@ -124,7 +127,26 @@ second, so sub-minute schedules are legible).
 
 ```bash
 barca list pipeline.py
+barca list pipeline.py --json   # array of {id, kind, freshness, inputs, next_fire?}
 ```
+
+## docs
+
+The manual, compiled into the binary: it works offline and always matches the installed version.
+Every command's `--help` also ends with runnable examples.
+
+```bash
+barca docs                    # topic index with one-line summaries
+barca docs types              # one topic as markdown (output formats, annotations, duckdb)
+barca docs examples/duckdb    # a runnable example pipeline
+barca docs --all              # every topic in one stream
+barca docs --json             # topic index as JSON; add a topic for its full text
+```
+
+Topics: `overview`, `assets`, `types`, `tasks`, `cache`, `partitions`, `sinks`, `scheduling`,
+`agents`, and `examples/*`. `barca docs agents` describes the output contract for scripts and AI
+agents: JSON on stdout, progress and errors on stderr, exit code `0` success / `1` runtime
+failure / `2` usage error.
 
 ## version
 
