@@ -44,11 +44,17 @@ jobs:
       # On Depot runners the GitHub Actions cache API is backed by Depot Cache,
       # which is not isolated per ref -- so a tag build can restore the cache
       # saved by the previous tag (GitHub's own cache cannot: each tag is a new
-      # ref). rust-cache restores target/ when Cargo.lock is unchanged; sccache
-      # (below) covers unchanged crates when it changes.
+      # ref). No sccache: maturin-action's `sccache: true` exports
+      # RUSTC_WRAPPER=sccache for the whole job, which breaks this step's
+      # post-run `cargo metadata` on the host (sccache is only installed in the
+      # manylinux container) so it saved an empty cache, and sccache's own
+      # GitHub-cache writes failed on every compile anyway.
+      # rust-cache never re-saves on an exact-key hit, so a bad entry sticks
+      # until the key changes. Bump the `v2` below if a cache ever needs busting
+      # (v1 held an empty Linux cache from the sccache breakage above).
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-v2-${{ matrix.target }}
 
       - uses: actions/setup-python@v5
         with:
@@ -63,7 +69,6 @@ jobs:
           target: ${{ matrix.maturin-target }}
           args: --release --out dist --find-interpreter
           manylinux: auto
-          sccache: true
 
       - name: Package standalone CLI binary
         run: |
