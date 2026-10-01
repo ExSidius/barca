@@ -20,7 +20,7 @@ Scope to a single sub-task (only it + its config asset run):
 
 Re-run, force-rerunning only one asset while the rest stay cached:
 
-    barca run release --burst config nested_project/assets.py
+    barca run release --refresh config nested_project/assets.py
 """
 
 from barca import asset, task

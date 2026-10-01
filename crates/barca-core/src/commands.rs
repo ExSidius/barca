@@ -145,12 +145,13 @@ fn default_pool_size() -> usize {
 pub enum CachePolicy {
     /// Normal cache-aware behavior — reuse fresh asset artifacts (`barca get`).
     CacheAware,
-    /// Force-rerun every asset in the target's cone (`barca run`, default).
-    BurstAll,
+    /// Force-rerun every asset in the target's cone
+    /// (`barca run <task> --refresh-all` / `--no-cache`).
+    RefreshAll,
     /// Force-rerun only the named assets; all others stay cache-aware
-    /// (`barca run <task> --burst a,b`). A name matches when it equals the
+    /// (`barca run <task> --refresh a,b`). A name matches when it equals the
     /// node's base id exactly, or matches the trailing `:name` segment.
-    BurstSelective(Vec<String>),
+    RefreshSelective(Vec<String>),
 }
 
 /// `barca get` — cache-aware execution of an asset (or all assets).
@@ -179,21 +180,17 @@ pub async fn get(
     .await
 }
 
-/// `barca run` — execute a task (and its cone), bursting upstream asset caches.
-/// `burst == None` bursts all upstream assets; `Some(names)` bursts only those.
+/// `barca run` — execute a task (and its cone). The task always re-runs;
+/// upstream assets follow `policy` (`CacheAware` by default, like `barca get`).
 pub async fn run(
     cfg: &crate::config::ResolvedConfig,
     target_name: &str,
     file_args: &[String],
     python: &PathBuf,
-    burst: Option<Vec<String>>,
+    policy: CachePolicy,
     agent_mode: bool,
     cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
-    let policy = match burst {
-        None => CachePolicy::BurstAll,
-        Some(names) => CachePolicy::BurstSelective(names),
-    };
     execute(
         cfg,
         Some(target_name),
@@ -476,7 +473,7 @@ async fn execute(
                 let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
 
                 // Compute run hashes for EVERY step (including sensors, tasks,
-                // bursted and partitioned steps that never cache-check): they
+                // refreshed and partitioned steps that never cache-check): they
                 // content-address the artifacts and key persistence. Steps are
                 // visited in stream order, so in-phase upstream hashes are
                 // already present when a consumer is hashed — check-time and
@@ -525,21 +522,21 @@ async fn execute(
                     continue;
                 }
 
-                // Burst policy (`barca run`): force-rerun assets in/named by the
-                // burst set, bypassing the cache. Tasks/sensors already re-ran above.
-                let bursted = match &policy {
+                // Refresh policy (`barca run`): force-rerun assets in/named by the
+                // refresh set, bypassing the cache. Tasks/sensors already re-ran above.
+                let refreshed = match &policy {
                     CachePolicy::CacheAware => false,
-                    CachePolicy::BurstAll => {
+                    CachePolicy::RefreshAll => {
                         base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
                     }
-                    CachePolicy::BurstSelective(names) => {
+                    CachePolicy::RefreshSelective(names) => {
                         base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
                             && names.iter().any(|name| {
                                 base_id == name || base_id.ends_with(&format!(":{name}"))
                             })
                     }
                 };
-                if bursted {
+                if refreshed {
                     uncached_steps.push(step.clone());
                     continue;
                 }

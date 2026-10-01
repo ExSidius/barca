@@ -176,7 +176,7 @@ the right home for "do something" operations that don't produce cacheable data.
   stale).
 
 Run a task with [`barca run`](/reference/cli/). By default `barca run` force-reruns
-every upstream asset; `--burst a,b` re-runs only the named assets.
+every upstream asset; `--refresh a,b` re-runs only the named assets; `--refresh-all` re-runs all of them.
 
 ```python
 from barca import asset, task

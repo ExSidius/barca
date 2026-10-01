@@ -10,7 +10,7 @@ is on your PATH.
 
 ```
 barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
-barca run <task> <file.py> [--burst a,b]     Run a task (always re-runs)
+barca run <task> <file.py> [--refresh a,b | --refresh-all]  Run a task (always re-runs)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
 barca history [-l N]                          Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
@@ -42,18 +42,24 @@ barca get pipeline.py -o value        # print just the final value (also: json |
 
 ## run
 
-Execute a task and its dependency cone. Tasks always re-run (they are never cached). By default,
-all upstream assets in the cone are also force-rerun (cache-busted). Use `--burst` to selectively
-re-run only named upstream assets while leaving others cache-aware.
+Execute a task and its dependency cone. Tasks always re-run (they are never cached). Upstream
+assets are cache-aware by default, exactly like `barca get`. Use `--refresh` to force
+re-materialize only named upstream assets, or `--refresh-all` (alias `--no-cache`) to refresh every
+upstream asset in the cone.
 
 ```bash
-barca run deploy pipeline.py             # run task + bust all upstream caches
-barca run deploy pipeline.py --burst fetch,transform  # only bust named assets
+barca run deploy pipeline.py                          # run task, upstream assets from cache
+barca run deploy pipeline.py --refresh fetch,transform  # re-materialize only named assets
+barca run deploy pipeline.py --refresh-all            # re-materialize all upstream assets
+barca run deploy pipeline.py --no-cache               # same as --refresh-all
 ```
 
 Unlike `barca get`, which targets assets and respects the cache, `barca run` is for tasks that
-produce side effects (deploys, notifications, reports). The task's upstream assets are re-run by
-default to ensure the task sees fresh data.
+produce side effects (deploys, notifications, reports). If a task must see fresh upstream data,
+pass `--refresh-all`.
+
+> **Behavior change:** `barca run` previously force-rerun every upstream asset by default and took
+> `--burst`. Add `--refresh-all` to restore the old default; `--burst a,b` is now `--refresh a,b`.
 
 ## plan
 

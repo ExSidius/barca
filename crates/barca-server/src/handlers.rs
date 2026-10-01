@@ -257,7 +257,16 @@ fn spawn_run(state: AppState, kind: RunKind) -> String {
                     .await
                 }
                 RunKind::Task(target) => {
-                    commands::run(&cfg, target, &files, &python, None, true, cancel.clone()).await
+                    commands::run(
+                        &cfg,
+                        target,
+                        &files,
+                        &python,
+                        commands::CachePolicy::RefreshAll,
+                        true,
+                        cancel.clone(),
+                    )
+                    .await
                 }
             }
         };

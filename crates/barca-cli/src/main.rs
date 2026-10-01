@@ -39,18 +39,22 @@ enum Cli {
         #[arg(long)]
         env: Option<String>,
     },
-    /// Run a task (and its cone) — always re-runs, bursting upstream asset caches
+    /// Run a task and its dependency cone — the task always re-runs
     ///
-    /// Like `get`, but for task-style workflows: tasks always execute, and by
-    /// default every upstream asset is force-rerun. Use `--burst` to re-run only
-    /// selected assets while the rest stay cached.
+    /// The task always re-runs. Upstream assets are served from cache when fresh
+    /// (same as `barca get`). Use `--refresh` to force re-materialize specific
+    /// upstream assets, or `--refresh-all` / `--no-cache` to refresh the entire
+    /// upstream cone.
     Run {
         /// TARGET file.py [file.py ...] — target task is required
         #[arg(required = true)]
         args: Vec<String>,
-        /// Comma-separated asset names to force-rerun. Omit to burst ALL upstream assets.
-        #[arg(long, value_delimiter = ',')]
-        burst: Option<Vec<String>>,
+        /// Comma-separated upstream asset names to force re-materialize
+        #[arg(long, value_delimiter = ',', conflicts_with = "refresh_all")]
+        refresh: Option<Vec<String>>,
+        /// Force re-materialize ALL upstream assets in the task's cone
+        #[arg(long, alias = "no-cache")]
+        refresh_all: bool,
         /// Output format
         #[arg(short, long, default_value = "json")]
         output: OutputMode,
@@ -228,7 +232,8 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
         }
         Cli::Run {
             args,
-            burst,
+            refresh,
+            refresh_all,
             output,
             agent,
             env,
@@ -236,17 +241,31 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             let (target, files) = split_target_files(args);
             let Some(target) = target else {
                 eprintln!(
-                    "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                    "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
                 );
                 std::process::exit(1);
             };
             if files.is_empty() {
                 eprintln!(
-                    "error: no .py files provided\n\nUsage: barca run <TARGET> <FILES>... [--burst a,b]"
+                    "error: no .py files provided\n\nUsage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
                 );
                 std::process::exit(1);
             }
-            run_cmd(env.as_deref(), target, files, &python, burst, output, agent).await
+            let policy = match (refresh_all, refresh) {
+                (true, _) => barca_core::commands::CachePolicy::RefreshAll,
+                (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective(names),
+                (false, None) => barca_core::commands::CachePolicy::CacheAware,
+            };
+            run_cmd(
+                env.as_deref(),
+                target,
+                files,
+                &python,
+                policy,
+                output,
+                agent,
+            )
+            .await
         }
         Cli::Plan { files, env: _ } => plan_cmd(files, &python).await,
         Cli::History { limit, env } => history_cmd(env.as_deref(), limit).await,
@@ -349,7 +368,7 @@ async fn run_cmd(
     target: String,
     files: Vec<PathBuf>,
     python: &PathBuf,
-    burst: Option<Vec<String>>,
+    policy: barca_core::commands::CachePolicy,
     mode: OutputMode,
     agent: bool,
 ) -> Result<(), barca_core::BarcaError> {
@@ -360,7 +379,7 @@ async fn run_cmd(
         &target,
         &file_args,
         python,
-        burst,
+        policy,
         agent,
         cancel_on_ctrl_c(),
     )

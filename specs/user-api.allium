@@ -316,7 +316,7 @@ rule GetAsset {
 -- ── Execution: barca run ─────────────────────────────────
 
 rule RunTask {
-    when: RunTask(target, files, burst)
+    when: RunTask(target, files, refresh)
 
     requires: target.kind = task
     -- Must target a task. Assets use barca get.
@@ -334,8 +334,8 @@ rule RunTask {
                 else if step.node.kind = sensor:
                     -- Sensors always re-run
                     ExecuteStep(step)
-                else if step.node in burst:
-                    -- Burst assets are force-rerun
+                else if step.node in refresh:
+                    -- Refreshed assets are force-rerun
                     ExecuteStep(step)
                 else if cache_hit(step):
                     step.status = cached
@@ -349,8 +349,9 @@ rule RunTask {
     )
 
     @guidance
-        -- If burst is empty/null, ALL upstream assets are burst (force-rerun).
-        -- If burst lists specific asset names, only those are force-rerun.
+        -- If refresh is empty/null, upstream assets are cache-aware (like get).
+        -- If refresh lists specific asset names, only those are force-rerun.
+        -- --refresh-all / --no-cache force-rerun ALL upstream assets.
 }
 
 -- ── Step execution ───────────────────────────────────────
@@ -573,7 +574,7 @@ surface Cli {
 
     provides:
         GetAsset(target, files, no_cache)
-        RunTask(target, files, burst)
+        RunTask(target, files, refresh)
         PlanDag(files)
         ShowHistory(limit)
         ShowStats(target, files)

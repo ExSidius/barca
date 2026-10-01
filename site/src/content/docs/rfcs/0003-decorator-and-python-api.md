@@ -37,7 +37,7 @@ identity-behaved at runtime.
 import barca
 
 value = barca.get("summary", "pipeline.py")           # cache-aware
-result = barca.run("deploy", "pipeline.py", burst=["fetch"])
+result = barca.run("deploy", "pipeline.py", refresh=["fetch"])
 plan = barca.plan("pipeline.py")                        # {"total_steps": ..., "phases": [...]}
 runs = barca.history(limit=25)
 s = barca.stats("summary", "pipeline.py")
