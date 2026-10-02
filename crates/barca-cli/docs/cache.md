@@ -54,8 +54,8 @@ steps would be served from cache and which would run, and why. It executes nothi
 nothing: no `.barca` directory is created and no run is recorded.
 
 ```bash
-barca run report pipeline.py --dry-run                 # JSON on one line
-barca run report pipeline.py --dry-run -o pretty       # a table for humans
+barca run report pipeline.py --dry-run --json          # JSON on one line
+barca run report pipeline.py --dry-run --pretty        # a table for humans
 barca run report pipeline.py --dry-run --refresh src   # preview a refresh before doing it
 barca get total pipeline.py --dry-run --no-cache
 ```

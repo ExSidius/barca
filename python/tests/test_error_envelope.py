@@ -8,6 +8,7 @@ JSON mode still prints its result line (`"status": "failed"`) there (#149).
 """
 
 import json
+import os
 
 import signal
 import subprocess
@@ -175,7 +176,8 @@ def test_human_mode_keeps_prose_and_appends_the_remediation(project):
 
 
 def test_human_mode_usage_error_is_prose(project):
-    proc = barca_cli(project, "list", "missing.py")
+    # Piped stdout picks JSON (#153), so ask for human output explicitly.
+    proc = barca_cli(project, "list", "missing.py", "--pretty")
     assert proc.returncode == 2
     assert proc.stderr.startswith("missing.py: ")
     assert "barca list --help" in proc.stderr
@@ -205,3 +207,22 @@ def test_python_api_exposes_the_envelope(project, monkeypatch):
         barca.get("nope", "pipeline.py")
     assert (exc.value.kind, exc.value.code) == ("usage", 2)
     assert "barca list pipeline.py" in exc.value.remediation
+
+
+def test_piped_inspection_command_errors_are_json(project):
+    """With no flag, a piped `list` prints JSON, so its errors are the envelope too (#153)."""
+    env = envelope(barca_cli(project, "list", "missing.py"))
+    assert env["kind"] == "usage"
+
+
+def test_invalid_barca_output_is_a_usage_error(project):
+    proc = subprocess.run(
+        [_find_binary(), "list", "pipeline.py"],
+        cwd=project,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "BARCA_OUTPUT": "yaml"},
+    )
+    env = envelope(proc)
+    assert env["kind"] == "usage"
+    assert "BARCA_OUTPUT" in env["error"]

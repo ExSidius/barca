@@ -32,7 +32,7 @@ def total(nums: list) -> dict:
 
 ```bash
 barca list pipeline.py           # discover nodes and dependencies
-barca get total pipeline.py      # run only what `total` needs; prints JSON on stdout
+barca get total pipeline.py      # run only what `total` needs; JSON on stdout when piped
 barca get total pipeline.py      # second time: everything is a cache hit
 ```
 
@@ -42,11 +42,15 @@ barca get total pipeline.py      # second time: everything is a cache hit
 |---|---|
 | `barca get [target] files...` | Get asset value(s); cache-aware. `barca file.py` is shorthand. |
 | `barca run task files...` | Run a task (always re-runs) and its dependency cone. |
-| `barca list files...` | List nodes with kind, freshness and dependencies (`--json`). |
+| `barca list files...` | List nodes with kind, freshness and dependencies. |
 | `barca plan files...` | Emit the tiered execution plan as JSON. |
-| `barca history` / `barca stats` | Past runs; timing and cache statistics (`--json`). |
+| `barca history` / `barca stats` | Past runs; timing and cache statistics. |
 | `barca serve files...` | HTTP API and cron scheduler. |
 | `barca docs [topic]` | This manual. |
+
+In a terminal, `get`/`run`/`list`/`history`/`stats` print human-readable output; piped or run
+from a program they print JSON. `--json` and `--pretty` (or `BARCA_OUTPUT=json|pretty`) override
+that; see `barca docs agents`.
 
 ## Topics
 

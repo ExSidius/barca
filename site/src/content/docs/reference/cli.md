@@ -12,7 +12,7 @@ is on your PATH.
 barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
 barca run <task> <file.py> [--refresh a,b | --refresh-all]  Run a task (always re-runs)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
-barca history [-l N]                          Show recent run history
+barca history [-l N] [--json|--pretty]        Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
                                                Run the HTTP API server
@@ -23,6 +23,34 @@ barca --help                                  Show help
 ```
 
 Shorthand: `barca pipeline.py` is rewritten to `barca get pipeline.py`.
+
+## Output format
+
+`get`, `run`, `list`, `history` and `stats` choose what to print on stdout by one rule, first
+match wins:
+
+1. **A flag:** `--json` forces JSON; `--pretty` forces human output (tables, summaries). `get` and
+   `run` also keep `-o json|value|pretty` for compatibility (`-o value` prints only the final
+   value); `-o` cannot be combined with `--json` / `--pretty`.
+2. **`BARCA_OUTPUT=json` or `BARCA_OUTPUT=pretty`** in the environment. Any other value is a usage
+   error (exit code 2).
+3. **The terminal:** stdout is a TTY → human output; a pipe, file or subprocess → JSON.
+
+```bash
+barca list pipeline.py            # a table in your terminal
+barca list pipeline.py | cat      # a JSON array
+barca list pipeline.py --json     # JSON even in a terminal
+barca history --pretty            # a table even when piped
+BARCA_OUTPUT=json barca get summary pipeline.py
+```
+
+`plan` always prints JSON and `docs` always prints markdown (`docs --json` for JSON). Progress and
+errors always go to stderr; the progress bar (the only ANSI output) draws only when stderr is a
+terminal, and `--agent` replaces it with plain progress lines.
+
+> **Behavior change:** `get` and `run` used to print JSON by default even in a terminal.
+> They now print the human summary there; scripts and agents that capture stdout still get JSON.
+> The Python API (`barca.get`, `barca.history`, ...) always requests JSON.
 
 ## get
 
@@ -53,6 +81,8 @@ barca get pipeline.py                 # all assets
 barca get summary pipeline.py         # a specific target
 barca get pipeline.py --no-cache      # execute everything fresh
 barca get pipeline.py --agent         # plain progress lines instead of a progress bar
+barca get pipeline.py --json          # JSON even in a terminal (the default when piped)
+barca get pipeline.py --pretty        # summary and value (the default in a terminal)
 barca get pipeline.py -o value        # print just the final value (also: json | pretty)
 ```
 
@@ -90,9 +120,10 @@ barca plan pipeline.py
 Show recent runs from `.barca/metadata.db` — run id, command, status, step counts, and timing.
 
 ```bash
-barca history          # last 10 runs
-barca history -l 25    # last 25
-barca history --json   # machine-readable array of runs
+barca history            # last 10 runs: a table in a terminal, JSON when piped
+barca history -l 25      # last 25
+barca history --json     # machine-readable array of runs, even in a terminal
+barca history --pretty   # the table, even when piped
 ```
 
 ## stats
@@ -102,7 +133,8 @@ percentiles (avg / median / p95 / max), cache hit rate, and recent runs.
 
 ```bash
 barca stats summary pipeline.py
-barca stats summary pipeline.py --json   # the same as one JSON object
+barca stats summary pipeline.py --json     # the same as one JSON object
+barca stats summary pipeline.py --pretty   # the text report, even when piped
 ```
 
 ## serve
@@ -135,7 +167,8 @@ second, so sub-minute schedules are legible).
 
 ```bash
 barca list pipeline.py
-barca list pipeline.py --json   # array of {id, kind, freshness, inputs, next_fire?}
+barca list pipeline.py --json     # array of {id, kind, freshness, inputs, next_fire?}
+barca list pipeline.py --pretty   # the table, even when piped
 ```
 
 ## docs
@@ -165,8 +198,9 @@ agents: JSON on stdout, progress and errors on stderr, and the exit codes and er
 | 3    | `infra`       | barca or its environment failed: metadata DB, worker pool, remote state, I/O |
 | 130  | `cancelled`   | interrupted (Ctrl-C)                                                       |
 
-In JSON output mode (`get`/`run` with the default `-o json`, `plan`, and `list`/`history`/`stats`/
-`docs` with `--json`), an error is a single JSON line, the last line on stderr:
+In JSON output mode (whenever results are JSON: piped or captured stdout, `--json`, `-o json` or
+`BARCA_OUTPUT=json`; `plan` always; `docs` with `--json`), an error is a single JSON line, the
+last line on stderr:
 
 ```
 {"code":2,"error":"Asset 'nope' not found. Available: pipeline.py:src, pipeline.py:total, pipeline.py:clean","kind":"usage","remediation":"Run `barca list pipeline.py` to see every node and its kind."}
@@ -182,7 +216,7 @@ succeeded):
 {"artifact_dir":".barca/artifacts/pipeline.py--clean","code":1,"error":"step 'pipeline.py:clean' failed: ZeroDivisionError: division by zero","kind":"step_failed","node":"pipeline.py:clean","remediation":"Fix the error in 'pipeline.py:clean' (see the traceback) and re-run the same command. Steps that succeeded are cached and will not re-run.","traceback":"  File \"/abs/path/pipeline.py\", line 11, in clean\n    return x / 0\n           ~~^~~"}
 ```
 
-In human mode (`-o pretty`, `-o value`, or no `--json`) the error is prose, with the remediation
+In human mode (a terminal, `--pretty`, `-o pretty` or `-o value`) the error is prose, with the remediation
 on the last lines. Errors never go to stdout. The Python API raises `barca.BarcaError` with the
 same fields as attributes (`kind`, `code`, `remediation`, `node`, `traceback`, `artifact_dir`).
 

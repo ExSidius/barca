@@ -207,9 +207,9 @@ def prices(ticker: str) -> dict:
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
 barca run <task> <file.py> ...             Run a task (always re-runs) and its cone
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
-barca list <file.py> [--json]              List all definitions with deps
-barca history [--limit N] [--json]         Show recent run history
-barca stats <target> <file.py> [--json]    Show timing/cache stats for an asset
+barca list <file.py> [--json|--pretty]     List all definitions with deps
+barca history [--limit N] [--json|--pretty] Show recent run history
+barca stats <target> <file.py> [--json|--pretty]  Timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
 barca docs [topic] [--all] [--json]        Built-in manual: concepts, formats, examples
 barca --help                               Show help (every command ends with examples)
@@ -217,10 +217,11 @@ barca --help                               Show help (every command ends with ex
 
 `barca docs` is the manual, compiled into the binary: topics for types and output formats,
 caching, tasks, partitions, scheduling, runnable examples, and conventions for scripts and AI
-agents (`barca docs agents`). Results are JSON on stdout, progress and errors on stderr. In JSON
-mode an error is one JSON line on stderr (`{"error", "code", "kind", "remediation"}`, plus `node`,
-`traceback` and `artifact_dir` when a step failed). Exit codes: `0` ok, `1` step failed, `2` usage
-error, `3` barca/infra failure, `130` cancelled.
+agents (`barca docs agents`). Results go to stdout: human-readable in a terminal, JSON when piped
+or captured (`--json` / `--pretty` or `BARCA_OUTPUT=json|pretty` override); progress and errors go
+to stderr. In JSON mode an error is one JSON line on stderr (`{"error", "code", "kind",
+"remediation"}`, plus `node`, `traceback` and `artifact_dir` when a step failed). Exit codes: `0`
+ok, `1` step failed, `2` usage error, `3` barca/infra failure, `130` cancelled.
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 

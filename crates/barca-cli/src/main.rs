@@ -2,22 +2,34 @@
 
 mod docs;
 mod error;
+mod output;
 
 use error::{CliError, Context, ErrorKind};
 
 use clap::{Parser, ValueEnum};
+use output::{Format, FormatFlags};
 use std::io::Write;
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+/// `-o` on get/run. Without `-o`, `--json` / `--pretty` / BARCA_OUTPUT / the terminal decide.
+#[derive(Clone, Copy, Debug, ValueEnum)]
 enum OutputMode {
-    /// One-line JSON (default)
-    #[default]
+    /// One-line JSON (default when stdout is not a terminal)
     Json,
     /// Just the final_output value, pretty-printed
     Value,
-    /// Human-friendly with timing info
+    /// Human-friendly with timing info (default when stdout is a terminal)
     Pretty,
+}
+
+impl OutputMode {
+    /// `-o` wins; otherwise the shared rule in `output::resolve`.
+    fn resolve(o: Option<OutputMode>, flags: FormatFlags) -> OutputMode {
+        o.unwrap_or_else(|| match output::resolve(flags.explicit()) {
+            Format::Json => OutputMode::Json,
+            Format::Pretty => OutputMode::Pretty,
+        })
+    }
 }
 
 // ─── Help text ────────────────────────────────────────────────────────────────
@@ -34,8 +46,9 @@ Quick start:
   barca run deploy pipeline.py      # run a task and its dependency cone
   barca docs                        # built-in manual: concepts, formats, examples
 
-Output: results are JSON on stdout; progress and errors go to stderr. In JSON mode (get/run
-default, plan, --json) an error is one JSON line on stderr: {error, code, kind, remediation}.
+Output: results go to stdout as tables/summaries in a terminal and as JSON when piped or
+captured; --json / --pretty (or BARCA_OUTPUT=json|pretty) override. Progress and errors go to
+stderr. In JSON mode an error is one JSON line on stderr: {error, code, kind, remediation}.
 Exit codes: 0 ok, 1 step failed, 2 usage error, 3 barca/infra failure, 130 cancelled.
 Scripts and AI agents: barca docs agents";
 
@@ -46,18 +59,23 @@ Examples:
   barca get total pipeline.py other.py     # target defined across several files
   barca get total pipeline.py --no-cache   # recompute everything in that cone
   barca get total pipeline.py --dry-run    # what would run vs come from cache; changes nothing
+  barca get total pipeline.py --json       # JSON even in a terminal (the default when piped)
+  barca get total pipeline.py --pretty     # summary and value for humans (the default in a terminal)
   barca get total pipeline.py -o value     # just the value, pretty-printed
   barca get total pipeline.py --agent      # plain progress lines on stderr
   barca get total pipeline.py --env dev    # separate cache and state per environment
   barca list pipeline.py                   # not sure of the name? list assets and tasks first
+  BARCA_OUTPUT=json barca get total pipeline.py   # env override for CI; a flag still wins
 
-Output: one JSON line on stdout with status (\"success\"), run_id, steps_executed (0 = all
-cached), phases and final_output, and `steps`: what happened to each step (ran or cached, and why). For parquet/pickle assets final_output is a pointer,
+Output format: --json / --pretty / -o, else BARCA_OUTPUT=json|pretty, else the terminal decides
+(TTY -> pretty, piped -> JSON). JSON is one line on stdout with status (\"success\"), run_id,
+steps_executed (0 = all cached), phases, final_output, and `steps`: what happened to each step
+(ran or cached, and why). For parquet/pickle assets final_output is a pointer,
 {\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
 loads the value for you.
 Targets must be assets; use `barca run` for tasks. The target comes before the files:
 `barca get pipeline.py total` exits 2 and prints `barca get total pipeline.py`.
-Errors: with -o json the last stderr line is one JSON object {error, code, kind, remediation},
+Errors: in JSON mode the last stderr line is one JSON object {error, code, kind, remediation},
 plus node, traceback and artifact_dir when a step failed. Exit 1 step failed, 2 usage error,
 3 barca/infra failure, 130 cancelled. A failed step still prints a stdout result line with
 status \"failed\" and failed_node.
@@ -70,6 +88,8 @@ Examples:
   barca run deploy pipeline.py --refresh-all           # re-materialize every upstream asset
   barca run deploy pipeline.py --no-cache              # same as --refresh-all
   barca run deploy pipeline.py --dry-run --refresh fetch   # preview: which steps run, which are cached
+  barca run deploy pipeline.py --json                  # JSON even in a terminal (the default when piped)
+  barca run deploy pipeline.py --pretty                # summary for humans (the default in a terminal)
   barca list pipeline.py                               # not sure of the name? list assets and tasks first
 
 --refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs only
@@ -78,7 +98,7 @@ a warning when that happens). A name that is not an upstream asset is an error.
 The target must be a task; use `barca get` for assets. The target comes before the files:
 `barca run pipeline.py deploy` exits 2 and prints `barca run deploy pipeline.py`. Every usage
 error exits 2 and ends by pointing at `barca list <files>`.
-Errors: with -o json the last stderr line is one JSON object {error, code, kind, remediation}
+Errors: in JSON mode the last stderr line is one JSON object {error, code, kind, remediation}
 (see barca docs agents). Exit 1 step failed, 2 usage error, 3 barca/infra failure, 130 cancelled.
 A raising task, or one that calls sys.exit(), fails the run: exit 1, and the stdout JSON line has
 status \"failed\" and failed_node.
@@ -89,15 +109,16 @@ Examples:
   barca plan pipeline.py              # phases and steps that would run; nothing executes
   barca plan pipeline.py other.py     # several files form one DAG
 
-Output: pretty-printed JSON {total_steps, phases: [{reason, streams: [{stream_id, steps}]}]}.
+Output: always pretty-printed JSON {total_steps, phases: [{reason, streams: [{stream_id, steps}]}]}.
 Planning is static analysis: it never imports your code.
 More: barca docs agents";
 
 const HISTORY_HELP: &str = "\
 Examples:
-  barca history                # last 10 runs as a table
+  barca history                # last 10 runs: a table in a terminal, JSON when piped
   barca history -l 25          # last 25
-  barca history --json         # machine-readable array of runs
+  barca history --json         # machine-readable array of runs, even in a terminal
+  barca history --pretty       # the table, even when piped
   barca history --env dev      # runs recorded in another environment
 
 More: barca docs cache";
@@ -105,7 +126,8 @@ More: barca docs cache";
 const STATS_HELP: &str = "\
 Examples:
   barca stats total pipeline.py             # timing percentiles and cache hit rate
-  barca stats total pipeline.py --json      # the same as one JSON object
+  barca stats total pipeline.py --json      # the same as one JSON object, even in a terminal
+  barca stats total pipeline.py --pretty    # the text report, even when piped
 
 More: barca docs cache";
 
@@ -122,8 +144,9 @@ More: barca docs scheduling";
 
 const LIST_HELP: &str = "\
 Examples:
-  barca list pipeline.py             # table of nodes: kind, freshness, dependencies
+  barca list pipeline.py             # table of nodes (in a terminal; JSON when piped)
   barca list pipeline.py --json      # array of {id, kind, freshness, inputs, next_fire?}
+  barca list pipeline.py --pretty    # the table, even when piped
   barca list a.py b.py               # several files form one DAG
 
 Run this first to confirm barca discovered your nodes.
@@ -170,9 +193,11 @@ enum Cli {
         /// [TARGET] file.py [file.py ...] — target is optional
         #[arg(required = true)]
         args: Vec<String>,
-        /// Output format
-        #[arg(short, long, default_value = "json")]
-        output: OutputMode,
+        /// Output format (kept for compatibility; --json / --pretty are the canonical spelling)
+        #[arg(short, long, conflicts_with_all = ["json", "pretty"])]
+        output: Option<OutputMode>,
+        #[command(flatten)]
+        format: FormatFlags,
         /// Skip cache — execute everything fresh
         #[arg(long)]
         no_cache: bool,
@@ -210,9 +235,11 @@ enum Cli {
         /// running or writing anything
         #[arg(long)]
         dry_run: bool,
-        /// Output format
-        #[arg(short, long, default_value = "json")]
-        output: OutputMode,
+        /// Output format (kept for compatibility; --json / --pretty are the canonical spelling)
+        #[arg(short, long, conflicts_with_all = ["json", "pretty"])]
+        output: Option<OutputMode>,
+        #[command(flatten)]
+        format: FormatFlags,
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
@@ -236,9 +263,8 @@ enum Cli {
         /// Number of recent runs to show
         #[arg(short, long, default_value = "10")]
         limit: usize,
-        /// Emit JSON (an array of runs) instead of a table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        format: FormatFlags,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -251,9 +277,8 @@ enum Cli {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Emit JSON instead of text
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        format: FormatFlags,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -291,9 +316,8 @@ enum Cli {
         /// Python source files containing definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Emit JSON (an array of nodes) instead of a table
-        #[arg(long)]
-        json: bool,
+        #[command(flatten)]
+        format: FormatFlags,
     },
     /// Show the built-in manual: concepts, output formats, examples, agent conventions
     ///
@@ -463,16 +487,19 @@ fn get_run_error(e: barca_core::BarcaError, ctx: &Context, files: &[PathBuf]) ->
 }
 
 /// Whether this invocation's output mode is JSON, which makes errors a JSON envelope on
-/// stderr (see error.rs): `get`/`run` with `-o json` (the default), `plan` (always JSON),
-/// and `--json` on the inspection commands.
+/// stderr (see error.rs). It follows the same rule as results (output.rs): get/run/list/
+/// history/stats print JSON when a flag or BARCA_OUTPUT says so, or when stdout is not a
+/// terminal; `plan` is always JSON; `docs` only with `--json`.
 fn json_output(cli: &Cli) -> bool {
     match cli {
-        Cli::Get { output, .. } | Cli::Run { output, .. } => matches!(output, OutputMode::Json),
+        Cli::Get { output, format, .. } | Cli::Run { output, format, .. } => {
+            matches!(OutputMode::resolve(*output, *format), OutputMode::Json)
+        }
         Cli::Plan { .. } => true,
-        Cli::History { json, .. }
-        | Cli::Stats { json, .. }
-        | Cli::List { json, .. }
-        | Cli::Docs { json, .. } => *json,
+        Cli::History { format, .. } | Cli::Stats { format, .. } | Cli::List { format, .. } => {
+            is_json(*format)
+        }
+        Cli::Docs { json, .. } => *json,
         Cli::Serve { .. } | Cli::Version => false,
     }
 }
@@ -623,6 +650,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
         Cli::Get {
             args,
             output,
+            format,
             no_cache,
             dry_run,
             agent,
@@ -648,7 +676,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 target,
                 files,
                 &python,
-                output,
+                OutputMode::resolve(output, format),
                 no_cache,
                 dry_run,
                 agent,
@@ -662,6 +690,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             refresh_all,
             dry_run,
             output,
+            format,
             agent,
             env,
         } => {
@@ -693,25 +722,27 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 &python,
                 policy,
                 dry_run,
-                output,
+                OutputMode::resolve(output, format),
                 agent,
             )
             .await
             .map_err(|e| get_run_error(e, ctx, &hint_files))
         }
         Cli::Plan { files, env: _ } => plan_cmd(files, &python).await.map_err(engine),
-        Cli::History { limit, json, env } => history_cmd(env.as_deref(), limit, json)
+        Cli::History { limit, format, env } => history_cmd(env.as_deref(), limit, is_json(format))
             .await
             .map_err(engine),
         Cli::Stats {
             target,
             files,
-            json,
+            format,
             env,
-        } => stats_cmd(env.as_deref(), target, files, json, &python)
+        } => stats_cmd(env.as_deref(), target, files, is_json(format), &python)
             .await
             .map_err(engine),
-        Cli::List { files, json } => list_cmd(files, json, &python).await.map_err(engine),
+        Cli::List { files, format } => list_cmd(files, is_json(format), &python)
+            .await
+            .map_err(engine),
         Cli::Serve {
             files,
             port,
@@ -734,6 +765,11 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
         Cli::Version => unreachable!("version is handled before runtime construction"),
         Cli::Docs { .. } => unreachable!("docs is handled before runtime construction"),
     }
+}
+
+/// Inspection commands: JSON or a table, by the shared rule in `output::resolve`.
+fn is_json(flags: FormatFlags) -> bool {
+    output::resolve(flags.explicit()) == Format::Json
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1518,5 +1554,36 @@ mod tests {
                 "`barca {name}` needs a --json flag for machine-readable output"
             );
         }
+    }
+
+    /// One override family everywhere: every command that follows the TTY rule takes both
+    /// `--json` and `--pretty` (see output.rs), and the manual explains the rule.
+    #[test]
+    fn tty_aware_commands_take_json_and_pretty_and_the_rule_is_documented() {
+        let root = Cli::command();
+        for name in ["get", "run", "list", "history", "stats"] {
+            let sub = root.find_subcommand(name).unwrap();
+            for flag in ["json", "pretty"] {
+                assert!(
+                    sub.get_arguments().any(|a| a.get_id() == flag),
+                    "`barca {name}` needs --{flag}"
+                );
+            }
+        }
+        for name in ["get", "run"] {
+            let help = after_help(root.find_subcommand(name).unwrap());
+            assert!(
+                help.contains("--pretty"),
+                "`barca {name} --help` needs a --pretty example"
+            );
+        }
+        let agents = docs::find("agents").expect("agents topic").body;
+        for needle in ["BARCA_OUTPUT", "--pretty", "--json", "terminal"] {
+            assert!(
+                agents.contains(needle),
+                "`barca docs agents` must mention {needle}"
+            );
+        }
+        assert!(after_help(&root).contains("BARCA_OUTPUT"));
     }
 }
