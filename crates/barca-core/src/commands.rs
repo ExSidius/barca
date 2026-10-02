@@ -21,6 +21,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 /// Format seconds as a fixed-width time string for progress display.
@@ -535,6 +536,7 @@ fn phase_step_count(phase: &Phase) -> usize {
 // ─── Result types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct GetResult {
     pub run_id: String,
     pub elapsed_seconds: f64,
@@ -548,6 +550,7 @@ pub struct GetResult {
 
 /// How a step was (or, in a dry run, will be) treated.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct StepReport {
     pub id: String,
     /// `asset`, `task` or `sensor`.
@@ -578,6 +581,7 @@ pub struct StepReport {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PartitionSummary {
     pub total: usize,
     pub cached: usize,
@@ -605,18 +609,21 @@ pub struct ExplainSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlanResult {
     pub total_steps: usize,
     pub phases: Vec<PlanPhase>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlanPhase {
     pub reason: String,
     pub streams: Vec<PlanStream>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct PlanStream {
     pub stream_id: String,
     pub steps: Vec<String>,
@@ -624,6 +631,7 @@ pub struct PlanStream {
 
 /// Lightweight summary of a single DAG node, for the server's `/assets` listing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct AssetSummary {
     /// Stable node id (continuity key), e.g. `pipeline.py:fetch`.
     pub id: String,
@@ -700,6 +708,32 @@ pub async fn get(
     agent_mode: bool,
     cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
+    get_streaming(
+        cfg,
+        target_name,
+        file_args,
+        python,
+        no_cache,
+        agent_mode,
+        cancel,
+        None,
+    )
+    .await
+}
+
+/// Like [`get`] but streams live [`crate::RunEvent`]s to `event_tx` as the run
+/// progresses (logs, step completion). Logs are persisted to the DB regardless.
+#[allow(clippy::too_many_arguments)]
+pub async fn get_streaming(
+    cfg: &crate::config::ResolvedConfig,
+    target_name: Option<&str>,
+    file_args: &[String],
+    python: &PathBuf,
+    no_cache: bool,
+    agent_mode: bool,
+    cancel: CancellationToken,
+    event_tx: Option<UnboundedSender<crate::RunEvent>>,
+) -> Result<GetResult, BarcaError> {
     execute(
         cfg,
         target_name,
@@ -710,6 +744,7 @@ pub async fn get(
         CachePolicy::CacheAware,
         "get",
         cancel,
+        event_tx,
     )
     .await
 }
@@ -725,6 +760,31 @@ pub async fn run(
     agent_mode: bool,
     cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
+    run_streaming(
+        cfg,
+        target_name,
+        file_args,
+        python,
+        policy,
+        agent_mode,
+        cancel,
+        None,
+    )
+    .await
+}
+
+/// Like [`run`] but streams live [`crate::RunEvent`]s to `event_tx`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_streaming(
+    cfg: &crate::config::ResolvedConfig,
+    target_name: &str,
+    file_args: &[String],
+    python: &PathBuf,
+    policy: CachePolicy,
+    agent_mode: bool,
+    cancel: CancellationToken,
+    event_tx: Option<UnboundedSender<crate::RunEvent>>,
+) -> Result<GetResult, BarcaError> {
     execute(
         cfg,
         Some(target_name),
@@ -735,6 +795,7 @@ pub async fn run(
         policy,
         "run",
         cancel,
+        event_tx,
     )
     .await
 }
@@ -898,6 +959,7 @@ async fn execute(
     policy: CachePolicy,
     command_label: &str,
     cancel: CancellationToken,
+    event_tx: Option<UnboundedSender<crate::RunEvent>>,
 ) -> Result<GetResult, BarcaError> {
     let t0 = Instant::now();
     // BARCA_TRACE_TIMING=1: emit a millisecond-resolution waterfall of every
@@ -987,6 +1049,8 @@ async fn execute(
     let mut step_reports: Vec<StepReport> = Vec::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
+    // Captured user stdout (node_id, line), persisted to the DB after the run.
+    let mut logs_buffer: Vec<(String, String)> = Vec::new();
     // Sink outcomes (JSON) per node, accumulated across phases for the DB.
     let mut all_sinks: HashMap<String, String> = HashMap::new();
     // Per-node self-timing (cpu_seconds, max_rss_bytes) reported by workers.
@@ -1293,10 +1357,34 @@ async fn execute(
                 }
             });
 
+        // Event sink — buffer log lines for DB persistence, and forward every
+        // event live to the caller's channel (the HTTP server) if present.
+        let event_tx_phase = event_tx.clone();
+        let logs_sink = &mut logs_buffer;
+        let on_event_cb: crate::io_loop::EventCallback<'_> =
+            Box::new(move |ev: crate::RunEvent| {
+                if let crate::RunEvent::Log {
+                    ref node_id,
+                    ref line,
+                } = ev
+                {
+                    logs_sink.push((node_id.clone(), line.clone()));
+                }
+                if let Some(ref tx) = event_tx_phase {
+                    let _ = tx.send(ev);
+                }
+            });
+
         // Drive this phase against the persistent pool. The cost model both
         // sizes the batch pulls and absorbs the timings coming back.
         let phase_err = pool
-            .run_phase(&mut coord, &mut cost_model, Some(on_step_cb), &cancel)
+            .run_phase(
+                &mut coord,
+                &mut cost_model,
+                Some(on_step_cb),
+                Some(on_event_cb),
+                &cancel,
+            )
             .await;
         trace_point!("phase{phase_idx}_run_phase_done");
         if let Err(e) = phase_err {
@@ -1461,6 +1549,9 @@ async fn execute(
         cost_snapshot: &cost_snapshot,
     };
     persist_run(&db_path, &ledger).await?;
+    // Persist captured stdout. Rust owns persistence — logs land in the DB
+    // regardless of how the run was triggered (CLI or server).
+    db::insert_logs(&db_path, &run_id, &logs_buffer).await?;
     trace_point!("persist_run_done");
 
     // Shared remote state: fold the WAL into the main file and conditionally
@@ -1482,6 +1573,7 @@ async fn execute(
                     state_token = Some(state_sync::pull_state(python, cfg).await?);
                     db::init_db(&db_path).await?;
                     persist_run(&db_path, &ledger).await?;
+                    db::insert_logs(&db_path, &run_id, &logs_buffer).await?;
                 }
             }
         }

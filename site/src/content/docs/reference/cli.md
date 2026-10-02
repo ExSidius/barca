@@ -1,6 +1,6 @@
 ---
 title: CLI Reference
-description: All barca CLI commands — get, run, plan, history, stats, serve, list, version.
+description: All barca CLI commands — get, run, plan, status, history, stats, serve, list, version.
 ---
 
 The `barca` binary is the entry point. Once installed (e.g. `uv add barca`), the `barca` command
@@ -13,8 +13,9 @@ barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
 barca run <task> <file.py> [--refresh a,b | --refresh-all]  Run a task (always re-runs)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
 barca history [-l N]                          Show recent run history
+barca status <file.py> [file.py ...]          Every node: fresh/stale/missing, last run, typical time
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
-barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
+barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ] [--read-only]
                                                Run the HTTP API server
 barca list <file.py> [file.py ...]            List discovered definitions and their deps
 barca docs [topic] [--all] [--json]           Built-in manual
@@ -87,6 +88,31 @@ barca history -l 25    # last 25
 barca history --json   # machine-readable array of runs
 ```
 
+## status
+
+Show every node's state at once: whether `barca get` would reuse its cached result, its latest
+attempt (failures included), its typical duration (median and p95 of the last 20 successful runs),
+and its next scheduled run. The table sorts failures and stale nodes first. Nothing executes.
+
+```bash
+barca status pipeline.py
+barca status pipeline.py --json   # array of node states, the same shape as GET /state
+```
+
+The cache decision is the one `barca get --dry-run` makes, so the two always agree. States:
+
+- `fresh`: the cached result matches the current code and inputs; `get` reuses it.
+- `stale` with `cause: code`: it materialized before, every upstream is fresh, so its own code
+  (or code it calls) changed. `cause: upstream`: something upstream recomputes first.
+- `missing`: never materialized successfully.
+- `partial`: some partition keys are cached (`cached` of `total`).
+- `always_runs`: tasks and sensors are never cached.
+- `unknown`: a dynamic partition (`partitions_from`) whose source has not run, so its keys, and
+  everything downstream of it, cannot be known yet.
+
+`barca status` is read-only: it reads a private copy of the metadata DB, so it never creates or
+writes it and is safe to run while other barca processes are working in the project.
+
 ## stats
 
 Show aggregated execution statistics for a single asset: total materializations, timing
@@ -109,7 +135,12 @@ barca serve pipeline.py --port 8400     # custom port
 barca serve pipeline.py --watch         # dev mode: re-parse the DAG on file change
 barca serve pipeline.py --no-schedule   # disable the cron scheduler
 barca serve pipeline.py --timezone utc  # evaluate cron in UTC (default: local)
+barca serve pipeline.py --read-only     # inspect only: no runs, no scheduler, DB never written
 ```
+
+`--read-only` serves the API without the ability to change anything: run and cancel endpoints
+return `403`, the scheduler never starts, and every read of the metadata DB goes through a
+private copy. Use it to look at a project another process is running.
 
 `--watch` is a local-development convenience and is off by default; a production deployment serves
 a fixed set of files and does not need it.

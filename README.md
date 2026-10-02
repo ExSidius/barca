@@ -209,6 +209,7 @@ barca run <task> <file.py> ...             Run a task (always re-runs) and its c
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
 barca list <file.py> [--json]              List all definitions with deps
 barca history [--limit N] [--json]         Show recent run history
+barca status <file.py> [--json]            Every node: fresh/stale/missing, last run, typical time
 barca stats <target> <file.py> [--json]    Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
 barca docs [topic] [--all] [--json]        Built-in manual: concepts, formats, examples
@@ -266,6 +267,7 @@ barca serve pipeline.py --port 8274      # default port 8274
 barca serve pipeline.py --watch          # dev mode: re-parse DAG on file change
 barca serve pipeline.py --no-schedule    # HTTP API only, don't fire scheduled jobs
 barca serve pipeline.py --timezone utc   # evaluate cron in UTC (default: local)
+barca serve pipeline.py --read-only      # inspect only: no runs, no scheduler, DB never written
 ```
 
 Runs are async: `POST` returns a `run_id` immediately, then you poll `/status/{run_id}`.

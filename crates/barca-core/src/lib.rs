@@ -1,3 +1,4 @@
+pub mod asset_state;
 pub mod cache;
 pub mod commands;
 pub mod cone;
@@ -7,6 +8,7 @@ pub mod cost;
 pub mod dag;
 pub mod db;
 pub mod dispatch;
+pub mod events;
 pub mod hash;
 pub mod io_loop;
 pub mod model;
@@ -16,6 +18,7 @@ pub mod protocol;
 pub mod state_sync;
 
 pub use dag::Dag;
+pub use events::RunEvent;
 pub use model::*;
 pub use planner::{ExecutionPlan, ResourceConfig, expand_partition_combos};
 /// Re-exported so callers (CLI, server) share one token type without depending

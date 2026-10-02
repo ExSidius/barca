@@ -5,23 +5,108 @@
 //! workers are terminated and the run is marked cancelled/failed.
 
 use crate::error::ApiError;
-use crate::state::{AppState, RunState, RunStatus, now_ts};
+use crate::state::{AppState, NodeState, RunChannel, RunState, RunStatus, now_ts};
 use axum::Json;
 use axum::extract::{Path, State};
+use axum::response::Sse;
+use axum::response::sse::{Event, KeepAlive};
 use barca_core::commands::{self, GetResult};
-use barca_core::{BarcaError, db};
+use barca_core::{BarcaError, RunEvent, db};
+use futures::stream::{self, Stream, StreamExt};
 use serde_json::{Value, json};
+use std::convert::Infallible;
 use std::time::Duration;
+use tokio_stream::wrappers::BroadcastStream;
 
 /// Default timeout for a single run (10 minutes).
 const RUN_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `GET /health` — liveness + version. No core work.
-pub async fn health() -> Json<Value> {
+/// `GET /health` — liveness, version, and whether this server is read-only.
+/// No core work.
+pub async fn health(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "status": "ok",
         "version": env!("CARGO_PKG_VERSION"),
+        "read_only": state.config.read_only,
     }))
+}
+
+/// Refuse a request that would run or cancel work on a `--read-only` server.
+fn refuse_if_read_only(state: &AppState) -> Result<(), ApiError> {
+    if state.config.read_only {
+        return Err(ApiError::Forbidden(
+            "this server is read-only (`barca serve --read-only`): it does not run or cancel work"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// A metadata DB a read-only request may query: a private snapshot of the real
+/// one, or — when there is no DB yet — an empty scratch DB, so the absence is
+/// preserved. Either way the schema is ensured on the copy, never on the
+/// original. Dropping it deletes the copy.
+struct SnapshotDb {
+    _snapshot: Option<db::DbSnapshot>,
+    _scratch: Option<tempfile::TempDir>,
+    path: String,
+}
+
+async fn snapshot_db(state: &AppState) -> Result<SnapshotDb, ApiError> {
+    let (snapshot, scratch, path) =
+        match db::DbSnapshot::take(&state.config.resolved.db_path).await? {
+            Some(s) => {
+                let path = s.path().to_string();
+                (Some(s), None, path)
+            }
+            None => {
+                let dir = tempfile::tempdir()
+                    .map_err(|e| BarcaError::Db(format!("failed to create scratch dir: {e}")))?;
+                let path = dir.path().join("metadata.db").display().to_string();
+                (None, Some(dir), path)
+            }
+        };
+    db::init_db(&path).await?;
+    Ok(SnapshotDb {
+        _snapshot: snapshot,
+        _scratch: scratch,
+        path,
+    })
+}
+
+/// `GET /state` — every node's cache state (would `barca get` reuse it?), latest
+/// attempt, typical durations, and next scheduled run. Read-only by
+/// construction: the cache check runs against a private snapshot of the DB.
+pub async fn state(State(state): State<AppState>) -> Result<Json<Vec<NodeState>>, ApiError> {
+    let cfg = &state.config;
+    Ok(Json(
+        node_states(&cfg.resolved, &cfg.files, &cfg.python).await?,
+    ))
+}
+
+/// Every node's [`NodeState`], in topological order: the asset state from the
+/// read-only dry run, plus the next fire time of its cron schedule (local
+/// time). Shared by `GET /state` and `barca status` so the two can't diverge.
+pub async fn node_states(
+    cfg: &barca_core::config::ResolvedConfig,
+    files: &[String],
+    python: &std::path::PathBuf,
+) -> Result<Vec<NodeState>, BarcaError> {
+    let (states, schedule) = tokio::join!(
+        barca_core::asset_state::asset_states(cfg, files, python),
+        crate::scheduler::describe_schedule(files, python),
+    );
+    let next_run: std::collections::HashMap<String, i64> = schedule
+        .into_iter()
+        .filter_map(|s| s.next_fire.map(|t| (s.id, t)))
+        .collect();
+    Ok(states?
+        .into_iter()
+        .map(|s| NodeState {
+            next_run: next_run.get(&s.id).copied(),
+            state: s,
+        })
+        .collect())
 }
 
 /// `GET /plan` — execution plan for the server's files (cache-aware).
@@ -78,13 +163,18 @@ pub async fn asset_detail(
         }
     };
 
-    let stats = commands::stats(
-        &state.config.resolved,
-        &summary.id,
-        &state.config.files,
-        &state.config.python,
-    )
-    .await?;
+    let stats = if state.config.read_only {
+        let snap = snapshot_db(&state).await?;
+        db::get_asset_stats(&snap.path, &summary.id).await?
+    } else {
+        commands::stats(
+            &state.config.resolved,
+            &summary.id,
+            &state.config.files,
+            &state.config.python,
+        )
+        .await?
+    };
 
     Ok(Json(json!({
         "asset": summary,
@@ -93,21 +183,30 @@ pub async fn asset_detail(
 }
 
 /// `POST /run` — trigger a full run; returns a polling handle immediately.
-pub async fn run(State(state): State<AppState>) -> Json<Value> {
+pub async fn run(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    refuse_if_read_only(&state)?;
     let handle = start_run(state, None);
-    Json(json!({ "run_id": handle }))
+    Ok(Json(json!({ "run_id": handle })))
 }
 
 /// `POST /run/{target}` — trigger a task run; returns a polling handle.
-pub async fn run_target(State(state): State<AppState>, Path(target): Path<String>) -> Json<Value> {
+pub async fn run_target(
+    State(state): State<AppState>,
+    Path(target): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    refuse_if_read_only(&state)?;
     let handle = start_run_task(state, target);
-    Json(json!({ "run_id": handle }))
+    Ok(Json(json!({ "run_id": handle })))
 }
 
 /// `POST /get/{target}` — trigger a target-scoped get; returns a polling handle.
-pub async fn get_target(State(state): State<AppState>, Path(target): Path<String>) -> Json<Value> {
+pub async fn get_target(
+    State(state): State<AppState>,
+    Path(target): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    refuse_if_read_only(&state)?;
     let handle = start_run(state, Some(target));
-    Json(json!({ "run_id": handle }))
+    Ok(Json(json!({ "run_id": handle })))
 }
 
 /// `DELETE /run/{run_id}` — cancel an in-flight run. The run's workers are
@@ -117,6 +216,7 @@ pub async fn cancel_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    refuse_if_read_only(&state)?;
     let run = state
         .runs
         .get(&run_id)
@@ -179,6 +279,66 @@ pub async fn status(
         .ok_or_else(|| ApiError::NotFound(format!("run '{run_id}' not found")))
 }
 
+/// `GET /events/{run_id}` — Server-Sent Events stream of a run's live events
+/// (run lifecycle, logs, step completion). Replays the backlog first so a client
+/// that connects a beat after the run starts still sees everything, then streams
+/// live. Each SSE message is a JSON-encoded [`RunEvent`].
+pub async fn events(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    let channel: RunChannel = state
+        .events
+        .get(&run_id)
+        .map(|c| c.clone())
+        .ok_or_else(|| ApiError::NotFound(format!("run '{run_id}' not found")))?;
+
+    let (backlog, rx) = channel.snapshot_and_subscribe();
+
+    let backlog_stream = stream::iter(backlog);
+    let live_stream = BroadcastStream::new(rx).filter_map(|r| async move { r.ok() });
+
+    let stream = backlog_stream.chain(live_stream).map(|ev: RunEvent| {
+        Ok(Event::default()
+            .json_data(&ev)
+            .unwrap_or_else(|_| Event::default()))
+    });
+
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+/// `GET /logs/{run_id}` — persisted stdout lines for a run (durable history).
+///
+/// Accepts the server-side polling handle and resolves it to the DB run id
+/// (which `commands::execute` generates and surfaces in the completed result);
+/// also accepts a raw DB run id directly.
+pub async fn logs(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    // Map a polling handle to its DB run id if we know it; otherwise treat the
+    // path param as a DB run id.
+    let db_run_id = state
+        .runs
+        .get(&run_id)
+        .and_then(|r| r.result.as_ref().map(|res| res.run_id.clone()))
+        .unwrap_or(run_id);
+
+    let entries = if state.config.read_only {
+        let snap = snapshot_db(&state).await?;
+        db::get_logs(&snap.path, &db_run_id).await?
+    } else {
+        let cfg = &state.config.resolved;
+        db::ensure_env_dirs(&cfg.env)?;
+        // Ensure the schema exists — /logs may be hit before any run, since the
+        // server inits the DB lazily on first execution.
+        db::init_db(&cfg.db_path).await?;
+        db::get_logs(&cfg.db_path, &db_run_id).await?
+    };
+
+    Ok(Json(json!({ "logs": entries })))
+}
+
 /// Which core command a background run executes.
 enum RunKind {
     /// `commands::get` with an optional target (assets).
@@ -216,6 +376,8 @@ fn spawn_run(state: AppState, kind: RunKind) -> String {
             cancel: cancel.clone(),
         },
     );
+    let channel = RunChannel::new();
+    state.events.insert(handle.clone(), channel.clone());
 
     let st = state.clone();
     let h = handle.clone();
@@ -231,61 +393,87 @@ fn spawn_run(state: AppState, kind: RunKind) -> String {
                 r.error = Some("run cancelled".to_string());
                 r.finished_at = Some(now_ts());
             }
+            channel.emit(RunEvent::RunFinished {
+                run_id: h.clone(),
+                ok: false,
+            });
             return;
         }
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.status = RunStatus::Running;
         }
+        channel.emit(RunEvent::RunStarted { run_id: h.clone() });
+
+        // Core streams RunEvents over an unbounded channel (sync send from
+        // inside the worker-pool loop). A drain task forwards them onto the
+        // run's broadcast/backlog channel.
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<RunEvent>();
+        let drain_ch = channel.clone();
+        let drain = tokio::spawn(async move {
+            while let Some(ev) = event_rx.recv().await {
+                drain_ch.emit(ev);
+            }
+        });
 
         let files = st.config.files.clone();
         let python = st.config.python.clone();
         let cfg = st.config.resolved.clone();
 
-        let fut = async {
-            match &kind {
-                RunKind::Get(target) => {
-                    commands::get(
-                        &cfg,
-                        target.as_deref(),
-                        &files,
-                        &python,
-                        false,
-                        true,
-                        cancel.clone(),
-                    )
-                    .await
-                }
-                RunKind::Task(target) => {
-                    commands::run(
-                        &cfg,
-                        target,
-                        &files,
-                        &python,
-                        commands::CachePolicy::RefreshAll,
-                        true,
-                        cancel.clone(),
-                    )
-                    .await
-                }
-            }
-        };
-        tokio::pin!(fut);
-
-        // On timeout, cancel the token and keep awaiting: the run observes the
-        // cancellation, terminates its workers, persists partial results, and
-        // returns — nothing is left running in the background.
         let mut timed_out = false;
-        let outcome: Result<GetResult, BarcaError> = tokio::select! {
-            res = &mut fut => res,
-            _ = tokio::time::sleep(RUN_TIMEOUT) => {
-                // An operator cancel that is still unwinding when the deadline
-                // hits stays classified as cancelled, not as a timeout.
-                timed_out = !cancel.is_cancelled();
-                cancel.cancel();
-                fut.await
+        let outcome: Result<GetResult, BarcaError> = {
+            let fut = async {
+                match &kind {
+                    RunKind::Get(target) => {
+                        commands::get_streaming(
+                            &cfg,
+                            target.as_deref(),
+                            &files,
+                            &python,
+                            false,
+                            true,
+                            cancel.clone(),
+                            Some(event_tx),
+                        )
+                        .await
+                    }
+                    RunKind::Task(target) => {
+                        commands::run_streaming(
+                            &cfg,
+                            target,
+                            &files,
+                            &python,
+                            commands::CachePolicy::RefreshAll,
+                            true,
+                            cancel.clone(),
+                            Some(event_tx),
+                        )
+                        .await
+                    }
+                }
+            };
+            tokio::pin!(fut);
+
+            // On timeout, cancel the token and keep awaiting: the run observes the
+            // cancellation, terminates its workers, persists partial results, and
+            // returns — nothing is left running in the background.
+            tokio::select! {
+                res = &mut fut => res,
+                _ = tokio::time::sleep(RUN_TIMEOUT) => {
+                    // An operator cancel that is still unwinding when the deadline
+                    // hits stays classified as cancelled, not as a timeout.
+                    timed_out = !cancel.is_cancelled();
+                    cancel.cancel();
+                    fut.await
+                }
             }
+            // `fut` (and with it the event sender) is dropped here.
         };
+
+        // The run has returned and its event sender is gone — await the drain
+        // so trailing logs land before RunFinished.
+        drain.await.ok();
+        let ok = outcome.is_ok();
 
         if let Some(mut r) = st.runs.get_mut(&h) {
             r.finished_at = Some(now_ts());
@@ -308,6 +496,10 @@ fn spawn_run(state: AppState, kind: RunKind) -> String {
                 }
             }
         }
+        channel.emit(RunEvent::RunFinished {
+            run_id: h.clone(),
+            ok,
+        });
         // The run slot is released here, freeing capacity for a queued run.
     });
 
@@ -320,14 +512,19 @@ pub async fn evict_finished_runs(state: AppState, interval: Duration, max_age: D
     loop {
         tokio::time::sleep(interval).await;
         let cutoff = now_ts() - max_age.as_secs_f64();
-        state.runs.retain(|_, run| {
-            match run.status {
+        state.runs.retain(|handle, run| {
+            let keep = match run.status {
                 RunStatus::Complete | RunStatus::Failed | RunStatus::Cancelled => {
                     // Keep if it finished recently (or hasn't finished yet somehow).
                     run.finished_at.map_or(true, |t| t > cutoff)
                 }
                 _ => true,
+            };
+            if !keep {
+                // Drop the live event channel too; subscribers' streams end.
+                state.events.remove(handle);
             }
+            keep
         });
     }
 }

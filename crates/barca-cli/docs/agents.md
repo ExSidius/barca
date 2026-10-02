@@ -1,12 +1,12 @@
 # Using barca from scripts and AI agents
 
 Conventions that make barca easy to drive programmatically. Everything here is stable CLI
-behavior; `barca docs --json` and `--json` on `list`/`history`/`stats` give structured output.
+behavior; `barca docs --json` and `--json` on `list`/`status`/`history`/`stats` give structured output.
 
 ## Output contract
 
 - **stdout** carries the result: one JSON object for `get`/`run` (default `-o json`), the plan
-  JSON for `plan`, or JSON for `list`/`history`/`stats` with `--json`. It is safe to parse.
+  JSON for `plan`, or JSON for `list`/`status`/`history`/`stats` with `--json`. It is safe to parse.
 - **stderr** carries progress (`[barca] 2/2 steps done in 0.0s`), your own `print` output from
   steps, warnings and errors. Use `--agent` for plain progress lines instead of a progress bar.
 - **Exit codes:** `0` success; `1` runtime failure (a step raised, unknown target, task/asset
@@ -62,6 +62,7 @@ barca run report pipeline.py --dry-run --refresh src
 
 ```bash
 barca list pipeline.py --json       # every node: id, kind, freshness, inputs
+barca status pipeline.py --json     # every node: fresh/stale/missing, last attempt, typical time
 barca plan pipeline.py              # phases and steps that would run, nothing executes
 barca history --json                # recent runs
 barca stats total pipeline.py --json  # timings and cache hit rate for one asset
@@ -98,7 +99,8 @@ raised with stderr text on failure. Or read a parquet `path` directly with duckd
 2. `barca list pipeline.py` — confirm the node, its kind and its dependencies were discovered.
 3. `barca get <target> pipeline.py` — check exit code, `steps_executed`, and `final_output`.
 4. Run it again — `steps_executed` should be 0 (cached). If not, something upstream changed.
-5. `barca plan` / `barca history --json` when you need to explain what ran.
+5. `barca status --json` to see what is stale or failed across the whole project;
+   `barca plan` / `barca history --json` when you need to explain what ran.
 
 ## Finding more
 

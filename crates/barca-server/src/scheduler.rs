@@ -466,6 +466,7 @@ mod tests {
             python: PathBuf::from("python3"),
             resolved: barca_core::config::resolve_in(None, std::path::Path::new("/nonexistent"))
                 .unwrap(),
+            read_only: false,
         })
     }
 

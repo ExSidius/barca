@@ -95,6 +95,35 @@ A real `barca get` / `barca run` returns the same per-step information in a `ste
 cached step also prints `[barca] step:<id> cached` on stderr, so a log shows what was served from
 cache as well as what ran. `barca history --json` and `barca stats` show the same over time.
 
+## Is everything up to date? `barca status`
+
+`barca status` shows every node at once: whether `barca get` would reuse it, its latest attempt
+(failures included), its typical duration, and its next scheduled run. Nothing executes.
+
+```bash
+barca status pipeline.py          # table, sorted so failures and stale nodes come first
+barca status pipeline.py --json   # array of node states, the same shape as GET /state
+```
+
+The cache decision is the one `--dry-run` makes, so the two always agree. States:
+
+- `fresh`: the cached result matches the current code and inputs; `get` reuses it.
+- `stale` with `cause: code`: it materialized before, every upstream is fresh, so its own code
+  (or code it calls) changed. `cause: upstream`: something upstream recomputes first.
+- `missing`: never materialized successfully.
+- `partial`: some partition keys are cached (`cached` of `total`).
+- `always_runs`: tasks and sensors are never cached.
+- `unknown`: a dynamic partition (`partitions_from`) whose source has not run, so its keys, and
+  everything downstream of it, cannot be known yet.
+
+`last` is the latest attempt whether or not it matches the current code: a node can be `fresh`
+with a newer failed attempt that never replaced its cached result. Typical durations are the
+median and p95 of the last 20 successful runs.
+
+`barca status` is read-only: it copies `.barca/metadata.db` to a temporary directory (under the
+lock below, when the lock file exists) and reads the copy, so it never creates, migrates or
+writes the DB and is safe to run while other barca processes work in the project.
+
 ## Concurrent runs
 
 Several barca processes can run in one project at once (parallel scripts or agents, `barca serve`
@@ -113,6 +142,7 @@ separates cache, artifacts and shared state. Use it for dev/staging/prod isolati
 ## Seeing what happened
 
 ```bash
+barca status pipeline.py --json # every node: fresh, stale or missing, last attempt, typical time
 barca history --json            # recent runs: status, steps executed, steps cached
 barca stats total pipeline.py --json   # timing percentiles and cache hit rate for one asset
 barca plan pipeline.py          # what would run, in phases, without running it
