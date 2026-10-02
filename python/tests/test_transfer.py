@@ -287,6 +287,71 @@ class TestLifecycle:
         _runtime._socket = h._saved
 
 
+class _HttpError(Exception):
+    """Shapes the cloud SDKs use to carry an HTTP status on their errors."""
+
+    def __init__(self, msg, *, status_code=None, code=None, response_status=None):
+        super().__init__(msg)
+        if status_code is not None:
+            self.status_code = status_code  # azure.core HttpResponseError
+        if code is not None:
+            self.code = code  # gcsfs HttpError, google.api_core errors
+        if response_status is not None:
+            self.response = type("R", (), {"status_code": response_status})()
+
+
+class TestHttpStatusClassification:
+    """SDK errors that aren't builtin OSErrors are classified by HTTP status:
+    4xx is permanent (except 408/429), everything else is retried."""
+
+    def _attempts(self, tmp_path, monkeypatch, exc) -> int:
+        calls = []
+
+        def failing(local, dest):
+            calls.append(1)
+            raise exc
+
+        monkeypatch.setattr(_storage, "put_file", failing)
+        h = Helper(retries=3)
+        try:
+            src = tmp_path / "a"
+            src.write_bytes(b"1")
+            h.request({"type": "put", "id": 1, "local": str(src), "remote": "memory://c/a"})
+            r = h.reply()
+            assert r["type"] == "error"
+            assert r["attempts"] == len(calls)
+            return len(calls)
+        finally:
+            h.close()
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            _HttpError("AuthenticationFailed", status_code=403),  # Azure auth
+            _HttpError("Unauthorized", status_code=401),
+            _HttpError("not found", code=404),  # GCS
+            _HttpError("precondition", response_status=412),
+            _HttpError("bad request", code="400"),  # string codes too
+        ],
+        ids=["azure-403", "401", "gcs-404", "response-412", "string-400"],
+    )
+    def test_client_errors_are_permanent(self, tmp_path, monkeypatch, exc):
+        assert self._attempts(tmp_path, monkeypatch, exc) == 1
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            _HttpError("busy", status_code=503),
+            _HttpError("throttled", status_code=429),
+            _HttpError("request timeout", code=408),
+            _HttpError("no status at all"),
+        ],
+        ids=["503", "429", "408", "no-status"],
+    )
+    def test_server_throttle_and_unknown_errors_are_retried(self, tmp_path, monkeypatch, exc):
+        assert self._attempts(tmp_path, monkeypatch, exc) == 4
+
+
 class TestTimeout:
     """A stalled attempt is failed by the helper's watchdog instead of hanging the run."""
 

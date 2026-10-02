@@ -89,8 +89,11 @@ same fsspec backends and credentials as everything else:
 
 **Retries and timeouts.** Each transfer is retried up to 3 times with
 exponential backoff (0.5s, 1s, 2s) when the error looks transient — dropped
-connections, timeouts, server errors. Errors no retry can fix (missing object,
-permission denied, bad configuration) fail on the first attempt. An attempt
+connections, timeouts, 5xx, 408 and 429 responses. Errors no retry can fix fail
+on the first attempt: missing objects, permission and authentication errors, and
+any other 4xx response (SDK errors are judged by the HTTP status they carry).
+The cloud SDKs also retry internally — Azure's backs off for up to ~15s on
+dropped connections — so the end-of-run wait can exceed barca's own backoff. An attempt
 that runs longer than `transfer_timeout` seconds (default 600, counted from
 when the attempt starts, not while it waits its turn) is failed as stalled and
 not retried — raise the limit if single artifacts take longer than that to
@@ -119,6 +122,11 @@ Remote I/O is reported on stderr, so its cost is visible:
 
 The "waited" figure is the only upload time the run paid for — the rest
 overlapped with execution. `BARCA_TRACE_TIMING=1` adds per-transfer timings.
+
+Using a GCS emulator such as fake-gcs-server with gcsfs 2026.10 or later? Set
+`GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT=false`: gcsfs's experimental mode makes a
+gRPC call the emulator doesn't serve, and transfers stall until
+`transfer_timeout`. Real GCS is unaffected.
 
 `[remote].uri` may also be a plain directory (a shared or network mount)
 instead of a URI; transfers are then local file copies.

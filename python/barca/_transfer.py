@@ -53,6 +53,44 @@ _PERMANENT = (
 )
 
 
+def _http_status(exc: BaseException) -> int | None:
+    """The HTTP status a cloud SDK attached to its error, if any.
+
+    azure.core's HttpResponseError carries `status_code`; gcsfs and
+    google.api_core errors carry `code`; requests-style errors carry
+    `response.status_code`.
+    """
+    for value in (
+        getattr(exc, "status_code", None),
+        getattr(exc, "code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+    ):
+        if value is None:
+            continue
+        try:
+            status = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= status <= 599:
+            return status
+    return None
+
+
+def _is_permanent(exc: BaseException) -> bool:
+    """True for failures no retry can fix.
+
+    Builtin OSError subclasses cover what s3fs and adlfs translate (missing
+    object, permission denied). SDK errors that stay untranslated — e.g.
+    Azure's HttpResponseError for a bad account key — are judged by HTTP
+    status: 4xx is the client's fault and permanent, except 408 (request
+    timeout) and 429 (throttled).
+    """
+    if isinstance(exc, _PERMANENT):
+        return True
+    status = _http_status(exc)
+    return status is not None and 400 <= status < 500 and status not in (408, 429)
+
+
 def _staged_get(remote: str, local: str) -> None:
     """Download into a temp file beside `local`, then rename into place."""
     dest = Path(local)
@@ -170,11 +208,8 @@ def _handle(msg: dict, requests: _Requests, retries: int, backoff: float) -> Non
             size = _transfer(msg)
             requests.resolve({"type": "done", "id": req_id, "size_bytes": size})
             return
-        except _PERMANENT as exc:
-            requests.resolve(_error(msg, exc, attempt))
-            return
         except Exception as exc:
-            if attempt > retries:
+            if _is_permanent(exc) or attempt > retries:
                 requests.resolve(_error(msg, exc, attempt))
                 return
             time.sleep(backoff * 2 ** (attempt - 1))
