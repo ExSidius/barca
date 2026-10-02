@@ -253,7 +253,7 @@ def test_status_topic_example(binary, topics, tmp_path):
     pytest.importorskip("pyarrow")
     write_example(topics, "status", tmp_path)
     assert result(barca(binary, tmp_path, "get", "total", "pipeline.py"))["run_id"]
-    table = barca(binary, tmp_path, "status", "pipeline.py")
+    table = barca(binary, tmp_path, "status", "pipeline.py", "--pretty")
     assert table.returncode == 0, table.stderr
     assert "3 rows x 2 cols" in table.stdout and "dict (1 key)" in table.stdout
     assert "2 cached, 0 stale, 0 never run, 0 partial, 0 unknown, 1 always run" in table.stdout

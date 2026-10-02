@@ -207,8 +207,9 @@ def test_target_scopes_status_to_the_upstream_cone(project):
 
 def test_an_unknown_target_is_an_error(project):
     proc = barca(project, "status", "nope", "pipeline.py", "--json")
-    assert proc.returncode != 0
+    assert proc.returncode == 2  # usage error (#154)
     assert "nope" in proc.stderr
+    assert json.loads(proc.stderr.strip().splitlines()[-1])["kind"] == "usage"
 
 
 def test_parquet_shape_reports_rows_and_schema(project):
@@ -261,7 +262,8 @@ def test_a_failed_last_attempt_is_reported(project):
 
 def test_human_table(project):
     ok(barca(project, "get", "mid", "pipeline.py"))
-    proc = barca(project, "status", "pipeline.py")
+    # Piped stdout picks JSON (#153); ask for the table.
+    proc = barca(project, "status", "pipeline.py", "--pretty")
     assert proc.returncode == 0, proc.stderr
     header = proc.stdout.splitlines()[0]
     for col in ("NAME", "KIND", "STATE", "LAST RUN", "SHAPE"):
@@ -305,3 +307,31 @@ def test_dynamic_partitions_are_unknown_until_their_source_has_run(project):
     warm = nodes(status(project, "dynamic.py"))["part"]
     assert warm["cache"]["state"] == "cached"
     assert warm["partitions"]["total"] == 2
+
+
+# ─── combined with TTY output (#153), bounded output (#155) and declared env (#156) ─────────
+
+
+def test_status_is_json_when_piped_and_bounded(project):
+    ok(barca(project, "get", "mid", "pipeline.py"))
+    doc = json.loads(barca(project, "status", "pipeline.py").stdout)  # no flag: piped -> JSON
+    assert doc["truncated"] is False and doc["total"] == len(doc["nodes"])
+    one = ok(barca(project, "status", "pipeline.py", "--limit", "1"))
+    assert len(one["nodes"]) == 1 and one["truncated"] is True and "--all" in one["hint"]
+    assert one["total"] == doc["total"]
+    assert sum(one["summary"].values()) == doc["total"]  # the summary counts every node
+
+
+def test_status_fields_trim_each_node(project):
+    out = ok(barca(project, "status", "pipeline.py", "--fields", "id,cache"))
+    assert all(set(n) == {"id", "cache"} for n in out["nodes"])
+    bad = barca(project, "status", "pipeline.py", "--fields", "nope")
+    assert bad.returncode == 2
+
+
+def test_status_lists_declared_env(project):
+    (project / "envd.py").write_text(
+        "from barca import asset\n\n\n@asset(env=['SOURCE_CSV'])\ndef a() -> int:\n    return 1\n"
+    )
+    out = ok(barca(project, "status", "envd.py", "--json"))
+    assert out["nodes"][0]["env"] == ["SOURCE_CSV"]
