@@ -2542,10 +2542,10 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
                 let module_path = std::path::Path::new(&node.source_file)
                     .canonicalize()
                     .unwrap_or_else(|_| PathBuf::from(&node.source_file));
-                let script = "import json, importlib.util, sys\n\
-                     _spec = importlib.util.spec_from_file_location('_m', sys.argv[1])\n\
-                     _mod = importlib.util.module_from_spec(_spec)\n\
-                     _spec.loader.exec_module(_mod)\n\
+                // Compile from source, never a cached .pyc, like the worker (#176).
+                let script = "import json, sys\n\
+                     from barca._source_import import load_source_module\n\
+                     _mod = load_source_module(sys.argv[1], '_m')\n\
                      _ns = vars(_mod); _ns['__builtins__'] = __builtins__\n\
                      print(json.dumps(eval(sys.argv[2], _ns)))\n"
                     .to_string();

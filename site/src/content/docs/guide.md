@@ -402,6 +402,8 @@ barca get pipeline.py    # run it
 
 - **Outputs are fully materialized between steps.** Workers never pass in-memory lazy handles across process boundaries — every asset writes a complete artifact file (json, pickle, or parquet). That is intentional: materialization *is* the cache checkpoint. Downstream steps read the file back; parameter type annotations (e.g. `orders: pl.DataFrame`) only choose *how* parquet is decoded, not whether it is persisted. By default barca uses JSON for dicts, lists, strings, numbers, and booleans. Two escape hatches beyond that: `@asset(serializer="pickle")` for large or non-JSON-serializable plain-Python payloads (faster than JSON for large list-of-dict structures too — see `benchmarks/RESULTS.md`'s `etl_duckdb` notes), or return a pandas/polars DataFrame and barca automatically serializes it as parquet — no `serializer=` needed, and it's the fastest option for tabular data (vectorized columnar (de)serialization instead of row-by-row). If one efficient computation should produce several cacheable outputs, use multiple `@asset` definitions (sharing helpers) rather than trying to keep a lazy graph alive between steps.
 
+- **Barca runs the code you saved.** Your pipeline files and the modules they import from the same directory tree are checked against a hash of their source, not `__pycache__` timestamps, so a same-size edit within one second (or under a tool that pins mtimes, such as Nix, Bazel or `touch -t`) never runs stale bytecode. Installed packages import as usual.
+
 - **Use `barca plan` liberally.** It's free (no execution) and shows you exactly how barca decomposes your DAG.
 
 - **Check `.barca/metadata.db`.** It's a SQLite database. You can query it directly:

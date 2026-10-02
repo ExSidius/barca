@@ -149,8 +149,7 @@ def barca(project: Path, *args: str) -> dict:
     proc = subprocess.run(
         [_find_binary(), *args],
         cwd=project,
-        # Tests rewrite p.py within the same second at the same size; a cached .pyc would mask it.
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env=os.environ,
         capture_output=True,
         text=True,
     )
