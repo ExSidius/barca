@@ -6,6 +6,9 @@ description: All barca CLI commands — get, run, plan, history, stats, serve, l
 The `barca` binary is the entry point. Once installed (e.g. `uv add barca`), the `barca` command
 is on your PATH.
 
+The [CLI contract](/reference/cli-contract/) lists every command, flag, environment variable, exit
+code and JSON output schema, marked stable or experimental, with the policy for changing them.
+
 ## Commands
 
 ```
@@ -341,8 +344,8 @@ barca docs --json             # topic index as JSON; add a topic for its full te
 ```
 
 Topics: `overview`, `assets`, `types`, `tasks`, `cache`, `partitions`, `sinks`, `scheduling`,
-`status`, `skill`, `agents`, and `examples/*`. `barca docs skill` is the short [agent skill](/reference/agent-skill/)
-(`SKILL.md` in the repository) an AI agent loads once. `barca docs agents` describes the output contract for scripts and AI
+`status`, `agents`, `contract`, `skill`, and `examples/*`. `barca docs skill` is the short [agent skill](/reference/agent-skill/)
+(`SKILL.md` in the repository) an AI agent loads once. `barca docs contract` is the [CLI contract](/reference/cli-contract/). `barca docs agents` describes the output contract for scripts and AI
 agents: JSON on stdout, progress and errors on stderr, and the exit codes and error envelope below.
 
 ## Errors and exit codes

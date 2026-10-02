@@ -32,4 +32,5 @@ barca docs skill > .claude/skills/barca/SKILL.md
 ```
 
 The longer reference, with the full error envelope, several-target output and bounded output, is
-`barca docs agents` (see also the [CLI reference](/reference/cli/)).
+`barca docs agents` (see also the [CLI reference](/reference/cli/)). Every command, flag and JSON
+schema, marked stable or experimental, is in the [CLI contract](/reference/cli-contract/).

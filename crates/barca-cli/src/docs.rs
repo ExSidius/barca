@@ -77,6 +77,11 @@ pub const TOPICS: &[Topic] = &[
         "agents.md"
     ),
     topic!(
+        "contract",
+        "The CLI contract: commands, flags, JSON schemas, exit codes, stability policy",
+        "contract.md"
+    ),
+    topic!(
         "skill",
         "Agent skill (SKILL.md): the short guide an AI agent loads once",
         "skill.md"

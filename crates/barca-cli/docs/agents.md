@@ -4,6 +4,10 @@ Conventions that make barca easy to drive programmatically. Everything here is s
 behavior. When stdout is not a terminal (a pipe, a subprocess, an agent) every result is JSON
 without any flag. List-shaped output is bounded by default (see "Bounded output" below).
 
+The complete surface (every command and flag, environment variable, exit code, JSON schema and
+`--agent` line), each marked stable or experimental, and the rules for changing it are in
+`barca docs contract`. It is checked against the real CLI in CI, so it matches this version.
+
 For a short version to load once, read `barca docs skill`: the same rules in about 1500 tokens,
 in the Agent Skills format (it is `SKILL.md` at the repository root). To install it as a skill,
 save it as a file, for example `barca docs skill > .claude/skills/barca/SKILL.md`.

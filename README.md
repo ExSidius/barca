@@ -248,6 +248,13 @@ on each item of any JSON output (`barca list pipeline.py --fields id,inputs`).
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets and sensors; tasks are skipped, use `barca run`).
 
+The CLI surface is written down as a contract: every command, flag, environment variable, exit
+code, JSON output schema and `--agent` line, each marked stable or experimental, in
+[`crates/barca-cli/docs/contract.md`](crates/barca-cli/docs/contract.md) (also `barca docs
+contract`, and [online](https://barca.sh/reference/cli-contract/)). Snapshot tests fail CI on any
+change to it that the contract does not reflect. Before 1.0 a breaking change ships in a minor
+release with a "Breaking" line in the release notes; from 1.0 changes are additive only.
+
 ## Scheduling
 
 Barca doubles as a plain **task scheduler**. Decorate a function with a cron
