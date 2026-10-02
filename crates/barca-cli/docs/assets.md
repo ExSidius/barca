@@ -95,6 +95,8 @@ Targets on the command line can use the bare function name (`barca get clean pip
 Several targets are one comma-separated list (`barca get clean,report pipeline.py`): their
 upstream cones are planned together, so an asset both need materializes once, and the JSON
 output is keyed by target (`barca docs agents`).
+With no target, `barca get pipeline.py` materializes every asset and sensor in the file and skips
+tasks (previously it ran them too); run a task with `barca run <task> pipeline.py`.
 Use `asset_ref("other/file.py:raw")` inside `inputs=` to reference a node in another file
 without importing it.
 
@@ -117,5 +119,9 @@ planner. Mark code barca cannot reason about with `@unsafe` (silences purity war
 
 `@sensor` observes external state and returns `(update_detected: bool, value)`. Sensors have no
 inputs and must use `Manual` or `Schedule(...)` freshness, never `Always`.
+
+`barca get <sensor> pipeline.py` observes one sensor. `barca get pipeline.py` (no target) observes
+every sensor, including one nothing depends on: a sensor is something `get` can target, and
+observing is read-only. Tasks are the only nodes a bare `get` skips.
 
 See also: `barca docs tasks`, `barca docs cache`, `barca docs scheduling`.

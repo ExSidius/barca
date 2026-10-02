@@ -66,9 +66,13 @@ parameter type annotations (e.g. `data: pl.DataFrame`) select the parquet *reade
 To cache several outputs from one efficient computation, define multiple assets (or compute
 them in one step and return the value you want cached).
 
-If the first positional argument ends in `.py`, all arguments are treated as files (gets all
-assets, returning the final asset's value). Otherwise the first argument is the target asset name
-and the rest are files.
+If the first positional argument ends in `.py`, all arguments are treated as files: barca gets
+every asset and sensor and returns the last asset's value. Tasks are skipped (previously a bare
+`get` ran them too); stderr names them and the `barca run` command, for example
+`[barca] skipped 1 task (report): ... Run a task with: barca run report pipeline.py`. A sensor
+nothing depends on is still observed, since `get` accepts sensors as targets. A file with only
+tasks gets nothing: exit 0, `"steps": []`, and a stderr note pointing at `barca run`. Otherwise
+the first argument is the target asset name and the rest are files.
 
 The target comes before the files. `barca get pipeline.py summary` (a file first, then a name)
 has only one valid reading, so it exits 2 and prints the corrected command,
@@ -79,7 +83,7 @@ missing target or files, unknown target, using `get` on a task or `run` on an as
 matching.
 
 ```bash
-barca get pipeline.py                 # all assets
+barca get pipeline.py                 # all assets and sensors (never tasks)
 barca get summary pipeline.py         # a specific target
 barca get summary,orders pipeline.py  # several targets in one run (see "Several targets" below)
 barca get pipeline.py --no-cache      # execute everything fresh

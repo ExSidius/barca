@@ -50,6 +50,10 @@ barca run send_email pipeline.py --no-cache           # same as --refresh-all
 executes. A task must be the target: `barca get` on a task is an error, and `barca run` on an
 asset is an error.
 
+`barca get pipeline.py` (no target) never runs tasks: it materializes every asset and sensor,
+and prints the skipped tasks and the `barca run` command on stderr. A deploy or notify task fires
+only when you name it with `barca run`. (Previously a bare `barca get` ran tasks too.)
+
 ## Several tasks in one run
 
 Name several tasks as one comma-separated list (no spaces). A validation sweep is the typical

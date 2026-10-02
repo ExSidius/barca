@@ -26,9 +26,11 @@ barca run report pipeline.py            # execute a task (always re-runs; upstre
 
 ## Argument order: target, then files
 
-`barca get total pipeline.py other.py`. With no target, `barca get pipeline.py` runs every node
-in the file, tasks included. `barca run pipeline.py report` exits 2, prints the corrected
-command (`barca run report pipeline.py`) and runs nothing.
+`barca get total pipeline.py other.py`. With no target, `barca get pipeline.py` materializes
+every asset and sensor in the file and skips tasks (previously it ran tasks too); stderr
+names the skipped tasks. A file with only tasks gets nothing (exit 0, empty `steps`); run a
+task with `barca run <task> <files>`. `barca run pipeline.py report` exits 2, prints the
+corrected command (`barca run report pipeline.py`) and runs nothing.
 
 ## Several targets, refresh, cascade
 

@@ -132,14 +132,14 @@ class Client:
     # ── trigger endpoints ──────────────────────────────────────────────────
     #
     # These mirror the CLI verbs. ``get`` matches ``barca get [TARGET]`` (the
-    # target is optional; omit it to materialize the whole DAG) and ``run``
+    # target is optional; omit it to get every asset and sensor) and ``run``
     # matches ``barca run TARGET``.
 
     def get(self, target: str | None = None) -> Run:
-        """Materialize an asset, or the whole DAG if ``target`` is None.
+        """Materialize an asset, or every asset and sensor if ``target`` is None.
 
         Mirrors ``barca get [TARGET]`` (``POST /get/{target}``, or ``POST /run``
-        for a full run).
+        with no target). Tasks never run without a target; use ``run``.
         """
         path = f"/get/{target}" if target is not None else "/run"
         payload = self._request("POST", path)
