@@ -1,11 +1,13 @@
 //! Barca CLI — invisible asset orchestrator.
 
+mod bounded;
 mod docs;
 mod error;
 mod output;
 
 use error::{CliError, Context, ErrorKind};
 
+use clap::builder::PossibleValuesParser;
 use clap::{Parser, ValueEnum};
 use output::{Format, FormatFlags};
 use std::io::Write;
@@ -66,6 +68,7 @@ Examples:
   barca get total pipeline.py --env dev    # separate cache and state per environment
   barca list pipeline.py                   # not sure of the name? list assets and tasks first
   BARCA_OUTPUT=json barca get total pipeline.py   # env override for CI; a flag still wins
+  barca get total pipeline.py --fields id,status   # JSON with each entry of `steps` trimmed to these keys
 
 Output format: --json / --pretty / -o, else BARCA_OUTPUT=json|pretty, else the terminal decides
 (TTY -> pretty, piped -> JSON). JSON is one line on stdout with status (\"success\"), run_id,
@@ -90,6 +93,7 @@ Examples:
   barca run deploy pipeline.py --dry-run --refresh fetch   # preview: which steps run, which are cached
   barca run deploy pipeline.py --json                  # JSON even in a terminal (the default when piped)
   barca run deploy pipeline.py --pretty                # summary for humans (the default in a terminal)
+  barca run deploy pipeline.py --fields id,status,reason   # JSON with each entry of `steps` trimmed
   barca list pipeline.py                               # not sure of the name? list assets and tasks first
 
 --refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs only
@@ -117,17 +121,22 @@ const HISTORY_HELP: &str = "\
 Examples:
   barca history                # last 10 runs: a table in a terminal, JSON when piped
   barca history -l 25          # last 25
-  barca history --json         # machine-readable array of runs, even in a terminal
+  barca history --all          # every recorded run
+  barca history --json         # {runs: [...], total, truncated, hint?}, even in a terminal
   barca history --pretty       # the table, even when piped
+  barca history --fields run_id,status,elapsed_seconds   # JSON with only these keys per run
   barca history --env dev      # runs recorded in another environment
 
-More: barca docs cache";
+Newest first. When more runs exist than are shown, JSON says `\"truncated\": true` with the
+`total`, and the table prints a one-line note on stderr.
+More: barca docs agents, barca docs cache";
 
 const STATS_HELP: &str = "\
 Examples:
   barca stats total pipeline.py             # timing percentiles and cache hit rate
   barca stats total pipeline.py --json      # the same as one JSON object, even in a terminal
   barca stats total pipeline.py --pretty    # the text report, even when piped
+  barca stats total pipeline.py --fields status,error_message   # JSON; trims recent_runs entries
 
 More: barca docs cache";
 
@@ -145,11 +154,15 @@ More: barca docs scheduling";
 const LIST_HELP: &str = "\
 Examples:
   barca list pipeline.py             # table of nodes (in a terminal; JSON when piped)
-  barca list pipeline.py --json      # array of {id, kind, freshness, inputs, next_fire?}
+  barca list pipeline.py --json      # {nodes: [{id, kind, freshness, inputs, next_fire?}], total, truncated}
   barca list pipeline.py --pretty    # the table, even when piped
+  barca list pipeline.py --fields id,inputs   # JSON with only these keys per node
+  barca list big.py --limit 20       # first 20 nodes (topological order)
+  barca list big.py --all            # every node (default: at most 100)
   barca list a.py b.py               # several files form one DAG
 
-Run this first to confirm barca discovered your nodes.
+Run this first to confirm barca discovered your nodes. When more nodes exist than are shown,
+JSON says `\"truncated\": true` with the `total`, and the table prints a note on stderr.
 More: barca docs assets, barca docs agents";
 
 const DOCS_HELP: &str = "\
@@ -160,6 +173,7 @@ Examples:
   barca docs --all              # the whole manual in one stream (paste into context)
   barca docs --json             # topic index as JSON
   barca docs cache --json       # one topic as JSON {name, summary, content}
+  barca docs --fields name      # JSON index with only topic names
 
 Topics are compiled into the binary: offline, and always matching this version.";
 
@@ -208,6 +222,10 @@ enum Cli {
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
+        /// Keep only these keys (comma-separated) on each entry of `steps` in the JSON output.
+        /// Not valid with -o value/pretty. An unknown key is a usage error listing the valid ones
+        #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::STEP_FIELDS))]
+        fields: Option<Vec<String>>,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -243,6 +261,10 @@ enum Cli {
         /// Agent-friendly output: plain structured progress lines instead of visual progress bar
         #[arg(long)]
         agent: bool,
+        /// Keep only these keys (comma-separated) on each entry of `steps` in the JSON output.
+        /// Not valid with -o value/pretty. An unknown key is a usage error listing the valid ones
+        #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::STEP_FIELDS))]
+        fields: Option<Vec<String>>,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -263,8 +285,15 @@ enum Cli {
         /// Number of recent runs to show
         #[arg(short, long, default_value = "10")]
         limit: usize,
+        /// Show every recorded run (no limit)
+        #[arg(long, conflicts_with = "limit")]
+        all: bool,
         #[command(flatten)]
         format: FormatFlags,
+        /// Output JSON with only these keys (comma-separated) on each entry of `runs`.
+        /// Implies --json. An unknown key is a usage error listing the valid ones
+        #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::HISTORY_FIELDS))]
+        fields: Option<Vec<String>>,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -279,6 +308,10 @@ enum Cli {
         files: Vec<PathBuf>,
         #[command(flatten)]
         format: FormatFlags,
+        /// Output JSON with only these keys (comma-separated) on each entry of `recent_runs`.
+        /// Implies --json. An unknown key is a usage error listing the valid ones
+        #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::STATS_FIELDS))]
+        fields: Option<Vec<String>>,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -318,6 +351,16 @@ enum Cli {
         files: Vec<PathBuf>,
         #[command(flatten)]
         format: FormatFlags,
+        /// Maximum number of nodes to show, in topological order
+        #[arg(short, long, default_value_t = bounded::LIST_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Show every node (no limit)
+        #[arg(long, conflicts_with = "limit")]
+        all: bool,
+        /// Output JSON with only these keys (comma-separated) on each entry of `nodes`.
+        /// Implies --json. An unknown key is a usage error listing the valid ones
+        #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::LIST_FIELDS))]
+        fields: Option<Vec<String>>,
     },
     /// Show the built-in manual: concepts, output formats, examples, agent conventions
     ///
@@ -333,6 +376,10 @@ enum Cli {
         /// Emit JSON instead of markdown
         #[arg(long)]
         json: bool,
+        /// Output JSON with only these keys (comma-separated) on each entry of `topics`, or on
+        /// the one topic. Implies --json. An unknown key is a usage error listing the valid ones
+        #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::DOCS_FIELDS))]
+        fields: Option<Vec<String>>,
     },
     /// Print version information
     Version,
@@ -492,14 +539,26 @@ fn get_run_error(e: barca_core::BarcaError, ctx: &Context, files: &[PathBuf]) ->
 /// terminal; `plan` is always JSON; `docs` only with `--json`.
 fn json_output(cli: &Cli) -> bool {
     match cli {
-        Cli::Get { output, format, .. } | Cli::Run { output, format, .. } => {
-            matches!(OutputMode::resolve(*output, *format), OutputMode::Json)
+        Cli::Get {
+            output,
+            format,
+            fields,
+            ..
         }
+        | Cli::Run {
+            output,
+            format,
+            fields,
+            ..
+        } => get_run_mode(*output, *format, fields.as_deref())
+            .is_ok_and(|m| matches!(m, OutputMode::Json)),
         Cli::Plan { .. } => true,
-        Cli::History { format, .. } | Cli::Stats { format, .. } | Cli::List { format, .. } => {
-            is_json(*format)
+        Cli::History { format, fields, .. }
+        | Cli::Stats { format, fields, .. }
+        | Cli::List { format, fields, .. } => {
+            fields_json(*format, fields.as_deref()).unwrap_or(false)
         }
-        Cli::Docs { json, .. } => *json,
+        Cli::Docs { json, fields, .. } => *json || fields.is_some(),
         Cli::Serve { .. } | Cli::Version => false,
     }
 }
@@ -519,6 +578,54 @@ fn context(cli: &Cli) -> Context {
         Cli::Version => ("version", Vec::new()),
     };
     Context { command, files }
+}
+
+/// The get/run output mode. `--fields` trims JSON, so it implies JSON; combined with an
+/// explicit human mode (`-o value`, `-o pretty`, `--pretty`) it is a usage error.
+#[allow(clippy::result_large_err)] // cold path: built once, right before exiting
+fn get_run_mode(
+    output: Option<OutputMode>,
+    format: FormatFlags,
+    fields: Option<&[String]>,
+) -> Result<OutputMode, CliError> {
+    if fields.is_none() {
+        return Ok(OutputMode::resolve(output, format));
+    }
+    match (output, format.pretty) {
+        (Some(OutputMode::Value | OutputMode::Pretty), _) | (_, true) => Err(CliError::from_prose(
+            ErrorKind::Usage,
+            "error: --fields applies to JSON output\nDrop -o/--pretty, or use --json.",
+        )),
+        _ => Ok(OutputMode::Json),
+    }
+}
+
+/// Whether an inspection command prints JSON. `--fields` implies JSON; with `--pretty` it is a
+/// usage error.
+#[allow(clippy::result_large_err)] // cold path: built once, right before exiting
+fn fields_json(format: FormatFlags, fields: Option<&[String]>) -> Result<bool, CliError> {
+    match (fields, format.pretty) {
+        (Some(_), true) => Err(CliError::from_prose(
+            ErrorKind::Usage,
+            "error: --fields applies to JSON output\nDrop --pretty, or use --json.",
+        )),
+        (Some(_), false) => Ok(true),
+        (None, _) => Ok(is_json(format)),
+    }
+}
+
+/// Apply `--fields` to `barca docs` JSON: each `topics[]` entry, or the single topic object.
+fn project_docs_json(out: String, fields: Option<&[String]>) -> String {
+    let Some(fields) = fields else { return out };
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&out) else {
+        return out;
+    };
+    if v.get("topics").is_some() {
+        bounded::project_key(&mut v, "topics", Some(fields));
+    } else {
+        bounded::project_one(&mut v, fields);
+    }
+    serde_json::to_string_pretty(&v).unwrap_or_default() + "\n"
 }
 
 /// Split the raw positional args into (optional target, files).
@@ -568,13 +675,21 @@ fn main() {
     }
 
     // The manual is compiled in: no runtime, no Python, no project files needed.
-    if let Cli::Docs { topic, all, json } = &cli {
-        match docs::run(topic.as_deref(), *all, *json) {
+    if let Cli::Docs {
+        topic,
+        all,
+        json,
+        fields,
+    } = &cli
+    {
+        match docs::run(topic.as_deref(), *all, *json || fields.is_some())
+            .map(|out| project_docs_json(out, fields.as_deref()))
+        {
             // Ignore write errors (e.g. a closed pipe from `barca docs --all | head`).
             Ok(out) => {
                 let _ = std::io::stdout().lock().write_all(out.as_bytes());
             }
-            Err(msg) => CliError::from_prose(ErrorKind::Usage, msg).emit(*json),
+            Err(msg) => CliError::from_prose(ErrorKind::Usage, msg).emit(*json || fields.is_some()),
         }
         return;
     }
@@ -654,9 +769,11 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             no_cache,
             dry_run,
             agent,
+            fields,
             env,
         } => {
             check_order("get", &args)?;
+            let output = get_run_mode(output, format, fields.as_deref())?;
             let (target, files) = split_target_files(args);
             check_py_files(&files, None)?;
             if files.is_empty() {
@@ -676,10 +793,11 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 target,
                 files,
                 &python,
-                OutputMode::resolve(output, format),
+                output,
                 no_cache,
                 dry_run,
                 agent,
+                fields.as_deref(),
             )
             .await
             .map_err(|e| get_run_error(e, ctx, &hint_files))
@@ -692,9 +810,11 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             output,
             format,
             agent,
+            fields,
             env,
         } => {
             check_order("run", &args)?;
+            let output = get_run_mode(output, format, fields.as_deref())?;
             let (target, files) = split_target_files(args);
             check_py_files(&files, refresh.as_deref())?;
             let Some(target) = target else {
@@ -722,27 +842,59 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 &python,
                 policy,
                 dry_run,
-                OutputMode::resolve(output, format),
+                output,
                 agent,
+                fields.as_deref(),
             )
             .await
             .map_err(|e| get_run_error(e, ctx, &hint_files))
         }
         Cli::Plan { files, env: _ } => plan_cmd(files, &python).await.map_err(engine),
-        Cli::History { limit, format, env } => history_cmd(env.as_deref(), limit, is_json(format))
-            .await
-            .map_err(engine),
+        Cli::History {
+            limit,
+            all,
+            format,
+            fields,
+            env,
+        } => {
+            let json = fields_json(format, fields.as_deref())?;
+            let limit = (!all).then_some(limit);
+            history_cmd(env.as_deref(), limit, json, fields.as_deref())
+                .await
+                .map_err(engine)
+        }
         Cli::Stats {
             target,
             files,
             format,
+            fields,
             env,
-        } => stats_cmd(env.as_deref(), target, files, is_json(format), &python)
+        } => {
+            let json = fields_json(format, fields.as_deref())?;
+            stats_cmd(
+                env.as_deref(),
+                target,
+                files,
+                json,
+                fields.as_deref(),
+                &python,
+            )
             .await
-            .map_err(engine),
-        Cli::List { files, format } => list_cmd(files, is_json(format), &python)
-            .await
-            .map_err(engine),
+            .map_err(engine)
+        }
+        Cli::List {
+            files,
+            format,
+            limit,
+            all,
+            fields,
+        } => {
+            let json = fields_json(format, fields.as_deref())?;
+            let limit = (!all).then_some(limit);
+            list_cmd(files, json, limit, fields.as_deref(), &python)
+                .await
+                .map_err(engine)
+        }
         Cli::Serve {
             files,
             port,
@@ -782,13 +934,14 @@ async fn get_cmd(
     no_cache: bool,
     dry_run: bool,
     agent: bool,
+    fields: Option<&[String]>,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     if dry_run {
         let policy = barca_core::commands::CachePolicy::CacheAware;
         return explain_cmd(
-            &cfg, target, &file_args, python, policy, no_cache, "get", mode,
+            &cfg, target, &file_args, python, policy, no_cache, "get", mode, fields,
         )
         .await;
     }
@@ -807,18 +960,17 @@ async fn get_cmd(
 
     match mode {
         OutputMode::Json => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "success",
-                    "run_id": result.run_id,
-                    "elapsed_seconds": result.elapsed_seconds,
-                    "steps_executed": result.steps_executed,
-                    "phases": result.phases,
-                    "final_output": final_output,
-                    "steps": &result.steps,
-                })
-            );
+            let mut out = serde_json::json!({
+                "status": "success",
+                "run_id": result.run_id,
+                "elapsed_seconds": result.elapsed_seconds,
+                "steps_executed": result.steps_executed,
+                "phases": result.phases,
+                "final_output": final_output,
+                "steps": &result.steps,
+            });
+            bounded::project_key(&mut out, "steps", fields);
+            println!("{out}");
         }
         OutputMode::Value => {
             if let Some(ref val) = final_output {
@@ -858,6 +1010,7 @@ async fn run_cmd(
     dry_run: bool,
     mode: OutputMode,
     agent: bool,
+    fields: Option<&[String]>,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
@@ -871,6 +1024,7 @@ async fn run_cmd(
             false,
             "run",
             mode,
+            fields,
         )
         .await;
     }
@@ -889,18 +1043,17 @@ async fn run_cmd(
 
     match mode {
         OutputMode::Json => {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "status": "success",
-                    "run_id": result.run_id,
-                    "elapsed_seconds": result.elapsed_seconds,
-                    "steps_executed": result.steps_executed,
-                    "phases": result.phases,
-                    "final_output": final_output,
-                    "steps": &result.steps,
-                })
-            );
+            let mut out = serde_json::json!({
+                "status": "success",
+                "run_id": result.run_id,
+                "elapsed_seconds": result.elapsed_seconds,
+                "steps_executed": result.steps_executed,
+                "phases": result.phases,
+                "final_output": final_output,
+                "steps": &result.steps,
+            });
+            bounded::project_key(&mut out, "steps", fields);
+            println!("{out}");
         }
         OutputMode::Value => {
             if let Some(ref val) = final_output {
@@ -936,6 +1089,7 @@ async fn explain_cmd(
     no_cache: bool,
     label: &str,
     mode: OutputMode,
+    fields: Option<&[String]>,
 ) -> Result<(), barca_core::BarcaError> {
     let result = barca_core::commands::explain(
         cfg,
@@ -948,7 +1102,11 @@ async fn explain_cmd(
     )
     .await?;
     match mode {
-        OutputMode::Json => println!("{}", serde_json::to_string(&result).unwrap()),
+        OutputMode::Json => {
+            let mut out = serde_json::to_value(&result).unwrap();
+            bounded::project_key(&mut out, "steps", fields);
+            println!("{out}");
+        }
         OutputMode::Value => println!("{}", serde_json::to_string_pretty(&result.steps).unwrap()),
         OutputMode::Pretty => {
             println!(
@@ -1022,19 +1180,27 @@ async fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_cor
 async fn list_cmd(
     files: Vec<PathBuf>,
     json: bool,
+    limit: Option<usize>,
+    fields: Option<&[String]>,
     python: &PathBuf,
 ) -> Result<(), barca_core::BarcaError> {
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let assets = barca_core::commands::list_assets(&file_args, python).await?;
-    if json {
-        // Machine-readable: every node, plus `next_fire` (local time) for scheduled ones.
-        let next_fires: std::collections::HashMap<String, String> =
-            barca_server::describe_schedule(&file_args, python)
-                .await
-                .into_iter()
-                .filter_map(|j| j.next_fire_local.map(|t| (j.id, t)))
-                .collect();
-        let nodes: Vec<serde_json::Value> = assets
+    let mut assets = barca_core::commands::list_assets(&file_args, python).await?;
+    // Bounded output: the first `limit` nodes in topological order (`--all` = no limit).
+    let total = assets.len();
+    assets.truncate(limit.unwrap_or(total));
+    let page = bounded::Page::new(assets.len(), total);
+
+    // Next fire times (local time) for scheduled definitions. Empty when nothing is
+    // scheduled, so the table's NEXT FIRE column only appears when it carries information.
+    let next_fires: std::collections::HashMap<String, String> =
+        barca_server::describe_schedule(&file_args, python)
+            .await
+            .into_iter()
+            .filter_map(|j| j.next_fire_local.map(|t| (j.id, t)))
+            .collect();
+    if json || fields.is_some() {
+        let mut nodes: Vec<serde_json::Value> = assets
             .iter()
             .map(|a| {
                 let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
@@ -1044,22 +1210,20 @@ async fn list_cmd(
                 v
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&nodes).unwrap());
+        if let Some(f) = fields {
+            bounded::project(&mut nodes, f);
+        }
+        let out = page.envelope("nodes", nodes, "nodes");
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
     }
     if assets.is_empty() {
-        println!("No definitions found.");
+        match page.note(0, "nodes") {
+            Some(note) => eprintln!("{note}"),
+            None => println!("No definitions found."),
+        }
         return Ok(());
     }
-
-    // Next fire times for scheduled definitions (empty when nothing is scheduled,
-    // so the NEXT FIRE column only appears when it carries information).
-    let next_fires: std::collections::HashMap<String, String> =
-        barca_server::describe_schedule(&file_args, python)
-            .await
-            .into_iter()
-            .filter_map(|j| j.next_fire_local.map(|t| (j.id, t)))
-            .collect();
     let has_schedule = !next_fires.is_empty();
 
     // Render each row's cells up front so column widths fit the actual content.
@@ -1156,22 +1320,38 @@ async fn list_cmd(
             );
         }
     }
+    if let Some(note) = page.note(rows.len(), "nodes") {
+        eprintln!("{note}");
+    }
     Ok(())
 }
 
 async fn history_cmd(
     env: Option<&str>,
-    limit: usize,
+    limit: Option<usize>,
     json: bool,
+    fields: Option<&[String]>,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
-    let runs = barca_core::commands::history(&cfg, limit).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&runs).unwrap());
+    let (runs, total) = barca_core::commands::history(&cfg, limit).await?;
+    let page = bounded::Page::new(runs.len(), total);
+    if json || fields.is_some() {
+        let mut items: Vec<serde_json::Value> = runs
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap_or(serde_json::Value::Null))
+            .collect();
+        if let Some(f) = fields {
+            bounded::project(&mut items, f);
+        }
+        let out = page.envelope("runs", items, "runs");
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
     }
     if runs.is_empty() {
-        println!("No run history found.");
+        match page.note(0, "runs") {
+            Some(note) => eprintln!("{note}"),
+            None => println!("No run history found."),
+        }
         return Ok(());
     }
     // Table header.
@@ -1196,6 +1376,9 @@ async fn history_cmd(
             r.started_at,
         );
     }
+    if let Some(note) = page.note(runs.len(), "runs") {
+        eprintln!("{note}");
+    }
     Ok(())
 }
 
@@ -1204,13 +1387,16 @@ async fn stats_cmd(
     target: String,
     files: Vec<PathBuf>,
     json: bool,
+    fields: Option<&[String]>,
     python: &PathBuf,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let stats = barca_core::commands::stats(&cfg, &target, &file_args, python).await?;
-    if json {
-        println!("{}", serde_json::to_string_pretty(&stats).unwrap());
+    if json || fields.is_some() {
+        let mut out = serde_json::to_value(&stats).unwrap();
+        bounded::project_key(&mut out, "recent_runs", fields);
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());
     }
     let fmt = |v: Option<f64>| v.map(|e| format!("{:.3}s", e)).unwrap_or("-".to_string());
@@ -1541,6 +1727,32 @@ mod tests {
         for text in [cmd.get_about(), cmd.get_long_about()] {
             let text = text.map(|s| s.to_string()).unwrap_or_default();
             assert!(text.contains("barca list"), "{text}");
+        }
+    }
+
+    #[test]
+    fn fields_flag_exists_on_every_command_with_json_output() {
+        let root = Cli::command();
+        for name in ["get", "run", "list", "history", "stats", "docs"] {
+            let sub = root.find_subcommand(name).unwrap();
+            assert!(
+                sub.get_arguments().any(|a| a.get_id() == "fields"),
+                "`barca {name}` emits JSON, so it needs --fields"
+            );
+        }
+    }
+
+    #[test]
+    fn list_shaped_commands_take_limit_and_all() {
+        let root = Cli::command();
+        for name in ["list", "history"] {
+            let sub = root.find_subcommand(name).unwrap();
+            for flag in ["limit", "all"] {
+                assert!(
+                    sub.get_arguments().any(|a| a.get_id() == flag),
+                    "`barca {name}` is list-shaped, so it needs --{flag}"
+                );
+            }
         }
     }
 

@@ -1741,13 +1741,17 @@ pub async fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, 
 
 // ─── history ──────────────────────────────────────────────────────────────────
 
+/// The most recent runs (newest first), at most `limit` of them (`None` = every run), plus the
+/// total number of recorded runs so callers can report truncation.
 pub async fn history(
     cfg: &crate::config::ResolvedConfig,
-    limit: usize,
-) -> Result<Vec<db::RunRecord>, BarcaError> {
+    limit: Option<usize>,
+) -> Result<(Vec<db::RunRecord>, usize), BarcaError> {
     db::ensure_env_dirs(&cfg.env)?;
     db::init_db(&cfg.db_path).await?;
-    db::get_recent_runs(&cfg.db_path, limit).await
+    let total = db::count_runs(&cfg.db_path).await?;
+    let runs = db::get_recent_runs(&cfg.db_path, limit.unwrap_or(total)).await?;
+    Ok((runs, total))
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────

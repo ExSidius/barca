@@ -12,11 +12,11 @@ is on your PATH.
 barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
 barca run <task> <file.py> [--refresh a,b | --refresh-all]  Run a task (always re-runs)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
-barca history [-l N] [--json|--pretty]        Show recent run history
+barca history [-l N | --all] [--json|--pretty]  Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
                                                Run the HTTP API server
-barca list <file.py> [file.py ...]            List discovered definitions and their deps
+barca list <file.py> ... [-l N | --all] [--json]  List discovered definitions and their deps
 barca docs [topic] [--all] [--json]           Built-in manual
 barca version                                 Print version
 barca --help                                  Show help
@@ -84,6 +84,7 @@ barca get pipeline.py --agent         # plain progress lines instead of a progre
 barca get pipeline.py --json          # JSON even in a terminal (the default when piped)
 barca get pipeline.py --pretty        # summary and value (the default in a terminal)
 barca get pipeline.py -o value        # print just the final value (also: json | pretty)
+barca get pipeline.py --fields id,status   # trim each entry of `steps` in the JSON
 ```
 
 ## run
@@ -120,11 +121,16 @@ barca plan pipeline.py
 Show recent runs from `.barca/metadata.db` — run id, command, status, step counts, and timing.
 
 ```bash
-barca history            # last 10 runs: a table in a terminal, JSON when piped
-barca history -l 25      # last 25
-barca history --json     # machine-readable array of runs, even in a terminal
-barca history --pretty   # the table, even when piped
+barca history                     # last 10 runs: a table in a terminal, JSON when piped
+barca history -l 25               # last 25
+barca history --all               # every recorded run
+barca history --json              # {"runs": [...], "total": N, "truncated": bool, "hint"?: "..."}
+barca history --pretty            # the table, even when piped
+barca history --fields run_id,status   # JSON with only these keys per run
 ```
+
+When more runs exist than are shown, the JSON has `"truncated": true`, the `total`, and a `hint`;
+the table prints the same hint as one line on stderr. See [Bounded output](#bounded-output).
 
 ## stats
 
@@ -135,6 +141,7 @@ percentiles (avg / median / p95 / max), cache hit rate, and recent runs.
 barca stats summary pipeline.py
 barca stats summary pipeline.py --json     # the same as one JSON object
 barca stats summary pipeline.py --pretty   # the text report, even when piped
+barca stats summary pipeline.py --fields status,error_message   # JSON; trims recent_runs entries
 ```
 
 ## serve
@@ -167,9 +174,38 @@ second, so sub-minute schedules are legible).
 
 ```bash
 barca list pipeline.py
-barca list pipeline.py --json     # array of {id, kind, freshness, inputs, next_fire?}
+barca list pipeline.py --json     # {"nodes": [{id, kind, freshness, inputs, next_fire?}], "total", "truncated"}
 barca list pipeline.py --pretty   # the table, even when piped
+barca list pipeline.py --limit 20   # first 20 nodes in topological order
+barca list pipeline.py --all        # every node (default: at most 100)
+barca list pipeline.py --fields id,inputs   # JSON with only these keys per node
 ```
+
+`list` prints at most 100 nodes by default, which covers typical pipelines; larger DAGs are cut
+off in topological order and say so (`"truncated": true` in JSON, a note on stderr for the table).
+
+## Bounded output
+
+List-shaped commands (`list`, `history`) are bounded by default so a large project cannot flood
+a terminal or an agent's context. Their JSON is an envelope:
+
+```json
+{"nodes": [...], "total": 312, "truncated": true,
+ "hint": "pass --limit N for more, or --all for all 312 nodes"}
+```
+
+`truncated` and `total` are always present, `hint` only when truncated. `--limit N` and `--all`
+choose how many items to print.
+
+`--fields a,b` keeps only those keys on each item of any JSON output: `nodes` (`list`), `runs`
+(`history`), `recent_runs` (`stats`), `steps` (`get`/`run`, including `--dry-run`) and `topics`
+(`docs`). It implies JSON everywhere; combining it with `--pretty`, `-o pretty` or `-o value` is
+a usage error (exit 2). An unknown key is a usage error (exit 2) that lists the valid ones. Limits bound
+how many items are printed, never their content: error messages and tracebacks are always
+complete. `plan` has no per-item objects (its steps are id strings), so it takes no `--fields`.
+
+> **Behavior change (after 0.9.0):** `list --json` and `history --json` used to print a bare
+> array. They now print the envelope above; read `.nodes` / `.runs` (e.g. `jq '.nodes[].id'`).
 
 ## docs
 
