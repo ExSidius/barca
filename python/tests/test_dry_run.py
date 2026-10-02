@@ -156,7 +156,7 @@ def test_dry_run_with_refresh_all_and_no_cache(project):
 
 def test_dry_run_rejects_an_unknown_refresh_name_like_a_real_run(project):
     proc = barca(project, "run", "report", "pipeline.py", "--dry-run", "--refresh", "nope")
-    assert proc.returncode == 1 and "no upstream asset named 'nope'" in proc.stderr
+    assert proc.returncode == 2 and "no upstream asset named 'nope'" in proc.stderr
 
 
 SCENARIOS = {

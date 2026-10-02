@@ -68,12 +68,12 @@ fn resolve_target(
             if let Some(node) = dag.get_node(&id) {
                 let kind = node.kind();
                 if command_label == "get" && kind == crate::NodeKind::Task {
-                    return Err(BarcaError::Other(format!(
+                    return Err(BarcaError::Usage(format!(
                         "'{name}' is a task — use `barca run` instead"
                     )));
                 }
                 if command_label == "run" && kind == crate::NodeKind::Asset {
-                    return Err(BarcaError::Other(format!(
+                    return Err(BarcaError::Usage(format!(
                         "'{name}' is an asset — use `barca get` instead"
                     )));
                 }
@@ -470,7 +470,7 @@ fn validate_refresh_names(
     for name in names {
         if !assets.iter().any(|id| refresh_name_matches(id, name)) {
             let valid: Vec<&str> = assets.iter().map(|id| short_name(id)).collect();
-            return Err(BarcaError::Other(format!(
+            return Err(BarcaError::Usage(format!(
                 "--refresh: no upstream asset named '{name}'{}.\n\
                  Upstream assets you can refresh: {}\n\
                  Pass several as a comma-separated list: --refresh {}",
