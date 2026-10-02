@@ -127,6 +127,106 @@ mod tests {
         );
     }
 
+    /// Run hashes of whole pipelines, pinned from barca 0.10.0 (before #178 taught the cone
+    /// analysis about bare filenames and `import module` + `module.attr`). Pipelines that use no
+    /// project helpers, or that import them with `from ... import` and were run as `./p.py` or by
+    /// absolute path, must keep exactly these hashes, or every existing cache is invalidated.
+    #[test]
+    fn run_hash_unchanged_for_pipelines_without_module_attribute_helpers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("p.py"),
+            r#"import json
+from barca import asset
+from helpers import compute
+from utils.maths import double
+
+RATE = 2
+
+
+def local_helper(x):
+    return x * RATE
+
+
+@asset()
+def plain() -> dict:
+    return {"v": 1}
+
+
+@asset()
+def uses_local() -> int:
+    return local_helper(3)
+
+
+@asset()
+def uses_from() -> int:
+    return compute()
+
+
+@asset()
+def uses_subdir() -> int:
+    return double(2)
+
+
+@asset()
+def uses_stdlib_module() -> str:
+    return json.dumps({"a": 1})
+
+
+@asset(inputs={"x": uses_from})
+def downstream(x: int) -> int:
+    return x + 1
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("helpers.py"),
+            "def compute():\n    return 1\n\n\ndef unrelated():\n    return 0\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("utils")).unwrap();
+        std::fs::write(
+            root.join("utils/maths.py"),
+            "def double(x):\n    return x * 2\n",
+        )
+        .unwrap();
+
+        let file = root.join("p.py").to_string_lossy().to_string();
+        let dag = crate::commands::build_dag_blocking(
+            std::slice::from_ref(&file),
+            &std::path::PathBuf::from("python3"),
+        )
+        .unwrap();
+        let mut hashes: HashMap<String, String> = HashMap::new();
+        let mut by_name: Vec<(String, String)> = Vec::new();
+        for id in dag.topo_order() {
+            let node = dag.get_node(id).unwrap();
+            let h = compute_run_hash(
+                &node.definition_hash,
+                None,
+                dag.upstream(id).into_iter(),
+                &hashes,
+                None,
+            );
+            hashes.insert(id.to_string(), h.clone());
+            by_name.push((node.extracted.function_name.clone(), h));
+        }
+        by_name.sort();
+        let got: Vec<String> = by_name.iter().map(|(n, h)| format!("{n} {h}")).collect();
+        assert_eq!(
+            got,
+            [
+                "downstream 1c56f2327b95052d761eb9f938de94d7bf6ceb4963f94c5ae7269d8bb70c56e0",
+                "plain 951e243083668324e552a72ac14fdaa7a44643e4e3ef612bae42ca99a012f4cd",
+                "uses_from 3cfd70e1f1c429d785cbca598dd6c658c516419b1db74fedd6da1f98f5f91b3c",
+                "uses_local 20c98bdcb5158223e28ad33f1eb2374383b20e07b6241c31bb6c0d93d90191d9",
+                "uses_stdlib_module 38349c33e82697699115193940df0487e7ee4a242b747e20f7b2ddbc153052f4",
+                "uses_subdir 6ef456461f6549fe2b0b99a8cacd7ac5eb069530470b5574aac096cfb6b013de",
+            ]
+        );
+    }
+
     #[test]
     fn declared_env_changes_the_run_hash() {
         use crate::envdeps::{hash_input, resolve_with};
