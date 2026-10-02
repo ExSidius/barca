@@ -8,6 +8,12 @@ with `env=[...]`. If the hash matches a previous successful materialization, the
 reused and the function does not run. Change the function's code, any upstream, or a declared
 environment variable and the hash changes, so only the affected subgraph re-runs.
 
+Barca runs exactly the source it hashed. It never runs stale bytecode for your pipeline files or
+the modules they import from the same directory tree: their `__pycache__` .pyc files are checked against a
+hash of the source, not its mtime and size, so an edit that keeps both (a same-size edit within
+one second, or a tool that pins mtimes such as Nix, Bazel, `touch -t` or `rsync -t`) still runs
+the new code. Installed packages import as usual.
+
 Environment variables a function reads **without** declaring them are not part of the hash:
 changing one does not invalidate anything. Declare them with `@asset(env=["NAME"])`
 (`barca docs assets`). Nodes that declare no env hash exactly as they did before `env=` existed,

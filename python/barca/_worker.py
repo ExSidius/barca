@@ -10,7 +10,6 @@ Protocol:
   - No DB access — Rust owns all persistence
 """
 
-import importlib.util
 import json
 import os
 import sys
@@ -20,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from barca import _duckdb, _storage
+from barca._source_import import load_source_module
 from barca._artifacts import (
     artifact_path,
     clean_staging,
@@ -191,22 +191,10 @@ def _emit_error(node_id, exc, elapsed=0.0):
 
 
 def load_module(source_file):
+    # Compiled from the source on disk, never a cached .pyc (#176); the file's directory
+    # goes on sys.path so cross-file imports work, and those compile from source too.
     path = Path(source_file).resolve()
-    # Add the file's directory to sys.path so cross-file imports work.
-    module_dir = str(path.parent)
-    if module_dir not in sys.path:
-        sys.path.insert(0, module_dir)
-    mod_name = f"_barca_{path.stem}"
-    spec = importlib.util.spec_from_file_location(mod_name, str(path))
-    if spec is None:
-        raise RuntimeError(f"Could not load module spec for {path}")
-    mod = importlib.util.module_from_spec(spec)
-    # Register in sys.modules so pickle can find classes defined in user code.
-    sys.modules[mod_name] = mod
-    if spec.loader is None:
-        raise RuntimeError(f"No loader for {path}")
-    spec.loader.exec_module(mod)
-    return mod
+    return load_source_module(str(path), f"_barca_{path.stem}")
 
 
 def _run_with_timeout(fn, kwargs, timeout_seconds):
