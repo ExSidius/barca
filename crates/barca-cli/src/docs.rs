@@ -179,7 +179,7 @@ pub fn all_json() -> Value {
 }
 
 /// Produce the text for `barca docs [topic] [--all] [--json]`.
-/// `Ok` goes to stdout; `Err` is the stderr message (exit code 1).
+/// `Ok` goes to stdout; `Err` is the stderr message (a usage error: exit code 2).
 pub fn run(topic: Option<&str>, all: bool, json: bool) -> Result<String, String> {
     let pretty = |v: Value| serde_json::to_string_pretty(&v).unwrap_or_default() + "\n";
     match (topic, all) {

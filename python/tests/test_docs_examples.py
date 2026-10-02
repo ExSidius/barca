@@ -94,7 +94,7 @@ def test_docs_command_surface(binary, tmp_path):
     one = result(barca(binary, tmp_path, "docs", "types", "--json"))
     assert one["name"] == "types" and one["content"].startswith("# ")
     bad = barca(binary, tmp_path, "docs", "typs")
-    assert bad.returncode == 1 and "Did you mean: types" in bad.stderr
+    assert bad.returncode == 2 and "Did you mean: types" in bad.stderr
     assert bad.stdout == ""
 
 

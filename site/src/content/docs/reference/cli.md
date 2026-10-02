@@ -153,8 +153,38 @@ barca docs --json             # topic index as JSON; add a topic for its full te
 
 Topics: `overview`, `assets`, `types`, `tasks`, `cache`, `partitions`, `sinks`, `scheduling`,
 `agents`, and `examples/*`. `barca docs agents` describes the output contract for scripts and AI
-agents: JSON on stdout, progress and errors on stderr, exit code `0` success / `1` runtime
-failure / `2` usage error (including the `get`/`run` usage errors above).
+agents: JSON on stdout, progress and errors on stderr, and the exit codes and error envelope below.
+
+## Errors and exit codes
+
+| Code | `kind`        | Meaning                                                                    |
+|------|---------------|----------------------------------------------------------------------------|
+| 0    |               | success                                                                    |
+| 1    | `step_failed` | a step of yours raised; the traceback is included and the run is recorded as failed |
+| 2    | `usage`       | bad flags or arguments, unknown target, `get` on a task or `run` on an asset, unreadable or invalid `.py` file, invalid `--env` or barca.toml |
+| 3    | `infra`       | barca or its environment failed: metadata DB, worker pool, remote state, I/O |
+| 130  | `cancelled`   | interrupted (Ctrl-C)                                                       |
+
+In JSON output mode (`get`/`run` with the default `-o json`, `plan`, and `list`/`history`/`stats`/
+`docs` with `--json`), an error is a single JSON line, the last line on stderr:
+
+```
+{"code":2,"error":"Asset 'nope' not found. Available: pipeline.py:src, pipeline.py:total, pipeline.py:clean","kind":"usage","remediation":"Run `barca list pipeline.py` to see every node and its kind."}
+```
+
+`error`, `code`, `kind` and `remediation` are always present. When a step fails (`kind:
+"step_failed"`) the envelope also has `node` (the failing step's id), `traceback` (the Python
+traceback of your code, with barca's own frames removed) and `artifact_dir` (where that step's
+artifacts are stored; a local path or remote URI, which may not exist if the step never
+succeeded):
+
+```
+{"artifact_dir":".barca/artifacts/pipeline.py--clean","code":1,"error":"step 'pipeline.py:clean' failed: ZeroDivisionError: division by zero","kind":"step_failed","node":"pipeline.py:clean","remediation":"Fix the error in 'pipeline.py:clean' (see the traceback) and re-run the same command. Steps that succeeded are cached and will not re-run.","traceback":"  File \"/abs/path/pipeline.py\", line 11, in clean\n    return x / 0\n           ~~^~~"}
+```
+
+In human mode (`-o pretty`, `-o value`, or no `--json`) the error is prose, with the remediation
+on the last lines. Errors never go to stdout. The Python API raises `barca.BarcaError` with the
+same fields as attributes (`kind`, `code`, `remediation`, `node`, `traceback`, `artifact_dir`).
 
 ## version
 

@@ -986,6 +986,8 @@ async fn execute(
     // What happened to each planned step, for the result.
     let mut step_reports: Vec<StepReport> = Vec::new();
     let mut phase_error: Option<String> = None;
+    // The step behind `phase_error`, when it was a user step (not the pool or a cancel).
+    let mut failed_node: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     // Sink outcomes (JSON) per node, accumulated across phases for the DB.
     let mut all_sinks: HashMap<String, String> = HashMap::new();
@@ -1352,7 +1354,7 @@ async fn execute(
         // Collect failures — parallel branch failures (group members) are
         // contained within the group and surfaced as ParallelError to the parent,
         // so they should NOT abort the entire phase.
-        let mut first_non_group_failure: Option<String> = None;
+        let mut first_non_group_failure: Option<(String, String)> = None;
         for (item_id, error_msg) in coord.failed_items() {
             let item = coord.item(item_id);
             if item.group.is_some() {
@@ -1361,7 +1363,7 @@ async fn execute(
             }
             let node_id = item.step_id.display();
             if first_non_group_failure.is_none() {
-                first_non_group_failure = Some(error_msg.to_string());
+                first_non_group_failure = Some((node_id.clone(), error_msg.to_string()));
             }
             all_failures.push(dispatch::StepFailure {
                 node_id,
@@ -1375,10 +1377,11 @@ async fn execute(
         }
 
         // Propagate non-group failures into phase_error if not already set
-        if let Some(msg) = first_non_group_failure {
-            if phase_error.is_none() {
-                phase_error = Some(msg);
-            }
+        if let Some((node, msg)) = first_non_group_failure
+            && phase_error.is_none()
+        {
+            phase_error = Some(msg);
+            failed_node = Some(node);
         }
 
         // Run hashes were computed pre-dispatch for every plan step (including
@@ -1492,7 +1495,20 @@ async fn execute(
         return Err(BarcaError::Cancelled);
     }
     if let Some(error) = phase_error {
-        return Err(BarcaError::WorkerFailed(error));
+        return Err(match failed_node {
+            // A user step raised (or crashed its worker): exit 1, with the node and traceback.
+            Some(node) => BarcaError::WorkerFailed(Box::new(crate::FailedStep {
+                artifact_dir: Some(format!(
+                    "{}/{}",
+                    cfg.artifact_root.trim_end_matches('/'),
+                    crate::safe_node_id(&node)
+                )),
+                node,
+                message: error,
+            })),
+            // The pool itself could not make progress (e.g. no worker could be spawned).
+            None => BarcaError::Other(format!("Worker failed: {error}")),
+        });
     }
 
     // Determine final_output: use target if specified, otherwise last planned step.
@@ -1857,7 +1873,7 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
 
     for path in &paths {
         let source = fs::read_to_string(path)
-            .map_err(|e| BarcaError::Other(format!("{}: {e}", path.display())))?;
+            .map_err(|e| BarcaError::Usage(format!("{}: {e}", path.display())))?;
         let file_str = path.to_string_lossy().to_string();
         let nodes =
             extract_nodes(&source, &file_str).map_err(|e| BarcaError::Parse(e.to_string()))?;

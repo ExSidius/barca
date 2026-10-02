@@ -9,16 +9,54 @@ behavior; `barca docs --json` and `--json` on `list`/`history`/`stats` give stru
   JSON for `plan`, or JSON for `list`/`history`/`stats` with `--json`. It is safe to parse.
 - **stderr** carries progress (`[barca] 2/2 steps done in 0.0s`), your own `print` output from
   steps, warnings and errors. Use `--agent` for plain progress lines instead of a progress bar.
-- **Exit codes:** `0` success; `1` runtime failure (a step raised); `2` usage error (bad flags,
-  missing arguments, positionals in the wrong order, unknown target, task/asset misuse, unknown
-  `--refresh` name). On failure stdout is empty and stderr explains, including the Python
-  traceback of a failed step. Every `get`/`run` usage error ends with
-  ``Run `barca list <files>` to see available assets and tasks.``
+- **Exit codes:** one per kind of failure, so you can decide what to do from the code alone.
+  On failure stdout is empty and stderr explains (see Errors below).
+
+| Code | `kind`        | Meaning                                                                         | What to do                    |
+|------|---------------|---------------------------------------------------------------------------------|-------------------------------|
+| 0    |               | success                                                                         |                               |
+| 1    | `step_failed` | a step of yours raised (traceback included); the run is recorded as failed      | fix the code, re-run          |
+| 2    | `usage`       | bad flags or arguments, unknown target, task/asset misuse, unreadable or invalid `.py` file, invalid `--env` or barca.toml | fix the command |
+| 3    | `infra`       | barca or its environment failed: metadata DB, worker pool, remote state, I/O    | not your code; retrying may help |
+| 130  | `cancelled`   | interrupted (Ctrl-C)                                                            | re-run                        |
 
 ```bash
 barca get total pipeline.py --agent > result.json 2> progress.log
 echo $?
 ```
+
+## Errors
+
+In JSON output mode (`get`/`run` with the default `-o json`, `plan`, and `list`/`history`/
+`stats`/`docs` with `--json`) an error is **one JSON line**, the last line on stderr:
+
+```
+{"code":2,"error":"Asset 'nope' not found. Available: pipeline.py:src, pipeline.py:total, pipeline.py:clean","kind":"usage","remediation":"Run `barca list pipeline.py` to see every node and its kind."}
+```
+
+| Field          | Always | Meaning                                                              |
+|----------------|--------|----------------------------------------------------------------------|
+| `error`        | yes    | what went wrong                                                      |
+| `code`         | yes    | the exit code (table above)                                          |
+| `kind`         | yes    | `usage`, `step_failed`, `infra` or `cancelled`                       |
+| `remediation`  | yes    | what to do next, often a command to run                              |
+| `node`         | `step_failed` | the failing step's id, e.g. `pipeline.py:clean`               |
+| `traceback`    | `step_failed` | the Python traceback of your code (barca frames removed), or null |
+| `artifact_dir` | `step_failed` | where that step's artifacts are stored (a path or remote URI); it may not exist if the step never succeeded |
+
+A failed step looks like this (one line; wrapped here):
+
+```
+{"artifact_dir":".barca/artifacts/pipeline.py--clean","code":1,
+ "error":"step 'pipeline.py:clean' failed: ZeroDivisionError: division by zero","kind":"step_failed",
+ "node":"pipeline.py:clean","remediation":"Fix the error in 'pipeline.py:clean' (see the traceback) and re-run the same command. Steps that succeeded are cached and will not re-run.",
+ "traceback":"  File \"/abs/path/pipeline.py\", line 11, in clean\n    return x / 0\n           ~~^~~"}
+```
+
+Parse it from the last stderr line; earlier lines are progress and your steps' own output.
+In human mode (`-o pretty`, `-o value`, or no `--json`) the same error is plain prose with the
+remediation on the last lines. Errors never go to stdout. From Python, `barca.BarcaError` carries
+the envelope as attributes: `kind`, `code`, `remediation`, `node`, `traceback`, `artifact_dir`.
 
 `get`/`run` JSON fields: `run_id`, `elapsed_seconds`, `steps_executed` (0 means everything was
 a cache hit), `phases`, `steps` (what happened to each step: `status` ran/cached/partial and why),
@@ -51,7 +89,7 @@ line has appeared for much longer than your slowest step, the process is genuine
 - `--refresh` re-runs only what you name. Cached assets downstream of a refreshed one are not
   recomputed and barca warns on stderr (`... does not reflect the refresh`). Name the whole chain
   or use `--refresh-all`. Details: `barca docs cache`.
-- An unknown name is an error (exit 2) listing the valid upstream assets.
+- An unknown name is an error (exit 2, `kind: usage`) listing the valid upstream assets.
 
 ## Inspect before you run
 
@@ -84,7 +122,8 @@ barca.run("send_email", "pipeline.py", refresh=["report"])
 ```
 
 `barca.plan`, `barca.history` and `barca.stats` return parsed dicts, and `barca.BarcaError` is
-raised with stderr text on failure. Or read a parquet `path` directly with duckdb/pandas/polars.
+raised on failure; for `get`/`run`/`plan` its `kind`, `code`, `remediation` (and for a failed step
+`node`, `traceback`, `artifact_dir`) come from the error envelope. Or read a parquet `path` directly with duckdb/pandas/polars.
 
 ## Targets and files
 
