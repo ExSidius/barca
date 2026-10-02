@@ -3,7 +3,8 @@
 The envelope is `{"error", "code", "kind", "remediation"}`; `step_failed` adds `node`,
 `traceback` and `artifact_dir`. `code` is the exit code: 1 step_failed, 2 usage, 3 infra,
 130 cancelled. In human mode (`-o pretty`/`-o value`, or no `--json` on inspection commands)
-the prose is printed with the remediation appended. Errors never go to stdout.
+the prose is printed with the remediation appended. Errors never go to stdout; a failed step in
+JSON mode still prints its result line (`"status": "failed"`) there (#149).
 """
 
 import json
@@ -67,9 +68,13 @@ def barca_cli(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 def envelope(proc: subprocess.CompletedProcess) -> dict:
     """The last stderr line, which must be the JSON envelope; checks the shared contract."""
     assert proc.returncode != 0, proc.stderr
-    assert proc.stdout == "", f"errors must not go to stdout: {proc.stdout!r}"
     last = proc.stderr.strip().splitlines()[-1]
     env = json.loads(last)
+    if env["kind"] == "step_failed" and proc.stdout:
+        result = json.loads(proc.stdout)  # one line: the failed run's result, not the error
+        assert result["status"] == "failed" and result["failed_node"] == env["node"], result
+    else:
+        assert proc.stdout == "", f"errors must not go to stdout: {proc.stdout!r}"
     assert env["kind"] in KIND_CODES, env
     assert env["code"] == KIND_CODES[env["kind"]] == proc.returncode, (env, proc.returncode)
     assert isinstance(env["error"], str) and env["error"], env

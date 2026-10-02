@@ -10,7 +10,8 @@ behavior; `barca docs --json` and `--json` on `list`/`history`/`stats` give stru
 - **stderr** carries progress (`[barca] 2/2 steps done in 0.0s`), your own `print` output from
   steps, warnings and errors. Use `--agent` for plain progress lines instead of a progress bar.
 - **Exit codes:** one per kind of failure, so you can decide what to do from the code alone.
-  On failure stdout is empty and stderr explains (see Errors below).
+  On failure stderr explains (see Errors below). stdout is empty, except that a failed step in
+  JSON mode still prints a result line with `"status": "failed"`.
 
 | Code | `kind`        | Meaning                                                                         | What to do                    |
 |------|---------------|---------------------------------------------------------------------------------|-------------------------------|
@@ -58,7 +59,13 @@ In human mode (`-o pretty`, `-o value`, or no `--json`) the same error is plain 
 remediation on the last lines. Errors never go to stdout. From Python, `barca.BarcaError` carries
 the envelope as attributes: `kind`, `code`, `remediation`, `node`, `traceback`, `artifact_dir`.
 
-`get`/`run` JSON fields: `run_id`, `elapsed_seconds`, `steps_executed` (0 means everything was
+When a step fails in JSON mode, `get`/`run` still print one result line on stdout, so you can
+read the outcome without parsing stderr: `{"status": "failed", "failed_node": ..., "error": ...,
+"run_id", "steps", ...}`, where the failed step's `status` is `failed`. A successful result has
+`"status": "success"`. Just before the error, stderr gets one greppable line:
+`[barca] run failed: step 'pipeline.py:clean' failed (exit 1)`.
+
+`get`/`run` JSON fields: `status` (`success`, or `failed` as above), `run_id`, `elapsed_seconds`, `steps_executed` (0 means everything was
 a cache hit), `phases`, `steps` (what happened to each step: `status` ran/cached/partial and why),
 `final_output`. `final_output` is the value for json artifacts and
 `{"_barca_artifact": {"path", "format", "size_bytes"}}` for parquet and pickle

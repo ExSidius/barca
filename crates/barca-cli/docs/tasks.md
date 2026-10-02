@@ -55,4 +55,11 @@ asset is an error.
 parallel worker processes and return results in argument order. A failed branch comes back as
 a `ParallelError` instead of raising. They are recognized inside `@task` bodies only.
 
+## When a task fails
+
+A task (or asset) that raises, or calls `sys.exit()` with any code, fails the run: barca prints
+the traceback on stderr and exits 1, and nothing downstream runs. To fail on purpose, for example
+on a validation error, raise an exception. A failed `parallel()` branch fails the run only if the
+parent task raises. Exit codes: `barca docs agents`.
+
 See also: `barca docs cache`, `barca docs examples/deploy-task`.

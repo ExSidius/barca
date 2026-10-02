@@ -362,6 +362,7 @@ mod tests {
                     node: "p.py:a".into(),
                     message: "ValueError: no\n  File \"p.py\", line 3, in a\n    raise".into(),
                     artifact_dir: Some(".barca/artifacts/p.py--a".into()),
+                    run: None,
                 })),
                 "step_failed",
             ),

@@ -333,6 +333,7 @@ Output is a JSON summary:
 
 ```json
 {
+  "status": "success",
   "run_id": "...",
   "elapsed_seconds": 0.27,
   "steps_executed": 2,
