@@ -227,6 +227,24 @@ def test_tasks_topic_example(binary, topics, tmp_path):
         assert result(barca(binary, tmp_path, "run", target, "pipeline.py"))["run_id"]
 
 
+def test_tasks_topic_several_targets_example(binary, topics, tmp_path):
+    (tmp_path / "pipeline.py").write_text(blocks(topics["tasks"], "python")[1])
+    targets = "validate_registry,validate_names"
+    dry = result(barca(binary, tmp_path, "run", targets, "pipeline.py", "--dry-run"))
+    assert dry["targets"] == ["validate_registry", "validate_names"]
+    assert dry["summary"]["will_run"] == 3
+    first = result(barca(binary, tmp_path, "run", targets, "pipeline.py"))
+    assert first["steps_executed"] == 3  # registry materializes once for both checks
+    assert [s["id"] for s in first["steps"]].count("pipeline.py:registry") == 1
+    assert first["targets"] == {
+        "validate_registry": {"status": "success", "final_output": {"models": 2}},
+        "validate_names": {"status": "success", "final_output": {"lowercase": True}},
+    }
+    assert "final_output" not in first
+    second = result(barca(binary, tmp_path, "run", targets, "pipeline.py"))
+    assert second["steps_executed"] == 2  # registry from cache; the tasks always re-run
+
+
 # ─── Machine-readable inspection commands ─────────────────────────────────────
 
 

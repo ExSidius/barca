@@ -36,7 +36,8 @@ BARCA_OUTPUT=json barca get total pipeline.py
   progress lines (`[barca] 1/2 ...`) on stderr instead of a progress bar.
 - **Exit codes:** one per kind of failure, so you can decide what to do from the code alone.
   On failure stderr explains (see Errors below). stdout is empty, except that a failed step in
-  JSON mode still prints a result line with `"status": "failed"`.
+  JSON mode still prints a result line with `"status": "failed"` (and a run with several targets
+  prints its full result; see below).
 
 | Code | `kind`        | Meaning                                                                         | What to do                    |
 |------|---------------|---------------------------------------------------------------------------------|-------------------------------|
@@ -98,6 +99,37 @@ used, for nodes with `env=[...]`),
 `final_output`. `final_output` is the value for json artifacts and
 `{"_barca_artifact": {"path", "format", "size_bytes"}}` for parquet and pickle
 (`barca docs types`).
+
+### Several targets in one call
+
+`barca run a,b pipeline.py` (or `barca get a,b ...`) runs every named target in one invocation:
+one plan over the union of their cones, so shared upstream steps run once. Use it instead of N
+calls. The output has the same run fields (`status` is `failed` when any target failed), but
+`final_output` is replaced by `targets`, keyed by target name in the order given:
+
+```json
+{"status": "failed", "run_id": "...", "elapsed_seconds": 0.2, "steps_executed": 5, "phases": 2, "steps": [...],
+ "targets": {"check_a": {"status": "success", "final_output": {"a_ok": true}},
+             "boom": {"status": "failed", "failed_step": "pipeline.py:boom",
+                      "error": "ValueError: check failed\n  File ..."}}}
+```
+
+- Every target runs even if another fails; a failure skips only the steps that depend on it
+  (`"status": "skipped"`, reason `upstream_failed`, in `steps`). `failed_step` names the step that
+  raised: the target itself or something upstream of it.
+- Exit code 1 if any target failed. stdout carries the full JSON (so you see which targets
+  passed); stderr has one `error: target '<name>' failed ...` line each, then the error envelope
+  for the first failed target (`kind: "step_failed"`).
+- One target (or a repeated name, `a,a`) gives exactly the single-target output.
+- `--dry-run` with several targets reports the union once, with `"targets": [names]` in place of
+  `"target"`. `-o value` prints `{target: value}` (null for a failed target).
+- Every name is checked before anything runs: an unknown name, a task passed to `get`, or an
+  empty name (`a,,b`) is a usage error, exit 2, and nothing runs.
+
+```bash
+barca run check_a,check_b pipeline.py --agent > result.json
+barca run check_a,check_b pipeline.py --dry-run
+```
 
 ## Parallel runs
 
@@ -219,6 +251,7 @@ raised on failure; for `get`/`run`/`plan` its `kind`, `code`, `remediation` (and
 - `barca get file.py` gets every asset (final value is the last asset).
 - `barca get name file.py [more.py ...]` gets one target; `name` can be the bare function name
   or the full id `file.py:name`. Cross-file inputs use `asset_ref("path.py:fn")`.
+- `barca get a,b file.py` / `barca run a,b file.py` take several targets in one run (see above).
 - `barca file.py` is shorthand for `barca get file.py`.
 - `get` is for assets and `run` is for tasks; using the wrong one exits 2 and says which to use.
 - The target comes before the files. If the first positional ends in `.py` and a later one does

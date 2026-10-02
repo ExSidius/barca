@@ -183,15 +183,25 @@ impl Dag {
     /// Get the subgraph of all nodes upstream of (and including) target.
     /// Returns node IDs in topological order (dependencies first).
     pub fn subgraph(&self, target_id: &str) -> Vec<&str> {
-        let Some(&target_idx) = self.index.get(target_id) else {
-            return vec![];
-        };
+        self.subgraph_many(&[target_id])
+    }
 
-        // BFS backwards from target to find all ancestors.
+    /// The union of the subgraphs of several targets: every node upstream of (and including)
+    /// any of them, each once, in topological order. Unknown ids are ignored.
+    pub fn subgraph_many(&self, target_ids: &[&str]) -> Vec<&str> {
+        // BFS backwards from the targets to find all ancestors.
         let mut visited = std::collections::HashSet::new();
         let mut queue = std::collections::VecDeque::new();
-        queue.push_back(target_idx);
-        visited.insert(target_idx);
+        for id in target_ids {
+            if let Some(&idx) = self.index.get(*id)
+                && visited.insert(idx)
+            {
+                queue.push_back(idx);
+            }
+        }
+        if queue.is_empty() {
+            return vec![];
+        }
 
         while let Some(idx) = queue.pop_front() {
             for pred in self.graph.neighbors_directed(idx, Direction::Incoming) {
@@ -330,6 +340,24 @@ mod tests {
             parallel_calls: Vec::new(),
             env: Vec::new(),
         }
+    }
+
+    #[test]
+    fn subgraph_many_is_the_union_of_cones_with_shared_upstream_once() {
+        let src = "from barca import asset\n\n\
+@asset()\ndef src() -> int:\n    return 1\n\n\
+@asset(inputs={\"s\": src})\ndef a(s: int) -> int:\n    return s\n\n\
+@asset(inputs={\"s\": src})\ndef b(s: int) -> int:\n    return s\n\n\
+@asset()\ndef other() -> int:\n    return 2\n";
+        let nodes = crate::parse::extract_nodes(src, "t.py").unwrap();
+        let dag = Dag::build(&nodes).unwrap();
+        let union = dag.subgraph_many(&["t.py:a", "t.py:b"]);
+        assert_eq!(union.len(), 3);
+        assert_eq!(union[0], "t.py:src", "dependencies come first");
+        assert!(union.contains(&"t.py:a") && union.contains(&"t.py:b"));
+        assert!(!union.contains(&"t.py:other"));
+        assert_eq!(dag.subgraph("t.py:a"), dag.subgraph_many(&["t.py:a"]));
+        assert!(dag.subgraph_many(&["t.py:nope"]).is_empty());
     }
 
     #[test]

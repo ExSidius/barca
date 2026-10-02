@@ -218,8 +218,8 @@ def prices(ticker: str) -> dict:
 ## CLI
 
 ```
-barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
-barca run <task> <file.py> ...             Run a task (always re-runs) and its cone
+barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware; `a,b` gets several
+barca run <task> <file.py> ...             Run a task (always re-runs) and its cone; `a,b` runs several
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
 barca list <file.py> [--json|--pretty] [--limit N]  List all definitions with deps and declared env
 barca history [--limit N] [--json|--pretty] Show recent run history

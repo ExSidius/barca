@@ -58,6 +58,7 @@ const GET_HELP: &str = "\
 Examples:
   barca get pipeline.py                    # every asset in the file; prints the last one's value
   barca get total pipeline.py              # one target and only its upstream cone
+  barca get total,orders pipeline.py       # several targets in one run; shared upstream runs once
   barca get total pipeline.py other.py     # target defined across several files
   barca get total pipeline.py --no-cache   # recompute everything in that cone
   barca get total pipeline.py --dry-run    # what would run vs come from cache; changes nothing
@@ -77,6 +78,9 @@ steps_executed (0 = all cached), phases, final_output, and `steps`: what happene
 secrets redacted). For parquet/pickle assets final_output is a pointer,
 {\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
 loads the value for you.
+Several targets (`a,b`, comma-separated, no spaces): final_output is replaced by `targets`, keyed by
+target, each {status: success, final_output} or {status: failed, failed_step, error}. Every target
+runs even if another fails; exit 1 if any failed.
 Targets must be assets; use `barca run` for tasks. The target comes before the files:
 `barca get pipeline.py total` exits 2 and prints `barca get total pipeline.py`.
 Errors: in JSON mode the last stderr line is one JSON object {error, code, kind, remediation},
@@ -95,7 +99,13 @@ Examples:
   barca run deploy pipeline.py --json                  # JSON even in a terminal (the default when piped)
   barca run deploy pipeline.py --pretty                # summary for humans (the default in a terminal)
   barca run deploy pipeline.py --fields id,status,reason   # JSON with each entry of `steps` trimmed
+  barca run check_a,check_b pipeline.py                # several tasks in one run; shared upstream runs once
+  barca run check_a,check_b pipeline.py --dry-run      # preview the union of both cones
   barca list pipeline.py                               # not sure of the name? list assets and tasks first
+
+Several targets: comma-separated, no spaces. Every target runs even if another fails (a failure
+skips only what depends on it); exit 1 if any failed. JSON output then carries `targets`, keyed by
+target, instead of `final_output` (see barca get --help, barca docs agents).
 
 --refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs only
 the assets you name: assets downstream of them stay cached unless you list them too (barca prints
@@ -201,14 +211,14 @@ enum Cli {
     ///
     /// If the first positional arg ends in .py, all args are treated as files
     /// (no target — gets all assets). Otherwise, the first arg is the target
-    /// asset name and the rest are files.
+    /// asset name (or several, comma-separated: `a,b`) and the rest are files.
     ///
     /// Each completed step writes a fully materialized artifact (never a lazy in-memory
     /// handle). If one computation should produce several cacheable outputs, define
     /// multiple assets or split the work inside a single step before returning.
     #[command(after_help = GET_HELP)]
     Get {
-        /// [TARGET] file.py [file.py ...] — target is optional
+        /// [TARGET[,TARGET...]] file.py [file.py ...] — target is optional
         #[arg(required = true)]
         args: Vec<String>,
         /// Output format (kept for compatibility; --json / --pretty are the canonical spelling)
@@ -242,7 +252,7 @@ enum Cli {
     /// upstream cone.
     #[command(after_help = RUN_HELP)]
     Run {
-        /// TARGET file.py [file.py ...] — target task is required
+        /// TARGET[,TARGET...] file.py [file.py ...] — one or more target tasks, comma-separated
         #[arg(required = true)]
         args: Vec<String>,
         /// Upstream assets to force re-materialize, as ONE comma-separated list
@@ -651,6 +661,35 @@ fn split_target_files(args: Vec<String>) -> (Option<String>, Vec<PathBuf>) {
     }
 }
 
+/// Split a target argument into its comma-separated names (`a,b` -> `[a, b]`), dropping
+/// repeats. An empty name (`a,,b`, `a,`) is a usage error.
+fn parse_targets(raw: &str) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in raw.split(',') {
+        if name.is_empty() {
+            return Err(format!(
+                "error: empty target name in '{raw}'\n\n\
+                 Separate several targets with single commas, no spaces: barca run a,b pipeline.py"
+            ));
+        }
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    }
+    Ok(out)
+}
+
+/// The target list of `get`/`run` (empty when no target was given); a malformed list is a
+/// usage error (exit 2).
+#[allow(clippy::result_large_err)] // cold path: built once, right before exiting
+fn targets_arg(target: Option<&str>, files: &[PathBuf]) -> Result<Vec<String>, CliError> {
+    match target.map(parse_targets) {
+        None => Ok(Vec::new()),
+        Some(Ok(names)) => Ok(names),
+        Some(Err(msg)) => Err(usage_error(&msg, files)),
+    }
+}
+
 fn main() {
     // Support `barca file.py [--flags]` as shorthand for `barca get file.py [--flags]`.
     let args: Vec<String> = std::env::args().collect();
@@ -792,9 +831,10 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 ));
             }
             let hint_files = files.clone();
+            let targets = targets_arg(target.as_deref(), &files)?;
             get_cmd(
                 env.as_deref(),
-                target,
+                targets,
                 files,
                 &python,
                 output,
@@ -839,9 +879,10 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective(names),
                 (false, None) => barca_core::commands::CachePolicy::CacheAware,
             };
+            let targets = targets_arg(Some(&target), &files)?;
             run_cmd(
                 env.as_deref(),
-                target,
+                targets,
                 files,
                 &python,
                 policy,
@@ -931,7 +972,7 @@ fn is_json(flags: FormatFlags) -> bool {
 #[allow(clippy::too_many_arguments)]
 async fn get_cmd(
     env: Option<&str>,
-    target: Option<String>,
+    targets: Vec<String>,
     files: Vec<PathBuf>,
     python: &PathBuf,
     mode: OutputMode,
@@ -945,10 +986,24 @@ async fn get_cmd(
     if dry_run {
         let policy = barca_core::commands::CachePolicy::CacheAware;
         return explain_cmd(
-            &cfg, target, &file_args, python, policy, no_cache, "get", mode, fields,
+            &cfg, &targets, &file_args, python, policy, no_cache, "get", mode, fields,
         )
         .await;
     }
+    if targets.len() > 1 {
+        let result = barca_core::commands::get_many(
+            &cfg,
+            &targets,
+            &file_args,
+            python,
+            no_cache,
+            agent,
+            cancel_on_ctrl_c(),
+        )
+        .await?;
+        return print_multi(&result, mode, "got", fields);
+    }
+    let target = targets.into_iter().next();
     let result = barca_core::commands::get(
         &cfg,
         target.as_deref(),
@@ -1007,7 +1062,7 @@ async fn get_cmd(
 #[allow(clippy::too_many_arguments)]
 async fn run_cmd(
     env: Option<&str>,
-    target: String,
+    targets: Vec<String>,
     files: Vec<PathBuf>,
     python: &PathBuf,
     policy: barca_core::commands::CachePolicy,
@@ -1020,18 +1075,24 @@ async fn run_cmd(
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     if dry_run {
         return explain_cmd(
-            &cfg,
-            Some(target),
-            &file_args,
-            python,
-            policy,
-            false,
-            "run",
-            mode,
-            fields,
+            &cfg, &targets, &file_args, python, policy, false, "run", mode, fields,
         )
         .await;
     }
+    if targets.len() > 1 {
+        let result = barca_core::commands::run_many(
+            &cfg,
+            &targets,
+            &file_args,
+            python,
+            policy,
+            agent,
+            cancel_on_ctrl_c(),
+        )
+        .await?;
+        return print_multi(&result, mode, "ran", fields);
+    }
+    let target = targets.into_iter().next().unwrap_or_default();
     let result = barca_core::commands::run(
         &cfg,
         &target,
@@ -1086,7 +1147,7 @@ async fn run_cmd(
 #[allow(clippy::too_many_arguments)]
 async fn explain_cmd(
     cfg: &barca_core::config::ResolvedConfig,
-    target: Option<String>,
+    targets: &[String],
     file_args: &[String],
     python: &PathBuf,
     policy: barca_core::commands::CachePolicy,
@@ -1095,16 +1156,9 @@ async fn explain_cmd(
     mode: OutputMode,
     fields: Option<&[String]>,
 ) -> Result<(), barca_core::BarcaError> {
-    let result = barca_core::commands::explain(
-        cfg,
-        target.as_deref(),
-        file_args,
-        python,
-        policy,
-        no_cache,
-        label,
-    )
-    .await?;
+    let result =
+        barca_core::commands::explain(cfg, targets, file_args, python, policy, no_cache, label)
+            .await?;
     match mode {
         OutputMode::Json => {
             let mut out = serde_json::to_value(&result).unwrap();
@@ -1115,17 +1169,161 @@ async fn explain_cmd(
         OutputMode::Pretty => {
             println!(
                 "Dry run: barca {label}{} (nothing executed, nothing written)\n",
-                result
-                    .target
-                    .as_deref()
-                    .map(|t| format!(" {t}"))
-                    .unwrap_or_default()
+                if result.targets.len() > 1 {
+                    format!(" {}", result.targets.join(","))
+                } else {
+                    result
+                        .target
+                        .as_deref()
+                        .map(|t| format!(" {t}"))
+                        .unwrap_or_default()
+                }
             );
             print_step_table(&result.steps, true);
             println!(
                 "\n{} will run, {} cached, {} unknown",
                 result.summary.will_run, result.summary.cached, result.summary.unknown
             );
+        }
+    }
+    Ok(())
+}
+
+/// A JSON object of `pairs` with keys in the given order (serde_json maps sort their keys).
+fn ordered_object(pairs: &[(String, serde_json::Value)]) -> String {
+    let body: Vec<String> = pairs
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "{}:{}",
+                serde_json::Value::from(k.as_str()),
+                serde_json::to_string(v).unwrap()
+            )
+        })
+        .collect();
+    format!("{{{}}}", body.join(","))
+}
+
+/// Print a multi-target run (`barca get|run a,b`) and exit 1 if any target failed.
+///
+/// JSON: the run fields of a single-target run without `final_output`, plus `targets`, keyed by
+/// target name in the order given: `{"status": "success", "final_output": ...}` or
+/// `{"status": "failed", "failed_step": ..., "error": ...}`.
+/// Print a multi-target result. When any target failed this returns the first failure as a
+/// step failure (exit 1, and the error envelope on stderr), after the full result was printed.
+fn print_multi(
+    result: &barca_core::commands::MultiResult,
+    mode: OutputMode,
+    verb: &str,
+    fields: Option<&[String]>,
+) -> Result<(), barca_core::BarcaError> {
+    let per_target: Vec<(String, serde_json::Value)> = result
+        .targets
+        .iter()
+        .map(|(name, t)| {
+            let mut obj = serde_json::Map::new();
+            obj.insert("status".into(), t.status.clone().into());
+            if t.status == "success" {
+                let value = t
+                    .final_output
+                    .as_ref()
+                    .map(read_final_output)
+                    .unwrap_or(serde_json::Value::Null);
+                obj.insert("final_output".into(), value);
+            }
+            if let Some(step) = &t.failed_step {
+                obj.insert("failed_step".into(), step.clone().into());
+            }
+            if let Some(err) = &t.error {
+                obj.insert("error".into(), err.clone().into());
+            }
+            (name.clone(), serde_json::Value::Object(obj))
+        })
+        .collect();
+
+    match mode {
+        OutputMode::Json => {
+            // Keys of the run object sort before `targets`, which keeps the given order.
+            let mut run = serde_json::json!({
+                "status": if result.any_failed() { "failed" } else { "success" },
+                "run_id": result.run_id,
+                "elapsed_seconds": result.elapsed_seconds,
+                "steps_executed": result.steps_executed,
+                "phases": result.phases,
+                "steps": &result.steps,
+            });
+            bounded::project_key(&mut run, "steps", fields);
+            let run = run.to_string();
+            println!(
+                "{},\"targets\":{}}}",
+                &run[..run.len() - 1],
+                ordered_object(&per_target)
+            );
+        }
+        OutputMode::Value => {
+            // Each target's value (null when it failed), keyed by target name.
+            let values: serde_json::Map<String, serde_json::Value> = per_target
+                .iter()
+                .map(|(name, t)| {
+                    let v = t.get("final_output").cloned().unwrap_or_default();
+                    (name.clone(), v)
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&values).unwrap());
+        }
+        OutputMode::Pretty => {
+            let failed = result.targets.iter().filter(|(_, t)| t.status != "success");
+            println!(
+                "Run {} | {verb} {} targets in {:.3}s ({} step{}, {} phase{}, {} failed)",
+                result.run_id,
+                result.targets.len(),
+                result.elapsed_seconds,
+                result.steps_executed,
+                if result.steps_executed == 1 { "" } else { "s" },
+                result.phases,
+                if result.phases == 1 { "" } else { "s" },
+                failed.count(),
+            );
+            for (name, t) in &per_target {
+                let status = t["status"].as_str().unwrap_or("?");
+                println!("\n{name}: {status}");
+                match t.get("final_output") {
+                    Some(v) => println!("{}", serde_json::to_string_pretty(v).unwrap()),
+                    None => println!(
+                        "  failed at {}",
+                        t["failed_step"].as_str().unwrap_or("(did not run)")
+                    ),
+                }
+            }
+        }
+    }
+    let _ = std::io::stdout().flush();
+
+    if result.any_failed() {
+        for (name, t) in &result.targets {
+            if t.status == "success" {
+                continue;
+            }
+            let at = t
+                .failed_step
+                .as_deref()
+                .map(|s| format!(" (failed step: {s})"))
+                .unwrap_or_default();
+            eprintln!(
+                "error: target '{name}' failed{at}: {}",
+                t.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        // The first failed target becomes the run's error: exit 1 with the error envelope.
+        if let Some((name, t)) = result.targets.iter().find(|(_, t)| t.status != "success") {
+            return Err(barca_core::BarcaError::WorkerFailed(Box::new(
+                barca_core::FailedStep {
+                    node: t.failed_step.clone().unwrap_or_else(|| name.clone()),
+                    message: t.error.clone().unwrap_or_else(|| "unknown error".into()),
+                    artifact_dir: None,
+                    run: None,
+                },
+            )));
         }
     }
     Ok(())
@@ -1747,6 +1945,28 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_target_argument_is_a_comma_separated_list() {
+        assert_eq!(parse_targets("total").unwrap(), vec!["total"]);
+        assert_eq!(parse_targets("a,b").unwrap(), vec!["a", "b"]);
+        assert_eq!(parse_targets("b,a,b").unwrap(), vec!["b", "a"]);
+        assert_eq!(
+            parse_targets("pipeline.py:a,b").unwrap(),
+            vec!["pipeline.py:a", "b"]
+        );
+        for bad in ["a,,b", "a,", ",a"] {
+            let err = parse_targets(bad).unwrap_err();
+            assert!(err.contains("empty target name"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn several_targets_split_from_the_files() {
+        let (target, files) = split_target_files(vec!["a,b".into(), "pipeline.py".into()]);
+        assert_eq!(target.as_deref(), Some("a,b"));
+        assert_eq!(files, vec![PathBuf::from("pipeline.py")]);
     }
 
     #[test]
