@@ -555,7 +555,7 @@ pub struct StepReport {
     /// Dry run only: `cached`, `run`, `partial` (some partition keys cached) or `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// Real run only: `ran`, `cached` or `partial`.
+    /// Real run only: `ran`, `cached`, `partial`, or `failed` (in a failed run's result).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// Why the step runs: `task`, `sensor`, `no_cache`, `refresh`, `refresh_all`,
@@ -1497,15 +1497,29 @@ async fn execute(
     if let Some(error) = phase_error {
         return Err(match failed_node {
             // A user step raised (or crashed its worker): exit 1, with the node and traceback.
-            Some(node) => BarcaError::WorkerFailed(Box::new(crate::FailedStep {
-                artifact_dir: Some(format!(
-                    "{}/{}",
-                    cfg.artifact_root.trim_end_matches('/'),
-                    crate::safe_node_id(&node)
-                )),
-                node,
-                message: error,
-            })),
+            Some(node) => {
+                let mut steps = merge_partition_reports(step_reports);
+                let base = crate::StepId::parse(&node).base_id().to_string();
+                if let Some(r) = steps.iter_mut().find(|r| r.id == node || r.id == base) {
+                    r.status = Some("failed".to_string());
+                }
+                BarcaError::WorkerFailed(Box::new(crate::FailedStep {
+                    artifact_dir: Some(format!(
+                        "{}/{}",
+                        cfg.artifact_root.trim_end_matches('/'),
+                        crate::safe_node_id(&node)
+                    )),
+                    run: Some(Box::new(crate::PartialRun {
+                        run_id,
+                        elapsed_seconds: elapsed,
+                        steps_executed,
+                        phases: exec_plan.phases.len(),
+                        steps,
+                    })),
+                    node,
+                    message: error,
+                }))
+            }
             // The pool itself could not make progress (e.g. no worker could be spawned).
             None => BarcaError::Other(format!("Worker failed: {error}")),
         });

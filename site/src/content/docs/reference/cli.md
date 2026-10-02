@@ -186,6 +186,12 @@ In human mode (`-o pretty`, `-o value`, or no `--json`) the error is prose, with
 on the last lines. Errors never go to stdout. The Python API raises `barca.BarcaError` with the
 same fields as attributes (`kind`, `code`, `remediation`, `node`, `traceback`, `artifact_dir`).
 
+When a step fails in JSON mode, `get`/`run` still print one result line on stdout, so you can
+read the outcome without parsing stderr: `{"status": "failed", "failed_node": ..., "error": ...,
+"run_id", "steps", ...}`, where the failed step's `status` is `failed`. A successful result has
+`"status": "success"`. Just before the error, stderr gets one greppable line:
+`[barca] run failed: step 'pipeline.py:clean' failed (exit 1)`.
+
 ## version
 
 ```bash

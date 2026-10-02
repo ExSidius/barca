@@ -51,15 +51,16 @@ Examples:
   barca get total pipeline.py --env dev    # separate cache and state per environment
   barca list pipeline.py                   # not sure of the name? list assets and tasks first
 
-Output: one JSON line on stdout with run_id, steps_executed (0 = all cached), phases and
-final_output, and `steps`: what happened to each step (ran or cached, and why). For parquet/pickle assets final_output is a pointer,
+Output: one JSON line on stdout with status (\"success\"), run_id, steps_executed (0 = all
+cached), phases and final_output, and `steps`: what happened to each step (ran or cached, and why). For parquet/pickle assets final_output is a pointer,
 {\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
 loads the value for you.
 Targets must be assets; use `barca run` for tasks. The target comes before the files:
 `barca get pipeline.py total` exits 2 and prints `barca get total pipeline.py`.
 Errors: with -o json the last stderr line is one JSON object {error, code, kind, remediation},
 plus node, traceback and artifact_dir when a step failed. Exit 1 step failed, 2 usage error,
-3 barca/infra failure, 130 cancelled.
+3 barca/infra failure, 130 cancelled. A failed step still prints a stdout result line with
+status \"failed\" and failed_node.
 More: barca docs cache, barca docs types, barca docs agents";
 
 const RUN_HELP: &str = "\
@@ -79,6 +80,8 @@ The target must be a task; use `barca get` for assets. The target comes before t
 error exits 2 and ends by pointing at `barca list <files>`.
 Errors: with -o json the last stderr line is one JSON object {error, code, kind, remediation}
 (see barca docs agents). Exit 1 step failed, 2 usage error, 3 barca/infra failure, 130 cancelled.
+A raising task, or one that calls sys.exit(), fails the run: exit 1, and the stdout JSON line has
+status \"failed\" and failed_node.
 More: barca docs tasks, barca docs cache, barca docs agents";
 
 const PLAN_HELP: &str = "\
@@ -563,8 +566,40 @@ fn main() {
         });
     let ctx = context(&cli);
     if let Err(e) = rt.block_on(run_cli(cli, &ctx)) {
+        // A failed run gets one greppable line naming the step, right before the error.
+        if e.kind == ErrorKind::StepFailed
+            && let Some(node) = &e.node
+        {
+            eprintln!(
+                "[barca] run failed: step '{node}' failed (exit {})",
+                e.code()
+            );
+        }
         e.emit(json);
     }
+}
+
+/// On a failed run in JSON mode, still print the one-line result on stdout so agents need not
+/// parse stderr: `status: "failed"`, the failing step and its error, and what ran before it.
+/// The error itself still goes to stderr as the envelope.
+fn print_failed_run(err: &barca_core::BarcaError, mode: OutputMode) {
+    let (barca_core::BarcaError::WorkerFailed(f), OutputMode::Json) = (err, mode) else {
+        return;
+    };
+    let Some(run) = &f.run else { return };
+    println!(
+        "{}",
+        serde_json::json!({
+            "status": "failed",
+            "run_id": run.run_id,
+            "elapsed_seconds": run.elapsed_seconds,
+            "steps_executed": run.steps_executed,
+            "phases": run.phases,
+            "failed_node": f.node,
+            "error": f.summary(),
+            "steps": &run.steps,
+        })
+    );
 }
 
 /// A token that cancels on Ctrl-C, so an interrupted run terminates its
@@ -730,7 +765,8 @@ async fn get_cmd(
         agent,
         cancel_on_ctrl_c(),
     )
-    .await?;
+    .await
+    .inspect_err(|e| print_failed_run(e, mode))?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -738,6 +774,7 @@ async fn get_cmd(
             println!(
                 "{}",
                 serde_json::json!({
+                    "status": "success",
                     "run_id": result.run_id,
                     "elapsed_seconds": result.elapsed_seconds,
                     "steps_executed": result.steps_executed,
@@ -810,7 +847,8 @@ async fn run_cmd(
         agent,
         cancel_on_ctrl_c(),
     )
-    .await?;
+    .await
+    .inspect_err(|e| print_failed_run(e, mode))?;
     let final_output = result.final_output.as_ref().map(read_final_output);
 
     match mode {
@@ -818,6 +856,7 @@ async fn run_cmd(
             println!(
                 "{}",
                 serde_json::json!({
+                    "status": "success",
                     "run_id": result.run_id,
                     "elapsed_seconds": result.elapsed_seconds,
                     "steps_executed": result.steps_executed,

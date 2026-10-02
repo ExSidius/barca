@@ -259,7 +259,8 @@ def run_failing(binary: str, cwd: Path, target: str) -> subprocess.CompletedProc
         text=True,
     )
     assert proc.returncode == 1, f"expected a failure, got exit {proc.returncode}"
-    assert proc.stdout == ""
+    # stdout carries only the failed run's result line (#149), never the error text.
+    assert json.loads(proc.stdout)["status"] == "failed"
     return proc
 
 

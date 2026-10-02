@@ -68,6 +68,20 @@ pub struct FailedStep {
     /// Where this step's artifacts are stored (`{artifact_root}/{safe node id}`): a local
     /// directory or a remote URI. It may not exist if the step never succeeded.
     pub artifact_dir: Option<String>,
+    /// What the run did before it stopped, so callers can still report it (`None` when the
+    /// failure is not from a full run, e.g. in tests).
+    pub run: Option<Box<PartialRun>>,
+}
+
+/// A run that stopped because a user step failed: what was reached before it stopped.
+#[derive(Debug, Clone)]
+pub struct PartialRun {
+    pub run_id: String,
+    pub elapsed_seconds: f64,
+    pub steps_executed: usize,
+    pub phases: usize,
+    /// What happened to each step that was reached; the failed step has status `failed`.
+    pub steps: Vec<commands::StepReport>,
 }
 
 impl FailedStep {
@@ -126,6 +140,7 @@ mod failed_step_tests {
             node: "p.py:oops".into(),
             message: message.into(),
             artifact_dir: None,
+            run: None,
         }
     }
 
