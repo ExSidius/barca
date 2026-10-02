@@ -91,8 +91,10 @@ read the outcome without parsing stderr: `{"status": "failed", "failed_node": ..
 `"status": "success"`. Just before the error, stderr gets one greppable line:
 `[barca] run failed: step 'pipeline.py:clean' failed (exit 1)`.
 
-`get`/`run` JSON fields: `status` (`success`, or `failed` as above), `run_id`, `elapsed_seconds`, `steps_executed` (0 means everything was
-a cache hit), `phases`, `steps` (what happened to each step: `status` ran/cached/partial and why),
+`get`/`run` JSON fields: `status` (`success`, or `failed` as above), `run_id`, `elapsed_seconds`,
+`steps_executed` (0 means everything was a cache hit), `phases`, `steps` (what happened to each
+step: `status` ran/cached/partial and why, plus `env`, the declared environment variable values
+used, for nodes with `env=[...]`),
 `final_output`. `final_output` is the value for json artifacts and
 `{"_barca_artifact": {"path", "format", "size_bytes"}}` for parquet and pickle
 (`barca docs types`).
@@ -116,6 +118,20 @@ Set `BARCA_PROGRESS_SECS` to change the interval (`0` turns it off). A completed
 `[barca] step:<id> completed ...` in `--agent` mode. If neither a completion nor a "still running"
 line has appeared for much longer than your slowest step, the process is genuinely stuck.
 
+## Environment variables
+
+A node that declares `env=["SOURCE_CSV"]` has those values in its cache key, and each `--agent`
+step line ends with them so a log records which inputs a run used:
+
+```
+[barca] step:pipeline.py:raw completed 0.0s (1/2) env API_TOKEN=<unset> SOURCE_CSV=b.csv
+[barca] step:pipeline.py:raw cached env API_TOKEN=<unset> SOURCE_CSV=b.csv
+```
+
+`<unset>` means the variable was not set; secret-looking names (`*_TOKEN`, `*_SECRET`, `*_KEY`,
+`*_PASSWORD`) show `<redacted>`. Values with spaces are double-quoted. Undeclared variables are
+invisible to barca (`barca docs assets`).
+
 ## Refreshing: syntax and pitfalls
 
 - Several assets are one comma-separated list: `--refresh a,b`. Never `--refresh a b`.
@@ -134,7 +150,7 @@ barca run report pipeline.py --dry-run --refresh src
 ```
 
 ```bash
-barca list pipeline.py --json       # {nodes: [{id, kind, freshness, inputs}], total, truncated}
+barca list pipeline.py --json       # {nodes: [{id, kind, freshness, inputs, env}], total, truncated}
 barca plan pipeline.py              # phases and steps that would run, nothing executes
 barca history --json                # {runs: [...], total, truncated}: the last 10 runs
 barca stats total pipeline.py --json  # timings and cache hit rate for one asset

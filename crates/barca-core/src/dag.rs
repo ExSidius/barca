@@ -328,6 +328,7 @@ mod tests {
             param_types: HashMap::new(),
             return_type: None,
             parallel_calls: Vec::new(),
+            env: Vec::new(),
         }
     }
 

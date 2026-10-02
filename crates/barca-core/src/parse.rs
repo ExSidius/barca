@@ -27,6 +27,16 @@ pub enum ParseError {
         cron: String,
         reason: String,
     },
+
+    #[error(
+        "{file}: {function}: invalid env= — {reason}. Declare environment variables as a literal \
+         list of strings, e.g. env=[\"SOURCE_CSV\", \"API_TOKEN\"]"
+    )]
+    InvalidEnv {
+        file: String,
+        function: String,
+        reason: String,
+    },
 }
 
 /// Parse a Python source file and extract all barca-decorated nodes.
@@ -99,6 +109,7 @@ fn try_extract_function(
     let retries = extract_int_kwarg(&keywords, "retries").unwrap_or(1).max(1);
     let retry_backoff_seconds = extract_float_kwarg(&keywords, "retry_backoff").unwrap_or(0.0);
     let tags = extract_tags(&keywords);
+    let env = extract_env(&keywords, file_path, func.name.as_str())?;
     let artifact_serializer = keywords
         .iter()
         .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("serializer"))
@@ -137,6 +148,7 @@ fn try_extract_function(
         param_types,
         return_type,
         parallel_calls,
+        env,
     }))
 }
 
@@ -520,6 +532,45 @@ fn extract_tags(keywords: &[&Keyword]) -> HashMap<String, String> {
     tags
 }
 
+/// `env=["NAME", ...]`: a literal list of string literals, read statically. Anything else (a
+/// variable, a call, a tuple, a non-string element) is a parse error, never silently ignored —
+/// an undeclared variable would silently drop out of the run hash.
+fn extract_env(
+    keywords: &[&Keyword],
+    file_path: &str,
+    function_name: &str,
+) -> Result<Vec<String>, ParseError> {
+    let err = |reason: String| ParseError::InvalidEnv {
+        file: file_path.to_string(),
+        function: function_name.to_string(),
+        reason,
+    };
+    let Some(kw) = keywords
+        .iter()
+        .find(|kw| kw.arg.as_ref().map(|a| a.as_str()) == Some("env"))
+    else {
+        return Ok(Vec::new());
+    };
+    let Expr::List(list) = &kw.value else {
+        return Err(err("expected a list literal".to_string()));
+    };
+    let mut names = Vec::with_capacity(list.elts.len());
+    for elt in &list.elts {
+        let Some(name) = extract_string_literal(elt) else {
+            return Err(err("every element must be a string literal".to_string()));
+        };
+        if name.is_empty() || name.contains('=') || name.contains('\0') {
+            return Err(err(format!(
+                "{name:?} is not a valid environment variable name"
+            )));
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
+}
+
 fn extract_string_kwarg(keywords: &[&Keyword], name: &str) -> Option<String> {
     for kw in keywords {
         let Some(ref ident) = kw.arg else { continue };
@@ -804,6 +855,49 @@ def single_asset() -> dict:
         assert_eq!(nodes[0].kind, NodeKind::Asset);
         assert_eq!(nodes[0].function_name, "single_asset");
         assert_eq!(nodes[0].freshness, Freshness::Always);
+    }
+
+    #[test]
+    fn env_list_is_read_statically() {
+        let src = r#"
+from barca import asset, task
+
+@asset(env=["SOURCE_CSV", "API_TOKEN", "SOURCE_CSV"])
+def raw() -> dict:
+    return {}
+
+@task(env=["DEPLOY_TARGET"])
+def deploy(raw):
+    pass
+
+@asset()
+def plain() -> int:
+    return 1
+"#;
+        let nodes = extract_nodes(src, "test.py").unwrap();
+        assert_eq!(nodes[0].env, vec!["SOURCE_CSV", "API_TOKEN"]);
+        assert_eq!(nodes[1].env, vec!["DEPLOY_TARGET"]);
+        assert!(nodes[2].env.is_empty());
+    }
+
+    #[test]
+    fn env_must_be_a_literal_list_of_strings() {
+        for decl in [
+            "env=NAMES",
+            "env=(\"A\",)",
+            "env=\"A\"",
+            "env=[\"A\", NAME]",
+            "env=[\"A\", 1]",
+            "env=[\"\"]",
+            "env=[\"A=B\"]",
+            "env=[f\"{X}\"]",
+        ] {
+            let src =
+                format!("from barca import asset\n\n@asset({decl})\ndef a():\n    return 1\n");
+            let err = extract_nodes(&src, "test.py").expect_err(decl).to_string();
+            assert!(err.contains("test.py: a: invalid env="), "{decl}: {err}");
+            assert!(err.contains("env=[\"SOURCE_CSV\""), "{decl}: {err}");
+        }
     }
 
     #[test]

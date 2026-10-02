@@ -165,6 +165,20 @@ def publish(report: str) -> None:
 
 ```
 
+### Declared environment variables
+
+Assets that read environment variables declare them, so a changed value invalidates the cache:
+
+```python
+@asset(env=["SOURCE_CSV", "API_TOKEN"])
+def raw() -> dict:
+    return load(os.environ["SOURCE_CSV"])
+```
+
+The values are folded into the run hash at plan time (unset is its own value) and reported per
+step in `--agent` lines and the JSON result. Names ending in `_TOKEN`, `_SECRET`, `_KEY` or
+`_PASSWORD` are hashed but redacted. Undeclared variables are not tracked.
+
 ### `@sink`
 
 Declares a sink output target (stacks on `@asset`; file writing coming soon).
@@ -207,7 +221,7 @@ def prices(ticker: str) -> dict:
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
 barca run <task> <file.py> ...             Run a task (always re-runs) and its cone
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
-barca list <file.py> [--json|--pretty] [--limit N]  List all definitions with deps
+barca list <file.py> [--json|--pretty] [--limit N]  List all definitions with deps and declared env
 barca history [--limit N] [--json|--pretty] Show recent run history
 barca stats <target> <file.py> [--json|--pretty]  Timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler

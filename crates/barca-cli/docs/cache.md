@@ -2,10 +2,16 @@
 
 ## What is cached
 
-Each asset step has a **run hash**: a hash of the function's definition, its inputs' run hashes
-and, for partitioned assets, the partition key. If the hash matches a previous successful
-materialization, the artifact is reused and the function does not run. Change the function's
-code or any upstream and the hash changes, so only the affected subgraph re-runs.
+Each asset step has a **run hash**: a hash of the function's definition, its inputs' run hashes,
+for partitioned assets the partition key, and the values of any environment variables it declares
+with `env=[...]`. If the hash matches a previous successful materialization, the artifact is
+reused and the function does not run. Change the function's code, any upstream, or a declared
+environment variable and the hash changes, so only the affected subgraph re-runs.
+
+Environment variables a function reads **without** declaring them are not part of the hash:
+changing one does not invalidate anything. Declare them with `@asset(env=["NAME"])`
+(`barca docs assets`). Nodes that declare no env hash exactly as they did before `env=` existed,
+so upgrading does not invalidate existing caches.
 
 Tasks and sensors are never served from cache. Partitioned assets are cached per key (see
 `barca docs partitions`).
@@ -93,7 +99,9 @@ checks that `will_run` equals the real run's `steps_executed` across cold, warm,
 A real `barca get` / `barca run` returns the same per-step information in a `steps` array, with a
 `status` of `ran`, `cached` or `partial` (and the same `reason` / `warning`). In `--agent` mode a
 cached step also prints `[barca] step:<id> cached` on stderr, so a log shows what was served from
-cache as well as what ran. `barca history --json` and `barca stats` show the same over time.
+cache as well as what ran. A step whose node declares `env=[...]` also carries `env`, the values
+it was hashed with (`null` when unset, `<redacted>` for secret-looking names), in both the JSON
+`steps` entry and the `--agent` line (`... env SOURCE_CSV=b.csv`). `barca history --json` and `barca stats` show the same over time.
 
 ## Concurrent runs
 

@@ -429,6 +429,7 @@ mod tests {
             kind,
             freshness: Freshness::Schedule(CronExpr(cron.to_string())),
             inputs: vec![],
+            env: vec![],
         }
     }
 
@@ -504,6 +505,7 @@ mod tests {
             kind: NodeKind::Asset,
             freshness: Freshness::Always,
             inputs: vec![],
+            env: vec![],
         }];
         assert!(jobs_from_summaries(summaries).is_empty());
     }
