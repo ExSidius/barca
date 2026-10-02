@@ -54,8 +54,7 @@ barca get total pipeline.py --no-cache            # recompute an asset's whole c
   anyway. `get`/`run` print one line: `status` (`success`/`failed`), `run_id`,
   `steps_executed`, `steps` (each `ran`/`cached` and why), `final_output` (for parquet/pickle a
   pointer, `{"_barca_artifact": {"path", "format", "size_bytes"}}`).
-- Your steps' `print` output also lands on stdout, before the result: the result is the
-  **last line**.
+- Your steps' own `print` output goes to stderr, so stdout is only the result.
 - **stderr** has progress and errors. In JSON mode its **last line** is the error envelope
   `{"error", "code", "kind", "remediation"}`, plus `node`, `traceback`, `artifact_dir` for a
   failed step. `remediation` is usually the command to run next.
@@ -85,7 +84,7 @@ barca list pipeline.py --fields id,kind,inputs          # trim each node
 
 ```bash
 set -o pipefail
-barca run report pipeline.py | tail -n 1 | jq '.status'
+barca run report pipeline.py | jq '.status'
 ```
 
 ## Guardrails
