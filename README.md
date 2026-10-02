@@ -217,7 +217,10 @@ barca --help                               Show help (every command ends with ex
 
 `barca docs` is the manual, compiled into the binary: topics for types and output formats,
 caching, tasks, partitions, scheduling, runnable examples, and conventions for scripts and AI
-agents (`barca docs agents`). Results are JSON on stdout, progress and errors on stderr.
+agents (`barca docs agents`). Results are JSON on stdout, progress and errors on stderr. In JSON
+mode an error is one JSON line on stderr (`{"error", "code", "kind", "remediation"}`, plus `node`,
+`traceback` and `artifact_dir` when a step failed). Exit codes: `0` ok, `1` step failed, `2` usage
+error, `3` barca/infra failure, `130` cancelled.
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 

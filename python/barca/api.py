@@ -15,7 +15,57 @@ from barca._artifacts import deserialize
 
 
 class BarcaError(Exception):
-    """Raised when a barca command fails."""
+    """Raised when a barca command fails.
+
+    When the CLI reported a structured error (the JSON envelope on stderr, see
+    ``barca docs agents``), its fields are attributes: ``kind`` (``usage`` |
+    ``step_failed`` | ``infra`` | ``cancelled``), ``code`` (the exit code),
+    ``remediation``, and for ``step_failed`` also ``node``, ``traceback`` and
+    ``artifact_dir``. They are ``None`` when the CLI printed plain text.
+    """
+
+    def __init__(self, message: str, envelope: dict | None = None, stderr: str | None = None):
+        super().__init__(message)
+        env = envelope or {}
+        self.envelope = envelope
+        self.stderr = stderr
+        self.kind: str | None = env.get("kind")
+        self.code: int | None = env.get("code")
+        self.remediation: str | None = env.get("remediation")
+        self.node: str | None = env.get("node")
+        self.traceback: str | None = env.get("traceback")
+        self.artifact_dir: str | None = env.get("artifact_dir")
+
+
+def _error_envelope(stderr: str) -> dict | None:
+    """The CLI's JSON error envelope: the last stderr line that is a JSON object with a kind."""
+    for line in reversed(stderr.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict) and "kind" in obj and "error" in obj:
+            return obj
+    return None
+
+
+def _failure(result: "subprocess.CompletedProcess[str]") -> BarcaError:
+    """Build the BarcaError for a failed barca invocation."""
+    stderr = result.stderr.strip()
+    envelope = _error_envelope(stderr)
+    if envelope is None:
+        # Plain-text error (human output mode): stderr is the message.
+        message = stderr[len("Error: ") :] if stderr.startswith("Error: ") else stderr
+        return BarcaError(message, stderr=stderr)
+    parts = [envelope["error"]]
+    if envelope.get("traceback"):
+        parts.append(envelope["traceback"])
+    if envelope.get("remediation"):
+        parts.append(envelope["remediation"])
+    return BarcaError("\n".join(parts), envelope=envelope, stderr=stderr)
 
 
 _cached_binary: str | None = None
@@ -74,11 +124,7 @@ def _exec(args: list[str]) -> dict:
         text=True,
     )
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        # Strip any leading "Error: " prefix to avoid doubling.
-        if stderr.startswith("Error: "):
-            stderr = stderr[len("Error: ") :]
-        raise BarcaError(stderr)
+        raise _failure(result)
 
     stdout = result.stdout.strip()
     if not stdout:
@@ -182,10 +228,7 @@ def history(limit: int = 10) -> list[dict]:
         text=True,
     )
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if stderr.startswith("Error: "):
-            stderr = stderr[len("Error: ") :]
-        raise BarcaError(stderr)
+        raise _failure(result)
 
     # Parse the table output into dicts.
     stdout = result.stdout.strip()
@@ -233,10 +276,7 @@ def stats(target: str, file: str, *extra_files: str) -> dict:
         text=True,
     )
     if result.returncode != 0:
-        stderr = result.stderr.strip()
-        if stderr.startswith("Error: "):
-            stderr = stderr[len("Error: ") :]
-        raise BarcaError(stderr)
+        raise _failure(result)
 
     stdout = result.stdout.strip()
     lines = stdout.splitlines()

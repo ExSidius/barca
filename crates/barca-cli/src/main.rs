@@ -1,6 +1,9 @@
 //! Barca CLI — invisible asset orchestrator.
 
 mod docs;
+mod error;
+
+use error::{CliError, Context, ErrorKind};
 
 use clap::{Parser, ValueEnum};
 use std::io::Write;
@@ -31,8 +34,10 @@ Quick start:
   barca run deploy pipeline.py      # run a task and its dependency cone
   barca docs                        # built-in manual: concepts, formats, examples
 
-Output: results are JSON on stdout; progress and errors go to stderr. Exit codes: 0 ok,
-1 runtime failure, 2 usage error. Scripts and AI agents: barca docs agents";
+Output: results are JSON on stdout; progress and errors go to stderr. In JSON mode (get/run
+default, plan, --json) an error is one JSON line on stderr: {error, code, kind, remediation}.
+Exit codes: 0 ok, 1 step failed, 2 usage error, 3 barca/infra failure, 130 cancelled.
+Scripts and AI agents: barca docs agents";
 
 const GET_HELP: &str = "\
 Examples:
@@ -52,6 +57,9 @@ final_output, and `steps`: what happened to each step (ran or cached, and why). 
 loads the value for you.
 Targets must be assets; use `barca run` for tasks. The target comes before the files:
 `barca get pipeline.py total` exits 2 and prints `barca get total pipeline.py`.
+Errors: with -o json the last stderr line is one JSON object {error, code, kind, remediation},
+plus node, traceback and artifact_dir when a step failed. Exit 1 step failed, 2 usage error,
+3 barca/infra failure, 130 cancelled.
 More: barca docs cache, barca docs types, barca docs agents";
 
 const RUN_HELP: &str = "\
@@ -69,7 +77,9 @@ a warning when that happens). A name that is not an upstream asset is an error.
 The target must be a task; use `barca get` for assets. The target comes before the files:
 `barca run pipeline.py deploy` exits 2 and prints `barca run deploy pipeline.py`. Every usage
 error exits 2 and ends by pointing at `barca list <files>`.
-More: barca docs tasks, barca docs cache";
+Errors: with -o json the last stderr line is one JSON object {error, code, kind, remediation}
+(see barca docs agents). Exit 1 step failed, 2 usage error, 3 barca/infra failure, 130 cancelled.
+More: barca docs tasks, barca docs cache, barca docs agents";
 
 const PLAN_HELP: &str = "\
 Examples:
@@ -328,19 +338,14 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-/// Print a `get`/`run` usage error, ending with the `barca list` pointer, and exit 2.
-fn usage_error(msg: &str, files: &[PathBuf]) -> ! {
-    eprintln!("{msg}\n\n{}", list_hint(files));
-    std::process::exit(2);
+/// A `get`/`run` usage error (exit 2), ending with the `barca list` pointer.
+fn usage_error(msg: &str, files: &[PathBuf]) -> CliError {
+    CliError::from_prose(ErrorKind::Usage, format!("{msg}\n\n{}", list_hint(files)))
 }
 
 /// Usage line for `barca get` / `barca run`.
 fn usage_line(sub: &str) -> &'static str {
-    if sub == "run" {
-        "Usage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
-    } else {
-        "Usage: barca get [TARGET] <FILES>..."
-    }
+    if sub == "run" { RUN_USAGE } else { GET_USAGE }
 }
 
 /// Positionals in the wrong order: the first ends in `.py` and a later one does not. With
@@ -399,20 +404,23 @@ fn wrong_order_error(sub: &str, args: &[String], raw: &[String]) -> Option<Strin
     }
 }
 
-/// Exit 2 with the corrected command when the positionals are in the wrong order.
-fn check_order(sub: &str, args: &[String]) {
+/// A usage error (exit 2) with the corrected command when the positionals are in the wrong
+/// order.
+#[allow(clippy::result_large_err)] // cold path: built once, right before exiting
+fn check_order(sub: &str, args: &[String]) -> Result<(), CliError> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(msg) = wrong_order_error(sub, args, &raw) {
-        eprintln!("{msg}");
-        std::process::exit(2);
+    match wrong_order_error(sub, args, &raw) {
+        Some(msg) => Err(CliError::from_prose(ErrorKind::Usage, msg)),
+        None => Ok(()),
     }
 }
 
 /// Reject file arguments that are not `.py` files, with a hint for the most common mistake:
 /// passing several assets to `--refresh` separated by spaces instead of commas.
-fn check_py_files(files: &[PathBuf], refresh: Option<&[String]>) {
+#[allow(clippy::result_large_err)] // cold path: built once, right before exiting
+fn check_py_files(files: &[PathBuf], refresh: Option<&[String]>) -> Result<(), CliError> {
     let Some(bad) = files.iter().find(|f| !f.to_string_lossy().ends_with(".py")) else {
-        return;
+        return Ok(());
     };
     let bad = bad.to_string_lossy();
     let mut msg = format!("error: '{bad}' is not a .py file.");
@@ -429,21 +437,58 @@ fn check_py_files(files: &[PathBuf], refresh: Option<&[String]>) {
         .filter(|f| f.to_string_lossy().ends_with(".py"))
         .cloned()
         .collect();
-    usage_error(&msg, &py);
+    Err(usage_error(&msg, &py))
 }
 
+const GET_USAGE: &str = "Usage: barca get [TARGET] <FILES>...";
+const RUN_USAGE: &str = "Usage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]";
+
 /// Errors from a `get`/`run` that are the caller's mistake (unknown target, task/asset misuse,
-/// unknown `--refresh` name) end with the `barca list` pointer and exit 2.
-fn exit_on_usage_error(
-    result: Result<(), barca_core::BarcaError>,
-    files: &[PathBuf],
-) -> Result<(), barca_core::BarcaError> {
-    match result {
-        Err(e @ (barca_core::BarcaError::Usage(_) | barca_core::BarcaError::AssetNotFound(..))) => {
-            usage_error(&format!("error: {e}"), files)
-        }
-        other => other,
+/// unknown `--refresh` name) end with the `barca list` pointer, like every other get/run usage
+/// error.
+fn get_run_error(e: barca_core::BarcaError, ctx: &Context, files: &[PathBuf]) -> CliError {
+    let usage = matches!(
+        e,
+        barca_core::BarcaError::Usage(_) | barca_core::BarcaError::AssetNotFound(..)
+    );
+    let err = CliError::from_barca(e, ctx);
+    if usage {
+        err.with_final_hint(list_hint(files))
+    } else {
+        err
     }
+}
+
+/// Whether this invocation's output mode is JSON, which makes errors a JSON envelope on
+/// stderr (see error.rs): `get`/`run` with `-o json` (the default), `plan` (always JSON),
+/// and `--json` on the inspection commands.
+fn json_output(cli: &Cli) -> bool {
+    match cli {
+        Cli::Get { output, .. } | Cli::Run { output, .. } => matches!(output, OutputMode::Json),
+        Cli::Plan { .. } => true,
+        Cli::History { json, .. }
+        | Cli::Stats { json, .. }
+        | Cli::List { json, .. }
+        | Cli::Docs { json, .. } => *json,
+        Cli::Serve { .. } | Cli::Version => false,
+    }
+}
+
+/// The command name and files of an invocation, for remediation hints.
+fn context(cli: &Cli) -> Context {
+    let paths = |files: &[PathBuf]| files.iter().map(|p| p.display().to_string()).collect();
+    let (command, files) = match cli {
+        Cli::Get { args, .. } => ("get", paths(&split_target_files(args.clone()).1)),
+        Cli::Run { args, .. } => ("run", paths(&split_target_files(args.clone()).1)),
+        Cli::Plan { files, .. } => ("plan", paths(files)),
+        Cli::Stats { files, .. } => ("stats", paths(files)),
+        Cli::Serve { files, .. } => ("serve", paths(files)),
+        Cli::List { files, .. } => ("list", paths(files)),
+        Cli::History { .. } => ("history", Vec::new()),
+        Cli::Docs { .. } => ("docs", Vec::new()),
+        Cli::Version => ("version", Vec::new()),
+    };
+    Context { command, files }
 }
 
 /// Split the raw positional args into (optional target, files).
@@ -467,17 +512,24 @@ fn split_target_files(args: Vec<String>) -> (Option<String>, Vec<PathBuf>) {
 
 fn main() {
     // Support `barca file.py [--flags]` as shorthand for `barca get file.py [--flags]`.
-    let cli = Cli::try_parse().unwrap_or_else(|_| {
-        let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
+    let parsed = Cli::try_parse_from(&args).or_else(|first| {
         if args.len() > 1 && !args[1].starts_with('-') && args[1].ends_with(".py") {
             // Insert "get" after the program name so clap handles all flags.
             let mut rewritten = vec![args[0].clone(), "get".to_string()];
             rewritten.extend_from_slice(&args[1..]);
-            Cli::parse_from(rewritten)
+            Cli::try_parse_from(rewritten)
         } else {
-            Cli::parse() // re-parse to show proper clap error
+            Err(first)
         }
     });
+    let cli = match parsed {
+        Ok(cli) => cli,
+        // `--help` / `--version` are not errors: clap prints them to stdout and exits 0.
+        Err(e) if !e.use_stderr() => e.exit(),
+        Err(e) => CliError::from_clap(&e).emit(error::json_mode_from_argv(&args)),
+    };
+    let json = json_output(&cli);
 
     // Version needs no runtime — answer before paying for thread spawns.
     if let Cli::Version = cli {
@@ -492,10 +544,7 @@ fn main() {
             Ok(out) => {
                 let _ = std::io::stdout().lock().write_all(out.as_bytes());
             }
-            Err(msg) => {
-                eprintln!("{msg}");
-                std::process::exit(1);
-            }
+            Err(msg) => CliError::from_prose(ErrorKind::Usage, msg).emit(*json),
         }
         return;
     }
@@ -506,14 +555,15 @@ fn main() {
         .enable_all()
         .build()
         .unwrap_or_else(|e| {
-            eprintln!("failed to create runtime: {e}");
-            std::process::exit(1);
+            CliError::from_barca(
+                barca_core::BarcaError::Other(format!("failed to create runtime: {e}")),
+                &Context::default(),
+            )
+            .emit(json)
         });
-    let result = rt.block_on(run_cli(cli));
-
-    if let Err(e) = result {
-        eprintln!("{e}");
-        std::process::exit(1);
+    let ctx = context(&cli);
+    if let Err(e) = rt.block_on(run_cli(cli, &ctx)) {
+        e.emit(json);
     }
 }
 
@@ -530,8 +580,9 @@ fn cancel_on_ctrl_c() -> barca_core::CancellationToken {
     cancel
 }
 
-async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
+async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
     let python = barca_core::commands::find_python();
+    let engine = |e: barca_core::BarcaError| CliError::from_barca(e, ctx);
 
     match cli {
         Cli::Get {
@@ -542,22 +593,22 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             agent,
             env,
         } => {
-            check_order("get", &args);
+            check_order("get", &args)?;
             let (target, files) = split_target_files(args);
-            check_py_files(&files, None);
+            check_py_files(&files, None)?;
             if files.is_empty() {
                 let what = if target.is_none() {
                     "files"
                 } else {
                     ".py files"
                 };
-                usage_error(
-                    &format!("error: no {what} provided\n\n{}", usage_line("get")),
+                return Err(usage_error(
+                    &format!("error: no {what} provided\n\n{GET_USAGE}"),
                     &files,
-                );
+                ));
             }
             let hint_files = files.clone();
-            let result = get_cmd(
+            get_cmd(
                 env.as_deref(),
                 target,
                 files,
@@ -567,8 +618,8 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 dry_run,
                 agent,
             )
-            .await;
-            exit_on_usage_error(result, &hint_files)
+            .await
+            .map_err(|e| get_run_error(e, ctx, &hint_files))
         }
         Cli::Run {
             args,
@@ -579,20 +630,20 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             agent,
             env,
         } => {
-            check_order("run", &args);
+            check_order("run", &args)?;
             let (target, files) = split_target_files(args);
-            check_py_files(&files, refresh.as_deref());
+            check_py_files(&files, refresh.as_deref())?;
             let Some(target) = target else {
-                usage_error(
-                    &format!("error: a target task is required\n\n{}", usage_line("run")),
+                return Err(usage_error(
+                    &format!("error: a target task is required\n\n{RUN_USAGE}"),
                     &files,
-                );
+                ));
             };
             if files.is_empty() {
-                usage_error(
-                    &format!("error: no .py files provided\n\n{}", usage_line("run")),
+                return Err(usage_error(
+                    &format!("error: no .py files provided\n\n{RUN_USAGE}"),
                     &files,
-                );
+                ));
             }
             let hint_files = files.clone();
             let policy = match (refresh_all, refresh) {
@@ -600,7 +651,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective(names),
                 (false, None) => barca_core::commands::CachePolicy::CacheAware,
             };
-            let result = run_cmd(
+            run_cmd(
                 env.as_deref(),
                 target,
                 files,
@@ -610,18 +661,22 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 output,
                 agent,
             )
-            .await;
-            exit_on_usage_error(result, &hint_files)
+            .await
+            .map_err(|e| get_run_error(e, ctx, &hint_files))
         }
-        Cli::Plan { files, env: _ } => plan_cmd(files, &python).await,
-        Cli::History { limit, json, env } => history_cmd(env.as_deref(), limit, json).await,
+        Cli::Plan { files, env: _ } => plan_cmd(files, &python).await.map_err(engine),
+        Cli::History { limit, json, env } => history_cmd(env.as_deref(), limit, json)
+            .await
+            .map_err(engine),
         Cli::Stats {
             target,
             files,
             json,
             env,
-        } => stats_cmd(env.as_deref(), target, files, json, &python).await,
-        Cli::List { files, json } => list_cmd(files, json, &python).await,
+        } => stats_cmd(env.as_deref(), target, files, json, &python)
+            .await
+            .map_err(engine),
+        Cli::List { files, json } => list_cmd(files, json, &python).await.map_err(engine),
         Cli::Serve {
             files,
             port,
@@ -629,18 +684,17 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             no_schedule,
             timezone,
             env,
-        } => {
-            serve_cmd(
-                env.as_deref(),
-                files,
-                port,
-                watch,
-                !no_schedule,
-                timezone,
-                &python,
-            )
-            .await
-        }
+        } => serve_cmd(
+            env.as_deref(),
+            files,
+            port,
+            watch,
+            !no_schedule,
+            timezone,
+            &python,
+        )
+        .await
+        .map_err(engine),
         // Answered in main() before the runtime is built — never reaches here.
         Cli::Version => unreachable!("version is handled before runtime construction"),
         Cli::Docs { .. } => unreachable!("docs is handled before runtime construction"),
@@ -1133,7 +1187,7 @@ async fn serve_cmd(
 ) -> Result<(), barca_core::BarcaError> {
     let resolved = barca_core::config::resolve(env)?;
     if resolved.state == barca_core::config::StateMode::Optimistic && resolved.state_uri.is_some() {
-        return Err(barca_core::BarcaError::Other(
+        return Err(barca_core::BarcaError::Usage(
             "barca serve does not support shared remote state yet — set state = \"off\" \
              in barca.toml (or BARCA_STATE=off) to serve with a local metadata DB"
                 .to_string(),
