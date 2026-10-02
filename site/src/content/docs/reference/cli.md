@@ -40,6 +40,14 @@ If the first positional argument ends in `.py`, all arguments are treated as fil
 assets, returning the final asset's value). Otherwise the first argument is the target asset name
 and the rest are files.
 
+The target comes before the files. `barca get pipeline.py summary` (a file first, then a name)
+has only one valid reading, so it exits 2 and prints the corrected command,
+`barca get summary pipeline.py`, instead of running. Every `get`/`run` usage error (wrong order,
+missing target or files, unknown target, using `get` on a task or `run` on an asset, an unknown
+`--refresh` name) exits 2 and ends with
+``Run `barca list <files>` to see available assets and tasks.`` There is no fuzzy "did you mean"
+matching.
+
 ```bash
 barca get pipeline.py                 # all assets
 barca get summary pipeline.py         # a specific target
@@ -146,7 +154,7 @@ barca docs --json             # topic index as JSON; add a topic for its full te
 Topics: `overview`, `assets`, `types`, `tasks`, `cache`, `partitions`, `sinks`, `scheduling`,
 `agents`, and `examples/*`. `barca docs agents` describes the output contract for scripts and AI
 agents: JSON on stdout, progress and errors on stderr, exit code `0` success / `1` runtime
-failure / `2` usage error.
+failure / `2` usage error (including the `get`/`run` usage errors above).
 
 ## version
 

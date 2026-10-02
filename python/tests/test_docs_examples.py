@@ -135,7 +135,7 @@ def test_example_deploy_task(binary, topics, tmp_path):
     refreshed = barca(binary, tmp_path, "run", "deploy", "pipeline.py", "--refresh", "model")
     assert result(refreshed)["steps_executed"] == 2
     wrong = barca(binary, tmp_path, "get", "deploy", "pipeline.py")
-    assert wrong.returncode == 1 and "barca run" in wrong.stderr
+    assert wrong.returncode == 2 and "barca run" in wrong.stderr
 
 
 def test_types_topic_example_reads_one_parquet_two_ways(binary, topics, tmp_path, monkeypatch):

@@ -48,4 +48,8 @@ pub enum BarcaError {
 
     #[error("{0}")]
     Other(String),
+
+    /// The caller's mistake (task/asset misuse, unknown `--refresh` name): the CLI exits 2.
+    #[error("{0}")]
+    Usage(String),
 }

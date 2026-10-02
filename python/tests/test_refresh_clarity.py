@@ -79,7 +79,7 @@ def warm(project) -> Path:
 
 def test_unknown_refresh_name_is_an_error_that_lists_the_valid_names(warm):
     proc = barca(warm, "run", "report", "pipeline.py", "--refresh", "nope")
-    assert proc.returncode == 1
+    assert proc.returncode == 2  # usage error
     assert proc.stdout == ""
     assert "no upstream asset named 'nope'" in proc.stderr
     assert "src" in proc.stderr and "mid" in proc.stderr
@@ -88,13 +88,13 @@ def test_unknown_refresh_name_is_an_error_that_lists_the_valid_names(warm):
 
 def test_one_valid_and_one_unknown_name_still_fails(warm):
     proc = barca(warm, "run", "report", "pipeline.py", "--refresh", "src,nope")
-    assert proc.returncode == 1
+    assert proc.returncode == 2
     assert "no upstream asset named 'nope'" in proc.stderr
 
 
 def test_space_separated_refresh_says_to_use_commas(warm):
     proc = barca(warm, "run", "report", "pipeline.py", "--refresh", "src", "mid")
-    assert proc.returncode == 1
+    assert proc.returncode == 2
     assert "'mid' is not a .py file" in proc.stderr
     assert "--refresh src,mid" in proc.stderr or "comma" in proc.stderr
     assert "No such file" not in proc.stderr

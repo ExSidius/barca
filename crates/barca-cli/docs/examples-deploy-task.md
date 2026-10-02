@@ -30,6 +30,6 @@ What to notice:
 - `--refresh model` forces `model` to re-materialize, so that run is 2 steps again.
   `--refresh-all` (alias `--no-cache`) refreshes every upstream asset.
 - The task's `print` goes to stderr; stdout stays a single JSON line.
-- `barca get deploy pipeline.py` exits 1 and tells you to use `barca run`.
+- `barca get deploy pipeline.py` exits 2 and tells you to use `barca run`.
 
 See also: `barca docs tasks`, `barca docs cache`.

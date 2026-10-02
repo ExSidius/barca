@@ -44,12 +44,14 @@ Examples:
   barca get total pipeline.py -o value     # just the value, pretty-printed
   barca get total pipeline.py --agent      # plain progress lines on stderr
   barca get total pipeline.py --env dev    # separate cache and state per environment
+  barca list pipeline.py                   # not sure of the name? list assets and tasks first
 
 Output: one JSON line on stdout with run_id, steps_executed (0 = all cached), phases and
 final_output, and `steps`: what happened to each step (ran or cached, and why). For parquet/pickle assets final_output is a pointer,
 {\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
 loads the value for you.
-Targets must be assets; use `barca run` for tasks.
+Targets must be assets; use `barca run` for tasks. The target comes before the files:
+`barca get pipeline.py total` exits 2 and prints `barca get total pipeline.py`.
 More: barca docs cache, barca docs types, barca docs agents";
 
 const RUN_HELP: &str = "\
@@ -59,11 +61,14 @@ Examples:
   barca run deploy pipeline.py --refresh-all           # re-materialize every upstream asset
   barca run deploy pipeline.py --no-cache              # same as --refresh-all
   barca run deploy pipeline.py --dry-run --refresh fetch   # preview: which steps run, which are cached
+  barca list pipeline.py                               # not sure of the name? list assets and tasks first
 
 --refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs only
 the assets you name: assets downstream of them stay cached unless you list them too (barca prints
 a warning when that happens). A name that is not an upstream asset is an error.
-The target must be a task; use `barca get` for assets.
+The target must be a task; use `barca get` for assets. The target comes before the files:
+`barca run pipeline.py deploy` exits 2 and prints `barca run deploy pipeline.py`. Every usage
+error exits 2 and ends by pointing at `barca list <files>`.
 More: barca docs tasks, barca docs cache";
 
 const PLAN_HELP: &str = "\
@@ -125,14 +130,15 @@ Topics are compiled into the binary: offline, and always matching this version."
 #[derive(Parser)]
 #[command(
     name = "barca",
-    about = "Invisible asset orchestrator",
+    about = "Invisible asset orchestrator. Discover a project's assets and tasks with `barca list <file.py>`",
     long_about = "Barca runs Python asset graphs with content-addressed caching.\n\
                   Every asset output is fully materialized to an artifact file at step \
                   boundaries (json, pickle, or parquet) — that persistence is the cache \
                   checkpoint. pandas/polars DataFrames, pyarrow Tables and duckdb relations \
                   are written as parquet; parameter type annotations choose how downstream \
                   steps read it back (pandas by default, or polars, pyarrow, duckdb) but do \
-                  not skip materialization. Run `barca docs` for the manual.",
+                  not skip materialization. Start with `barca list <file.py>` to discover a \
+                  project's assets and tasks; run `barca docs` for the manual.",
     after_help = TOP_HELP,
     version
 )]
@@ -295,6 +301,113 @@ enum Cli {
     Version,
 }
 
+/// The line every `get`/`run` usage error ends with: `barca list` is how you discover the
+/// assets and tasks a project defines.
+fn list_hint(files: &[PathBuf]) -> String {
+    let files = if files.is_empty() {
+        "<file.py>".to_string()
+    } else {
+        files
+            .iter()
+            .map(|f| shell_quote(&f.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!("Run `barca list {files}` to see available assets and tasks.")
+}
+
+/// Quote a word for display in a copy-pasteable shell command.
+fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:,=@+%".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// Print a `get`/`run` usage error, ending with the `barca list` pointer, and exit 2.
+fn usage_error(msg: &str, files: &[PathBuf]) -> ! {
+    eprintln!("{msg}\n\n{}", list_hint(files));
+    std::process::exit(2);
+}
+
+/// Usage line for `barca get` / `barca run`.
+fn usage_line(sub: &str) -> &'static str {
+    if sub == "run" {
+        "Usage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
+    } else {
+        "Usage: barca get [TARGET] <FILES>..."
+    }
+}
+
+/// Positionals in the wrong order: the first ends in `.py` and a later one does not. With
+/// exactly one such name there is one valid reading, so the error prints the corrected command
+/// (same files and flags, target first). With several it states the rule without guessing.
+/// `raw` is the command line after the program name, used to carry the flags over.
+fn wrong_order_error(sub: &str, args: &[String], raw: &[String]) -> Option<String> {
+    let first = args.first()?;
+    if !first.ends_with(".py") {
+        return None;
+    }
+    let targets: Vec<&String> = args.iter().filter(|a| !a.ends_with(".py")).collect();
+    let files: Vec<PathBuf> = args
+        .iter()
+        .filter(|a| a.ends_with(".py"))
+        .map(PathBuf::from)
+        .collect();
+    let hint = list_hint(&files);
+    match targets.as_slice() {
+        [] => None,
+        [target] => {
+            // Flags: the raw command line minus the subcommand and the positionals, in order.
+            let mut rest = raw;
+            if rest.first().map(String::as_str) == Some(sub) {
+                rest = &rest[1..];
+            }
+            let mut pending = args.iter().peekable();
+            let flags: Vec<String> = rest
+                .iter()
+                .filter(|tok| {
+                    if pending.peek() == Some(tok) {
+                        pending.next();
+                        false
+                    } else {
+                        true
+                    }
+                })
+                .map(|t| shell_quote(t))
+                .collect();
+            let mut cmd = vec!["barca".to_string(), sub.to_string(), shell_quote(target)];
+            cmd.extend(files.iter().map(|f| shell_quote(&f.to_string_lossy())));
+            cmd.extend(flags);
+            Some(format!(
+                "error: the target comes before the files\n\n  {}\n\n{hint}",
+                cmd.join(" ")
+            ))
+        }
+        several => {
+            let names: Vec<String> = several.iter().map(|t| format!("'{t}'")).collect();
+            Some(format!(
+                "error: the target comes before the files (found {} after '{first}')\n\n{}\n\n{hint}",
+                names.join(", "),
+                usage_line(sub)
+            ))
+        }
+    }
+}
+
+/// Exit 2 with the corrected command when the positionals are in the wrong order.
+fn check_order(sub: &str, args: &[String]) {
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(msg) = wrong_order_error(sub, args, &raw) {
+        eprintln!("{msg}");
+        std::process::exit(2);
+    }
+}
+
 /// Reject file arguments that are not `.py` files, with a hint for the most common mistake:
 /// passing several assets to `--refresh` separated by spaces instead of commas.
 fn check_py_files(files: &[PathBuf], refresh: Option<&[String]>) {
@@ -302,16 +415,35 @@ fn check_py_files(files: &[PathBuf], refresh: Option<&[String]>) {
         return;
     };
     let bad = bad.to_string_lossy();
-    eprintln!("error: '{bad}' is not a .py file.");
+    let mut msg = format!("error: '{bad}' is not a .py file.");
     if let Some(names) = refresh {
         let mut all: Vec<String> = names.to_vec();
         all.push(bad.to_string());
-        eprintln!(
-            "\nIf you meant to refresh several assets, join them with commas: --refresh {}",
+        msg.push_str(&format!(
+            "\n\nIf you meant to refresh several assets, join them with commas: --refresh {}",
             all.join(",")
-        );
+        ));
     }
-    std::process::exit(1);
+    let py: Vec<PathBuf> = files
+        .iter()
+        .filter(|f| f.to_string_lossy().ends_with(".py"))
+        .cloned()
+        .collect();
+    usage_error(&msg, &py);
+}
+
+/// Errors from a `get`/`run` that are the caller's mistake (unknown target, task/asset misuse,
+/// unknown `--refresh` name) end with the `barca list` pointer and exit 2.
+fn exit_on_usage_error(
+    result: Result<(), barca_core::BarcaError>,
+    files: &[PathBuf],
+) -> Result<(), barca_core::BarcaError> {
+    match result {
+        Err(e @ (barca_core::BarcaError::Usage(_) | barca_core::BarcaError::AssetNotFound(..))) => {
+            usage_error(&format!("error: {e}"), files)
+        }
+        other => other,
+    }
 }
 
 /// Split the raw positional args into (optional target, files).
@@ -410,17 +542,22 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             agent,
             env,
         } => {
+            check_order("get", &args);
             let (target, files) = split_target_files(args);
             check_py_files(&files, None);
-            if files.is_empty() && target.is_none() {
-                eprintln!("error: no files provided\n\nUsage: barca get [TARGET] <FILES>...");
-                std::process::exit(1);
+            if files.is_empty() {
+                let what = if target.is_none() {
+                    "files"
+                } else {
+                    ".py files"
+                };
+                usage_error(
+                    &format!("error: no {what} provided\n\n{}", usage_line("get")),
+                    &files,
+                );
             }
-            if files.is_empty() && target.is_some() {
-                eprintln!("error: no .py files provided\n\nUsage: barca get [TARGET] <FILES>...");
-                std::process::exit(1);
-            }
-            get_cmd(
+            let hint_files = files.clone();
+            let result = get_cmd(
                 env.as_deref(),
                 target,
                 files,
@@ -430,7 +567,8 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 dry_run,
                 agent,
             )
-            .await
+            .await;
+            exit_on_usage_error(result, &hint_files)
         }
         Cli::Run {
             args,
@@ -441,26 +579,28 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             agent,
             env,
         } => {
+            check_order("run", &args);
             let (target, files) = split_target_files(args);
             check_py_files(&files, refresh.as_deref());
             let Some(target) = target else {
-                eprintln!(
-                    "error: a target task is required\n\nUsage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
+                usage_error(
+                    &format!("error: a target task is required\n\n{}", usage_line("run")),
+                    &files,
                 );
-                std::process::exit(1);
             };
             if files.is_empty() {
-                eprintln!(
-                    "error: no .py files provided\n\nUsage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]"
+                usage_error(
+                    &format!("error: no .py files provided\n\n{}", usage_line("run")),
+                    &files,
                 );
-                std::process::exit(1);
             }
+            let hint_files = files.clone();
             let policy = match (refresh_all, refresh) {
                 (true, _) => barca_core::commands::CachePolicy::RefreshAll,
                 (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective(names),
                 (false, None) => barca_core::commands::CachePolicy::CacheAware,
             };
-            run_cmd(
+            let result = run_cmd(
                 env.as_deref(),
                 target,
                 files,
@@ -470,7 +610,8 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 output,
                 agent,
             )
-            .await
+            .await;
+            exit_on_usage_error(result, &hint_files)
         }
         Cli::Plan { files, env: _ } => plan_cmd(files, &python).await,
         Cli::History { limit, json, env } => history_cmd(env.as_deref(), limit, json).await,
@@ -1190,6 +1331,87 @@ mod tests {
                 "`barca {}` has no description",
                 sub.get_name()
             );
+        }
+    }
+
+    fn strings(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn files_before_target_prints_the_corrected_command() {
+        let msg = wrong_order_error(
+            "run",
+            &strings(&["pipeline.py", "validate_foo"]),
+            &strings(&["run", "pipeline.py", "validate_foo"]),
+        )
+        .expect("wrong order must be an error");
+        assert_eq!(
+            msg,
+            "error: the target comes before the files\n\n  barca run validate_foo pipeline.py\n\n\
+             Run `barca list pipeline.py` to see available assets and tasks."
+        );
+    }
+
+    #[test]
+    fn corrected_command_keeps_flags_and_handles_the_shorthand() {
+        let msg = wrong_order_error(
+            "get",
+            &strings(&["a.py", "total", "b.py"]),
+            &strings(&["a.py", "total", "b.py", "--env", "dev", "-o", "value"]),
+        )
+        .unwrap();
+        assert!(
+            msg.contains("\n  barca get total a.py b.py --env dev -o value\n"),
+            "{msg}"
+        );
+        assert!(msg.ends_with("Run `barca list a.py b.py` to see available assets and tasks."));
+    }
+
+    #[test]
+    fn several_non_py_positionals_after_a_file_do_not_guess() {
+        let msg = wrong_order_error(
+            "run",
+            &strings(&["pipeline.py", "report", "mid"]),
+            &strings(&["run", "pipeline.py", "report", "mid"]),
+        )
+        .unwrap();
+        assert!(msg.starts_with("error: the target comes before the files"));
+        assert!(!msg.contains("barca run report pipeline.py"), "{msg}");
+        assert!(msg.contains("Usage: barca run <TARGET> <FILES>..."));
+    }
+
+    #[test]
+    fn correct_order_and_files_only_are_not_wrong_order() {
+        for args in [
+            &["report", "pipeline.py"][..],
+            &["pipeline.py"][..],
+            &["a.py", "b.py"][..],
+            &["report", "pipeline.py", "mid"][..], // `--refresh a b`: handled by check_py_files
+        ] {
+            let a = strings(args);
+            assert!(wrong_order_error("run", &a, &a).is_none(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn list_hint_names_the_files_or_a_placeholder() {
+        assert_eq!(
+            list_hint(&[PathBuf::from("a.py"), PathBuf::from("my dir/b.py")]),
+            "Run `barca list a.py 'my dir/b.py'` to see available assets and tasks."
+        );
+        assert_eq!(
+            list_hint(&[]),
+            "Run `barca list <file.py>` to see available assets and tasks."
+        );
+    }
+
+    #[test]
+    fn top_level_description_names_barca_list() {
+        let cmd = Cli::command();
+        for text in [cmd.get_about(), cmd.get_long_about()] {
+            let text = text.map(|s| s.to_string()).unwrap_or_default();
+            assert!(text.contains("barca list"), "{text}");
         }
     }
 

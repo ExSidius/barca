@@ -9,9 +9,11 @@ behavior; `barca docs --json` and `--json` on `list`/`history`/`stats` give stru
   JSON for `plan`, or JSON for `list`/`history`/`stats` with `--json`. It is safe to parse.
 - **stderr** carries progress (`[barca] 2/2 steps done in 0.0s`), your own `print` output from
   steps, warnings and errors. Use `--agent` for plain progress lines instead of a progress bar.
-- **Exit codes:** `0` success; `1` runtime failure (a step raised, unknown target, task/asset
-  misuse, no files); `2` usage error (bad flags or missing arguments, from the argument parser).
-  On failure stdout is empty and stderr explains, including the Python traceback of a failed step.
+- **Exit codes:** `0` success; `1` runtime failure (a step raised); `2` usage error (bad flags,
+  missing arguments, positionals in the wrong order, unknown target, task/asset misuse, unknown
+  `--refresh` name). On failure stdout is empty and stderr explains, including the Python
+  traceback of a failed step. Every `get`/`run` usage error ends with
+  ``Run `barca list <files>` to see available assets and tasks.``
 
 ```bash
 barca get total pipeline.py --agent > result.json 2> progress.log
@@ -49,7 +51,7 @@ line has appeared for much longer than your slowest step, the process is genuine
 - `--refresh` re-runs only what you name. Cached assets downstream of a refreshed one are not
   recomputed and barca warns on stderr (`... does not reflect the refresh`). Name the whole chain
   or use `--refresh-all`. Details: `barca docs cache`.
-- An unknown name is an error (exit 1) listing the valid upstream assets.
+- An unknown name is an error (exit 2) listing the valid upstream assets.
 
 ## Inspect before you run
 
@@ -90,7 +92,22 @@ raised with stderr text on failure. Or read a parquet `path` directly with duckd
 - `barca get name file.py [more.py ...]` gets one target; `name` can be the bare function name
   or the full id `file.py:name`. Cross-file inputs use `asset_ref("path.py:fn")`.
 - `barca file.py` is shorthand for `barca get file.py`.
-- `get` is for assets and `run` is for tasks; using the wrong one exits 1 and says which to use.
+- `get` is for assets and `run` is for tasks; using the wrong one exits 2 and says which to use.
+- The target comes before the files. If the first positional ends in `.py` and a later one does
+  not, there is exactly one valid reading, so barca exits 2 and prints the corrected command
+  (same files and flags) instead of running anything:
+
+  ```
+  $ barca run pipeline.py report
+  error: the target comes before the files
+
+    barca run report pipeline.py
+
+  Run `barca list pipeline.py` to see available assets and tasks.
+  ```
+
+  With more than one non-`.py` name after a file it states the rule and does not guess. barca
+  never offers fuzzy "did you mean" suggestions; run `barca list <files>` to find a name.
 
 ## Editing a barca project: a safe loop
 
