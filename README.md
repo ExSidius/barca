@@ -234,7 +234,9 @@ barca --help                               Show help (every command ends with ex
 
 `barca docs` is the manual, compiled into the binary: topics for types and output formats,
 caching, tasks, partitions, scheduling, runnable examples, and conventions for scripts and AI
-agents (`barca docs agents`). Results go to stdout: human-readable in a terminal, JSON when piped
+agents (`barca docs agents`). AI agents: load [`SKILL.md`](SKILL.md) (also `barca docs skill`), a
+~1500-token [Agent Skill](https://barca.sh/reference/agent-skill/) with the commands, argument
+order, exit codes and guardrails. Results go to stdout: human-readable in a terminal, JSON when piped
 or captured (`--json` / `--pretty` or `BARCA_OUTPUT=json|pretty` override); progress and errors go
 to stderr. In JSON mode an error is one JSON line on stderr (`{"error", "code", "kind",
 "remediation"}`, plus `node`, `traceback` and `artifact_dir` when a step failed). Exit codes: `0`

@@ -5,6 +5,10 @@
 //! sdist). Keep them in sync with CLI/decorator behavior: the tests below and in `main.rs`
 //! fail if a topic is empty, unreferenced, or contains a `barca ...` command that no longer
 //! parses.
+//!
+//! `docs/skill.md` is also the repo-root `SKILL.md` (Agent Skills format, so it starts with YAML
+//! frontmatter). The root file is a copy for agents and skill installers that read the repo;
+//! `skill_md_at_repo_root_matches_the_topic` keeps the two identical.
 
 use serde_json::{Value, json};
 
@@ -71,6 +75,11 @@ pub const TOPICS: &[Topic] = &[
         "agents",
         "Output contract, exit codes and workflows for scripts and AI agents",
         "agents.md"
+    ),
+    topic!(
+        "skill",
+        "Agent skill (SKILL.md): the short guide an AI agent loads once",
+        "skill.md"
     ),
     topic!(
         "examples",
@@ -266,11 +275,22 @@ mod tests {
         }
     }
 
+    /// The body after an optional `---` YAML frontmatter block (only the skill has one).
+    fn without_frontmatter(body: &str) -> &str {
+        match body
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+        {
+            Some((_, after)) => after.trim_start_matches('\n'),
+            None => body,
+        }
+    }
+
     #[test]
     fn every_body_starts_with_an_h1_and_has_no_trailing_junk() {
         for t in TOPICS {
             assert!(
-                t.body.starts_with("# "),
+                without_frontmatter(t.body).starts_with("# "),
                 "{} must start with '# Title'",
                 t.name
             );
@@ -308,6 +328,45 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    #[test]
+    fn skill_has_agent_skills_frontmatter() {
+        let body = find("skill").unwrap().body;
+        let (front, _) = body
+            .strip_prefix("---\n")
+            .and_then(|rest| rest.split_once("\n---\n"))
+            .expect("skill.md must start with a `---` YAML frontmatter block");
+        let field = |key: &str| {
+            front
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{key}: ")))
+                .unwrap_or_else(|| panic!("skill frontmatter needs `{key}:`"))
+                .trim()
+        };
+        assert_eq!(field("name"), "barca");
+        let description = field("description");
+        assert!(!description.is_empty());
+        assert!(
+            description.chars().count() <= 1024,
+            "skill description is {} characters; the Agent Skills limit is 1024",
+            description.chars().count()
+        );
+    }
+
+    /// The repo-root SKILL.md is a copy of docs/skill.md. Skipped when the root file is not
+    /// there (a crate or sdist build outside the repository).
+    #[test]
+    fn skill_md_at_repo_root_matches_the_topic() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../SKILL.md");
+        let Ok(root_text) = std::fs::read_to_string(&root) else {
+            return;
+        };
+        assert!(
+            root_text == find("skill").unwrap().body,
+            "SKILL.md at the repo root differs from crates/barca-cli/docs/skill.md; \
+             edit docs/skill.md and copy it: cp crates/barca-cli/docs/skill.md SKILL.md"
+        );
     }
 
     #[test]
