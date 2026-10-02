@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState } from 'react'
+import { useSearchParams } from 'react-router'
 import { Filter, Maximize, ArrowRight, ArrowDown } from 'lucide-react'
 import { IconButton, StatusDot } from '@/components'
 import { GraphCanvas, type GraphCanvasHandle } from '@/components/graph/GraphCanvas'
@@ -16,7 +17,9 @@ export function GraphPage() {
   const { data: assets = [], isError } = useAssets()
   const { data: health } = useHealth()
   const [dir, setDir] = useState<LayoutDir>('LR')
-  const [selected, setSelected] = useState<string | null>(null)
+  // `?focus=<node id>` (from the Assets table) opens with that node selected.
+  const [searchParams] = useSearchParams()
+  const [selected, setSelected] = useState<string | null>(searchParams.get('focus'))
   const [run, setRun] = useState<{ handle: string; nodeId: string } | null>(null)
   const canvasRef = useRef<GraphCanvasHandle>(null)
 
@@ -94,6 +97,7 @@ export function GraphPage() {
             logs={stream.logs}
             running={stream.running}
             error={selectedError}
+            readOnly={health?.read_only ?? false}
             onTrigger={(handle, nodeId) => setRun({ handle, nodeId })}
             onClose={() => setSelected(null)}
           />

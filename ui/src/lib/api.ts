@@ -8,6 +8,7 @@
 import type {
   AssetSummary,
   AssetDetail,
+  NodeState,
   PlanResult,
   RunState,
   RunHandle,
@@ -49,6 +50,7 @@ export const api = {
   assets: () => request<AssetSummary[]>('/assets'),
   asset: (name: string) => request<AssetDetail>(`/assets/${encodeURIComponent(name)}`),
   plan: () => request<PlanResult>('/plan'),
+  state: () => request<NodeState[]>('/state'),
   status: (runId: string) => request<RunState>(`/status/${encodeURIComponent(runId)}`),
   run: () => request<RunHandle>('/run', { method: 'POST' }),
   runTarget: (target: string) =>

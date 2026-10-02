@@ -18,6 +18,8 @@ interface NodeInspectorProps {
   running: boolean
   /** Failure message for this node, if the last run failed. */
   error: string | null
+  /** The server refuses runs (`barca serve --read-only`). */
+  readOnly: boolean
   /** Fired when a get/run is triggered, with the run handle + target node id. */
   onTrigger: (handle: string, nodeId: string) => void
   onClose: () => void
@@ -56,6 +58,7 @@ export function NodeInspector({
   logs,
   running,
   error,
+  readOnly,
   onTrigger,
   onClose,
 }: NodeInspectorProps) {
@@ -146,6 +149,8 @@ export function NodeInspector({
             size="sm"
             iconLeft={isTask ? <Play size={12} /> : <Download size={12} />}
             loading={trigger.isPending || running}
+            disabled={readOnly}
+            title={readOnly ? 'This server is read-only' : undefined}
             onClick={onFire}
           >
             {verb}

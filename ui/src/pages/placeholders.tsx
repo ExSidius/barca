@@ -1,12 +1,8 @@
-import { Activity, Layers, Clock, Book } from 'lucide-react'
+import { Activity, Clock, Book } from 'lucide-react'
 import { EmptyState } from './EmptyState'
 
 export function RunsPage() {
   return <EmptyState icon={Activity} title="Runs" note="run history · the graph is the good part" />
-}
-
-export function AssetsPage() {
-  return <EmptyState icon={Layers} title="Asset catalog" note="browse + search assets · coming soon" />
 }
 
 export function SchedulesPage() {

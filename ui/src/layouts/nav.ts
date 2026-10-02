@@ -8,9 +8,9 @@ export interface NavItem {
 }
 
 export const NAV_ITEMS: NavItem[] = [
+  { id: 'assets', label: 'Assets', path: '/assets', icon: Layers },
   { id: 'graph', label: 'Graph', path: '/graph', icon: GitBranch },
   { id: 'runs', label: 'Runs', path: '/runs', icon: Activity },
-  { id: 'assets', label: 'Assets', path: '/assets', icon: Layers },
   { id: 'schedules', label: 'Schedules', path: '/schedules', icon: Clock },
   { id: 'docs', label: 'Docs', path: '/docs', icon: Book },
 ]

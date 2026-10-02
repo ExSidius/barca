@@ -22,6 +22,11 @@ export type { RunStatus } from './generated/RunStatus'
 export type { AssetStats } from './generated/AssetStats'
 export type { AssetRunEntry } from './generated/AssetRunEntry'
 export type { LogEntry } from './generated/LogEntry'
+export type { NodeState } from './generated/NodeState'
+export type { CacheState } from './generated/CacheState'
+export type { StaleCause } from './generated/StaleCause'
+export type { LastMaterialization } from './generated/LastMaterialization'
+export type { Durations } from './generated/Durations'
 
 import type { AssetSummary } from './generated/AssetSummary'
 import type { AssetStats } from './generated/AssetStats'
@@ -32,6 +37,8 @@ import type { AssetStats } from './generated/AssetStats'
 export interface Health {
   status: string
   version: string
+  /** `barca serve --read-only`: run and cancel endpoints are refused. */
+  read_only: boolean
 }
 
 /** POST /run, /run/{target}, /get/{target} — ad-hoc `{ run_id }`. */
