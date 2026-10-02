@@ -52,10 +52,10 @@ def steps(result: dict) -> dict:
     return {s["id"].split(":")[-1]: s for s in result["steps"]}
 
 
-# Helper tests name the pipeline as `./p.py`: given a bare `p.py`, the planner does not scan
-# the file's directory for imported modules, so helper edits never reach the run hash (a
-# separate, pre-existing limitation reported on #176).
-PIPELINE = "./p.py"
+# Helper tests name the pipeline by its bare filename, the way most people type it. That form
+# used to skip the helper scan, so helper edits never reached the run hash (#178); it now covers
+# that fix too.
+PIPELINE = "p.py"
 
 
 @pytest.fixture()

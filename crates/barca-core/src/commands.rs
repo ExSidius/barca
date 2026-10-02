@@ -2381,7 +2381,25 @@ pub async fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, Ba
         .map_err(|e| BarcaError::Other(format!("DAG analysis task failed: {e}")))?
 }
 
-fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
+/// The directory a pipeline file lives in, as a path that can be read: the directory its helper
+/// modules are scanned from (static analysis), and the one `barca serve --watch` watches.
+///
+/// `Path::new("p.py").parent()` is `Some("")`, an empty path that `read_dir` cannot open, so a
+/// bare filename used to scan no helpers at all (#178). Every spelling of the same file must
+/// scan the same directory: `p.py` and `./p.py` give `.`, `sub/p.py` gives `sub`, and an
+/// absolute path gives its parent. Only what is scanned changes; node ids keep the spelling
+/// given on the command line.
+pub fn source_dir(file: &std::path::Path) -> PathBuf {
+    match file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+pub(crate) fn build_dag_blocking(
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<Dag, BarcaError> {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
@@ -2401,7 +2419,9 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
             .to_string_lossy()
             .to_string();
         file_sources.insert(stem, source.clone());
-        if let Some(parent) = path.parent() {
+        {
+            let parent = source_dir(path);
+            let parent = parent.as_path();
             // Scan subdirectories FIRST — packages (__init__.py) take precedence
             // over same-named sibling .py files, matching Python's import semantics.
             scan_subdirectories(parent, parent, &mut file_sources, &mut packages);
@@ -2410,7 +2430,9 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
             if let Ok(entries) = std::fs::read_dir(parent) {
                 for entry in entries.flatten() {
                     let ep = entry.path();
-                    if ep.extension().map(|e| e == "py").unwrap_or(false) && ep != *path {
+                    if ep.extension().map(|e| e == "py").unwrap_or(false)
+                        && ep.file_name() != path.file_name()
+                    {
                         let estem = ep
                             .file_stem()
                             .unwrap_or_default()
@@ -2893,5 +2915,25 @@ def lone() -> int:
             "{s}"
         );
         assert!(r.any_failed());
+    }
+}
+
+#[cfg(test)]
+mod source_dir_tests {
+    use super::source_dir;
+    use std::path::{Path, PathBuf};
+
+    /// Every spelling of a pipeline file names a directory that can be read (#178): a bare
+    /// filename used to give an empty path, so no helper module was scanned or hashed.
+    #[test]
+    fn every_spelling_of_a_file_names_a_readable_directory() {
+        assert_eq!(source_dir(Path::new("p.py")), PathBuf::from("."));
+        assert_eq!(source_dir(Path::new("./p.py")), PathBuf::from("."));
+        assert_eq!(source_dir(Path::new("sub/p.py")), PathBuf::from("sub"));
+        assert_eq!(
+            source_dir(Path::new("/abs/sub/p.py")),
+            PathBuf::from("/abs/sub")
+        );
+        assert!(std::fs::read_dir(source_dir(Path::new("p.py"))).is_ok());
     }
 }

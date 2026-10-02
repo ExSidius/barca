@@ -8,6 +8,55 @@ with `env=[...]`. If the hash matches a previous successful materialization, the
 reused and the function does not run. Change the function's code, any upstream, or a declared
 environment variable and the hash changes, so only the affected subgraph re-runs.
 
+### What the definition covers
+
+The definition part of the hash is the function's source, its decorator arguments, and its
+**dependency cone**: every module-level function, constant and import the function uses, followed
+transitively. That includes **helper modules in your project**: `.py` files in the pipeline
+file's directory and its subdirectories (packages with or without `__init__.py`). Both import
+styles are followed, at the same precision:
+
+```python
+# helpers.py
+def clean(rows):
+    return [r for r in rows if r]
+
+
+def unused():
+    return "editing this re-runs nothing"
+```
+
+```python
+# pipeline.py
+import helpers
+from barca import asset
+
+
+@asset()
+def rows() -> list:
+    return helpers.clean([1, 0, 2])
+```
+
+Editing `clean` (or anything `clean` calls) changes `rows`' hash and it re-runs; editing `unused`
+does not. `from helpers import clean` + `clean(...)`, `import pkg.mod as m` + `m.f()`,
+`import pkg.mod` + `pkg.mod.f()` and `from pkg import mod` + `mod.f()` hash exactly the same
+way: only the definitions the step uses, never the whole module. Modules outside the project
+(the standard library, installed packages) are not hashed: after upgrading one, recompute with
+`--no-cache` or `--refresh` (below).
+
+The pipeline file can be named any way on the command line: `barca get rows pipeline.py`,
+`./pipeline.py`, an absolute path, and `barca get rows project/pipeline.py` from the parent
+directory all compute the same run hash. Node ids keep the spelling you typed (`pipeline.py:rows`
+vs `./pipeline.py:rows`), as before.
+
+Not followed yet (an edit there does not change the hash; recompute with `--no-cache` or
+`--refresh`):
+
+- classes (`from helpers import Model`): the import is recorded, but not the class body;
+- imports inside the function body (`def rows(): from helpers import clean`);
+- a module used as a value rather than through an attribute (`getattr(helpers, name)`);
+- modules above the pipeline file's directory.
+
 Barca runs exactly the source it hashed. It never runs stale bytecode for your pipeline files or
 the modules they import from the same directory tree: their `__pycache__` .pyc files are checked against a
 hash of the source, not its mtime and size, so an edit that keeps both (a same-size edit within

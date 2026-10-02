@@ -286,6 +286,28 @@ Barca merges all discovered nodes into a single DAG and plans execution across t
 With no target, `barca get` materializes the assets (and sensors) from all three files and skips
 the tasks in `tasks.py`; run a task by name with `barca run <task> <files>`.
 
+### Helper modules and the cache
+
+Plain helper modules don't need to be passed on the command line. An asset's run hash covers the
+helpers it uses from `.py` files in the pipeline file's directory and its subdirectories, so
+editing one re-runs exactly the assets that use it. Both import styles are followed, and both hash
+only the definitions the asset uses, not the whole module:
+
+```python
+import helpers                    # helpers.clean(...)
+import utils.text as t            # t.normalize(...)
+from helpers import clean         # clean(...)
+```
+
+Editing `clean` (or anything it calls) re-runs the assets that call it; editing another function
+in `helpers.py` re-runs nothing. The pipeline path can be spelled any way (`pipeline.py`,
+`./pipeline.py`, an absolute path, or `my_project/pipeline.py` from the parent directory): all
+compute the same run hash. Not followed yet: class bodies, imports inside a function body, a
+module used as a value (`getattr(helpers, name)`), and modules above the pipeline's directory.
+Standard-library and installed packages are never hashed. In those cases recompute with
+`barca get <asset> pipeline.py --no-cache` (or `barca run <task> pipeline.py --refresh <asset>`).
+See `barca docs cache`.
+
 ## 9. Freshness markers
 
 Control when assets should re-run:
