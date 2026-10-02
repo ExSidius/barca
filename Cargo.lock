@@ -284,6 +284,7 @@ version = "0.9.0"
 dependencies = [
  "barca-core",
  "barca-server",
+ "chrono",
  "clap",
  "serde_json",
  "tokio",
