@@ -52,7 +52,7 @@ Output: results go to stdout as tables/summaries in a terminal and as JSON when 
 captured; --json / --pretty (or BARCA_OUTPUT=json|pretty) override. Progress and errors go to
 stderr. In JSON mode an error is one JSON line on stderr: {error, code, kind, remediation}.
 Exit codes: 0 ok, 1 step failed, 2 usage error, 3 barca/infra failure, 130 cancelled.
-Scripts and AI agents: barca docs agents";
+Scripts and AI agents: barca docs skill (short, start here), barca docs agents (full contract)";
 
 const GET_HELP: &str = "\
 Examples:
@@ -204,6 +204,7 @@ Examples:
   barca docs                    # topic index with one-line summaries
   barca docs types              # one topic as markdown
   barca docs examples/duckdb    # a runnable example pipeline
+  barca docs skill              # the agent skill (SKILL.md, with frontmatter): save it to install
   barca docs --all              # the whole manual in one stream (paste into context)
   barca docs --json             # topic index as JSON
   barca docs cache --json       # one topic as JSON {name, summary, content}
@@ -1975,7 +1976,8 @@ mod tests {
     }
 
     /// `barca ...` command lines found in `text`: indented example lines in help text, or
-    /// lines inside ```bash fences in a docs topic. Trailing `# comments` are stripped.
+    /// lines inside ```bash fences in a docs topic. Trailing `# comments` and anything after a
+    /// pipe (`barca ... | jq ...`) are stripped.
     fn command_lines(text: &str, only_in_bash_fences: bool) -> Vec<String> {
         let mut out = Vec::new();
         let mut in_bash = false;
@@ -1991,7 +1993,8 @@ mod tests {
                 }
             }
             if t.starts_with("barca ") {
-                let cmd = t.split(" #").next().unwrap_or(t).trim();
+                let cmd = t.split(" #").next().unwrap_or(t);
+                let cmd = cmd.split(" | ").next().unwrap_or(cmd).trim();
                 out.push(cmd.to_string());
             }
         }

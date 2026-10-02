@@ -63,6 +63,7 @@ that; see `barca docs agents`.
 - `barca docs sinks` — export outputs to local or remote paths
 - `barca docs scheduling` — freshness, cron schedules, `barca serve`
 - `barca docs status` — one view of cache state, last run and artifact shape per node
+- `barca docs skill` — the short agent skill (also `SKILL.md` in the repo): start here if you are an AI agent
 - `barca docs agents` — output contract, exit codes and workflows for scripts and AI agents
 - `barca docs examples` — runnable example pipelines (`examples/duckdb`, `examples/partitions`, ...)
 

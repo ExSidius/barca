@@ -331,12 +331,14 @@ Every command's `--help` also ends with runnable examples.
 barca docs                    # topic index with one-line summaries
 barca docs types              # one topic as markdown (output formats, annotations, duckdb)
 barca docs examples/duckdb    # a runnable example pipeline
+barca docs skill              # the agent skill (SKILL.md), with its frontmatter
 barca docs --all              # every topic in one stream
 barca docs --json             # topic index as JSON; add a topic for its full text
 ```
 
 Topics: `overview`, `assets`, `types`, `tasks`, `cache`, `partitions`, `sinks`, `scheduling`,
-`status`, `agents`, and `examples/*`. `barca docs agents` describes the output contract for scripts and AI
+`status`, `skill`, `agents`, and `examples/*`. `barca docs skill` is the short [agent skill](/reference/agent-skill/)
+(`SKILL.md` in the repository) an AI agent loads once. `barca docs agents` describes the output contract for scripts and AI
 agents: JSON on stdout, progress and errors on stderr, and the exit codes and error envelope below.
 
 ## Errors and exit codes

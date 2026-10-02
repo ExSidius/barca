@@ -53,6 +53,7 @@ export default defineConfig({
           label: 'Reference',
           items: [
             { label: 'CLI', slug: 'reference/cli' },
+            { label: 'Agent Skill', slug: 'reference/agent-skill' },
             { label: 'Configuration', slug: 'reference/config' },
             { label: 'Remote Storage', slug: 'reference/remote-storage' },
             { label: 'Server API', slug: 'reference/server-api' },

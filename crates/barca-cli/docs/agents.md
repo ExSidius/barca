@@ -4,6 +4,10 @@ Conventions that make barca easy to drive programmatically. Everything here is s
 behavior. When stdout is not a terminal (a pipe, a subprocess, an agent) every result is JSON
 without any flag. List-shaped output is bounded by default (see "Bounded output" below).
 
+For a short version to load once, read `barca docs skill`: the same rules in about 1500 tokens,
+in the Agent Skills format (it is `SKILL.md` at the repository root). To install it as a skill,
+save it as a file, for example `barca docs skill > .claude/skills/barca/SKILL.md`.
+
 ## Output format: JSON unless stdout is a terminal
 
 `get`, `run`, `list`, `status`, `history` and `stats` pick their stdout format by one rule, first match wins:
