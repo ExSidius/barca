@@ -1,6 +1,8 @@
 //! Barca CLI — invisible asset orchestrator.
 
 mod bounded;
+#[cfg(test)]
+mod contract;
 mod docs;
 mod error;
 mod output;
