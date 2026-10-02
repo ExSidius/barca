@@ -14,7 +14,7 @@ use serde_json::{Map, Value};
 pub const LIST_DEFAULT_LIMIT: usize = 100;
 
 /// Item fields of `barca list --json` (`nodes[]`). `next_fire` appears only on scheduled nodes.
-pub const LIST_FIELDS: &[&str] = &["id", "kind", "freshness", "inputs", "next_fire"];
+pub const LIST_FIELDS: &[&str] = &["id", "kind", "freshness", "inputs", "env", "next_fire"];
 
 /// Item fields of `barca history --json` (`runs[]`).
 pub const HISTORY_FIELDS: &[&str] = &[
@@ -44,6 +44,7 @@ pub const STEP_FIELDS: &[&str] = &[
     "artifact",
     "warning",
     "partitions",
+    "env",
 ];
 
 /// Item fields of `recent_runs[]` in `barca stats --json`.
@@ -178,6 +179,7 @@ mod tests {
             kind: barca_core::NodeKind::Asset,
             freshness: barca_core::Freshness::Always,
             inputs: vec![],
+            env: vec![],
         };
         let mut want = keys(&serde_json::to_value(node).unwrap());
         want.insert("next_fire".into()); // added by `barca list` for scheduled nodes
@@ -219,6 +221,7 @@ mod tests {
             artifact: s(),
             warning: s(),
             partitions: Some(Default::default()),
+            env: Some(Default::default()),
         };
         assert_eq!(keys(&serde_json::to_value(step).unwrap()), set(STEP_FIELDS));
     }

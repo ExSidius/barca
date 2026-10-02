@@ -202,11 +202,11 @@ def test_assets_topic_env_example(binary, topics, tmp_path):
     # Unset and empty are different values.
     assert result(get(SOURCE_CSV="b.csv", API_TOKEN=""))["steps_executed"] == 2
 
-    nodes = result(barca(binary, tmp_path, "list", "pipeline.py", "--json"))
+    nodes = result(barca(binary, tmp_path, "list", "pipeline.py", "--json"))["nodes"]
     by_id = {n["id"]: n for n in nodes}
     assert by_id["pipeline.py:raw"]["env"] == ["SOURCE_CSV", "API_TOKEN"]
     assert by_id["pipeline.py:summary"]["env"] == []
-    table = barca(binary, tmp_path, "list", "pipeline.py").stdout
+    table = barca(binary, tmp_path, "list", "pipeline.py", "--pretty").stdout
     assert "ENV" in table.splitlines()[0] and "SOURCE_CSV, API_TOKEN" in table
 
 
@@ -216,8 +216,9 @@ def test_env_must_be_a_literal_list(binary, tmp_path):
         "@asset(env=NAMES)\ndef a() -> int:\n    return 1\n"
     )
     proc = barca(binary, tmp_path, "list", "pipeline.py")
-    assert proc.returncode == 1
-    assert "invalid env=" in proc.stderr and 'env=["SOURCE_CSV"' in proc.stderr
+    assert proc.returncode == 2  # a parse error is a usage error
+    error = json.loads(proc.stderr.strip().splitlines()[-1])["error"]  # JSON when piped
+    assert "invalid env=" in error and 'env=["SOURCE_CSV"' in error
 
 
 def test_tasks_topic_example(binary, topics, tmp_path):
