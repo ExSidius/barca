@@ -1792,7 +1792,7 @@ async fn execute(
                             error_type: "UploadError".to_string(),
                             message: format!("upload to {} failed: {}", f.store, f.message),
                             traceback: String::new(),
-                            attempts: 1,
+                            attempts: f.attempts,
                         },
                     });
                     detail.push(format!("  {} ({}): {}", f.key, f.store, f.message));
@@ -2032,21 +2032,18 @@ async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError>
     // columns NULL). Failed rows are never served as cache hits.
     for failure in l.all_failures {
         let node_id = &failure.node_id;
-        let base = crate::StepId::parse(node_id).base_id().to_string();
         let run_h = l.run_hashes.get(node_id).cloned().unwrap_or_default();
-        let attempts = l
-            .all_attempts
-            .get(&base)
-            .copied()
-            .unwrap_or(failure.error.attempts);
+        // Each failure carries its own attempt count: dispatches for a worker
+        // failure, transfer attempts for an upload failure.
         conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, status, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5)",
+                "INSERT INTO materializations (node_id, run_hash, status, error_type, error_message, error_traceback, attempts) VALUES (?1, ?2, 'failed', ?3, ?4, ?5, ?6)",
                 [
                     node_id.clone(),
                     run_h,
+                    failure.error.error_type.clone(),
                     failure.error.message.clone(),
                     failure.error.traceback.clone(),
-                    attempts.to_string(),
+                    failure.error.attempts.to_string(),
                 ],
             )
             .await
@@ -2558,6 +2555,61 @@ mod store_tests {
             resolve_cache_hit(oref("/elsewhere/n/h.json"), Some(&layout)),
             CacheHit::Miss
         ));
+    }
+
+    #[tokio::test]
+    async fn persist_run_records_failure_type_and_its_own_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("m.db").to_string_lossy().into_owned();
+        db::init_db(&db_path).await.unwrap();
+        let failures = vec![dispatch::StepFailure {
+            node_id: "f:a".to_string(),
+            error: dispatch::StepError {
+                error_type: "UploadError".to_string(),
+                message: "upload to s3://b/f__a/h1.json failed: ConnectionError: reset".to_string(),
+                traceback: String::new(),
+                attempts: 4,
+            },
+        }];
+        let run_hashes = HashMap::from([("f:a".to_string(), "h1".to_string())]);
+        // The step itself ran once; the upload made 4 attempts.
+        let all_attempts = HashMap::from([("f:a".to_string(), 1u32)]);
+        let ledger = RunLedger {
+            run_id: "r1",
+            status: "failed",
+            command: "get",
+            files: "f.py".to_string(),
+            target: None,
+            steps_total: 1,
+            steps_executed: 1,
+            steps_cached: 0,
+            elapsed: 0.1,
+            all_outputs: &HashMap::new(),
+            all_failures: &failures,
+            all_sinks: &HashMap::new(),
+            all_attempts: &all_attempts,
+            all_timings: &HashMap::new(),
+            cached_node_ids: &std::collections::HashSet::new(),
+            run_hashes: &run_hashes,
+            store_paths: &HashMap::new(),
+            cost_snapshot: &[],
+        };
+        persist_run(&db_path, &ledger).await.unwrap();
+
+        let (_db, conn) = db::open_conn(&db_path).await.unwrap();
+        let mut rows = conn
+            .query(
+                "SELECT status, error_type, attempts, artifact_path IS NULL, run_hash FROM materializations",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "failed");
+        assert_eq!(row.get::<String>(1).unwrap(), "UploadError");
+        assert_eq!(row.get::<i64>(2).unwrap(), 4);
+        assert_eq!(row.get::<i64>(3).unwrap(), 1);
+        assert_eq!(row.get::<String>(4).unwrap(), "h1");
     }
 
     #[tokio::test]

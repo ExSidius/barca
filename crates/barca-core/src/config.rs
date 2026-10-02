@@ -34,6 +34,8 @@ pub struct RemoteToml {
     pub push_retries: Option<u32>,
     /// Concurrent artifact uploads/downloads by the transfer helper.
     pub transfer_concurrency: Option<usize>,
+    /// Seconds one transfer attempt may run before it is failed as stalled.
+    pub transfer_timeout: Option<u64>,
     /// Per-fsspec-protocol option tables, e.g. `[remote.storage_options.abfs]`.
     pub storage_options: Option<toml::Table>,
 }
@@ -62,6 +64,8 @@ pub struct ResolvedConfig {
     pub local_artifact_dir: String,
     /// Concurrent transfers to/from a separate artifact store.
     pub transfer_concurrency: usize,
+    /// Per-attempt transfer limit, from when the attempt starts.
+    pub transfer_timeout_secs: u64,
     /// Remote location of the shared metadata blob, when remote mode is on.
     pub state_uri: Option<String>,
     pub state: StateMode,
@@ -214,6 +218,23 @@ pub fn resolve_in(cli_env: Option<&str>, cwd: &Path) -> Result<ResolvedConfig, B
         },
     };
 
+    let transfer_timeout_secs = match env_var("BARCA_TRANSFER_TIMEOUT") {
+        Some(v) => v.parse::<u64>().ok().filter(|&n| n > 0).ok_or_else(|| {
+            BarcaError::Other(format!(
+                "invalid BARCA_TRANSFER_TIMEOUT '{v}' (expected a positive number of seconds)"
+            ))
+        })?,
+        None => match remote.transfer_timeout {
+            Some(0) => {
+                return Err(BarcaError::Other(
+                    "[remote].transfer_timeout must be at least 1 second".to_string(),
+                ));
+            }
+            Some(n) => n,
+            None => 600,
+        },
+    };
+
     let storage_options_json = merge_storage_options(remote.storage_options.as_ref())?;
 
     Ok(ResolvedConfig {
@@ -222,6 +243,7 @@ pub fn resolve_in(cli_env: Option<&str>, cwd: &Path) -> Result<ResolvedConfig, B
         artifact_root,
         local_artifact_dir: local.artifact_dir,
         transfer_concurrency,
+        transfer_timeout_secs,
         state_uri,
         state,
         push_retries,
@@ -306,6 +328,7 @@ mod tests {
         "BARCA_PUSH_RETRIES",
         "BARCA_STORAGE_OPTIONS",
         "BARCA_TRANSFER_CONCURRENCY",
+        "BARCA_TRANSFER_TIMEOUT",
     ];
 
     fn clean_env() -> EnvGuard {
@@ -491,6 +514,36 @@ push_retries = 2
             resolve_in(None, dir.path()).unwrap().transfer_concurrency,
             16
         );
+    }
+
+    #[test]
+    fn transfer_timeout_default_toml_and_env() {
+        let _e = clean_env();
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_in(None, dir.path()).unwrap().transfer_timeout_secs,
+            600
+        );
+        write_toml(
+            dir.path(),
+            "[remote]\nuri = \"s3://b/p\"\ntransfer_timeout = 120\n",
+        );
+        assert_eq!(
+            resolve_in(None, dir.path()).unwrap().transfer_timeout_secs,
+            120
+        );
+        unsafe { std::env::set_var("BARCA_TRANSFER_TIMEOUT", "30") };
+        assert_eq!(
+            resolve_in(None, dir.path()).unwrap().transfer_timeout_secs,
+            30
+        );
+        for bad in ["0", "soon"] {
+            unsafe { std::env::set_var("BARCA_TRANSFER_TIMEOUT", bad) };
+            assert!(
+                resolve_in(None, dir.path()).is_err(),
+                "{bad} should be rejected"
+            );
+        }
     }
 
     #[test]

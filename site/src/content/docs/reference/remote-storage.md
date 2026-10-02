@@ -83,9 +83,24 @@ same fsspec backends and credentials as everything else:
   intermediates that nothing in the run reads are never downloaded — a fully
   cached `barca get` fetches only the final output.
 - **Drain** — before the run is recorded and the state blob pushed, barca
-  waits for every upload. A step whose upload fails is not recorded (it
+  waits for every upload. A step whose upload fails gets no success row (it
   recomputes next run) and the run exits with an error naming it, so the
   shared metadata never points at an artifact missing from the store.
+
+**Retries and timeouts.** Each transfer is retried up to 3 times with
+exponential backoff (0.5s, 1s, 2s) when the error looks transient — dropped
+connections, timeouts, server errors. Errors no retry can fix (missing object,
+permission denied, bad configuration) fail on the first attempt. An attempt
+that runs longer than `transfer_timeout` seconds (default 600, counted from
+when the attempt starts, not while it waits its turn) is failed as stalled and
+not retried — raise the limit if single artifacts take longer than that to
+move over your link.
+
+A failed upload is recorded as a `failed` row for that step with
+`error_type = 'UploadError'`, no artifact path, the number of attempts made,
+and the store error as `error_message` (`upload to <location> failed: …`);
+the run's status is `failed`. `barca stats <asset>` shows it like any other
+failure.
 
 The local artifact directory doubles as a cache of the store: a second run on
 the same machine reads from it without downloading anything. Nothing is

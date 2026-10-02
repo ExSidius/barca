@@ -221,7 +221,12 @@ class TestErrors:
             src.write_bytes(b"1")
             h.request({"type": "put", "id": 5, "local": str(src), "remote": "memory://r/a"})
             r = h.reply()
-            assert r == {"type": "error", "id": 5, "message": "ConnectionError: unreachable"}
+            assert r == {
+                "type": "error",
+                "id": 5,
+                "message": "ConnectionError: unreachable",
+                "attempts": 3,
+            }
         finally:
             h.close()
 
@@ -238,7 +243,8 @@ class TestErrors:
             src = tmp_path / "a"
             src.write_bytes(b"1")
             h.request({"type": "put", "id": 1, "local": str(src), "remote": "memory://r/a"})
-            assert h.reply()["type"] == "error"
+            r = h.reply()
+            assert r["type"] == "error" and r["attempts"] == 1
             assert calls == [1]
         finally:
             h.close()
@@ -277,6 +283,119 @@ class TestLifecycle:
         h.peer.shutdown(socket.SHUT_RDWR)
         h.thread.join(timeout=5)
         assert not h.thread.is_alive()
+        h.peer.close()
+        _runtime._socket = h._saved
+
+
+class TestTimeout:
+    """A stalled attempt is failed by the helper's watchdog instead of hanging the run."""
+
+    def _stall(self, monkeypatch, seconds, record=None):
+        release = threading.Event()
+
+        def stalled_put(local, dest):
+            if record is not None:
+                record.append(dest)
+            release.wait(seconds)
+
+        monkeypatch.setattr(_storage, "put_file", stalled_put)
+        return release
+
+    def test_stalled_attempt_times_out_with_error_reply(self, tmp_path, monkeypatch):
+        release = self._stall(monkeypatch, 5)
+        h = Helper(timeout=0.3)
+        try:
+            src = tmp_path / "a"
+            src.write_bytes(b"1")
+            t0 = time.monotonic()
+            h.request({"type": "put", "id": 1, "local": str(src), "remote": "memory://t/a"})
+            r = h.reply()
+            assert time.monotonic() - t0 < 2
+            assert r["type"] == "error" and r["id"] == 1 and r["attempts"] == 1
+            assert r["message"].startswith("TimeoutError:")
+            assert "0.3s" in r["message"]
+        finally:
+            release.set()
+            h.close()
+
+    def test_late_completion_after_timeout_sends_no_second_reply(self, tmp_path, monkeypatch):
+        real_put = _storage.put_file
+        gate = threading.Event()
+
+        def slow_then_ok(local, dest):
+            gate.wait(5)
+            real_put(local, dest)
+
+        monkeypatch.setattr(_storage, "put_file", slow_then_ok)
+        h = Helper(timeout=0.2)
+        try:
+            a = tmp_path / "a"
+            a.write_bytes(b"1")
+            h.request({"type": "put", "id": 1, "local": str(a), "remote": "memory://t/a"})
+            assert h.reply()["type"] == "error"
+            gate.set()  # the abandoned attempt now finishes
+            monkeypatch.setattr(_storage, "put_file", real_put)
+            b = tmp_path / "b"
+            b.write_bytes(b"22")
+            h.request({"type": "put", "id": 2, "local": str(b), "remote": "memory://t/b"})
+            # The next reply is for request 2, not a stale "done" for 1.
+            assert h.reply() == {"type": "done", "id": 2, "size_bytes": 2}
+        finally:
+            gate.set()
+            h.close()
+
+    def test_timed_out_attempt_is_not_retried(self, tmp_path, monkeypatch):
+        calls = []
+        release = self._stall(monkeypatch, 5, record=calls)
+        h = Helper(timeout=0.2, retries=3)
+        try:
+            src = tmp_path / "a"
+            src.write_bytes(b"1")
+            h.request({"type": "put", "id": 1, "local": str(src), "remote": "memory://t/a"})
+            assert h.reply()["type"] == "error"
+            release.set()
+            time.sleep(0.3)
+            assert len(calls) == 1
+        finally:
+            release.set()
+            h.close()
+
+    def test_timeout_clock_starts_when_the_transfer_starts_not_when_queued(
+        self, tmp_path, monkeypatch
+    ):
+        """With one worker, the second request waits behind the first; its
+        queue time must not count against it."""
+        real_put = _storage.put_file
+
+        def slowish(local, dest):
+            time.sleep(0.25)
+            real_put(local, dest)
+
+        monkeypatch.setattr(_storage, "put_file", slowish)
+        h = Helper(concurrency=1, timeout=0.4)
+        try:
+            for i in range(3):
+                src = tmp_path / f"{i}"
+                src.write_bytes(b"1")
+                h.request({"type": "put", "id": i, "local": str(src), "remote": f"memory://q/{i}"})
+            got = h.replies(3)
+            assert all(r["type"] == "done" for r in got.values()), got
+        finally:
+            h.close()
+
+    def test_shutdown_does_not_wait_for_abandoned_attempts(self, tmp_path, monkeypatch):
+        release = self._stall(monkeypatch, 3)
+        h = Helper(timeout=0.2)
+        src = tmp_path / "a"
+        src.write_bytes(b"1")
+        h.request({"type": "put", "id": 1, "local": str(src), "remote": "memory://t/a"})
+        assert h.reply()["type"] == "error"
+        t0 = time.monotonic()
+        h.request({"type": "shutdown"})
+        h.thread.join(timeout=5)
+        assert not h.thread.is_alive()
+        assert time.monotonic() - t0 < 1.5, "shutdown waited for the stuck attempt"
+        release.set()
         h.peer.close()
         _runtime._socket = h._saved
 

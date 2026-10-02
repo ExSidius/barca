@@ -95,6 +95,9 @@ pub struct TransferFailure {
     pub key: String,
     pub store: String,
     pub message: String,
+    /// Attempts made before giving up (0 if the request never reached a
+    /// running helper).
+    pub attempts: u32,
 }
 
 /// Outcome of [`TransferClient::drain`] / [`TransferClient::await_fetches`].
@@ -105,8 +108,10 @@ pub struct TransferReport {
     pub failures: Vec<TransferFailure>,
 }
 
-type ReplyRx = oneshot::Receiver<Result<u64, String>>;
-type ReplyTx = oneshot::Sender<Result<u64, String>>;
+/// Bytes transferred, or the error message and attempts made.
+type Outcome = Result<u64, (String, u32)>;
+type ReplyRx = oneshot::Receiver<Outcome>;
+type ReplyTx = oneshot::Sender<Outcome>;
 
 struct Pending {
     key: String,
@@ -140,10 +145,15 @@ impl TransferClient {
         let layout = ArtifactLayout::new(local_root, &cfg.artifact_root);
 
         let mut cmd = Command::new(python);
-        cmd.args(["-m", "barca._transfer"]).env(
-            "BARCA_TRANSFER_CONCURRENCY",
-            cfg.transfer_concurrency.to_string(),
-        );
+        cmd.args(["-m", "barca._transfer"])
+            .env(
+                "BARCA_TRANSFER_CONCURRENCY",
+                cfg.transfer_concurrency.to_string(),
+            )
+            .env(
+                "BARCA_TRANSFER_TIMEOUT",
+                cfg.transfer_timeout_secs.to_string(),
+            );
         if let Some(ref opts) = cfg.storage_options_json {
             cmd.env("BARCA_STORAGE_OPTIONS", opts);
         }
@@ -213,7 +223,7 @@ impl TransferClient {
         self.next_id += 1;
         let (tx, rx) = oneshot::channel();
         if let Err(mpsc::error::SendError((_, tx))) = self.req_tx.send((build(self.next_id), tx)) {
-            let _ = tx.send(Err("transfer helper is not running".to_string()));
+            let _ = tx.send(Err(("transfer helper is not running".to_string(), 0)));
         }
         rx
     }
@@ -271,10 +281,11 @@ impl TransferClient {
                     report.transferred += 1;
                     report.bytes += bytes;
                 }
-                Err(message) => report.failures.push(TransferFailure {
+                Err((message, attempts)) => report.failures.push(TransferFailure {
                     key: p.key,
                     store: p.store,
                     message,
+                    attempts,
                 }),
             }
         }
@@ -303,10 +314,11 @@ impl TransferClient {
                     report.transferred += 1;
                     report.bytes += bytes;
                 }
-                Err(message) => report.failures.push(TransferFailure {
+                Err((message, attempts)) => report.failures.push(TransferFailure {
                     key,
                     store,
                     message,
+                    attempts,
                 }),
             }
         }
@@ -344,9 +356,9 @@ impl TransferClient {
     }
 }
 
-async fn settle(rx: ReplyRx) -> Result<u64, String> {
+async fn settle(rx: ReplyRx) -> Outcome {
     rx.await
-        .unwrap_or_else(|_| Err("transfer helper exited".to_string()))
+        .unwrap_or_else(|_| Err(("transfer helper exited".to_string(), 1)))
 }
 
 /// Owns the socket: writes requests, routes replies to their waiters. On
@@ -368,7 +380,7 @@ async fn io_task(
                     TransferRequest::Shutdown => None,
                 };
                 if write_frame(&mut stream, &req).await.is_err() {
-                    let _ = tx.send(Err("transfer helper exited".to_string()));
+                    let _ = tx.send(Err(("transfer helper exited".to_string(), 1)));
                     break;
                 }
                 if let Some((id, what)) = entry {
@@ -378,7 +390,9 @@ async fn io_task(
             reply = read_frame::<_, TransferReply>(&mut stream) => {
                 let (id, result) = match reply {
                     Ok(Some(TransferReply::Done { id, size_bytes })) => (id, Ok(size_bytes)),
-                    Ok(Some(TransferReply::Error { id, message })) => (id, Err(message)),
+                    Ok(Some(TransferReply::Error { id, message, attempts })) => {
+                        (id, Err((message, attempts)))
+                    }
                     Ok(None) | Err(_) => break,
                 };
                 if let Some((tx, t0, what)) = pending.remove(&id) {
@@ -398,7 +412,7 @@ async fn io_task(
     drop(pending);
     req_rx.close();
     while let Some((_, tx)) = req_rx.recv().await {
-        let _ = tx.send(Err("transfer helper exited".to_string()));
+        let _ = tx.send(Err(("transfer helper exited".to_string(), 1)));
     }
 }
 
@@ -491,7 +505,7 @@ def handle(m):
     if "slow" in m["remote"]: time.sleep(0.3)
     if "die" in m["remote"]: os._exit(3)
     if "fail" in m["remote"]:
-        return send({"type": "error", "id": m["id"], "message": "PermissionError: denied"})
+        return send({"type": "error", "id": m["id"], "message": "PermissionError: denied", "attempts": 2})
     os.makedirs(os.path.dirname(dst), exist_ok=True); shutil.copyfile(src, dst)
     send({"type": "done", "id": m["id"], "size_bytes": os.path.getsize(dst)})
 threads = []
@@ -628,6 +642,7 @@ for t in threads: t.join()
         assert_eq!(f.key, "bad");
         assert!(f.store.ends_with("fail/h.json"));
         assert_eq!(f.message, "PermissionError: denied");
+        assert_eq!(f.attempts, 2);
         within(c.shutdown()).await;
     }
 

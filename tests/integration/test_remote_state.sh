@@ -207,6 +207,41 @@ import sqlite3
 print(sqlite3.connect('$STATE_BLOB').execute(\"SELECT COUNT(*) FROM materializations WHERE node_id LIKE '%unshippable%' AND status='success'\").fetchone()[0])
 ")
     [ "$BEFORE" = "$AFTER" ] || { echo "FAIL: success row recorded for an artifact missing from the store"; exit 1; }
+
+    echo "── the failure is recorded in shared state: type, no path, attempts, failed run"
+    python3 - "$STATE_BLOB" << 'PYEOF' || exit 1
+import sqlite3, sys
+conn = sqlite3.connect(sys.argv[1])
+row = conn.execute(
+    "SELECT status, error_type, artifact_path, attempts, error_message FROM materializations "
+    "WHERE node_id LIKE '%unshippable%' ORDER BY id DESC LIMIT 1"
+).fetchone()
+status, error_type, path, attempts, message = row
+problems = []
+if status != "failed": problems.append(f"status={status}")
+if error_type != "UploadError": problems.append(f"error_type={error_type}")
+if path is not None: problems.append(f"artifact_path={path}")
+# Permission denied is permanent: one attempt, no wasted retries.
+if attempts != 1: problems.append(f"attempts={attempts}")
+if not message.startswith("upload to ") or "PermissionError" not in message:
+    problems.append(f"message={message!r}")
+run_status = conn.execute("SELECT status FROM runs ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+if run_status != "failed": problems.append(f"run status={run_status}")
+if problems:
+    print("FAIL: upload failure row:", ", ".join(problems))
+    sys.exit(1)
+PYEOF
+
+    echo "── once the store is writable again, the step recomputes and is recorded"
+    (cd "$TMP/machine-g" && $BARCA get unshippable pipeline.py --agent > rerun-g.json 2> rerun-g.log) \
+        || { echo "FAIL: rerun after fixing the store failed"; cat "$TMP/machine-g/rerun-g.log"; exit 1; }
+    ls "$SHARED"/default/artifacts/*unshippable*/*.json > /dev/null 2>&1 \
+        || { echo "FAIL: rerun did not upload the artifact"; exit 1; }
+    OK=$(python3 -c "
+import sqlite3
+print(sqlite3.connect('$STATE_BLOB').execute(\"SELECT COUNT(*) FROM materializations WHERE node_id LIKE '%unshippable%' AND status='success' AND artifact_path IS NOT NULL\").fetchone()[0])
+")
+    [ "$OK" = "1" ] || { echo "FAIL: expected one success row after rerun, got $OK"; exit 1; }
 fi
 
 echo "── conflict replay: remote modified between B's pull and push survives"

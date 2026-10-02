@@ -132,8 +132,21 @@ pub enum TransferRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TransferReply {
-    Done { id: u64, size_bytes: u64 },
-    Error { id: u64, message: String },
+    Done {
+        id: u64,
+        size_bytes: u64,
+    },
+    Error {
+        id: u64,
+        message: String,
+        /// Attempts the helper made (retries plus the first try).
+        #[serde(default = "one")]
+        attempts: u32,
+    },
+}
+
+fn one() -> u32 {
+    1
 }
 
 // ─── Framing functions ───────────────────────────────────────────────────────
@@ -629,16 +642,26 @@ mod tests {
                 size_bytes: 42
             }
         ));
-        let err: TransferReply =
-            serde_json::from_str(r#"{"type":"error","id":4,"message":"PermissionError: no"}"#)
-                .unwrap();
+        let err: TransferReply = serde_json::from_str(
+            r#"{"type":"error","id":4,"message":"PermissionError: no","attempts":3}"#,
+        )
+        .unwrap();
         match err {
-            TransferReply::Error { id, message } => {
+            TransferReply::Error {
+                id,
+                message,
+                attempts,
+            } => {
                 assert_eq!(id, 4);
                 assert_eq!(message, "PermissionError: no");
+                assert_eq!(attempts, 3);
             }
             _ => panic!("expected Error"),
         }
+        // A reply without attempts (older helper) counts as one attempt.
+        let bare: TransferReply =
+            serde_json::from_str(r#"{"type":"error","id":5,"message":"x"}"#).unwrap();
+        assert!(matches!(bare, TransferReply::Error { attempts: 1, .. }));
     }
 
     #[tokio::test]
