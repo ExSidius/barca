@@ -29,6 +29,11 @@ def summary(all_sales: list[dict]) -> dict:
 - The partition key is passed to the function as the parameter named in `partitions={...}`.
 - `partitions_from(upstream)` reuses an upstream asset's partition keys.
 - `collect(upstream)` inside `inputs=` aggregates all partitions of `upstream` into one list.
+- An unpartitioned asset in `inputs=` is passed whole to every key, for example
+  `@asset(inputs={"m": multiplier}, partitions={"k": partitions(["a", "b"])})` calls the
+  function with `k` and `m`. It runs once, before any key, and its run hash is part of every
+  key's run hash: changing it, or `--refresh multiplier`, re-runs every key (and, with the
+  default cascade, everything downstream of them).
 - Artifacts are stored per key, for example
   `.barca/artifacts/pipeline.py--sales_region_emea/<run_hash>.json`. `barca plan` lists one step
   per key, all under the same node id (`pipeline.py:sales`).
