@@ -264,6 +264,8 @@ def global_summary(sales: list[dict]) -> dict:
 - `regional_sales` runs 3 times, once per region
 - `collect(regional_sales)` aggregates all partition outputs into a single list
 - `global_summary` receives all three results at once
+- An unpartitioned asset passed in `inputs=` to a partitioned asset reaches every key unchanged;
+  it runs once, before any key, and changing it (or `--refresh` on it) re-runs every key
 
 ## 8. Multi-file pipelines
 

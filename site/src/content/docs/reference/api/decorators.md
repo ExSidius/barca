@@ -137,7 +137,10 @@ def summary(prices: list[dict]) -> dict:
 expression — e.g. a list comprehension or function call — which is evaluated by the Python runtime
 at plan time. `partitions_from(...)` derives an asset's partition keys from an upstream asset's own
 partitions, rather than declaring them again. `collect(...)`, used inside `inputs=`, aggregates
-every partition of an upstream asset into a single list delivered to the parameter.
+every partition of an upstream asset into a single list delivered to the parameter. An
+unpartitioned asset in a partitioned asset's `inputs=` is delivered whole to every key; it runs
+once, before any key, and its run hash is part of every key's run hash, so changing it (or
+`--refresh` on it) re-runs every key.
 
 `asset_ref("path/to/file.py:function_name")`, used inside `inputs=`, references a node by its
 canonical id (source file path + function name, or its explicit `name=`) instead of importing the
