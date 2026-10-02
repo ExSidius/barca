@@ -49,6 +49,54 @@ barca run send_email pipeline.py --no-cache           # same as --refresh-all
 executes. A task must be the target: `barca get` on a task is an error, and `barca run` on an
 asset is an error.
 
+## Several tasks in one run
+
+Name several tasks as one comma-separated list (no spaces). A validation sweep is the typical
+use: each check is its own task, and one invocation runs them all.
+
+```python
+from barca import asset, task
+
+
+@asset()
+def registry() -> dict:
+    return {"models": ["churn", "ltv"]}
+
+
+@task(inputs={"reg": registry})
+def validate_registry(reg: dict) -> dict:
+    assert reg["models"], "registry is empty"
+    return {"models": len(reg["models"])}
+
+
+@task(inputs={"reg": registry})
+def validate_names(reg: dict) -> dict:
+    return {"lowercase": all(m == m.lower() for m in reg["models"])}
+```
+
+```bash
+barca run validate_registry,validate_names pipeline.py             # both checks; registry runs once
+barca run validate_registry,validate_names pipeline.py --dry-run   # preview the union of both cones
+```
+
+- The union of the targets' cones is planned once: `registry` materializes once (3 steps), and a
+  second run serves it from cache (2 steps, the tasks).
+- Every target runs even if another fails. A failure skips only the steps that depend on it
+  (reported with `"status": "skipped"`, reason `upstream_failed`); the exit code is 1 if any
+  target failed.
+- The JSON output replaces `final_output` with `targets`, keyed by target:
+
+```json
+{"run_id": "...", "steps_executed": 3, "steps": [...],
+ "targets": {"validate_registry": {"status": "success", "final_output": {"models": 2}},
+             "validate_names": {"status": "success", "final_output": {"lowercase": true}}}}
+```
+
+  A failed target is `{"status": "failed", "failed_step": "pipeline.py:...", "error": "..."}`,
+  where `failed_step` is the target itself or the upstream step that failed. With one target the
+  output is unchanged. `--refresh` names may come from any target's cone. `barca get a,b` works
+  the same way for assets.
+
 ## Fan-out from inside a task
 
 `parallel(partial(f, x), ...)` and `parallel_map(f, items)` run other `@task` functions in

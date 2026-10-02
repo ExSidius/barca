@@ -9,8 +9,8 @@ is on your PATH.
 ## Commands
 
 ```
-barca get [target] <file.py> [file.py ...]   Get asset value(s) — cache-aware
-barca run <task> <file.py> [--refresh a,b | --refresh-all]  Run a task (always re-runs)
+barca get [target[,target...]] <file.py> [file.py ...]   Get asset value(s) — cache-aware
+barca run <task[,task...]> <file.py> [--refresh a,b | --refresh-all]  Run task(s) (always re-run)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
 barca history [-l N | --all] [--json|--pretty]  Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
@@ -79,6 +79,7 @@ matching.
 ```bash
 barca get pipeline.py                 # all assets
 barca get summary pipeline.py         # a specific target
+barca get summary,orders pipeline.py  # several targets in one run (see "Several targets" below)
 barca get pipeline.py --no-cache      # execute everything fresh
 barca get pipeline.py --agent         # plain progress lines instead of a progress bar
 barca get pipeline.py --json          # JSON even in a terminal (the default when piped)
@@ -112,6 +113,38 @@ pass `--refresh-all`.
 
 > **Behavior change:** `barca run` previously force-rerun every upstream asset by default and took
 > `--burst`. Add `--refresh-all` to restore the old default; `--burst a,b` is now `--refresh a,b`.
+
+### Several targets
+
+`barca run` and `barca get` take one comma-separated list of targets (no spaces), matching the
+`--refresh a,b` convention:
+
+```bash
+barca run validate_registry,validate_names pipeline.py             # both tasks, one run
+barca run validate_registry,validate_names pipeline.py --dry-run   # preview the union
+barca get summary,orders pipeline.py                               # several assets
+```
+
+- The union of the targets' cones is planned once, so an upstream step shared by several targets
+  runs (or is served from cache) once. `--refresh` names may come from any target's cone.
+- Every target runs even if another fails. A failure skips only the steps that depend on it
+  (`"status": "skipped"`, reason `upstream_failed`). The exit code is 1 if any target failed,
+  stdout still carries the JSON (with `"status": "failed"`), and the last stderr line is the error
+  envelope for the first failed target.
+- Every name is checked before anything runs; an unknown name, a task passed to `get`, or an
+  empty name (`a,,b`) is a usage error (exit 2) and runs nothing.
+- With one target the output is unchanged. With several, `final_output` is replaced by `targets`,
+  keyed by target name in the order given:
+
+```json
+{"run_id": "...", "elapsed_seconds": 0.2, "steps_executed": 3, "phases": 2, "steps": [...],
+ "targets": {"validate_registry": {"status": "success", "final_output": {"models": 2}},
+             "validate_names": {"status": "success", "final_output": {"lowercase": true}}}}
+```
+
+A failed target is `{"status": "failed", "failed_step": "pipeline.py:...", "error": "..."}`, where
+`failed_step` is the target itself or the upstream step that failed. `--dry-run` with several
+targets reports `"targets": [names]` in place of `"target"`; `-o value` prints `{target: value}`.
 
 ## plan
 

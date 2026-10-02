@@ -40,8 +40,8 @@ barca get total pipeline.py      # second time: everything is a cache hit
 
 | Command | Purpose |
 |---|---|
-| `barca get [target] files...` | Get asset value(s); cache-aware. `barca file.py` is shorthand. |
-| `barca run task files...` | Run a task (always re-runs) and its dependency cone. |
+| `barca get [target] files...` | Get asset value(s); cache-aware. `barca file.py` is shorthand. `a,b` gets several in one run. |
+| `barca run task files...` | Run a task (always re-runs) and its dependency cone. `a,b` runs several in one run. |
 | `barca list files...` | List nodes with kind, freshness and dependencies (`--json`, `--limit`/`--all`, `--fields`; `barca docs agents`). |
 | `barca plan files...` | Emit the tiered execution plan as JSON. |
 | `barca history` / `barca stats` | Past runs; timing and cache statistics (`--json`, `--fields`; history takes `--limit`/`--all`). |

@@ -92,6 +92,9 @@ invalidate the asset.
 
 A node id is `<file>:<function>` (for example `pipeline.py:clean`), or the explicit `name=`.
 Targets on the command line can use the bare function name (`barca get clean pipeline.py`).
+Several targets are one comma-separated list (`barca get clean,report pipeline.py`): their
+upstream cones are planned together, so an asset both need materializes once, and the JSON
+output is keyed by target (`barca docs agents`).
 Use `asset_ref("other/file.py:raw")` inside `inputs=` to reference a node in another file
 without importing it.
 
