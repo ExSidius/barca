@@ -238,8 +238,9 @@ the right home for "do something" operations that don't produce cacheable data.
   stale).
 
 Run a task with [`barca run`](/reference/cli/). Upstream assets are served from cache by
-default (like `barca get`); `--refresh a,b` re-materializes only the named assets, and
-`--refresh-all` (alias `--no-cache`) re-materializes all of them.
+default (like `barca get`); `--refresh a,b` re-materializes the named assets and everything
+downstream of them (`--no-cascade` limits it to the named assets), and `--refresh-all` (alias
+`--no-cache`) re-materializes all of them.
 
 ```python
 from barca import asset, task

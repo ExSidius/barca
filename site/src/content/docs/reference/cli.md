@@ -10,7 +10,7 @@ is on your PATH.
 
 ```
 barca get [target[,target...]] <file.py> [file.py ...]   Get asset value(s) — cache-aware
-barca run <task[,task...]> <file.py> [--refresh a,b | --refresh-all]  Run task(s) (always re-run)
+barca run <task[,task...]> <file.py> [--refresh a,b [--no-cascade] | --refresh-all]  Run task(s) (always re-run)
 barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
 barca history [-l N | --all] [--json|--pretty]  Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
@@ -97,12 +97,15 @@ with `env NAME=value ...`. See [Decorators](/reference/api/decorators/#declared-
 
 Execute a task and its dependency cone. Tasks always re-run (they are never cached). Upstream
 assets are cache-aware by default, exactly like `barca get`. Use `--refresh` to force
-re-materialize only named upstream assets, or `--refresh-all` (alias `--no-cache`) to refresh every
-upstream asset in the cone.
+re-materialize named upstream assets and every asset downstream of them in the task's cone, add
+`--no-cascade` to re-materialize only the named assets, or use `--refresh-all` (alias `--no-cache`)
+to refresh every upstream asset in the cone.
 
 ```bash
 barca run deploy pipeline.py                          # run task, upstream assets from cache
-barca run deploy pipeline.py --refresh fetch,transform  # re-materialize only named assets
+barca run deploy pipeline.py --refresh fetch,transform  # re-materialize these and their downstream
+barca run deploy pipeline.py --refresh fetch --no-cascade  # re-materialize only fetch
+barca run deploy pipeline.py --dry-run --refresh fetch  # preview the cascade
 barca run deploy pipeline.py --refresh-all            # re-materialize all upstream assets
 barca run deploy pipeline.py --no-cache               # same as --refresh-all
 ```
@@ -113,6 +116,11 @@ pass `--refresh-all`.
 
 > **Behavior change:** `barca run` previously force-rerun every upstream asset by default and took
 > `--burst`. Add `--refresh-all` to restore the old default; `--burst a,b` is now `--refresh a,b`.
+
+> **Behavior change:** `--refresh` previously did not cascade: it re-ran only the named assets and
+> left assets downstream of them cached (with a warning). It now re-materializes everything
+> downstream of the named assets too; pass `--no-cascade` for the old behavior. A step re-run by the
+> cascade reports `reason: "refresh_cascade"`.
 
 ### Several targets
 
@@ -137,7 +145,7 @@ barca get summary,orders pipeline.py                               # several ass
   keyed by target name in the order given:
 
 ```json
-{"run_id": "...", "elapsed_seconds": 0.2, "steps_executed": 3, "phases": 2, "steps": [...],
+{"status": "success", "run_id": "...", "elapsed_seconds": 0.2, "steps_executed": 3, "phases": 2, "steps": [...],
  "targets": {"validate_registry": {"status": "success", "final_output": {"models": 2}},
              "validate_names": {"status": "success", "final_output": {"lowercase": true}}}}
 ```

@@ -130,9 +130,24 @@ def test_a_dry_run_leaves_no_history_record(project):
     assert ok(barca(project, "history", "--json")) == before
 
 
-def test_dry_run_with_refresh_names_the_reason_and_warns_about_stale_downstream(project):
+def test_dry_run_with_refresh_shows_the_cascade(project):
     ok(barca(project, "run", "report", "pipeline.py"))
     result = ok(barca(project, "run", "report", "pipeline.py", "--dry-run", "--refresh", "src"))
+    by = steps_by_name(result)
+    assert by["src"]["action"] == "run" and by["src"]["reason"] == "refresh"
+    assert by["mid"]["action"] == "run" and by["mid"]["reason"] == "refresh_cascade"
+    assert "src" in by["mid"]["detail"]
+    assert "warning" not in by["mid"]
+    assert result["summary"] == {"will_run": 3, "cached": 0, "unknown": 0}
+
+
+def test_dry_run_with_no_cascade_names_the_reason_and_warns_about_stale_downstream(project):
+    ok(barca(project, "run", "report", "pipeline.py"))
+    result = ok(
+        barca(
+            project, "run", "report", "pipeline.py", "--dry-run", "--refresh", "src", "--no-cascade"
+        )
+    )
     by = steps_by_name(result)
     assert by["src"]["action"] == "run" and by["src"]["reason"] == "refresh"
     assert by["mid"]["action"] == "cached"
@@ -163,6 +178,8 @@ SCENARIOS = {
     "cold": [],
     "warm": [],
     "refresh_src": ["--refresh", "src"],
+    "refresh_src_no_cascade": ["--refresh", "src", "--no-cascade"],
+    "refresh_mid": ["--refresh", "mid"],
     "refresh_both": ["--refresh", "src,mid"],
     "refresh_all": ["--refresh-all"],
 }
@@ -210,8 +227,11 @@ def test_real_runs_report_what_each_step_did(project):
     by = steps_by_name(second)
     assert by["src"]["status"] == "cached" and by["mid"]["status"] == "cached"
     assert by["report"]["status"] == "ran"
+    cascaded = steps_by_name(ok(barca(project, "run", "report", "pipeline.py", "--refresh", "src")))
+    assert cascaded["src"]["status"] == "ran" and cascaded["src"]["reason"] == "refresh"
+    assert cascaded["mid"]["status"] == "ran" and cascaded["mid"]["reason"] == "refresh_cascade"
     refreshed = steps_by_name(
-        ok(barca(project, "run", "report", "pipeline.py", "--refresh", "src"))
+        ok(barca(project, "run", "report", "pipeline.py", "--refresh", "src", "--no-cascade"))
     )
     assert refreshed["src"]["status"] == "ran" and refreshed["src"]["reason"] == "refresh"
     assert (

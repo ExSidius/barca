@@ -92,7 +92,8 @@ More: barca docs cache, barca docs types, barca docs agents";
 const RUN_HELP: &str = "\
 Examples:
   barca run deploy pipeline.py                         # task runs; upstream assets come from cache
-  barca run deploy pipeline.py --refresh fetch,clean   # also re-materialize these upstream assets
+  barca run deploy pipeline.py --refresh fetch,clean   # re-materialize these and everything downstream of them
+  barca run deploy pipeline.py --refresh fetch --no-cascade   # re-materialize only fetch; downstream stays cached
   barca run deploy pipeline.py --refresh-all           # re-materialize every upstream asset
   barca run deploy pipeline.py --no-cache              # same as --refresh-all
   barca run deploy pipeline.py --dry-run --refresh fetch   # preview: which steps run, which are cached
@@ -107,9 +108,11 @@ Several targets: comma-separated, no spaces. Every target runs even if another f
 skips only what depends on it); exit 1 if any failed. JSON output then carries `targets`, keyed by
 target, instead of `final_output` (see barca get --help, barca docs agents).
 
---refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs only
-the assets you name: assets downstream of them stay cached unless you list them too (barca prints
-a warning when that happens). A name that is not an upstream asset is an error.
+--refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs the
+assets you name and every asset downstream of them in the task's cone (reason `refresh_cascade`),
+so fresh data reaches the task. --no-cascade re-runs only the named assets; cached assets
+downstream of them then do not reflect the refresh, and barca warns. (Previously --refresh did
+not cascade.) A name that is not an upstream asset is an error.
 The target must be a task; use `barca get` for assets. The target comes before the files:
 `barca run pipeline.py deploy` exits 2 and prints `barca run deploy pipeline.py`. Every usage
 error exits 2 and ends by pointing at `barca list <files>`.
@@ -256,10 +259,14 @@ enum Cli {
         #[arg(required = true)]
         args: Vec<String>,
         /// Upstream assets to force re-materialize, as ONE comma-separated list
-        /// (`--refresh a,b`, not `--refresh a b`). Assets downstream of them stay cached
-        /// unless also listed; barca warns when that happens
+        /// (`--refresh a,b`, not `--refresh a b`). Every asset downstream of them in the
+        /// task's cone re-materializes too (see --no-cascade)
         #[arg(long, value_delimiter = ',', conflicts_with = "refresh_all")]
         refresh: Option<Vec<String>>,
+        /// With --refresh: re-materialize only the named assets, not what is downstream of
+        /// them. Cached downstream assets then do not reflect the refresh; barca warns
+        #[arg(long, requires = "refresh")]
+        no_cascade: bool,
         /// Force re-materialize ALL upstream assets in the task's cone
         #[arg(long, alias = "no-cache")]
         refresh_all: bool,
@@ -849,6 +856,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
         Cli::Run {
             args,
             refresh,
+            no_cascade,
             refresh_all,
             dry_run,
             output,
@@ -876,7 +884,10 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             let hint_files = files.clone();
             let policy = match (refresh_all, refresh) {
                 (true, _) => barca_core::commands::CachePolicy::RefreshAll,
-                (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective(names),
+                (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective {
+                    names,
+                    cascade: !no_cascade,
+                },
                 (false, None) => barca_core::commands::CachePolicy::CacheAware,
             };
             let targets = targets_arg(Some(&target), &files)?;
