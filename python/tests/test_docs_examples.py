@@ -155,6 +155,71 @@ def test_types_topic_example_reads_one_parquet_two_ways(binary, topics, tmp_path
     assert df["doubled"].tolist() == [19.0]
 
 
+def test_assets_topic_env_example(binary, topics, tmp_path):
+    """`@asset(env=[...])`: declared values are hashed, reported, and secrets redacted."""
+    import os
+
+    code = next(c for c in blocks(topics["assets"], "python") if "env=[" in c)
+    (tmp_path / "pipeline.py").write_text(code)
+
+    def get(**env):
+        base = {k: v for k, v in os.environ.items() if k not in ("SOURCE_CSV", "API_TOKEN")}
+        return subprocess.run(
+            [binary, "get", "summary", "pipeline.py", "--agent"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            env={**base, **env},
+        )
+
+    first = get(SOURCE_CSV="a.csv")
+    out = result(first)
+    assert out["steps_executed"] == 2
+    assert out["final_output"] == {"from": "a.csv"}
+    raw = next(s for s in out["steps"] if s["id"] == "pipeline.py:raw")
+    assert raw["env"] == {"API_TOKEN": None, "SOURCE_CSV": "a.csv"}
+    summary = next(s for s in out["steps"] if s["id"] == "pipeline.py:summary")
+    assert "env" not in summary  # declares nothing
+    assert "env API_TOKEN=<unset> SOURCE_CSV=a.csv" in first.stderr
+
+    cached = get(SOURCE_CSV="a.csv")
+    assert result(cached)["steps_executed"] == 0
+    assert "step:pipeline.py:raw cached env API_TOKEN=<unset> SOURCE_CSV=a.csv" in cached.stderr
+
+    changed = result(get(SOURCE_CSV="b.csv"))
+    assert changed["steps_executed"] == 2  # raw and everything downstream
+    assert changed["final_output"] == {"from": "b.csv"}
+
+    # A secret is part of the hash but never printed.
+    secret = get(SOURCE_CSV="b.csv", API_TOKEN="hunter2")
+    out = result(secret)
+    assert out["steps_executed"] == 2
+    raw = next(s for s in out["steps"] if s["id"] == "pipeline.py:raw")
+    assert raw["env"]["API_TOKEN"] == "<redacted>"
+    assert "hunter2" not in secret.stdout + secret.stderr
+    assert "API_TOKEN=<redacted>" in secret.stderr
+
+    # Unset and empty are different values.
+    assert result(get(SOURCE_CSV="b.csv", API_TOKEN=""))["steps_executed"] == 2
+
+    nodes = result(barca(binary, tmp_path, "list", "pipeline.py", "--json"))
+    by_id = {n["id"]: n for n in nodes}
+    assert by_id["pipeline.py:raw"]["env"] == ["SOURCE_CSV", "API_TOKEN"]
+    assert by_id["pipeline.py:summary"]["env"] == []
+    table = barca(binary, tmp_path, "list", "pipeline.py").stdout
+    assert "ENV" in table.splitlines()[0] and "SOURCE_CSV, API_TOKEN" in table
+
+
+def test_env_must_be_a_literal_list(binary, tmp_path):
+    (tmp_path / "pipeline.py").write_text(
+        "from barca import asset\n\nNAMES = ['A']\n\n\n"
+        "@asset(env=NAMES)\ndef a() -> int:\n    return 1\n"
+    )
+    proc = barca(binary, tmp_path, "list", "pipeline.py")
+    assert proc.returncode == 1
+    assert "invalid env=" in proc.stderr and 'env=["SOURCE_CSV"' in proc.stderr
+
+
 def test_tasks_topic_example(binary, topics, tmp_path):
     write_example(topics, "tasks", tmp_path)
     for target in ("send_email", "notify"):

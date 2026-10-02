@@ -169,6 +169,10 @@ async fn decide_step(
     let display_id = step.step_id.display();
     let base_node = dag.get_node(base_id);
     let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
+    // Declared env (`@asset(env=[...])`) is read now, at plan time, and folded into the run hash.
+    let env_input = base_node
+        .map(|n| crate::envdeps::hash_input(&crate::envdeps::resolve(&n.extracted.env)))
+        .unwrap_or(None);
 
     // Run hashes for EVERY step (sensors, tasks, refreshed and partitioned steps too): they
     // content-address artifacts and key persistence.
@@ -184,6 +188,7 @@ async fn decide_step(
             partition_key.as_deref(),
             step.inputs.values(),
             &state.run_hashes,
+            env_input.as_deref(),
         );
         state.run_hashes.insert(display_id.clone(), run_h.clone());
         step.run_hashes.insert(display_id.clone(), run_h);
@@ -195,6 +200,7 @@ async fn decide_step(
                 Some(&pk.suffix()),
                 step.inputs.values(),
                 &state.run_hashes,
+                env_input.as_deref(),
             );
             state.run_hashes.insert(pdisplay.clone(), run_h.clone());
             step.run_hashes.insert(pdisplay, run_h);
@@ -339,6 +345,28 @@ fn stale_warning(display_id: &str, root: &str, dry: bool) -> String {
     )
 }
 
+/// The declared env values of `base_id` as reported in output (secrets redacted, unset = null),
+/// or `None` when the node declares no env.
+fn env_report(
+    dag: &Dag,
+    base_id: &str,
+) -> Option<std::collections::BTreeMap<String, Option<String>>> {
+    let node = dag.get_node(base_id)?;
+    if node.extracted.env.is_empty() {
+        return None;
+    }
+    Some(crate::envdeps::report(&crate::envdeps::resolve(
+        &node.extracted.env,
+    )))
+}
+
+/// The `--agent` step-line suffix for `node_id`'s declared env (empty when none is declared).
+fn env_suffix(dag: &Dag, node_id: &str) -> String {
+    dag.get_node(crate::StepId::parse(node_id).base_id())
+        .map(|n| crate::envdeps::agent_suffix(&crate::envdeps::resolve(&n.extracted.env)))
+        .unwrap_or_default()
+}
+
 fn kind_str(kind: Option<crate::NodeKind>) -> String {
     match kind {
         Some(crate::NodeKind::Asset) => "asset",
@@ -362,6 +390,7 @@ fn report_for(
     let mut r = StepReport {
         id: base_id.to_string(),
         kind: kind_str(dag.get_node(base_id).map(|n| n.kind())),
+        env: env_report(dag, base_id),
         ..Default::default()
     };
     let (word_cached, word_run, word_partial) = if dry {
@@ -575,6 +604,10 @@ pub struct StepReport {
     pub warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitions: Option<PartitionSummary>,
+    /// Declared env values the step used (`@asset(env=[...])`): name -> value, `null` when unset,
+    /// `"<redacted>"` for secret-looking names. Absent when the node declares no env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -633,6 +666,9 @@ pub struct AssetSummary {
     pub freshness: crate::Freshness,
     /// Upstream node ids this node depends on (direct + collected), sorted.
     pub inputs: Vec<String>,
+    /// Declared environment variable names (`@asset(env=[...])`), in declaration order.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 // ─── Shared setup ────────────────────────────────────────────────────────────
@@ -1162,7 +1198,10 @@ async fn execute(
                             );
                         }
                         if agent_mode {
-                            eprintln!("[barca] step:{display_id} cached");
+                            eprintln!(
+                                "[barca] step:{display_id} cached{}",
+                                env_suffix(&dag, &display_id)
+                            );
                         }
                         all_outputs.insert(display_id.clone(), oref);
                         cached_node_ids.insert(display_id);
@@ -1286,11 +1325,12 @@ async fn execute(
                     bar.set_message(format!("{short_name} done"));
                 } else if agent_mode {
                     eprintln!(
-                        "[barca] step:{} completed {:.1}s ({}/{})",
+                        "[barca] step:{} completed {:.1}s ({}/{}){}",
                         node_id,
                         elapsed_s.unwrap_or(0.0),
                         completed_steps,
-                        total_steps
+                        total_steps,
+                        env_suffix(&dag, node_id)
                     );
                 }
             });
@@ -1810,6 +1850,7 @@ pub async fn list_assets(
                 kind: node.kind(),
                 freshness: node.extracted.freshness.clone(),
                 inputs,
+                env: node.extracted.env.clone(),
             }
         })
         .collect();

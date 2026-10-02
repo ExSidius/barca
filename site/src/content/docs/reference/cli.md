@@ -87,6 +87,11 @@ barca get pipeline.py -o value        # print just the final value (also: json |
 barca get pipeline.py --fields id,status   # trim each entry of `steps` in the JSON
 ```
 
+Each entry in the result's `steps` array says what happened to that step. A node that declares
+environment variables with `env=[...]` also carries `env`, the values the step was hashed with
+(`null` when unset, `<redacted>` for names like `*_TOKEN`), and its `--agent` progress line ends
+with `env NAME=value ...`. See [Decorators](/reference/api/decorators/#declared-environment-variables-env).
+
 ## run
 
 Execute a task and its dependency cone. Tasks always re-run (they are never cached). Upstream
@@ -174,7 +179,7 @@ second, so sub-minute schedules are legible).
 
 ```bash
 barca list pipeline.py
-barca list pipeline.py --json     # {"nodes": [{id, kind, freshness, inputs, next_fire?}], "total", "truncated"}
+barca list pipeline.py --json     # {"nodes": [{id, kind, freshness, inputs, env, next_fire?}], "total", "truncated"}
 barca list pipeline.py --pretty   # the table, even when piped
 barca list pipeline.py --limit 20   # first 20 nodes in topological order
 barca list pipeline.py --all        # every node (default: at most 100)
@@ -183,6 +188,9 @@ barca list pipeline.py --fields id,inputs   # JSON with only these keys per node
 
 `list` prints at most 100 nodes by default, which covers typical pipelines; larger DAGs are cut
 off in topological order and say so (`"truncated": true` in JSON, a note on stderr for the table).
+
+When any node declares environment variables (`@asset(env=["SOURCE_CSV"])`), the table gains an
+ENV column listing them; `--json` always includes `env` (an empty list when none are declared).
 
 ## Bounded output
 

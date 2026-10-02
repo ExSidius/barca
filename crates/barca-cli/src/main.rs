@@ -73,7 +73,8 @@ Examples:
 Output format: --json / --pretty / -o, else BARCA_OUTPUT=json|pretty, else the terminal decides
 (TTY -> pretty, piped -> JSON). JSON is one line on stdout with status (\"success\"), run_id,
 steps_executed (0 = all cached), phases, final_output, and `steps`: what happened to each step
-(ran or cached, and why). For parquet/pickle assets final_output is a pointer,
+(ran or cached, and why; `env` holds the values of variables the node declares with env=[...],
+secrets redacted). For parquet/pickle assets final_output is a pointer,
 {\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
 loads the value for you.
 Targets must be assets; use `barca run` for tasks. The target comes before the files:
@@ -154,12 +155,15 @@ More: barca docs scheduling";
 const LIST_HELP: &str = "\
 Examples:
   barca list pipeline.py             # table of nodes (in a terminal; JSON when piped)
-  barca list pipeline.py --json      # {nodes: [{id, kind, freshness, inputs, next_fire?}], total, truncated}
+  barca list pipeline.py --json      # {nodes: [{id, kind, freshness, inputs, env, next_fire?}], total, truncated}
   barca list pipeline.py --pretty    # the table, even when piped
   barca list pipeline.py --fields id,inputs   # JSON with only these keys per node
   barca list big.py --limit 20       # first 20 nodes (topological order)
   barca list big.py --all            # every node (default: at most 100)
   barca list a.py b.py               # several files form one DAG
+
+An ENV column (and `env` in JSON) lists the environment variables each node declares with
+@asset(env=[...]); their values are part of the run hash.
 
 Run this first to confirm barca discovered your nodes. When more nodes exist than are shown,
 JSON says `\"truncated\": true` with the `total`, and the table prints a note on stderr.
@@ -1225,9 +1229,26 @@ async fn list_cmd(
         return Ok(());
     }
     let has_schedule = !next_fires.is_empty();
+    // Like NEXT FIRE, the ENV column only appears when some node declares env.
+    let has_env = assets.iter().any(|a| !a.env.is_empty());
 
     // Render each row's cells up front so column widths fit the actual content.
-    let rows: Vec<(&str, String, String, &str, String)> = assets
+    let mut header = vec!["NAME", "KIND", "FRESHNESS"];
+    if has_schedule {
+        header.push("NEXT FIRE");
+    }
+    header.push("DEPS");
+    if has_env {
+        header.push("ENV");
+    }
+    let list_or_dash = |v: &[String]| {
+        if v.is_empty() {
+            "-".to_string()
+        } else {
+            v.join(", ")
+        }
+    };
+    let rows: Vec<Vec<String>> = assets
         .iter()
         .map(|a| {
             let kind = serde_json::to_value(&a.kind)
@@ -1246,79 +1267,51 @@ async fn list_cmd(
                     }
                 })
                 .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
-            let next = next_fires.get(&a.id).map(String::as_str).unwrap_or("-");
-            let deps = if a.inputs.is_empty() {
-                "-".to_string()
-            } else {
-                a.inputs.join(", ")
-            };
-            (a.id.as_str(), kind, freshness, next, deps)
+            let mut row = vec![a.id.clone(), kind, freshness];
+            if has_schedule {
+                row.push(next_fires.get(&a.id).cloned().unwrap_or_else(|| "-".into()));
+            }
+            row.push(list_or_dash(&a.inputs));
+            if has_env {
+                row.push(list_or_dash(&a.env));
+            }
+            row
         })
         .collect();
 
-    let max_name = assets.iter().map(|a| a.id.len()).max().unwrap_or(4).max(4);
-    let max_kind = rows.iter().map(|r| r.1.len()).max().unwrap_or(4).max(4);
-    let max_fresh = rows.iter().map(|r| r.2.len()).max().unwrap_or(9).max(9); // "FRESHNESS"
-    let max_next = rows.iter().map(|r| r.3.len()).max().unwrap_or(9).max(9); // "NEXT FIRE"
-
-    if has_schedule {
-        println!(
-            "{:<wn$}  {:<wk$}  {:<ws$}  {:<wf$}  {}",
-            "NAME",
-            "KIND",
-            "FRESHNESS",
-            "NEXT FIRE",
-            "DEPS",
-            wn = max_name,
-            wk = max_kind,
-            ws = max_fresh,
-            wf = max_next,
-        );
-        println!(
-            "{}",
-            "-".repeat(max_name + max_kind + max_fresh + max_next + 12)
-        );
-    } else {
-        println!(
-            "{:<wn$}  {:<wk$}  {:<ws$}  {}",
-            "NAME",
-            "KIND",
-            "FRESHNESS",
-            "DEPS",
-            wn = max_name,
-            wk = max_kind,
-            ws = max_fresh,
-        );
-        println!("{}", "-".repeat(max_name + max_kind + max_fresh + 10));
-    }
-
+    let widths: Vec<usize> = (0..header.len())
+        .map(|i| {
+            rows.iter()
+                .map(|r| r[i].len())
+                .chain(std::iter::once(header[i].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    // Every column but the last is padded; the last runs to the end of the line.
+    let last = header.len() - 1;
+    let render = |cells: &[&str]| {
+        cells
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                if i == last {
+                    c.to_string()
+                } else {
+                    format!("{c:<w$}", w = widths[i])
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+    };
+    println!("{}", render(&header));
+    println!(
+        "{}",
+        "-".repeat(widths[..last].iter().sum::<usize>() + 2 * last + 4)
+    );
     for row in &rows {
-        let (id, kind, freshness, next, deps) = row;
-        if has_schedule {
-            println!(
-                "{:<wn$}  {:<wk$}  {:<ws$}  {:<wf$}  {}",
-                id,
-                kind,
-                freshness,
-                next,
-                deps,
-                wn = max_name,
-                wk = max_kind,
-                ws = max_fresh,
-                wf = max_next,
-            );
-        } else {
-            println!(
-                "{:<wn$}  {:<wk$}  {:<ws$}  {}",
-                id,
-                kind,
-                freshness,
-                deps,
-                wn = max_name,
-                wk = max_kind,
-                ws = max_fresh,
-            );
-        }
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        println!("{}", render(&cells));
     }
     if let Some(note) = page.note(rows.len(), "nodes") {
         eprintln!("{note}");

@@ -38,7 +38,55 @@ def daily() -> dict:
 | `timeout_seconds=` | Per-attempt time limit (default 300). |
 | `retries=` | Total attempts on failure; 1 means no retry. |
 | `retry_backoff=` | Base delay in seconds; the delay grows linearly with the attempt number. |
+| `env=["NAME", ...]` | Environment variables the function reads. Their values are part of the cache key and are reported per step. See below. |
 | `description=`, `tags=` | Metadata. |
+
+## Environment variables: `env=`
+
+An asset that reads an environment variable (a source path, a region, a model name) should
+declare it. Barca reads the declared variables when it plans the run, folds each name and value
+into the run hash, and reports the values each step used.
+
+```python
+import os
+
+from barca import asset
+
+
+@asset(env=["SOURCE_CSV", "API_TOKEN"])
+def raw() -> dict:
+    return {"source": os.environ.get("SOURCE_CSV", "default.csv")}
+
+
+@asset(inputs={"data": raw})
+def summary(data: dict) -> dict:
+    return {"from": data["source"]}
+```
+
+```bash
+export SOURCE_CSV=a.csv
+barca get summary pipeline.py --agent     # raw and summary run
+barca get summary pipeline.py --agent     # both cached
+export SOURCE_CSV=b.csv
+barca get summary pipeline.py --agent     # raw and summary run again
+```
+
+- Changing a declared variable re-materializes the asset and everything downstream of it.
+  Unset is its own value, distinct from an empty string. Variables that are not declared are
+  not part of the cache key.
+- The JSON result's `steps` entry for the node carries `"env": {"API_TOKEN": null,
+  "SOURCE_CSV": "b.csv"}` (`null` = unset), and `--agent` step lines end with
+  `env API_TOKEN=<unset> SOURCE_CSV=b.csv`.
+- Names ending in `_TOKEN`, `_SECRET`, `_KEY` or `_PASSWORD` (any case, or the bare word) are
+  hashed like any other but shown as `<redacted>` in all output.
+- `barca list` shows the declared names in an ENV column (`env` in `--json`).
+- `env=` must be a literal list of string literals; anything else (a variable, a tuple, a
+  computed name) is a parse error. It is also accepted on `@task` and `@sensor`, which always
+  run: there it only records the values used.
+
+**Limitation:** barca cannot see environment variables your code reads without declaring them.
+Those are not part of the cache key and are not reported, so a changed value does not
+invalidate the asset.
 
 ## How a node is identified
 

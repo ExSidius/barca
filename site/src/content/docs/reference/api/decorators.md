@@ -19,6 +19,7 @@ Core decorators for defining assets, sensors, tasks, sinks, and related primitiv
     retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
+    env: list[str] | None = None,
 )
 ```
 
@@ -26,6 +27,9 @@ Declares a cacheable, provenance-tracked asset. The default freshness is `Always
 
 `retries` is the total number of attempts on failure (1 = no retry). `retry_backoff` is the base
 delay in seconds between attempts (delay grows linearly: `retry_backoff * attempt`).
+
+`env` declares the environment variables the function reads. See
+[Declared environment variables](#declared-environment-variables-env) below.
 
 ```python
 from barca import asset, Always, Manual, Schedule
@@ -69,6 +73,37 @@ Supported annotation shapes (statically parsed, no import):
 | `pl.LazyFrame` | polars (materialized on write; read back as `DataFrame`) |
 | `pyarrow.Table` | pyarrow (written with `pyarrow.parquet`) |
 | `duckdb.DuckDBPyRelation` | duckdb (relation on read; materialized to parquet on write) |
+
+### Declared environment variables (`env=`)
+
+```python
+import os
+from barca import asset
+
+@asset(env=["SOURCE_CSV", "API_TOKEN"])
+def raw() -> dict:
+    return {"source": os.environ.get("SOURCE_CSV", "default.csv")}
+```
+
+`env=` must be a literal list of string literals; barca reads it statically (a variable, tuple or
+computed name is a parse error). When it plans a run, barca reads each declared variable from its
+own environment (the workers inherit the same environment) and folds the name and value into
+the step's run hash:
+
+- Changing a declared variable re-materializes the asset and everything downstream of it. An
+  unset variable is its own value, distinct from an empty string.
+- Each step's entry in the JSON result carries `"env": {"API_TOKEN": null, "SOURCE_CSV": "b.csv"}`
+  (`null` = unset), and `--agent` step lines end with `env API_TOKEN=<unset> SOURCE_CSV=b.csv`.
+- Names ending in `_TOKEN`, `_SECRET`, `_KEY` or `_PASSWORD` (any case, or the bare word) are
+  hashed but shown as `<redacted>` in every output.
+- `barca list` shows declared names in an ENV column, and as `env` in `--json`.
+- Nodes that declare no `env` hash exactly as before, so existing caches stay valid.
+
+`env=` is also accepted on `@task` and `@sensor`. Those always run, so there it only records the
+values each run used.
+
+**Limitation:** environment variables your code reads without declaring them are invisible to
+barca. They are not part of the cache key, so changing one does not invalidate anything.
 
 ## Partitions
 
@@ -154,10 +189,11 @@ For partitioned assets, each partition writes its own sink file with the partiti
     retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
+    env: list[str] | None = None,
 )
 ```
 
-Declares an external-state observer. Sensors must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors (polling frequency must be declared explicitly). See `@asset` above for `retries` / `retry_backoff` semantics.
+Declares an external-state observer. Sensors must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors (polling frequency must be declared explicitly). See `@asset` above for `env`, `retries` and `retry_backoff` semantics.
 
 Sensors return `(update_detected: bool, output)` tuples. The full tuple is passed as input to downstream assets.
 
@@ -184,6 +220,7 @@ Sensors are source nodes only — they have no upstream inputs.
     retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
+    env: list[str] | None = None,
 )
 ```
 

@@ -7,6 +7,7 @@ pub mod cost;
 pub mod dag;
 pub mod db;
 pub mod dispatch;
+pub mod envdeps;
 pub mod hash;
 pub mod io_loop;
 pub mod model;

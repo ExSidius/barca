@@ -407,6 +407,10 @@ pub struct ExtractedNode {
     /// Parallel calls found in this task's function body.
     /// Only populated for `@task` nodes. Empty for assets/sensors.
     pub parallel_calls: Vec<ParallelCall>,
+    /// Declared environment variables (`@asset(env=["NAME", ...])`), in declaration order.
+    /// Their values are read at plan time and folded into the run hash; see [`crate::envdeps`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
 }
 
 impl ExtractedNode {

@@ -2,12 +2,14 @@
 
 use std::collections::HashMap;
 
-/// Compute the run_hash for a step given its context.
+/// Compute the run_hash for a step given its context. `env` is the step's declared env values
+/// ([`crate::envdeps::hash_input`]); `None` leaves the hash exactly as a node without `env=`.
 pub fn compute_run_hash(
     def_hash: &str,
     partition_key: Option<&str>,
     upstream_ids: impl Iterator<Item = impl AsRef<str>>,
     cached_run_hashes: &HashMap<String, String>,
+    env: Option<&str>,
 ) -> String {
     let mut upstream_hashes: Vec<String> = Vec::new();
     for uid in upstream_ids {
@@ -38,7 +40,7 @@ pub fn compute_run_hash(
         }
     }
     let hash_refs: Vec<&str> = upstream_hashes.iter().map(|s| s.as_str()).collect();
-    crate::hash::run_hash(def_hash, partition_key, &hash_refs, None)
+    crate::hash::run_hash(def_hash, partition_key, &hash_refs, None, env)
 }
 
 #[cfg(test)]
@@ -80,20 +82,99 @@ mod tests {
         let mut hashes = HashMap::new();
         hashes.insert("upstream".to_string(), "h_up".to_string());
 
-        let h1 = compute_run_hash("def_abc", None, ["upstream".to_string()].iter(), &hashes);
-        let h2 = compute_run_hash("def_abc", None, ["upstream".to_string()].iter(), &hashes);
+        let h1 = compute_run_hash(
+            "def_abc",
+            None,
+            ["upstream".to_string()].iter(),
+            &hashes,
+            None,
+        );
+        let h2 = compute_run_hash(
+            "def_abc",
+            None,
+            ["upstream".to_string()].iter(),
+            &hashes,
+            None,
+        );
         assert_eq!(h1, h2);
+    }
+
+    /// Pinned run hashes computed by barca <= 0.9.0 (before declared env existed). A node that
+    /// declares no env must keep exactly these hashes, or every existing cache is invalidated.
+    #[test]
+    fn run_hash_unchanged_for_nodes_without_env() {
+        let mut hashes = HashMap::new();
+        hashes.insert("upstream".to_string(), "h_up".to_string());
+        assert_eq!(
+            compute_run_hash(
+                "def_abc",
+                None,
+                ["upstream".to_string()].iter(),
+                &hashes,
+                None
+            ),
+            "bc7c6531d8fe3452c9a9ac36fef43665103624231e112b5d87bf20376e2e9288"
+        );
+        assert_eq!(
+            compute_run_hash(
+                "def_abc",
+                Some("t=X"),
+                std::iter::empty::<&String>(),
+                &HashMap::new(),
+                None
+            ),
+            "7a4d6ec23915f304b5520de445fd04343119f46d664c9737a7edb7ae11babc5d"
+        );
+    }
+
+    #[test]
+    fn declared_env_changes_the_run_hash() {
+        use crate::envdeps::{hash_input, resolve_with};
+        let names = vec!["SOURCE_CSV".to_string()];
+        let hashes = HashMap::new();
+        let h = |v: Option<&str>| {
+            let vals = resolve_with(&names, |_| v.map(String::from));
+            compute_run_hash(
+                "def_abc",
+                None,
+                std::iter::empty::<&String>(),
+                &hashes,
+                hash_input(&vals).as_deref(),
+            )
+        };
+        let none = compute_run_hash(
+            "def_abc",
+            None,
+            std::iter::empty::<&String>(),
+            &hashes,
+            None,
+        );
+        assert_ne!(h(Some("/a.csv")), h(Some("/b.csv")));
+        assert_ne!(h(None), h(Some("")));
+        assert_ne!(
+            h(None),
+            none,
+            "declaring a variable (even unset) is part of the identity"
+        );
+        assert_eq!(h(Some("/a.csv")), h(Some("/a.csv")));
     }
 
     #[test]
     fn compute_run_hash_changes_with_partition() {
         let hashes = HashMap::new();
-        let h1 = compute_run_hash("def_abc", None, std::iter::empty::<&String>(), &hashes);
+        let h1 = compute_run_hash(
+            "def_abc",
+            None,
+            std::iter::empty::<&String>(),
+            &hashes,
+            None,
+        );
         let h2 = compute_run_hash(
             "def_abc",
             Some("t=X"),
             std::iter::empty::<&String>(),
             &hashes,
+            None,
         );
         assert_ne!(h1, h2);
     }

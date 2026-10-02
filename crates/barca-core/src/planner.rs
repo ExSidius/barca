@@ -700,6 +700,7 @@ mod tests {
                     param_types: HashMap::new(),
                     return_type: None,
                     parallel_calls: Vec::new(),
+                    env: Vec::new(),
                 }
             })
             .collect();
@@ -754,6 +755,7 @@ mod tests {
             param_types: HashMap::new(),
             return_type: None,
             parallel_calls: Vec::new(),
+            env: Vec::new(),
         };
         extracted.sinks.push(SinkDecl {
             path: "exports/out.parquet".to_string(),
@@ -1180,6 +1182,7 @@ mod tests {
                 param_types: HashMap::new(),
                 return_type: None,
                 parallel_calls: Vec::new(),
+                env: Vec::new(),
             })
             .collect();
         let dag = Dag::build(&extracted).unwrap();
@@ -1321,6 +1324,7 @@ mod tests {
                     param_types: HashMap::new(),
                     return_type: None,
                     parallel_calls: Vec::new(),
+                    env: Vec::new(),
                 }
             })
             .collect();
@@ -1456,6 +1460,7 @@ mod tests {
             param_types: HashMap::new(),
             return_type: None,
             parallel_calls: Vec::new(),
+            env: Vec::new(),
         };
         let collector = ExtractedNode {
             kind: NodeKind::Asset,
@@ -1483,6 +1488,7 @@ mod tests {
             param_types: HashMap::new(),
             return_type: None,
             parallel_calls: Vec::new(),
+            env: Vec::new(),
         };
         Dag::build(&[producer, collector]).unwrap()
     }
@@ -1561,6 +1567,7 @@ mod tests {
             param_types: HashMap::new(),
             return_type: None,
             parallel_calls: Vec::new(),
+            env: Vec::new(),
         };
         let fetch_prices = ExtractedNode {
             kind: NodeKind::Asset,
@@ -1589,6 +1596,7 @@ mod tests {
             param_types: HashMap::new(),
             return_type: None,
             parallel_calls: Vec::new(),
+            env: Vec::new(),
         };
         let aggregate = ExtractedNode {
             kind: NodeKind::Asset,
@@ -1616,6 +1624,7 @@ mod tests {
             param_types: HashMap::new(),
             return_type: None,
             parallel_calls: Vec::new(),
+            env: Vec::new(),
         };
         let dag = Dag::build(&[tickers, fetch_prices, aggregate]).unwrap();
         let p = plan_from_dag(&dag, &cfg(10));
