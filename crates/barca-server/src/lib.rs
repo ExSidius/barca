@@ -18,8 +18,9 @@ mod scheduler;
 mod state;
 mod watch;
 
+pub use handlers::node_states;
 pub use scheduler::{ScheduleInfo, describe_schedule};
-pub use state::ServeConfig;
+pub use state::{NodeState, ServeConfig};
 
 use state::AppState;
 
@@ -45,7 +46,9 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
     let addr = std::net::SocketAddr::new(config.host, config.port);
     let n_files = config.files.len();
     let watch = config.watch;
-    let schedule = config.schedule;
+    // A read-only server never runs anything, so it never schedules either.
+    let schedule = config.schedule && !config.read_only;
+    let read_only = config.read_only;
 
     let state = AppState::new(config);
 
@@ -55,6 +58,12 @@ pub async fn serve(config: ServeConfig) -> Result<(), ServeError> {
         std::time::Duration::from_secs(300),
         std::time::Duration::from_secs(3600),
     ));
+
+    if read_only {
+        eprintln!(
+            "[barca] read-only: runs are refused and the metadata DB is only read from snapshots"
+        );
+    }
 
     // Fire `Schedule(...)` assets on their cron ticks (local time). On by default.
     if schedule {

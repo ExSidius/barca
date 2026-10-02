@@ -35,7 +35,18 @@ fn fixture_config(dir: &std::path::Path) -> ServeConfig {
         timezone: "local".to_string(),
         python: barca_core::commands::find_python(),
         resolved: barca_core::config::resolve_in(None, dir).unwrap(),
+        read_only: false,
     }
+}
+
+/// Like [`fixture_config`], with the DB pointed into the temp dir so tests can
+/// assert whether it was created.
+fn isolated_config(dir: &std::path::Path, read_only: bool) -> ServeConfig {
+    let mut config = fixture_config(dir);
+    config.resolved.db_path = dir.join("metadata.db").display().to_string();
+    config.resolved.artifact_root = dir.join("artifacts").display().to_string();
+    config.read_only = read_only;
+    config
 }
 
 async fn body_json(resp: axum::response::Response) -> serde_json::Value {
@@ -404,4 +415,69 @@ async fn logs_for_unknown_run_returns_empty() {
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["logs"], serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn state_reports_every_node_without_creating_a_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(isolated_config(dir.path(), false));
+    let (status, json) = send(&app, "GET", "/state").await;
+    assert_eq!(status, StatusCode::OK);
+    let nodes = json.as_array().expect("array of node states");
+    assert_eq!(nodes.len(), 2);
+    for n in nodes {
+        assert_eq!(n["cache"]["state"], "missing", "{n}");
+        assert!(n["last"].is_null());
+        assert!(n["next_run"].is_null(), "unscheduled: {n}");
+    }
+    assert!(
+        !dir.path().join("metadata.db").exists(),
+        "GET /state created the DB"
+    );
+}
+
+#[tokio::test]
+async fn read_only_rejects_everything_that_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(isolated_config(dir.path(), true));
+    for (method, uri) in [
+        ("POST", "/run"),
+        ("POST", "/run/second"),
+        ("POST", "/get/second"),
+        ("DELETE", "/run/deadbeef"),
+    ] {
+        let (status, json) = send(&app, method, uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {uri}");
+        assert!(
+            json["error"].as_str().unwrap_or("").contains("read-only"),
+            "{method} {uri}: {json}"
+        );
+    }
+    let (_, health) = send(&app, "GET", "/health").await;
+    assert_eq!(health["read_only"], true);
+}
+
+#[tokio::test]
+async fn read_only_reads_never_create_or_touch_the_db() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(isolated_config(dir.path(), true));
+    for uri in ["/state", "/assets/first", "/logs/deadbeef"] {
+        let (status, _) = send(&app, "GET", uri).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+    }
+    let entries: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("metadata.db"))
+        .collect();
+    assert!(entries.is_empty(), "read-only reads created {entries:?}");
+}
+
+#[tokio::test]
+async fn health_reports_writable_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = app(isolated_config(dir.path(), false));
+    let (_, health) = send(&app, "GET", "/health").await;
+    assert_eq!(health["read_only"], false);
 }

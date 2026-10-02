@@ -41,6 +41,11 @@ pub struct ServeConfig {
     pub python: PathBuf,
     /// Resolved barca configuration (environment, DB path, artifact root, state).
     pub resolved: barca_core::config::ResolvedConfig,
+    /// Inspect-only mode (`--read-only`): endpoints that run or cancel work
+    /// return 403, the scheduler never starts, and every DB read goes through a
+    /// private snapshot — the metadata DB is never opened, locked, created, or
+    /// written. Safe to point at a project another process is running.
+    pub read_only: bool,
 }
 
 /// Lifecycle of an async run tracked by the server.
@@ -89,6 +94,18 @@ pub struct RunState {
 pub struct DagCache {
     pub assets: Option<Vec<AssetSummary>>,
     pub plan: Option<PlanResult>,
+}
+
+/// One row of `GET /state`: a node's [`AssetState`] plus when its cron
+/// schedule next fires (local time, unix epoch seconds), if it has one.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct NodeState {
+    #[serde(flatten)]
+    #[cfg_attr(feature = "ts", ts(flatten))]
+    pub state: barca_core::asset_state::AssetState,
+    #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+    pub next_run: Option<i64>,
 }
 
 /// Live event channel for one run: a broadcast for subscribers plus a backlog

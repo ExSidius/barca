@@ -32,7 +32,12 @@ barca serve pipeline.py                        # HTTP API on 127.0.0.1:8274 + sc
 barca serve pipeline.py --timezone utc         # evaluate cron in UTC (default: local)
 barca serve pipeline.py --no-schedule          # API only, no scheduler
 barca serve pipeline.py --watch                # dev: re-parse the DAG when files change
+barca serve pipeline.py --read-only            # inspect only: no runs, no scheduler
 ```
+
+`--read-only` serves the API without the ability to change anything: run and cancel endpoints
+return `403`, the scheduler never starts, and every read of the metadata DB goes through a
+private copy, so it is safe to point at a project another process is running.
 
 `serve` binds to `127.0.0.1` with no authentication. Endpoints are documented at
 https://barca.sh/reference/server-api/ and `GET /schedule` reports live schedule status.

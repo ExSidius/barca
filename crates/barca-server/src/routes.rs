@@ -21,6 +21,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/get/{target}", post(handlers::get_target))
         .route("/status/{run_id}", get(handlers::status))
+        .route("/state", get(handlers::state))
         .route("/events/{run_id}", get(handlers::events))
         .route("/logs/{run_id}", get(handlers::logs))
         .route("/schedule", get(handlers::schedule))

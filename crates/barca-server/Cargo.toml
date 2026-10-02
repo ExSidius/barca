@@ -17,6 +17,7 @@ futures = "0.3"
 croner = "3.0.1"
 chrono = "0.4.45"
 chrono-tz = "0.10.4"
+tempfile = "3"
 ts-rs = { version = "12", optional = true }
 
 [features]

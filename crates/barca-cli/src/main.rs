@@ -98,9 +98,24 @@ Examples:
   barca serve pipeline.py --watch            # dev: re-parse the DAG when files change
   barca serve pipeline.py --no-schedule      # API only; Schedule(...) nodes do not fire
   barca serve pipeline.py --timezone utc     # evaluate cron in UTC (default: local)
+  barca serve pipeline.py --read-only        # inspect only: no runs, no scheduler, DB never written
 
 Binds to localhost with no authentication.
 More: barca docs scheduling";
+
+const STATUS_HELP: &str = "\
+Examples:
+  barca status pipeline.py              # every node: state, last run, typical time, next run
+  barca status pipeline.py --json       # array of node states (same shape as GET /state)
+  barca status a.py b.py --env prod     # another environment's cache
+
+States: fresh (the cached result matches the code and inputs), stale (code: its own code
+changed; upstream: something upstream recomputes), missing (never succeeded), partial (some
+partition keys cached), always_runs (tasks and sensors), unknown (a dynamic partition's keys
+are not known until its source runs). `last` is the latest attempt, failures included.
+Read-only: reads a private copy of the metadata DB, so it is safe while other barca
+processes run. Nothing executes.
+More: barca docs cache";
 
 const LIST_HELP: &str = "\
 Examples:
@@ -260,6 +275,25 @@ enum Cli {
         /// Timezone for cron evaluation: local (default), utc, or an IANA name
         #[arg(long, default_value = "local")]
         timezone: String,
+        /// Inspect only: refuse runs, never schedule, read the metadata DB from snapshots
+        #[arg(long)]
+        read_only: bool,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
+    },
+    /// Show every node's state: fresh, stale, missing or failed, plus typical time and next run
+    ///
+    /// Read-only: computed from a private copy of the metadata DB with the same cache
+    /// decisions `barca get --dry-run` makes. Nothing executes and nothing is written.
+    #[command(after_help = STATUS_HELP)]
+    Status {
+        /// Python source files containing definitions
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Emit JSON (an array of node states) instead of a table
+        #[arg(long)]
+        json: bool,
         /// Environment name (separates cache/state per environment)
         #[arg(long)]
         env: Option<String>,
@@ -481,12 +515,14 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
             env,
         } => stats_cmd(env.as_deref(), target, files, json, &python).await,
         Cli::List { files, json } => list_cmd(files, json, &python).await,
+        Cli::Status { files, json, env } => status_cmd(env.as_deref(), files, json, &python).await,
         Cli::Serve {
             files,
             port,
             watch,
             no_schedule,
             timezone,
+            read_only,
             env,
         } => {
             serve_cmd(
@@ -496,6 +532,7 @@ async fn run_cli(cli: Cli) -> Result<(), barca_core::BarcaError> {
                 watch,
                 !no_schedule,
                 timezone,
+                read_only,
                 &python,
             )
             .await
@@ -889,6 +926,118 @@ async fn list_cmd(
     Ok(())
 }
 
+/// Severity rank for the status table: what needs attention sorts first.
+fn status_rank(n: &barca_server::NodeState) -> u8 {
+    use barca_core::asset_state::CacheState;
+    let failed = n.state.last.as_ref().is_some_and(|l| l.status == "failed");
+    match (&n.state.cache, failed) {
+        (_, true) => 0,
+        (CacheState::Stale { .. }, _) => 1,
+        (CacheState::Missing, _) => 2,
+        (CacheState::Partial { .. }, _) => 3,
+        (CacheState::Unknown, _) => 4,
+        (CacheState::AlwaysRuns, _) => 5,
+        (CacheState::Fresh, _) => 6,
+    }
+}
+
+fn status_label(cache: &barca_core::asset_state::CacheState) -> String {
+    use barca_core::asset_state::{CacheState, StaleCause};
+    match cache {
+        CacheState::Fresh => "fresh".into(),
+        CacheState::Partial { cached, total } => format!("partial {cached}/{total}"),
+        CacheState::Stale {
+            cause: StaleCause::Code,
+        } => "stale (code)".into(),
+        CacheState::Stale {
+            cause: StaleCause::Upstream,
+        } => "stale (upstream)".into(),
+        CacheState::Missing => "missing".into(),
+        CacheState::AlwaysRuns => "always runs".into(),
+        CacheState::Unknown => "unknown".into(),
+    }
+}
+
+async fn status_cmd(
+    env: Option<&str>,
+    files: Vec<PathBuf>,
+    json: bool,
+    python: &PathBuf,
+) -> Result<(), barca_core::BarcaError> {
+    check_py_files(&files, None);
+    let cfg = barca_core::config::resolve(env)?;
+    let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    let mut nodes = barca_server::node_states(&cfg, &file_args, python).await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&nodes).unwrap());
+        return Ok(());
+    }
+    if nodes.is_empty() {
+        println!("No definitions found.");
+        return Ok(());
+    }
+
+    let failed = nodes
+        .iter()
+        .filter(|n| n.state.last.as_ref().is_some_and(|l| l.status == "failed"))
+        .count();
+    let count = |rank: u8| nodes.iter().filter(|n| status_rank(n) == rank).count();
+    println!(
+        "{} nodes: {failed} failed · {} stale · {} missing · {} fresh",
+        nodes.len(),
+        count(1),
+        count(2),
+        count(6)
+    );
+    println!();
+
+    nodes.sort_by_key(status_rank);
+    let name_w = nodes
+        .iter()
+        .map(|n| n.state.id.rsplit(':').next().unwrap_or(&n.state.id).len())
+        .max()
+        .unwrap_or(4)
+        .clamp(4, 48);
+    println!(
+        "{:<name_w$}  {:<6}  {:<16}  {:<7}  {:<19}  {:>7}  {:<16}",
+        "NODE", "KIND", "STATE", "LAST", "AT (UTC)", "TYPICAL", "NEXT RUN"
+    );
+    for n in &nodes {
+        let s = &n.state;
+        let name = s.id.rsplit(':').next().unwrap_or(&s.id);
+        let kind = serde_json::to_value(s.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let (last, at) = match &s.last {
+            Some(l) => (l.status.as_str(), l.created_at.as_str()),
+            None => ("-", "-"),
+        };
+        let typical = s
+            .durations
+            .as_ref()
+            .map(|d| format!("{:.1}s", d.median_seconds))
+            .unwrap_or_else(|| "-".into());
+        let next = n
+            .next_run
+            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+            .map(|t| {
+                t.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_else(|| match s.freshness {
+                barca_core::Freshness::Schedule(_) => "?".into(),
+                _ => "-".into(),
+            });
+        println!(
+            "{name:<name_w$}  {kind:<6}  {:<16}  {last:<7}  {at:<19}  {typical:>7}  {next:<16}",
+            status_label(&s.cache)
+        );
+    }
+    Ok(())
+}
+
 async fn history_cmd(
     env: Option<&str>,
     limit: usize,
@@ -988,6 +1137,7 @@ async fn serve_cmd(
     watch: bool,
     schedule: bool,
     timezone: String,
+    read_only: bool,
     python: &std::path::Path,
 ) -> Result<(), barca_core::BarcaError> {
     let resolved = barca_core::config::resolve(env)?;
@@ -1007,6 +1157,7 @@ async fn serve_cmd(
         timezone,
         python: python.to_path_buf(),
         resolved,
+        read_only,
     };
     barca_server::serve(config)
         .await

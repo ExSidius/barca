@@ -44,6 +44,7 @@ barca get total pipeline.py      # second time: everything is a cache hit
 | `barca run task files...` | Run a task (always re-runs) and its dependency cone. |
 | `barca list files...` | List nodes with kind, freshness and dependencies (`--json`). |
 | `barca plan files...` | Emit the tiered execution plan as JSON. |
+| `barca status files...` | Every node: fresh, stale or missing, last attempt, typical time (`--json`). |
 | `barca history` / `barca stats` | Past runs; timing and cache statistics (`--json`). |
 | `barca serve files...` | HTTP API and cron scheduler. |
 | `barca docs [topic]` | This manual. |
