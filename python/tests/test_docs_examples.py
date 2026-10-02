@@ -134,6 +134,10 @@ def test_example_deploy_task(binary, topics, tmp_path):
     assert result(barca(binary, tmp_path, "run", "deploy", "pipeline.py"))["steps_executed"] == 1
     refreshed = barca(binary, tmp_path, "run", "deploy", "pipeline.py", "--refresh", "model")
     assert result(refreshed)["steps_executed"] == 2
+    only = barca(
+        binary, tmp_path, "run", "deploy", "pipeline.py", "--refresh", "model", "--no-cascade"
+    )
+    assert result(only)["steps_executed"] == 2  # nothing besides the task is downstream of model
     wrong = barca(binary, tmp_path, "get", "deploy", "pipeline.py")
     assert wrong.returncode == 2 and "barca run" in wrong.stderr
 

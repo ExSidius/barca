@@ -16,6 +16,11 @@ so upgrading does not invalidate existing caches.
 Tasks and sensors are never served from cache. Partitioned assets are cached per key (see
 `barca docs partitions`).
 
+A sensor's *output* is not part of its consumers' run hashes. A sensor has no inputs, so its run
+hash depends only on its code; when it returns a new value (a new blob etag, say), an asset that
+reads it keeps the same run hash and is served from cache with the old data. To pick up external
+data that changed in place, refresh the asset that reads it: `--refresh bronze` (below).
+
 ## Where things live
 
 ```
@@ -34,24 +39,34 @@ content-addressed, so they can be shared between machines when remote state is c
 | Normal, cache-aware | `barca get target pipeline.py` |
 | Recompute everything in the cone | `barca get target pipeline.py --no-cache` |
 | Run a task, cached upstream | `barca run task pipeline.py` |
-| Run a task, refresh chosen upstream assets | `barca run task pipeline.py --refresh a,b` |
+| Run a task, refresh chosen upstream assets and everything downstream of them | `barca run task pipeline.py --refresh a,b` |
+| Run a task, refresh only the chosen assets | `barca run task pipeline.py --refresh a,b --no-cascade` |
 | Run a task, refresh all upstream assets | `barca run task pipeline.py --refresh-all` |
 
 `barca run` previously refreshed every upstream asset by default and called the selective flag
 `--burst`. The default is now cache-aware and the flag is `--refresh`.
 
+Previously `--refresh` did not cascade: it re-ran only the named assets and left their downstream
+assets cached. It now cascades by default; `--no-cascade` keeps the old behavior.
+
 ### Exactly what `--refresh` does
 
-- `--refresh a,b` re-materializes **only** the assets you name. It takes one comma-separated
-  list; `--refresh a b` is an error ("'b' is not a .py file"). A name that is not an upstream
-  asset of the task is an error that lists the valid names, so a typo never silently does nothing.
-- It does **not** rebuild the upstream of what you name. Unnamed assets keep serving from cache.
-- It does **not** invalidate assets *downstream* of what you name. Run hashes cover definitions
-  and upstream hashes, not output contents, so a cached downstream asset still matches and the
+- `--refresh a,b` re-materializes the assets you name **and every asset downstream of them** in
+  the task's cone (the cascade), so the refreshed data reaches the task. A step re-run by the
+  cascade reports `reason: "refresh_cascade"` and a `detail` naming the asset it cascaded from.
+- It takes one comma-separated list; `--refresh a b` is an error ("'b' is not a .py file"). A
+  name that is not an upstream asset of the task is an error that lists the valid names, so a
+  typo never silently does nothing.
+- It does **not** rebuild the upstream of what you name, or assets in the cone that do not depend
+  on it. Those keep serving from cache.
+- `--no-cascade` re-materializes **only** the assets you name. Run hashes cover definitions and
+  upstream hashes, not output contents, so a cached downstream asset still matches and the
   refreshed data never reaches it. Barca prints
   `warning: 'mid' was served from cache but depends on refreshed 'src' ...` when this happens.
-  To push fresh data through a chain, name the whole chain (`--refresh src,mid`) or use
-  `--refresh-all`.
+  `--no-cascade` without `--refresh` is a usage error (exit 2).
+
+Use `--refresh` when external data changed in place (a blob overwritten at the same path): name
+the asset that reads it, and everything built from it re-runs.
 
 ## Seeing what will happen: `--dry-run`
 
@@ -62,7 +77,7 @@ nothing: no `.barca` directory is created and no run is recorded.
 ```bash
 barca run report pipeline.py --dry-run --json          # JSON on one line
 barca run report pipeline.py --dry-run --pretty        # a table for humans
-barca run report pipeline.py --dry-run --refresh src   # preview a refresh before doing it
+barca run report pipeline.py --dry-run --refresh src   # preview a refresh and its cascade
 barca get total pipeline.py --dry-run --no-cache
 ```
 
@@ -85,14 +100,15 @@ Each step has an `action`:
 | `unknown` | Cannot be known without running: a dynamic partition (`partitions_from`) whose source has to run first to produce its keys, and anything that depends on it. |
 
 `reason` is one of `task` and `sensor` (always run), `no_cache` (`--no-cache`), `refresh` (named in
-`--refresh`), `refresh_all`, or `not_materialized` (no cached result for this code and these
-inputs: never run, or the code or an upstream changed). A cached step downstream of a refreshed
-asset carries a `warning` (see the refresh notes above). `summary` counts steps, one per partition
+`--refresh`), `refresh_cascade` (downstream of an asset named in `--refresh`), `refresh_all`, or
+`not_materialized` (no cached result for this code and these inputs: never run, or the code or an
+upstream changed). Under `--no-cascade`, a cached step downstream of a refreshed asset carries a
+`warning` (see the refresh notes above). `summary` counts steps, one per partition
 key.
 
 A dry run makes the same decisions a real run makes (it calls the same code), and the test suite
-checks that `will_run` equals the real run's `steps_executed` across cold, warm, `--refresh` and
-`--refresh-all` runs.
+checks that `will_run` equals the real run's `steps_executed` across cold, warm, `--refresh`,
+`--refresh --no-cascade` and `--refresh-all` runs.
 
 ## What a run reports
 

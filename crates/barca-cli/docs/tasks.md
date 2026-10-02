@@ -40,7 +40,8 @@ def notify(_migrate) -> None:
 
 ```bash
 barca run send_email pipeline.py                      # task runs; upstream assets come from cache
-barca run send_email pipeline.py --refresh report     # also re-materialize these upstream assets
+barca run send_email pipeline.py --refresh report     # re-materialize report and what is downstream of it
+barca run send_email pipeline.py --refresh report --no-cascade   # re-materialize only report
 barca run send_email pipeline.py --refresh-all        # re-materialize every upstream asset
 barca run send_email pipeline.py --no-cache           # same as --refresh-all
 ```

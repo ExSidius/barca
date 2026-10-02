@@ -191,36 +191,46 @@ fn target_outcomes(
 // dry run cannot drift from what a run would do.
 
 /// Why a step runs instead of being served from cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RunReason {
     Task,
     Sensor,
     NoCache,
     Refresh,
+    /// Downstream of an asset named in `--refresh` (the cascade); `root` is that asset.
+    RefreshCascade {
+        root: String,
+    },
     RefreshAll,
     NotMaterialized,
 }
 
 impl RunReason {
-    fn code(self) -> &'static str {
+    fn code(&self) -> &'static str {
         match self {
             RunReason::Task => "task",
             RunReason::Sensor => "sensor",
             RunReason::NoCache => "no_cache",
             RunReason::Refresh => "refresh",
+            RunReason::RefreshCascade { .. } => "refresh_cascade",
             RunReason::RefreshAll => "refresh_all",
             RunReason::NotMaterialized => "not_materialized",
         }
     }
 
-    fn detail(self) -> &'static str {
+    fn detail(&self) -> String {
         match self {
-            RunReason::Task => "tasks always re-run",
-            RunReason::Sensor => "sensors always re-run",
-            RunReason::NoCache => "--no-cache",
-            RunReason::Refresh => "named in --refresh",
-            RunReason::RefreshAll => "--refresh-all",
-            RunReason::NotMaterialized => "no cached result for this code and these inputs",
+            RunReason::Task => "tasks always re-run".to_string(),
+            RunReason::Sensor => "sensors always re-run".to_string(),
+            RunReason::NoCache => "--no-cache".to_string(),
+            RunReason::Refresh => "named in --refresh".to_string(),
+            RunReason::RefreshCascade { root } => {
+                format!("downstream of refreshed '{root}'")
+            }
+            RunReason::RefreshAll => "--refresh-all".to_string(),
+            RunReason::NotMaterialized => {
+                "no cached result for this code and these inputs".to_string()
+            }
         }
     }
 }
@@ -244,6 +254,9 @@ enum Decision {
 struct DecideState {
     run_hashes: HashMap<String, String>,
     refreshed_ids: std::collections::HashSet<String>,
+    /// Refreshed asset -> the `--refresh` name it was refreshed for (itself, or the named
+    /// upstream it cascaded from).
+    cascade_roots: HashMap<String, String>,
     stale_cached: HashMap<String, String>,
 }
 
@@ -319,17 +332,38 @@ async fn decide_step(
         return (step, Decision::Run(RunReason::NoCache));
     }
 
-    // Refresh policy (`barca run`): force-rerun assets in/named by the refresh set.
+    // Refresh policy (`barca run`): force-rerun assets named in the refresh set and, when
+    // cascading, every asset downstream of one (plan order puts upstream steps first, so a
+    // refreshed upstream is already in `cascade_roots` when its consumers are decided).
     let is_asset = kind == Some(crate::NodeKind::Asset);
     let refresh = match policy {
         CachePolicy::CacheAware => None,
         CachePolicy::RefreshAll => is_asset.then_some(RunReason::RefreshAll),
-        CachePolicy::RefreshSelective(names) => (is_asset
-            && names.iter().any(|name| refresh_name_matches(base_id, name)))
-        .then_some(RunReason::Refresh),
+        CachePolicy::RefreshSelective { names, cascade } => {
+            if !is_asset {
+                None
+            } else if names.iter().any(|name| refresh_name_matches(base_id, name)) {
+                Some(RunReason::Refresh)
+            } else if *cascade {
+                step.inputs.values().find_map(|up| {
+                    let up_base = up.split('[').next().unwrap_or(up);
+                    state
+                        .cascade_roots
+                        .get(up_base)
+                        .map(|root| RunReason::RefreshCascade { root: root.clone() })
+                })
+            } else {
+                None
+            }
+        }
     };
     if let Some(reason) = refresh {
+        let root = match &reason {
+            RunReason::RefreshCascade { root } => root.clone(),
+            _ => short_name(base_id).to_string(),
+        };
         state.refreshed_ids.insert(base_id.to_string());
+        state.cascade_roots.insert(base_id.to_string(), root);
         return (step, Decision::Run(reason));
     }
 
@@ -442,7 +476,8 @@ fn stale_warning(display_id: &str, root: &str, dry: bool) -> String {
     };
     format!(
         "'{id}' {served} from cache but depends on refreshed '{root}', so it {reflect} the \
-         refresh. Add it to --refresh (for example --refresh {root},{id}) or use --refresh-all."
+         refresh. Drop --no-cascade, add it to --refresh (for example --refresh {root},{id}) or \
+         use --refresh-all."
     )
 }
 
@@ -502,7 +537,7 @@ fn report_for(
     let verdict = match decision {
         Decision::Run(reason) => {
             r.reason = Some(reason.code().to_string());
-            r.detail = Some(reason.detail().to_string());
+            r.detail = Some(reason.detail());
             r.run_hash = step.run_hashes.get(&display_id).cloned();
             if step.partition_keys.is_empty() {
                 word_run
@@ -540,7 +575,7 @@ fn report_for(
             });
             if !missing.is_empty() {
                 r.reason = Some(RunReason::NotMaterialized.code().to_string());
-                r.detail = Some(RunReason::NotMaterialized.detail().to_string());
+                r.detail = Some(RunReason::NotMaterialized.detail());
             }
             match (cached.is_empty(), missing.is_empty()) {
                 (_, true) => word_cached,
@@ -896,10 +931,11 @@ pub enum CachePolicy {
     /// Force-rerun every asset in the target's cone
     /// (`barca run <task> --refresh-all` / `--no-cache`).
     RefreshAll,
-    /// Force-rerun only the named assets; all others stay cache-aware
-    /// (`barca run <task> --refresh a,b`). A name matches when it equals the
-    /// node's base id exactly, or matches the trailing `:name` segment.
-    RefreshSelective(Vec<String>),
+    /// Force-rerun the named assets (`barca run <task> --refresh a,b`). A name matches when it
+    /// equals the node's base id exactly, or matches the trailing `:name` segment. With
+    /// `cascade` (the default) every asset downstream of a named one in the target's cone
+    /// re-runs too; without it (`--no-cascade`) all other assets stay cache-aware.
+    RefreshSelective { names: Vec<String>, cascade: bool },
 }
 
 /// `barca get` — cache-aware execution of an asset (or all assets).
@@ -1075,7 +1111,7 @@ pub async fn explain(
         concurrency_groups: HashMap::new(),
     };
     let exec_plan = plan_for_targets(&dag, &target_ids, &config);
-    if let CachePolicy::RefreshSelective(names) = &policy {
+    if let CachePolicy::RefreshSelective { names, .. } = &policy {
         validate_refresh_names(&dag, &target_ids, names)?;
     }
 
@@ -1259,7 +1295,7 @@ async fn execute(
     let exec_plan = plan_for_targets(&dag, &target_ids, &config);
     trace_point!("planned");
 
-    if let CachePolicy::RefreshSelective(names) = &policy {
+    if let CachePolicy::RefreshSelective { names, .. } = &policy {
         validate_refresh_names(&dag, &target_ids, names)?;
     }
 

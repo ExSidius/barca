@@ -173,12 +173,15 @@ def run(
     *files: str,
     refresh: list[str] | None = None,
     refresh_all: bool = False,
+    cascade: bool = True,
 ) -> Any:
     """Run a task (and its cone). The task always re-runs.
 
     Upstream assets are served from cache when fresh (same as ``get``). Pass
-    ``refresh=["asset_name", ...]`` to force re-materialize only those assets,
-    or ``refresh_all=True`` to refresh every upstream asset.
+    ``refresh=["asset_name", ...]`` to force re-materialize those assets and every
+    asset downstream of them in the task's cone; add ``cascade=False``
+    (``--no-cascade``) to re-materialize only the named assets. Pass
+    ``refresh_all=True`` to refresh every upstream asset.
 
     Returns the deserialized value of the target task directly (or ``None``).
     """
@@ -187,6 +190,8 @@ def run(
         args.append("--refresh-all")
     elif refresh:
         args += ["--refresh", ",".join(refresh)]
+        if not cascade:
+            args.append("--no-cascade")
     result = _exec(args)
     output = result.get("final_output")
     if output is not None:

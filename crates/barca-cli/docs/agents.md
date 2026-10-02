@@ -167,9 +167,9 @@ invisible to barca (`barca docs assets`).
 ## Refreshing: syntax and pitfalls
 
 - Several assets are one comma-separated list: `--refresh a,b`. Never `--refresh a b`.
-- `--refresh` re-runs only what you name. Cached assets downstream of a refreshed one are not
-  recomputed and barca warns on stderr (`... does not reflect the refresh`). Name the whole chain
-  or use `--refresh-all`. Details: `barca docs cache`.
+- `--refresh a` re-runs `a` and every asset downstream of it in the task's cone (reason
+  `refresh_cascade`). `--no-cascade` re-runs only what you name; cached downstream assets then
+  do not reflect the refresh and barca warns on stderr. Details: `barca docs cache`.
 - An unknown name is an error (exit 2, `kind: usage`) listing the valid upstream assets.
 
 ## Inspect before you run
