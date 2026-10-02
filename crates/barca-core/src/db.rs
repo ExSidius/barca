@@ -593,6 +593,23 @@ pub async fn get_recent_runs(db_path: &str, limit: usize) -> Result<Vec<RunRecor
     Ok(records)
 }
 
+/// Total number of recorded runs (for `barca history` truncation reporting).
+pub async fn count_runs(db_path: &str) -> Result<usize, BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM runs", ())
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to count runs: {e}")))?;
+    let n = rows
+        .next()
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+        .map(|r| r.get::<i64>(0).unwrap_or(0))
+        .unwrap_or(0);
+    Ok(n.max(0) as usize)
+}
+
 /// Get aggregated stats for a specific asset/node.
 pub async fn get_asset_stats(db_path: &str, node_id: &str) -> Result<AssetStats, BarcaError> {
     let _g = db_guard().await;
@@ -950,6 +967,7 @@ mod tests {
         }
 
         assert_eq!(get_recent_runs(&db_path, 100).await.unwrap().len(), 8);
+        assert_eq!(count_runs(&db_path).await.unwrap(), 8);
         assert_eq!(get_schedule_state(&db_path).await.unwrap().len(), 8);
     }
 

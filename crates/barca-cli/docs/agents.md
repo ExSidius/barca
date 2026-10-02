@@ -2,7 +2,7 @@
 
 Conventions that make barca easy to drive programmatically. Everything here is stable CLI
 behavior. When stdout is not a terminal (a pipe, a subprocess, an agent) every result is JSON
-without any flag.
+without any flag. List-shaped output is bounded by default (see "Bounded output" below).
 
 ## Output format: JSON unless stdout is a terminal
 
@@ -10,12 +10,13 @@ without any flag.
 
 1. **A flag:** `--json` forces JSON, `--pretty` forces human output (tables, summaries).
    `get`/`run` also keep `-o json|value|pretty`; `-o value` prints only the final value.
+   `--fields` implies JSON.
 2. **`BARCA_OUTPUT=json` or `BARCA_OUTPUT=pretty`** in the environment (for CI or a shell
    profile). Any other value is a usage error (exit 2).
 3. **The terminal:** stdout is a TTY → human output; anything else → JSON.
 
 So `barca list pipeline.py` shows a table in your terminal, and `barca list pipeline.py | cat`
-or a subprocess call gets a JSON array. Pass `--json` anyway in scripts: it states the intent
+or a subprocess call gets JSON. Pass `--json` anyway in scripts: it states the intent
 and survives someone setting `BARCA_OUTPUT=pretty`. `plan` always prints JSON and `docs` always
 prints markdown (`barca docs --json` for JSON); neither follows the rule.
 
@@ -133,13 +134,53 @@ barca run report pipeline.py --dry-run --refresh src
 ```
 
 ```bash
-barca list pipeline.py --json       # every node: id, kind, freshness, inputs
+barca list pipeline.py --json       # {nodes: [{id, kind, freshness, inputs}], total, truncated}
 barca plan pipeline.py              # phases and steps that would run, nothing executes
-barca history --json                # recent runs
+barca history --json                # {runs: [...], total, truncated}: the last 10 runs
 barca stats total pipeline.py --json  # timings and cache hit rate for one asset
 ```
 
 Planning is pure static analysis: it never imports your code and never runs a step.
+
+## Bounded output: --limit, --all, --fields
+
+List-shaped commands print a bounded number of items so a large project cannot flood your
+context: `barca list` shows at most 100 nodes (in topological order) and `barca history` the 10
+most recent runs. Their JSON is an envelope that says whether you saw everything:
+
+```json
+{"nodes": [...], "total": 312, "truncated": true,
+ "hint": "pass --limit N for more, or --all for all 312 nodes"}
+```
+
+`truncated` and `total` are always present; `hint` only when `truncated` is true. The human table
+prints the same hint as one line on stderr, so stdout stays just the table.
+
+```bash
+barca list pipeline.py --limit 20   # first 20 nodes
+barca list pipeline.py --all        # every node
+barca history -l 50 --json          # last 50 runs
+barca history --all --json          # every recorded run
+```
+
+`--fields a,b` keeps only those keys on each item: `nodes` for `list`, `runs` for `history`,
+`recent_runs` for `stats`, `steps` for `get`/`run` (including `--dry-run`), and `topics` for
+`docs`. The rest of the JSON is unchanged. `--fields` implies JSON on every command, even in a
+terminal; combining it with `--pretty`, `-o pretty` or `-o value` is a usage error. A key that is valid but absent on an item (for example
+`next_fire` on an unscheduled node) is simply omitted. An unknown key is a usage error (exit 2)
+that lists the valid keys, and nothing runs; `barca <command> --help` lists them too.
+
+```bash
+barca list pipeline.py --fields id,inputs
+barca history --fields run_id,status,elapsed_seconds
+barca get total pipeline.py --fields id,status,reason
+```
+
+Limits bound how many items are printed, never what an item says: error messages and the Python
+traceback of a failed step are always complete.
+
+Breaking change after 0.9.0: `list --json` and `history --json` used to print a bare array; they now print
+the envelope above. Read `.nodes` / `.runs` (for example `jq '.nodes[].id'`).
 
 ## Getting values, not pointers
 

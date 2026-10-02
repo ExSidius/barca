@@ -81,7 +81,7 @@ def test_every_pipeline_example_is_discovered_by_list(binary, topics, tmp_path):
             f = tmp_path / f"{name.replace('/', '_')}_{i}.py"
             f.write_text(code)
             proc = barca(binary, tmp_path, "list", str(f), "--json")
-            nodes = result(proc)
+            nodes = result(proc)["nodes"]
             assert nodes, f"docs topic '{name}', block {i}: `barca list` found no nodes"
             checked += 1
     assert checked >= 8, "expected the manual to contain many pipeline examples"
@@ -171,14 +171,15 @@ def test_json_inspection_commands(binary, tmp_path):
         '@asset(inputs={"nums": numbers})\ndef total(nums: list) -> dict:\n'
         '    return {"total": sum(nums)}\n'
     )
-    nodes = result(barca(binary, tmp_path, "list", "pipeline.py", "--json"))
-    by_id = {n["id"]: n for n in nodes}
+    listing = result(barca(binary, tmp_path, "list", "pipeline.py", "--json"))
+    assert listing["total"] == 2 and listing["truncated"] is False
+    by_id = {n["id"]: n for n in listing["nodes"]}
     assert by_id["pipeline.py:total"]["inputs"] == ["pipeline.py:numbers"]
     assert by_id["pipeline.py:numbers"]["kind"] == "asset"
 
     assert result(barca(binary, tmp_path, "get", "total", "pipeline.py"))["steps_executed"] == 2
-    runs = result(barca(binary, tmp_path, "history", "--json"))
-    assert isinstance(runs, list) and runs[0]["status"] == "success"
+    history = result(barca(binary, tmp_path, "history", "--json"))
+    assert history["total"] == 1 and history["runs"][0]["status"] == "success"
     stats = result(barca(binary, tmp_path, "stats", "total", "pipeline.py", "--json"))
     assert stats["node_id"] == "pipeline.py:total"
     assert barca(binary, tmp_path, "get", "total", "pipeline.py").stdout.count("\n") == 1

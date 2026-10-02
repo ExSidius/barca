@@ -252,7 +252,7 @@ def test_failed_run_prints_a_json_result_with_the_failing_node(project):
     assert out["run_id"]
     steps = {s["id"]: s["status"] for s in out["steps"]}
     assert steps == {"pipeline.py:good": "cached", "pipeline.py:boom": "failed"}
-    history = json.loads(barca(project, "history", "--json").stdout)
+    history = json.loads(barca(project, "history", "--json").stdout)["runs"]
     assert history[0]["run_id"] == out["run_id"] and history[0]["status"] == "failed"
 
 
@@ -370,5 +370,5 @@ def test_sigint_exits_130(project):
     _, err = proc.communicate(timeout=30)
     assert proc.returncode == 130, err
     assert "cancelled" in err
-    history = json.loads(barca(project, "history", "--json").stdout)
+    history = json.loads(barca(project, "history", "--json").stdout)["runs"]
     assert history[0]["status"] == "cancelled"

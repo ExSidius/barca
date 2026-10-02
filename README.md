@@ -207,7 +207,7 @@ def prices(ticker: str) -> dict:
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
 barca run <task> <file.py> ...             Run a task (always re-runs) and its cone
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
-barca list <file.py> [--json|--pretty]     List all definitions with deps
+barca list <file.py> [--json|--pretty] [--limit N]  List all definitions with deps
 barca history [--limit N] [--json|--pretty] Show recent run history
 barca stats <target> <file.py> [--json|--pretty]  Timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
@@ -222,6 +222,10 @@ or captured (`--json` / `--pretty` or `BARCA_OUTPUT=json|pretty` override); prog
 to stderr. In JSON mode an error is one JSON line on stderr (`{"error", "code", "kind",
 "remediation"}`, plus `node`, `traceback` and `artifact_dir` when a step failed). Exit codes: `0`
 ok, `1` step failed, `2` usage error, `3` barca/infra failure, `130` cancelled.
+
+List output is bounded: `list` shows 100 nodes and `history` 10 runs unless you pass `--limit N`
+or `--all`, and their JSON reports `truncated` and `total`. `--fields a,b` keeps only those keys
+on each item of any JSON output (`barca list pipeline.py --fields id,inputs`).
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 
