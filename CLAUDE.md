@@ -95,7 +95,8 @@ command, flag, decorator, output format, or caching behavior ships with all of:
    `crates/barca-cli/src/docs.rs`. New topics go in `TOPICS` and must be linked from
    `overview.md` (or `examples.md`). The files live inside the crate so they ship in the sdist.
 3. **Machine-readable output** — results as JSON on stdout (inspection commands take `--json`),
-   progress and errors on stderr, exit codes 0 ok / 1 runtime failure / 2 usage error.
+   progress and errors on stderr, exit codes 0 ok / 1 a step failed / 2 usage error / 3 barca infra failure / 130 cancelled
+   (see `barca docs contract`).
 4. **Site docs** (`site/src/content/docs/`) and the README CLI table.
 5. **The CLI contract** — `crates/barca-cli/docs/contract.md` (`barca docs contract`) and its
    snapshots. A change to the surface (a command, flag, environment variable, exit code, JSON
