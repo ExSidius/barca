@@ -65,6 +65,8 @@ that; see `barca docs agents`.
 - `barca docs status` — one view of cache state, last run and artifact shape per node
 - `barca docs skill` — the short agent skill (also `SKILL.md` in the repo): start here if you are an AI agent
 - `barca docs agents` — output contract, exit codes and workflows for scripts and AI agents
+- `barca docs contract` — the CLI contract: every command, flag, environment variable, exit code and
+  JSON schema, marked stable or experimental, and the policy for changing them
 - `barca docs examples` — runnable example pipelines (`examples/duckdb`, `examples/partitions`, ...)
 
 Run `barca docs` for one-line summaries of every topic.
