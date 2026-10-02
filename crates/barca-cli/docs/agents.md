@@ -6,7 +6,7 @@ without any flag. List-shaped output is bounded by default (see "Bounded output"
 
 ## Output format: JSON unless stdout is a terminal
 
-`get`, `run`, `list`, `history` and `stats` pick their stdout format by one rule, first match wins:
+`get`, `run`, `list`, `status`, `history` and `stats` pick their stdout format by one rule, first match wins:
 
 1. **A flag:** `--json` forces JSON, `--pretty` forces human output (tables, summaries).
    `get`/`run` also keep `-o json|value|pretty`; `-o value` prints only the final value.
@@ -181,6 +181,16 @@ and why, and writes nothing (`barca docs cache`):
 barca run report pipeline.py --dry-run --refresh src
 ```
 
+One call answers "what is here and what state is it in": `barca status` gives, per node, its
+kind and inputs, its cache state with the reason (the same decision `--dry-run` makes), its last
+materialization, and the artifact's row count and columns, without importing your code
+(`barca docs status`):
+
+```bash
+barca status pipeline.py --json                 # every node: cache state, last run, shape
+barca status total pipeline.py --json --sample 3   # one cone, with 3 sample rows per artifact
+```
+
 ```bash
 barca list pipeline.py --json       # {nodes: [{id, kind, freshness, inputs, env}], total, truncated}
 barca plan pipeline.py              # phases and steps that would run, nothing executes
@@ -276,7 +286,8 @@ raised on failure; for `get`/`run`/`plan` its `kind`, `code`, `remediation` (and
 2. `barca list pipeline.py` — confirm the node, its kind and its dependencies were discovered.
 3. `barca get <target> pipeline.py` — check exit code, `steps_executed`, and `final_output`.
 4. Run it again — `steps_executed` should be 0 (cached). If not, something upstream changed.
-5. `barca plan` / `barca history --json` when you need to explain what ran.
+5. `barca status pipeline.py --json` when you need to explain what is cached, what ran last, and
+   what an artifact holds; `barca history --json` for past runs.
 
 ## Finding more
 

@@ -1,0 +1,138 @@
+# barca status
+
+One read-only view of every node: what it is, whether it is cached and why, when it last ran,
+and what its artifact looks like. It answers in one call what would otherwise take `barca list`,
+`--dry-run`, `barca history` and a script that opens the artifact.
+
+```python
+import pandas as pd
+from barca import asset, task
+
+
+@asset()
+def orders() -> pd.DataFrame:
+    return pd.DataFrame({"id": [1, 2, 3], "amount": [9.5, 3.0, 12.25]})
+
+
+@asset(inputs={"df": orders})
+def total(df: pd.DataFrame) -> dict:
+    return {"total": float(df["amount"].sum())}
+
+
+@task(inputs={"t": total})
+def notify(t: dict) -> None:
+    print(t)
+```
+
+```bash
+barca get total pipeline.py
+barca status pipeline.py --pretty               # table (the default in a terminal)
+barca status total pipeline.py                  # only `total` and its upstream cone
+barca status pipeline.py --json                 # one JSON document (the default when piped)
+barca status pipeline.py --fields id,cache      # JSON with only these keys per node
+barca status pipeline.py --json --sample 2      # plus up to 2 sample rows per json/parquet artifact
+```
+
+```
+NAME    KIND   STATE        WHY           LAST RUN                           SHAPE            DEPS
+orders  asset  cached       materialized  success 2026-10-02 11:56:43 0.54s  3 rows x 2 cols  -
+total   asset  cached       materialized  success 2026-10-02 11:56:43 0.00s  dict (1 key)     orders
+notify  task   always-runs  task          -                                  -                total
+
+2 cached, 0 stale, 0 never run, 0 partial, 0 unknown, 1 always run
+```
+
+Status never imports your code and never writes: no `.barca` directory is created, no run is
+recorded. Like every inspection command, the result goes to stdout (a table in a terminal, JSON
+when piped; `--json` / `--pretty` override) and errors to stderr; an unknown target is a usage
+error (exit 2).
+
+Like `list`, status shows at most 100 nodes unless you pass `--limit N` or `--all`. The
+`summary` still counts every node, and the JSON adds `total` and `truncated` (with a `hint` when
+truncated). Each node also lists `env`, the environment variables it declares with `env=[...]`
+(`barca docs assets`). `--fields` keeps only the named keys on each node.
+
+## Cache state
+
+`cache.state` is the same decision `barca get --dry-run` makes (both call one function), so the
+two cannot disagree.
+
+| state | meaning | `reason` |
+|---|---|---|
+| `cached` | a successful result matches this code and these inputs; `get` serves it | `materialized` |
+| `stale` | it ran before, but `get` would run it again | `changed`, `upstream_stale`, `failed` |
+| `never-run` | no successful materialization is recorded | `no_record`, `failed` |
+| `partial` | a partitioned asset with some keys cached | `partitions_missing` |
+| `unknown` | dynamic partitions (`partitions_from`) whose source has not run yet | `partitions_unknown` |
+| `always-runs` | tasks and sensors are never cached | `task`, `sensor` |
+
+- `changed`: the run hash differs from the last materialization, because this function's code or
+  its upstream outputs changed. barca records the combined run hash, not the two parts, so it
+  cannot say which.
+- `upstream_stale`: an input is itself not cached, so this node's inputs will change when it runs.
+  `detail` names the input.
+- `failed`: the last attempt at exactly this code and these inputs raised; `detail` carries the
+  message.
+
+`cache.run_hash` is the cache key for the current code and inputs; `cache.artifact` is the file a
+`get` would serve (only when `cached`).
+
+## Last materialization
+
+`last_materialization` is the most recent execution recorded in the metadata DB, successful or
+failed: `status`, `created_at` (UTC), `elapsed_seconds`, `run_hash`, `artifact`, `format`,
+`size_bytes`, and `error` for a failure. A cache hit is not an execution, so serving from cache
+does not change it. It is `null` when the node never ran.
+
+## Artifact shape
+
+`shape` describes the artifact of `last_materialization` when that run succeeded (`null`
+otherwise). It is read from the file alone by a small Python helper; your modules are never
+imported.
+
+| format | shape |
+|---|---|
+| parquet | `type: "table"`, `rows`, `columns: [{name, type}]` (arrow types) from the file footer |
+| json list | `type: "list"`, `rows`; for a list of objects also `columns` with the JSON types seen (`str \| null`) |
+| json object | `type: "dict"`, `keys` (first 100; `key_count` when there are more) |
+| other json | `type` (`int`, `str`, ...) |
+| pickle | `type` only, e.g. `myproject.Model`, read from the pickle opcodes without unpickling |
+
+`--sample N` adds `sample`: the first N rows (parquet, json list), the first N entries (json
+object), or the value (other json). It is off by default to keep output small. Pickles are never
+sampled: loading one would import and run code.
+
+When the shape cannot be read, `shape` has a `note` instead of `rows`/`columns`: parquet without
+pyarrow installed (`pip install 'barca[parquet]'`), a remote artifact (shape is only read for local
+files), or a file that no longer exists.
+
+## Partitioned assets
+
+A partitioned asset is one node with a `partitions` summary: `total`, `cached`, `missing` and up
+to 20 `missing_keys`. Its state is `cached` when every key is, `partial` when some are, and
+`stale`/`never-run` when none are. `last_materialization` is the most recent key that ran, named
+in its `partition` field (for example `k=a`), and `shape` describes that one key's artifact.
+
+## JSON
+
+```json
+{
+  "target": "total",
+  "nodes": [
+    {
+      "id": "pipeline.py:orders",
+      "name": "orders",
+      "kind": "asset",
+      "inputs": [],
+      "partitioned": false,
+      "cache": {"state": "cached", "reason": "materialized", "detail": "...", "run_hash": "6db9...", "artifact": ".barca/artifacts/pipeline.py--orders/6db9....parquet"},
+      "last_materialization": {"status": "success", "created_at": "2026-10-02 11:56:43", "elapsed_seconds": 0.54, "run_hash": "6db9...", "artifact": ".barca/artifacts/pipeline.py--orders/6db9....parquet", "format": "parquet", "size_bytes": 2182},
+      "shape": {"type": "table", "rows": 3, "columns": [{"name": "id", "type": "int64"}, {"name": "amount", "type": "double"}]}
+    }
+  ],
+  "summary": {"cached": 2, "stale": 0, "never_run": 0, "partial": 0, "unknown": 0, "always_runs": 0}
+}
+```
+
+Keys inside a `sample` row are printed in alphabetical order; `columns` keeps the file's column
+order. `--env <name>` reads another environment's state (`barca docs cache`).

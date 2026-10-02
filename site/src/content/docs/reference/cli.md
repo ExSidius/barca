@@ -1,6 +1,6 @@
 ---
 title: CLI Reference
-description: All barca CLI commands — get, run, plan, history, stats, serve, list, version.
+description: All barca CLI commands — get, run, plan, history, stats, serve, list, status, version.
 ---
 
 The `barca` binary is the entry point. Once installed (e.g. `uv add barca`), the `barca` command
@@ -17,6 +17,8 @@ barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an ass
 barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
                                                Run the HTTP API server
 barca list <file.py> ... [-l N | --all] [--json]  List discovered definitions and their deps
+barca status [target] <file.py> [--json] [--sample N]
+                                               Cache state, last run and artifact shape per node
 barca docs [topic] [--all] [--json]           Built-in manual
 barca version                                 Print version
 barca --help                                  Show help
@@ -235,7 +237,7 @@ ENV column listing them; `--json` always includes `env` (an empty list when none
 
 ## Bounded output
 
-List-shaped commands (`list`, `history`) are bounded by default so a large project cannot flood
+List-shaped commands (`list`, `status`, `history`) are bounded by default so a large project cannot flood
 a terminal or an agent's context. Their JSON is an envelope:
 
 ```json
@@ -246,7 +248,7 @@ a terminal or an agent's context. Their JSON is an envelope:
 `truncated` and `total` are always present, `hint` only when truncated. `--limit N` and `--all`
 choose how many items to print.
 
-`--fields a,b` keeps only those keys on each item of any JSON output: `nodes` (`list`), `runs`
+`--fields a,b` keeps only those keys on each item of any JSON output: `nodes` (`list`, `status`), `runs`
 (`history`), `recent_runs` (`stats`), `steps` (`get`/`run`, including `--dry-run`) and `topics`
 (`docs`). It implies JSON everywhere; combining it with `--pretty`, `-o pretty` or `-o value` is
 a usage error (exit 2). An unknown key is a usage error (exit 2) that lists the valid ones. Limits bound
@@ -255,6 +257,70 @@ complete. `plan` has no per-item objects (its steps are id strings), so it takes
 
 > **Behavior change (after 0.9.0):** `list --json` and `history --json` used to print a bare
 > array. They now print the envelope above; read `.nodes` / `.runs` (e.g. `jq '.nodes[].id'`).
+
+## status
+
+One read-only view of every node in scope: kind, inputs, whether it is partitioned, its cache
+state with the reason, its last materialization, and the shape of its artifact. It replaces the
+round trip through `list`, `--dry-run`, `history` and a one-off script that opens the artifact.
+
+```bash
+barca status pipeline.py                         # table in a terminal, JSON when piped
+barca status total pipeline.py                   # only `total` and its upstream cone
+barca status pipeline.py --json                  # {target, nodes, summary, total, truncated}
+barca status pipeline.py --pretty                # the table, even when piped
+barca status pipeline.py --fields id,cache       # JSON with only these keys per node
+barca status pipeline.py --json --sample 5       # plus up to 5 sample rows per json/parquet artifact
+```
+
+```
+NAME    KIND   STATE        WHY           LAST RUN                           SHAPE            DEPS
+orders  asset  cached       materialized  success 2026-10-02 11:56:43 0.54s  3 rows x 2 cols  -
+total   asset  cached       materialized  success 2026-10-02 11:56:43 0.00s  dict (1 key)     orders
+notify  task   always-runs  task          -                                  -                total
+
+2 cached, 0 stale, 0 never run, 0 partial, 0 unknown, 1 always run
+```
+
+**Cache state** (`cache.state`) is the decision `--dry-run` makes, from the same code path:
+
+| state | meaning | reasons |
+|---|---|---|
+| `cached` | a successful result matches this code and these inputs | `materialized` |
+| `stale` | ran before, but would run again | `changed`, `upstream_stale`, `failed` |
+| `never-run` | no successful materialization recorded | `no_record`, `failed` |
+| `partial` | partitioned, some keys cached | `partitions_missing` |
+| `unknown` | dynamic partitions whose source has not run | `partitions_unknown` |
+| `always-runs` | tasks and sensors | `task`, `sensor` |
+
+`changed` means the run hash differs from the last materialization: this function's code or its
+upstream outputs changed. barca stores only the combined hash, so it cannot say which.
+
+**Last materialization** is the most recent execution recorded in the metadata DB (success or
+failure): `status`, `created_at` (UTC), `elapsed_seconds`, `run_hash`, `artifact`, `format`,
+`size_bytes`, and `error` for a failure. Cache hits do not change it.
+
+**Shape** is read from the artifact file only, by a small Python helper; your code is never
+imported:
+
+- parquet: `rows` and `columns` (name and arrow type) from the file footer. Needs pyarrow;
+  without it, `shape.note` says so.
+- json: `type`; a list adds `rows` (and `columns` with the JSON types seen, for a list of
+  objects); an object adds `keys`.
+- pickle: `type` only (e.g. `myproject.Model`), read from the pickle opcodes without unpickling.
+  Pickles are never sampled.
+- Remote artifacts (`artifacts = "az://..."` and the like) are not opened; `shape.note` says so.
+
+**Partitioned assets** appear as one node with `partitions: {total, cached, missing,
+missing_keys}` (up to 20 keys). `last_materialization` is the most recently run key (named in its
+`partition` field), and `shape` describes that key's artifact.
+
+Each node also lists `env`, the environment variables it declares with `env=[...]`. Like `list`,
+status shows at most 100 nodes unless you pass `--limit N` or `--all`; the `summary` still counts
+every node, and the JSON reports `total` and `truncated` (see [Bounded output](#bounded-output)).
+
+Status writes nothing: no `.barca` directory is created and no run is recorded. An unknown target
+is a usage error (exit 2). See `barca docs status`.
 
 ## docs
 
@@ -270,7 +336,7 @@ barca docs --json             # topic index as JSON; add a topic for its full te
 ```
 
 Topics: `overview`, `assets`, `types`, `tasks`, `cache`, `partitions`, `sinks`, `scheduling`,
-`agents`, and `examples/*`. `barca docs agents` describes the output contract for scripts and AI
+`status`, `agents`, and `examples/*`. `barca docs agents` describes the output contract for scripts and AI
 agents: JSON on stdout, progress and errors on stderr, and the exit codes and error envelope below.
 
 ## Errors and exit codes
@@ -319,7 +385,7 @@ barca version
 
 ## --env
 
-`get`, `run`, `plan`, `serve`, `history`, and `stats` accept `--env <name>`
+`get`, `run`, `plan`, `serve`, `history`, `stats`, and `status` accept `--env <name>`
 (default: `BARCA_ENV`, then `default_env` in barca.toml, then `default`).
 Environments fully separate cache, artifacts, and shared remote state — see
 [Configuration](/reference/config/).

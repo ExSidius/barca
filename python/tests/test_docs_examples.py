@@ -249,6 +249,27 @@ def test_tasks_topic_several_targets_example(binary, topics, tmp_path):
     assert second["steps_executed"] == 2  # registry from cache; the tasks always re-run
 
 
+def test_status_topic_example(binary, topics, tmp_path):
+    pytest.importorskip("pyarrow")
+    write_example(topics, "status", tmp_path)
+    assert result(barca(binary, tmp_path, "get", "total", "pipeline.py"))["run_id"]
+    table = barca(binary, tmp_path, "status", "pipeline.py")
+    assert table.returncode == 0, table.stderr
+    assert "3 rows x 2 cols" in table.stdout and "dict (1 key)" in table.stdout
+    assert "2 cached, 0 stale, 0 never run, 0 partial, 0 unknown, 1 always run" in table.stdout
+    doc = result(barca(binary, tmp_path, "status", "total", "pipeline.py", "--json"))
+    assert doc["target"] == "total"
+    by = {n["name"]: n for n in doc["nodes"]}
+    assert list(by) == ["orders", "total"]
+    assert by["orders"]["shape"]["columns"] == [
+        {"name": "id", "type": "int64"},
+        {"name": "amount", "type": "double"},
+    ]
+    assert by["orders"]["cache"]["artifact"] == by["orders"]["last_materialization"]["artifact"]
+    sampled = result(barca(binary, tmp_path, "status", "pipeline.py", "--json", "--sample", "2"))
+    assert len({n["name"]: n for n in sampled["nodes"]}["orders"]["shape"]["sample"]) == 2
+
+
 # ─── Machine-readable inspection commands ─────────────────────────────────────
 
 

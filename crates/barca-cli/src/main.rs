@@ -182,6 +182,23 @@ Run this first to confirm barca discovered your nodes. When more nodes exist tha
 JSON says `\"truncated\": true` with the `total`, and the table prints a note on stderr.
 More: barca docs assets, barca docs agents";
 
+const STATUS_HELP: &str = "\
+Examples:
+  barca status pipeline.py                 # table in a terminal (JSON when piped): kind, cache state, last run, shape
+  barca status total pipeline.py           # only `total` and its upstream cone
+  barca status pipeline.py --json          # {target, nodes, summary, total, truncated}, even in a terminal
+  barca status pipeline.py --pretty        # the table, even when piped
+  barca status pipeline.py --fields id,cache   # JSON with only these keys per node
+  barca status big.py --limit 20           # first 20 nodes (default: at most 100); the summary counts all
+  barca status total pipeline.py --json --sample 5   # add up to 5 sample rows per json/parquet artifact
+  barca status pipeline.py --env dev       # state recorded in another environment
+
+Cache state per node: cached, stale (ran before; code or inputs changed), never-run, partial
+(some partition keys cached), unknown (dynamic partitions not yet known) or always-runs (tasks,
+sensors), with a reason. It is the same decision `--dry-run` makes. Read-only: never imports your
+code, never writes. Shape (rows, columns, type) is read from the artifact file only.
+More: barca docs status, barca docs agents";
+
 const DOCS_HELP: &str = "\
 Examples:
   barca docs                    # topic index with one-line summaries
@@ -383,6 +400,36 @@ enum Cli {
         #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::LIST_FIELDS))]
         fields: Option<Vec<String>>,
     },
+    /// Show every node's cache state, last materialization and artifact shape (read-only)
+    ///
+    /// One aggregated view: what `barca list`, `--dry-run`, `barca history` and a look inside the
+    /// artifact would each tell you. If the first positional arg ends in .py, all args are files;
+    /// otherwise the first is a target and only its upstream cone is shown.
+    #[command(after_help = STATUS_HELP)]
+    Status {
+        /// [TARGET] file.py [file.py ...] — target is optional
+        #[arg(required = true)]
+        args: Vec<String>,
+        #[command(flatten)]
+        format: FormatFlags,
+        /// Maximum number of nodes to show, in topological order
+        #[arg(short, long, default_value_t = bounded::LIST_DEFAULT_LIMIT)]
+        limit: usize,
+        /// Show every node (no limit)
+        #[arg(long, conflicts_with = "limit")]
+        all: bool,
+        /// Output JSON with only these keys (comma-separated) on each entry of `nodes`.
+        /// Implies --json. An unknown key is a usage error listing the valid ones
+        #[arg(long, value_delimiter = ',', value_parser = PossibleValuesParser::new(bounded::STATUS_FIELDS))]
+        fields: Option<Vec<String>>,
+        /// Include up to N sample rows from each json/parquet artifact (off by default; pickles
+        /// are never sampled)
+        #[arg(long, value_name = "N")]
+        sample: Option<usize>,
+        /// Environment name (separates cache/state per environment)
+        #[arg(long)]
+        env: Option<String>,
+    },
     /// Show the built-in manual: concepts, output formats, examples, agent conventions
     ///
     /// Topics are compiled into the binary, so this works offline and always matches the
@@ -576,7 +623,8 @@ fn json_output(cli: &Cli) -> bool {
         Cli::Plan { .. } => true,
         Cli::History { format, fields, .. }
         | Cli::Stats { format, fields, .. }
-        | Cli::List { format, fields, .. } => {
+        | Cli::List { format, fields, .. }
+        | Cli::Status { format, fields, .. } => {
             fields_json(*format, fields.as_deref()).unwrap_or(false)
         }
         Cli::Docs { json, fields, .. } => *json || fields.is_some(),
@@ -594,6 +642,7 @@ fn context(cli: &Cli) -> Context {
         Cli::Stats { files, .. } => ("stats", paths(files)),
         Cli::Serve { files, .. } => ("serve", paths(files)),
         Cli::List { files, .. } => ("list", paths(files)),
+        Cli::Status { args, .. } => ("status", paths(&split_target_files(args.clone()).1)),
         Cli::History { .. } => ("history", Vec::new()),
         Cli::Docs { .. } => ("docs", Vec::new()),
         Cli::Version => ("version", Vec::new()),
@@ -950,6 +999,40 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             list_cmd(files, json, limit, fields.as_deref(), &python)
                 .await
                 .map_err(engine)
+        }
+        Cli::Status {
+            args,
+            format,
+            limit,
+            all,
+            fields,
+            sample,
+            env,
+        } => {
+            let json = fields_json(format, fields.as_deref())?;
+            let (target, files) = split_target_files(args);
+            check_py_files(&files, None)?;
+            if files.is_empty() {
+                return Err(usage_error(
+                    "error: no .py files provided\n\nUsage: barca status [TARGET] <FILES>...",
+                    &files,
+                ));
+            }
+            let limit = (!all).then_some(limit);
+            status_cmd(
+                env.as_deref(),
+                target,
+                files,
+                StatusOpts {
+                    json,
+                    limit,
+                    fields: fields.as_deref(),
+                    sample: sample.unwrap_or(0),
+                },
+                &python,
+            )
+            .await
+            .map_err(engine)
         }
         Cli::Serve {
             files,
@@ -1528,6 +1611,187 @@ async fn list_cmd(
     Ok(())
 }
 
+/// How `barca status` prints: format, bounds, field projection and sampling.
+struct StatusOpts<'a> {
+    json: bool,
+    limit: Option<usize>,
+    fields: Option<&'a [String]>,
+    sample: usize,
+}
+
+async fn status_cmd(
+    env: Option<&str>,
+    target: Option<String>,
+    files: Vec<PathBuf>,
+    opts: StatusOpts<'_>,
+    python: &PathBuf,
+) -> Result<(), barca_core::BarcaError> {
+    let cfg = barca_core::config::resolve(env)?;
+    let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
+    let mut result = barca_core::status::status(
+        &cfg,
+        target.as_deref(),
+        &file_args,
+        python,
+        opts.sample,
+        true,
+    )
+    .await?;
+    // Bounded like `list`: the summary still counts every node; `nodes` is cut to the limit.
+    let total = result.nodes.len();
+    if let Some(limit) = opts.limit {
+        result.nodes.truncate(limit);
+    }
+    let page = bounded::Page::new(result.nodes.len(), total);
+    if opts.json {
+        let mut out = serde_json::to_value(&result).unwrap();
+        bounded::project_key(&mut out, "nodes", opts.fields);
+        if let serde_json::Value::Object(obj) = &mut out
+            && let serde_json::Value::Object(env) = page.envelope("nodes", vec![], "nodes")
+        {
+            // Add `total`, `truncated` and (when truncated) `hint` beside `nodes`.
+            for (k, v) in env {
+                if k != "nodes" {
+                    obj.insert(k, v);
+                }
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        return Ok(());
+    }
+    print_status_table(&result);
+    if let Some(note) = page.note(result.nodes.len(), "nodes") {
+        eprintln!("{note}");
+    }
+    Ok(())
+}
+
+/// One row per node: NAME KIND STATE WHY LAST RUN SHAPE DEPS.
+fn print_status_table(result: &barca_core::status::StatusResult) {
+    let short = |id: &str| -> String {
+        let base = id.split('[').next().unwrap_or(id);
+        base.rsplit(':').next().unwrap_or(base).to_string()
+    };
+    let rows: Vec<[String; 7]> = result
+        .nodes
+        .iter()
+        .map(|n| {
+            let why = match &n.partitions {
+                Some(p) if n.cache.state != "cached" => {
+                    format!(
+                        "{} of {} keys cached; {}",
+                        p.cached, p.total, n.cache.reason
+                    )
+                }
+                _ => n.cache.reason.clone(),
+            };
+            let last = n
+                .last_materialization
+                .as_ref()
+                .map(|m| {
+                    let secs = m
+                        .elapsed_seconds
+                        .map(|e| format!(" {e:.2}s"))
+                        .unwrap_or_default();
+                    format!("{} {}{secs}", m.status, m.created_at)
+                })
+                .unwrap_or_else(|| "-".to_string());
+            let deps = if n.inputs.is_empty() {
+                "-".to_string()
+            } else {
+                n.inputs
+                    .iter()
+                    .map(|i| short(i))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            [
+                n.name.clone(),
+                n.kind.clone(),
+                n.cache.state.clone(),
+                why,
+                last,
+                n.shape
+                    .as_ref()
+                    .map(shape_cell)
+                    .unwrap_or_else(|| "-".to_string()),
+                deps,
+            ]
+        })
+        .collect();
+    let header = ["NAME", "KIND", "STATE", "WHY", "LAST RUN", "SHAPE", "DEPS"];
+    let widths: Vec<usize> = (0..header.len())
+        .map(|i| {
+            rows.iter()
+                .map(|r| r[i].chars().count())
+                .chain([header[i].len()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |cells: &[String]| {
+        let mut out = String::new();
+        for (i, c) in cells.iter().enumerate() {
+            if i + 1 == cells.len() {
+                out.push_str(c);
+            } else {
+                out.push_str(&format!("{c:<w$}  ", w = widths[i]));
+            }
+        }
+        println!("{}", out.trim_end());
+    };
+    line(&header.map(String::from));
+    for r in &rows {
+        line(r);
+    }
+    let s = &result.summary;
+    println!(
+        "\n{} cached, {} stale, {} never run, {} partial, {} unknown, {} always run",
+        s.cached, s.stale, s.never_run, s.partial, s.unknown, s.always_runs
+    );
+}
+
+/// Compact text for a shape object: `3 rows x 2 cols`, `dict (4 keys)`, `pandas.DataFrame`.
+fn shape_cell(shape: &serde_json::Value) -> String {
+    let rows = shape.get("rows").and_then(|v| v.as_u64());
+    let cols = shape
+        .get("columns")
+        .and_then(|v| v.as_array())
+        .map(|c| c.len());
+    let ty = shape.get("type").and_then(|v| v.as_str());
+    match (rows, cols, ty) {
+        (Some(r), Some(c), _) => format!("{} x {}", plural(r, "row"), plural(c as u64, "col")),
+        (Some(r), None, _) => plural(r, "row"),
+        (None, _, Some("dict")) => {
+            let n = shape
+                .get("key_count")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    shape
+                        .get("keys")
+                        .and_then(|k| k.as_array())
+                        .map(|k| k.len() as u64)
+                })
+                .unwrap_or(0);
+            format!("dict ({})", plural(n, "key"))
+        }
+        (None, _, Some(t)) => t.to_string(),
+        _ => shape
+            .get("note")
+            .and_then(|v| v.as_str())
+            .map(|n| format!("? ({n})"))
+            .unwrap_or_else(|| "-".to_string()),
+    }
+}
+
+fn plural(n: u64, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
+
 async fn history_cmd(
     env: Option<&str>,
     limit: Option<usize>,
@@ -1700,7 +1964,7 @@ mod tests {
 
     /// Subcommands that must carry runnable examples in their `--help`.
     const DOCUMENTED: &[&str] = &[
-        "get", "run", "plan", "history", "stats", "serve", "list", "docs",
+        "get", "run", "plan", "history", "stats", "serve", "list", "status", "docs",
     ];
 
     fn after_help(cmd: &clap::Command) -> String {
@@ -1983,7 +2247,7 @@ mod tests {
     #[test]
     fn json_flags_exist_on_inspection_commands() {
         let root = Cli::command();
-        for name in ["list", "history", "stats", "docs"] {
+        for name in ["list", "history", "stats", "status", "docs"] {
             let sub = root.find_subcommand(name).unwrap();
             assert!(
                 sub.get_arguments().any(|a| a.get_id() == "json"),

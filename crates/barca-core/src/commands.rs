@@ -1103,16 +1103,38 @@ pub async fn explain(
     command_label: &str,
 ) -> Result<ExplainResult, BarcaError> {
     let dag = build_dag(file_args, python).await?;
-    let targets = resolve_targets(&dag, target_names, command_label)?;
+    explain_dag(
+        &dag,
+        cfg,
+        target_names,
+        python,
+        policy,
+        no_cache,
+        command_label,
+    )
+    .await
+}
+
+/// [`explain`] on an already-built DAG (`barca status` reuses its DAG for the node listing).
+pub(crate) async fn explain_dag(
+    dag: &Dag,
+    cfg: &crate::config::ResolvedConfig,
+    target_names: &[String],
+    python: &std::path::Path,
+    policy: CachePolicy,
+    no_cache: bool,
+    command_label: &str,
+) -> Result<ExplainResult, BarcaError> {
+    let targets = resolve_targets(dag, target_names, command_label)?;
     let target_ids: Vec<&str> = targets.iter().map(|(_, id)| id.as_str()).collect();
     let pool_size = default_pool_size();
     let config = ResourceConfig {
         pool_size,
         concurrency_groups: HashMap::new(),
     };
-    let exec_plan = plan_for_targets(&dag, &target_ids, &config);
+    let exec_plan = plan_for_targets(dag, &target_ids, &config);
     if let CachePolicy::RefreshSelective { names, .. } = &policy {
-        validate_refresh_names(&dag, &target_ids, names)?;
+        validate_refresh_names(dag, &target_ids, names)?;
     }
 
     // Shared remote state: pull it like a real run, so the cache check sees every machine's
@@ -1158,7 +1180,7 @@ pub async fn explain(
                     Some(src) => {
                         let base = st.step_id.base_id();
                         steps.push(unknown_report(
-                            &dag,
+                            dag,
                             base,
                             format!(
                                 "partition keys come from the output of '{src}', which is not \
@@ -1186,7 +1208,7 @@ pub async fn explain(
                     .find(|up| unknown_ids.contains(up.split('[').next().unwrap_or(up.as_str())));
                 if let Some(up) = unknown_dep {
                     steps.push(unknown_report(
-                        &dag,
+                        dag,
                         base,
                         format!(
                             "depends on '{}', whose partitions are not known until it runs",
@@ -1199,8 +1221,8 @@ pub async fn explain(
                 }
 
                 let (step, decision) =
-                    decide_step(&dag, &policy, no_cache, cache.as_ref(), &mut state, step).await;
-                steps.push(report_for(&dag, &step, &decision, true));
+                    decide_step(dag, &policy, no_cache, cache.as_ref(), &mut state, step).await;
+                steps.push(report_for(dag, &step, &decision, true));
                 match decision {
                     Decision::Run(_) => summary.will_run += step.partition_keys.len().max(1),
                     Decision::Cached { oref, .. } => {

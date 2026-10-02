@@ -56,6 +56,21 @@ pub const STATS_FIELDS: &[&str] = &[
     "attempts",
 ];
 
+/// Item fields of `barca status --json` (`nodes[]`). `partitions` appears only on partitioned
+/// nodes.
+pub const STATUS_FIELDS: &[&str] = &[
+    "id",
+    "name",
+    "kind",
+    "inputs",
+    "partitioned",
+    "cache",
+    "partitions",
+    "last_materialization",
+    "shape",
+    "env",
+];
+
 /// Fields of `barca docs --json`: `topics[]` items, or the single topic object.
 pub const DOCS_FIELDS: &[&str] = &["name", "summary", "content"];
 
@@ -236,6 +251,38 @@ mod tests {
             attempts: 0,
         };
         assert_eq!(keys(&serde_json::to_value(e).unwrap()), set(STATS_FIELDS));
+    }
+
+    #[test]
+    fn status_fields_match_a_fully_populated_node() {
+        use barca_core::status::{CacheStatus, NodeStatus, PartitionState};
+        let node = NodeStatus {
+            id: String::new(),
+            name: String::new(),
+            kind: String::new(),
+            inputs: vec![],
+            partitioned: true,
+            cache: CacheStatus {
+                state: String::new(),
+                reason: String::new(),
+                detail: String::new(),
+                run_hash: None,
+                artifact: None,
+            },
+            partitions: Some(PartitionState {
+                total: 0,
+                cached: 0,
+                missing: 0,
+                missing_keys: vec![],
+            }),
+            last_materialization: None,
+            shape: None,
+            env: vec![],
+        };
+        assert_eq!(
+            keys(&serde_json::to_value(node).unwrap()),
+            set(STATUS_FIELDS)
+        );
     }
 
     #[test]

@@ -43,6 +43,7 @@ barca get total pipeline.py      # second time: everything is a cache hit
 | `barca get [target] files...` | Get asset value(s); cache-aware. `barca file.py` is shorthand. `a,b` gets several in one run. |
 | `barca run task files...` | Run a task (always re-runs) and its dependency cone. `a,b` runs several in one run. |
 | `barca list files...` | List nodes with kind, freshness and dependencies (`--json`, `--limit`/`--all`, `--fields`; `barca docs agents`). |
+| `barca status [target] files...` | Per node: cache state and why, last run, artifact rows/columns (`--json`, `--limit`/`--all`, `--fields`). |
 | `barca plan files...` | Emit the tiered execution plan as JSON. |
 | `barca history` / `barca stats` | Past runs; timing and cache statistics (`--json`, `--fields`; history takes `--limit`/`--all`). |
 | `barca serve files...` | HTTP API and cron scheduler. |
@@ -61,6 +62,7 @@ that; see `barca docs agents`.
 - `barca docs partitions` — fan-out over keys, fan-in with `collect`
 - `barca docs sinks` — export outputs to local or remote paths
 - `barca docs scheduling` — freshness, cron schedules, `barca serve`
+- `barca docs status` — one view of cache state, last run and artifact shape per node
 - `barca docs agents` — output contract, exit codes and workflows for scripts and AI agents
 - `barca docs examples` — runnable example pipelines (`examples/duckdb`, `examples/partitions`, ...)
 
