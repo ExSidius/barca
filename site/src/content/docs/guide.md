@@ -405,7 +405,7 @@ barca get pipeline.py    # run it
   sqlite3 .barca/metadata.db "SELECT node_id, status, created_at FROM materializations ORDER BY created_at DESC LIMIT 10"
   ```
 
-- **Stderr is for diagnostics.** Barca prints timing and topology info to stderr. Stdout is reserved for structured JSON output. Pipe stdout to `jq` for clean formatting:
+- **Stderr is for diagnostics.** Barca prints timing and topology info to stderr. Stdout is reserved for the result: a human summary in a terminal, structured JSON when piped (or with `--json`). Pipe stdout to `jq` for clean formatting:
   ```bash
   barca get pipeline.py 2>/dev/null | jq .
   ```

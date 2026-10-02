@@ -1,14 +1,38 @@
 # Using barca from scripts and AI agents
 
 Conventions that make barca easy to drive programmatically. Everything here is stable CLI
-behavior; `barca docs --json` and `--json` on `list`/`history`/`stats` give structured output.
+behavior. When stdout is not a terminal (a pipe, a subprocess, an agent) every result is JSON
+without any flag.
+
+## Output format: JSON unless stdout is a terminal
+
+`get`, `run`, `list`, `history` and `stats` pick their stdout format by one rule, first match wins:
+
+1. **A flag:** `--json` forces JSON, `--pretty` forces human output (tables, summaries).
+   `get`/`run` also keep `-o json|value|pretty`; `-o value` prints only the final value.
+2. **`BARCA_OUTPUT=json` or `BARCA_OUTPUT=pretty`** in the environment (for CI or a shell
+   profile). Any other value is a usage error (exit 2).
+3. **The terminal:** stdout is a TTY → human output; anything else → JSON.
+
+So `barca list pipeline.py` shows a table in your terminal, and `barca list pipeline.py | cat`
+or a subprocess call gets a JSON array. Pass `--json` anyway in scripts: it states the intent
+and survives someone setting `BARCA_OUTPUT=pretty`. `plan` always prints JSON and `docs` always
+prints markdown (`barca docs --json` for JSON); neither follows the rule.
+
+```bash
+barca list pipeline.py --json        # JSON even in a terminal
+barca history --pretty               # a table even when piped
+BARCA_OUTPUT=json barca get total pipeline.py
+```
 
 ## Output contract
 
-- **stdout** carries the result: one JSON object for `get`/`run` (default `-o json`), the plan
-  JSON for `plan`, or JSON for `list`/`history`/`stats` with `--json`. It is safe to parse.
+- **stdout** carries the result: one JSON object for `get`/`run`, the plan JSON for `plan`, and
+  JSON for `list`/`history`/`stats` (whenever the rule above picks JSON). It is safe to parse.
 - **stderr** carries progress (`[barca] 2/2 steps done in 0.0s`), your own `print` output from
-  steps, warnings and errors. Use `--agent` for plain progress lines instead of a progress bar.
+  steps, warnings and errors. The progress bar draws only when stderr is a terminal; barca
+  writes no ANSI colour or cursor codes to a stream that is not one. Use `--agent` for plain
+  progress lines (`[barca] 1/2 ...`) on stderr instead of a progress bar.
 - **Exit codes:** one per kind of failure, so you can decide what to do from the code alone.
   On failure stderr explains (see Errors below). stdout is empty, except that a failed step in
   JSON mode still prints a result line with `"status": "failed"`.
@@ -28,8 +52,9 @@ echo $?
 
 ## Errors
 
-In JSON output mode (`get`/`run` with the default `-o json`, `plan`, and `list`/`history`/
-`stats`/`docs` with `--json`) an error is **one JSON line**, the last line on stderr:
+In JSON output mode (whenever the output rule above picks JSON: piped or captured stdout,
+`--json`, `-o json` or `BARCA_OUTPUT=json`; `plan` always; `docs` with `--json`) an error is
+**one JSON line**, the last line on stderr:
 
 ```
 {"code":2,"error":"Asset 'nope' not found. Available: pipeline.py:src, pipeline.py:total, pipeline.py:clean","kind":"usage","remediation":"Run `barca list pipeline.py` to see every node and its kind."}
@@ -55,7 +80,7 @@ A failed step looks like this (one line; wrapped here):
 ```
 
 Parse it from the last stderr line; earlier lines are progress and your steps' own output.
-In human mode (`-o pretty`, `-o value`, or no `--json`) the same error is plain prose with the
+In human mode (a terminal, `--pretty`, `-o pretty` or `-o value`) the same error is plain prose with the
 remediation on the last lines. Errors never go to stdout. From Python, `barca.BarcaError` carries
 the envelope as attributes: `kind`, `code`, `remediation`, `node`, `traceback`, `artifact_dir`.
 

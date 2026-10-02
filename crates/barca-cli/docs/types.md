@@ -57,7 +57,7 @@ def as_polars(orders: pl.DataFrame) -> pl.DataFrame:  # same file, read with pol
 
 ## Reading results back
 
-`barca get` prints one JSON object on stdout. `final_output` is the value itself for json
+`barca get` prints one JSON object on stdout (whenever stdout is not a terminal, or with `--json`). `final_output` is the value itself for json
 artifacts; for parquet and pickle it is a pointer:
 
 ```json
