@@ -224,6 +224,7 @@ barca run <task> <file.py> [--refresh a,b] Run a task (always re-runs) and its c
                                            (--no-cascade: only a, b)
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
 barca list <file.py> [--json|--pretty] [--limit N]  List all definitions with deps and declared env
+barca status [target] <file.py> [--json|--pretty]  Cache state, last run, artifact rows/columns per node
 barca history [--limit N] [--json|--pretty] Show recent run history
 barca stats <target> <file.py> [--json|--pretty]  Timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler

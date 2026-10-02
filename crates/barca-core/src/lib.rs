@@ -15,6 +15,7 @@ pub mod parse;
 pub mod planner;
 pub mod protocol;
 pub mod state_sync;
+pub mod status;
 
 pub use dag::Dag;
 pub use model::*;

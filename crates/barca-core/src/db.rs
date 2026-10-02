@@ -719,6 +719,93 @@ pub async fn get_asset_stats(db_path: &str, node_id: &str) -> Result<AssetStats,
     })
 }
 
+/// One row of `materializations`, as `barca status` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializationRecord {
+    /// Exact node id, including the partition suffix for a partitioned step.
+    pub node_id: String,
+    pub run_hash: Option<String>,
+    pub artifact_path: Option<String>,
+    pub artifact_format: Option<String>,
+    pub artifact_size_bytes: Option<i64>,
+    pub elapsed_seconds: Option<f64>,
+    /// `success` or `failed`.
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
+}
+
+/// What the metadata DB knows about one node (all partition keys of a partitioned node).
+#[derive(Debug, Clone, Default)]
+pub struct NodeHistory {
+    /// The most recent materialization attempt, successful or not.
+    pub latest: Option<MaterializationRecord>,
+    /// Whether any attempt ever succeeded.
+    pub ever_succeeded: bool,
+}
+
+/// Latest materialization and success flag for each base node id. Rows of partitioned steps
+/// (`<base>[k=v]`) count toward their base id. Read-only; the caller ensures the DB exists.
+pub async fn node_histories(
+    db_path: &str,
+    base_ids: &[String],
+) -> Result<HashMap<String, NodeHistory>, BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut out = HashMap::new();
+    for base in base_ids {
+        let prefix = format!("{base}[");
+        let filter = "(node_id = ?1 OR substr(node_id, 1, length(?2)) = ?2)";
+        let mut h = NodeHistory::default();
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, \
+                     elapsed_seconds, status, error_message, created_at FROM materializations \
+                     WHERE {filter} ORDER BY id DESC LIMIT 1"
+                ),
+                [base.clone(), prefix.clone()],
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query materializations: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+        {
+            let opt = |i: usize| row.get::<String>(i).ok().filter(|s| !s.is_empty());
+            h.latest = Some(MaterializationRecord {
+                node_id: row.get::<String>(0).unwrap_or_default(),
+                run_hash: opt(1),
+                artifact_path: opt(2),
+                artifact_format: opt(3),
+                artifact_size_bytes: row.get::<i64>(4).ok(),
+                elapsed_seconds: row.get::<f64>(5).ok(),
+                status: opt(6).unwrap_or_else(|| "success".to_string()),
+                error_message: opt(7),
+                created_at: row.get::<String>(8).unwrap_or_default(),
+            });
+        }
+        drop(rows);
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT 1 FROM materializations WHERE {filter} AND status = 'success' LIMIT 1"
+                ),
+                [base.clone(), prefix],
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query materializations: {e}")))?;
+        h.ever_succeeded = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+            .is_some();
+        out.insert(base.clone(), h);
+    }
+    Ok(out)
+}
+
 /// Compute the p-th percentile from a sorted slice of values.
 fn percentile(sorted: &[f64], p: f64) -> Option<f64> {
     if sorted.is_empty() {

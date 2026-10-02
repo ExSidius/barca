@@ -63,6 +63,11 @@ pub const TOPICS: &[Topic] = &[
         "scheduling.md"
     ),
     topic!(
+        "status",
+        "barca status: cache state, last run and artifact shape per node",
+        "status.md"
+    ),
+    topic!(
         "agents",
         "Output contract, exit codes and workflows for scripts and AI agents",
         "agents.md"
