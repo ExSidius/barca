@@ -249,6 +249,41 @@ def test_tasks_topic_several_targets_example(binary, topics, tmp_path):
     assert second["steps_executed"] == 2  # registry from cache; the tasks always re-run
 
 
+def test_cache_topic_helper_module_example(binary, topics, tmp_path):
+    """Editing a used helper re-runs the step, editing an unused one doesn't, and every spelling
+    of the pipeline path computes the same run hash (#178)."""
+    helpers, pipeline = (b for b in blocks(topics["cache"], "python") if "helpers" in b)
+    assert helpers.startswith("# helpers.py") and pipeline.startswith("# pipeline.py")
+    (tmp_path / "helpers.py").write_text(helpers)
+    (tmp_path / "pipeline.py").write_text(pipeline)
+
+    def get() -> dict:
+        return result(barca(binary, tmp_path, "get", "rows", "pipeline.py"))
+
+    first = get()
+    assert first["steps_executed"] == 1 and first["final_output"] == [1, 2]
+    assert get()["steps_executed"] == 0
+
+    (tmp_path / "helpers.py").write_text(helpers.replace("editing this", "edited, this"))
+    assert get()["steps_executed"] == 0, "editing an unused helper re-runs nothing"
+
+    (tmp_path / "helpers.py").write_text(helpers.replace("if r]", "if r] + [3]"))
+    edited = get()
+    assert edited["steps_executed"] == 1 and edited["final_output"] == [1, 2, 3]
+
+    def run_hash(cwd: Path, arg: str) -> str:
+        status = result(barca(binary, cwd, "status", "rows", arg, "--json"))
+        return status["nodes"][0]["cache"]["run_hash"]
+
+    spellings = [
+        (tmp_path, "pipeline.py"),
+        (tmp_path, "./pipeline.py"),
+        (tmp_path, str(tmp_path / "pipeline.py")),
+        (tmp_path.parent, f"{tmp_path.name}/pipeline.py"),
+    ]
+    assert len({run_hash(cwd, arg) for cwd, arg in spellings}) == 1
+
+
 def test_status_topic_example(binary, topics, tmp_path):
     pytest.importorskip("pyarrow")
     write_example(topics, "status", tmp_path)
