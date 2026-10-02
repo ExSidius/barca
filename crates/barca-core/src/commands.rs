@@ -104,14 +104,61 @@ fn resolve_targets(
 }
 
 /// The plan for these targets: the union of their cones, planned once, so an upstream step
-/// shared by several targets appears (and runs) once. No targets means the whole DAG.
-fn plan_for_targets(dag: &Dag, target_ids: &[&str], config: &ResourceConfig) -> ExecutionPlan {
+/// shared by several targets appears (and runs) once. No targets means everything the command
+/// covers: for `get`, every asset and sensor (tasks are skipped: get is for assets, run is for
+/// tasks); for anything else (`status`), the whole DAG.
+fn plan_for_targets(
+    dag: &Dag,
+    target_ids: &[&str],
+    config: &ResourceConfig,
+    command_label: &str,
+) -> ExecutionPlan {
     let full_plan = planner::plan_from_dag(dag, config);
-    if target_ids.is_empty() {
-        full_plan
-    } else {
+    if !target_ids.is_empty() {
         filter_plan_to_subgraph(full_plan, &dag.subgraph_many(target_ids))
+    } else if command_label == "get" {
+        // A task is never upstream of an asset or sensor, so this is closed under upstream.
+        let gettable: Vec<&str> = dag
+            .topo_order()
+            .into_iter()
+            .filter(|id| !is_task(dag, id))
+            .collect();
+        filter_plan_to_subgraph(full_plan, &gettable)
+    } else {
+        full_plan
     }
+}
+
+fn is_task(dag: &Dag, id: &str) -> bool {
+    dag.get_node(id)
+        .is_some_and(|n| n.kind() == crate::NodeKind::Task)
+}
+
+/// The stderr note for `barca get <files>` with no target when the files define tasks: which
+/// tasks were skipped and how to run one. `None` when there is no task to mention.
+fn skipped_tasks_note(dag: &Dag, file_args: &[String]) -> Option<String> {
+    let order = dag.topo_order();
+    let tasks: Vec<&str> = order
+        .iter()
+        .filter(|id| is_task(dag, id))
+        .map(|id| short_name(id))
+        .collect();
+    let first = tasks.first()?;
+    let run_hint = format!("barca run {first} {}", file_args.join(" "));
+    let listed = tasks.join(", ");
+    Some(if tasks.len() == order.len() {
+        format!(
+            "[barca] nothing to get: no assets or sensors, only tasks ({listed}). \
+             `barca get` without a target never runs tasks; run one with: {run_hint}"
+        )
+    } else {
+        format!(
+            "[barca] skipped {} task{} ({listed}): `barca get` without a target materializes \
+             assets only. Run a task with: {run_hint}",
+            tasks.len(),
+            if tasks.len() == 1 { "" } else { "s" },
+        )
+    })
 }
 
 /// The failed node upstream of `base_id`, if any: it blocks `base_id` from running. Used when
@@ -1103,6 +1150,12 @@ pub async fn explain(
     command_label: &str,
 ) -> Result<ExplainResult, BarcaError> {
     let dag = build_dag(file_args, python).await?;
+    if command_label == "get"
+        && target_names.is_empty()
+        && let Some(note) = skipped_tasks_note(&dag, file_args)
+    {
+        eprintln!("{note}");
+    }
     explain_dag(
         &dag,
         cfg,
@@ -1132,7 +1185,7 @@ pub(crate) async fn explain_dag(
         pool_size,
         concurrency_groups: HashMap::new(),
     };
-    let exec_plan = plan_for_targets(dag, &target_ids, &config);
+    let exec_plan = plan_for_targets(dag, &target_ids, &config, command_label);
     if let CachePolicy::RefreshSelective { names, .. } = &policy {
         validate_refresh_names(dag, &target_ids, names)?;
     }
@@ -1296,6 +1349,12 @@ async fn execute(
 
     let targets = resolve_targets(&dag, target_names, command_label)?;
     let target_ids: Vec<&str> = targets.iter().map(|(_, id)| id.as_str()).collect();
+    if command_label == "get"
+        && target_ids.is_empty()
+        && let Some(note) = skipped_tasks_note(&dag, file_args)
+    {
+        eprintln!("{note}");
+    }
     // Several targets: a step failure stops only what depends on it, so every target that can
     // still run does (one run reports every failure). One target keeps the stop-at-first-failure
     // behavior: nothing else in its cone could produce its value.
@@ -1314,7 +1373,7 @@ async fn execute(
         pool_size,
         concurrency_groups: HashMap::new(),
     };
-    let exec_plan = plan_for_targets(&dag, &target_ids, &config);
+    let exec_plan = plan_for_targets(&dag, &target_ids, &config, command_label);
     trace_point!("planned");
 
     if let CachePolicy::RefreshSelective { names, .. } = &policy {
@@ -1955,12 +2014,22 @@ async fn execute(
     } else if keep_going {
         None
     } else {
-        // No target: return the last planned step's output.
-        let last_planned_id = exec_plan
+        // No target: return the last planned asset's output (a sensor's only when the plan
+        // has no asset).
+        let planned: Vec<&planner::StreamStep> = exec_plan
             .phases
-            .last()
-            .and_then(|p| p.streams.last())
-            .and_then(|s| s.steps.last())
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .collect();
+        let last_planned_id = planned
+            .iter()
+            .rev()
+            .find(|st| {
+                dag.get_node(st.step_id.base_id())
+                    .is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+            })
+            .or(planned.last())
             .map(|s| s.step_id.display())
             .unwrap_or_default();
         all_outputs.get(&last_planned_id).cloned().or_else(|| {
@@ -2676,7 +2745,7 @@ def lone() -> int:
             pool_size: 4,
             concurrency_groups: HashMap::new(),
         };
-        let plan = plan_for_targets(&dag, &["p.py:check_a", "p.py:check_b"], &config);
+        let plan = plan_for_targets(&dag, &["p.py:check_a", "p.py:check_b"], &config, "run");
         let ids: Vec<String> = plan
             .phases
             .iter()
@@ -2689,6 +2758,51 @@ def lone() -> int:
             assert!(ids.iter().any(|i| i == want), "{want} missing from {ids:?}");
         }
         assert!(!ids.iter().any(|i| i == "p.py:lone"));
+    }
+
+    fn planned_ids(plan: &ExecutionPlan) -> Vec<String> {
+        plan.phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .map(|s| s.step_id.display())
+            .collect()
+    }
+
+    #[test]
+    fn bare_get_plans_every_asset_and_no_task() {
+        let dag = dag();
+        let config = ResourceConfig {
+            pool_size: 4,
+            concurrency_groups: HashMap::new(),
+        };
+        let mut got = planned_ids(&plan_for_targets(&dag, &[], &config, "get"));
+        got.sort();
+        assert_eq!(got, ["p.py:deeper", "p.py:left", "p.py:lone", "p.py:src"]);
+        // status (inspection) still covers the whole file, tasks included.
+        let all = planned_ids(&plan_for_targets(&dag, &[], &config, "status"));
+        assert!(all.iter().any(|i| i == "p.py:check_a"), "{all:?}");
+    }
+
+    #[test]
+    fn skipped_tasks_note_names_the_tasks_and_the_run_command() {
+        let files = names(&["p.py"]);
+        let note = skipped_tasks_note(&dag(), &files).unwrap();
+        assert!(
+            note.contains("skipped 2 tasks (check_a, check_b)"),
+            "{note}"
+        );
+        assert!(note.contains("barca run check_a p.py"), "{note}");
+
+        let only = "from barca import task\n\n@task()\ndef deploy() -> None:\n    pass\n";
+        let only = Dag::build(&crate::parse::extract_nodes(only, "t.py").unwrap()).unwrap();
+        let note = skipped_tasks_note(&only, &names(&["t.py"])).unwrap();
+        assert!(note.contains("nothing to get"), "{note}");
+        assert!(note.contains("barca run deploy t.py"), "{note}");
+
+        let assets = "from barca import asset\n\n@asset()\ndef a() -> int:\n    return 1\n";
+        let assets = Dag::build(&crate::parse::extract_nodes(assets, "a.py").unwrap()).unwrap();
+        assert!(skipped_tasks_note(&assets, &names(&["a.py"])).is_none());
     }
 
     #[test]

@@ -153,7 +153,9 @@ def _read_output(output_ref: Any) -> Any:
 def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
     """Get asset value(s).
 
-    If target_or_file ends in .py, gets all assets in the file.
+    If target_or_file ends in .py, gets every asset and sensor in the file and
+    returns the last asset's value. Tasks are never run (use ``run``); a file
+    with only tasks returns None.
     Otherwise, treats it as a target asset name and remaining args as files.
 
     Returns the deserialized value of the target asset directly.

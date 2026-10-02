@@ -246,7 +246,7 @@ List output is bounded: `list` shows 100 nodes and `history` 10 runs unless you 
 or `--all`, and their JSON reports `truncated` and `total`. `--fields a,b` keeps only those keys
 on each item of any JSON output (`barca list pipeline.py --fields id,inputs`).
 
-Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
+Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets and sensors; tasks are skipped, use `barca run`).
 
 ## Scheduling
 
@@ -314,7 +314,7 @@ See the [Server API reference](https://barca.sh/reference/server-api/) for the f
 ```python
 import barca
 
-# Get all assets in a file (returns the last asset's value)
+# Get all assets in a file (returns the last asset's value; tasks are not run)
 value = barca.get("pipeline.py")
 print(value)  # {"count": 3, "total": 6}
 
@@ -351,7 +351,7 @@ $ barca plan pipeline.py
 
 ### `barca get` -- execute and get results
 
-Parses source, builds DAG, spawns workers, collects outputs, persists to `.barca/metadata.db`. With a target, only the target's subgraph runs. Without a target, all assets run.
+Parses source, builds DAG, spawns workers, collects outputs, persists to `.barca/metadata.db`. With a target, only the target's subgraph runs. Without a target, every asset and sensor runs and tasks are skipped (previously tasks ran too); stderr names the skipped tasks. Run tasks with `barca run`.
 
 Output is a JSON summary:
 

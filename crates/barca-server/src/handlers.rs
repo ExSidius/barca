@@ -92,7 +92,8 @@ pub async fn asset_detail(
     })))
 }
 
-/// `POST /run` — trigger a full run; returns a polling handle immediately.
+/// `POST /run` — get every asset and sensor (`barca get <files>` with no target; tasks are
+/// skipped); returns a polling handle immediately.
 pub async fn run(State(state): State<AppState>) -> Json<Value> {
     let handle = start_run(state, None);
     Json(json!({ "run_id": handle }))

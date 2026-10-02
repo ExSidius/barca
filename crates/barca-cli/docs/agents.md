@@ -262,7 +262,9 @@ raised on failure; for `get`/`run`/`plan` its `kind`, `code`, `remediation` (and
 
 ## Targets and files
 
-- `barca get file.py` gets every asset (final value is the last asset).
+- `barca get file.py` gets every asset and sensor (final value is the last asset). It never runs
+  tasks (it used to): stderr names the skipped tasks and the `barca run` command. A file with only
+  tasks gets nothing and exits 0 with `"steps": []`.
 - `barca get name file.py [more.py ...]` gets one target; `name` can be the bare function name
   or the full id `file.py:name`. Cross-file inputs use `asset_ref("path.py:fn")`.
 - `barca get a,b file.py` / `barca run a,b file.py` take several targets in one run (see above).

@@ -283,6 +283,8 @@ barca get my_project/sources.py my_project/transforms.py my_project/tasks.py
 ```
 
 Barca merges all discovered nodes into a single DAG and plans execution across the full graph.
+With no target, `barca get` materializes the assets (and sensors) from all three files and skips
+the tasks in `tasks.py`; run a task by name with `barca run <task> <files>`.
 
 ## 9. Freshness markers
 

@@ -56,7 +56,7 @@ Scripts and AI agents: barca docs skill (short, start here), barca docs agents (
 
 const GET_HELP: &str = "\
 Examples:
-  barca get pipeline.py                    # every asset in the file; prints the last one's value
+  barca get pipeline.py                    # every asset and sensor, never tasks; prints the last asset's value
   barca get total pipeline.py              # one target and only its upstream cone
   barca get total,orders pipeline.py       # several targets in one run; shared upstream runs once
   barca get total pipeline.py other.py     # target defined across several files
@@ -81,8 +81,11 @@ loads the value for you.
 Several targets (`a,b`, comma-separated, no spaces): final_output is replaced by `targets`, keyed by
 target, each {status: success, final_output} or {status: failed, failed_step, error}. Every target
 runs even if another fails; exit 1 if any failed.
-Targets must be assets; use `barca run` for tasks. The target comes before the files:
-`barca get pipeline.py total` exits 2 and prints `barca get total pipeline.py`.
+Targets must be assets; use `barca run` for tasks. With no target, get materializes every asset and
+sensor and skips tasks (previously it ran tasks too); stderr names the skipped tasks and the
+`barca run` command. A file with only tasks gets nothing: exit 0, empty `steps`.
+The target comes before the files: `barca get pipeline.py total` exits 2 and prints
+`barca get total pipeline.py`.
 Errors: in JSON mode the last stderr line is one JSON object {error, code, kind, remediation},
 plus node, traceback and artifact_dir when a step failed. Exit 1 step failed, 2 usage error,
 3 barca/infra failure, 130 cancelled. A failed step still prints a stdout result line with
@@ -231,7 +234,8 @@ enum Cli {
     /// Get asset value(s) — cache-aware, runs only the needed subgraph
     ///
     /// If the first positional arg ends in .py, all args are treated as files
-    /// (no target — gets all assets). Otherwise, the first arg is the target
+    /// (no target — gets every asset and sensor; tasks are skipped, use `barca run` for
+    /// them). Otherwise, the first arg is the target
     /// asset name (or several, comma-separated: `a,b`) and the rest are files.
     ///
     /// Each completed step writes a fully materialized artifact (never a lazy in-memory
