@@ -89,12 +89,13 @@ def test_list_limit_and_all(project):
 
 
 def test_list_table_truncation_note_goes_to_stderr(project):
-    proc = barca(project, "list", "big.py", "-l", "3")
+    # Piped stdout picks JSON (#153); ask for the table.
+    proc = barca(project, "list", "big.py", "-l", "3", "--pretty")
     assert proc.returncode == 0, proc.stderr
     rows = proc.stdout.strip().splitlines()
     assert len(rows) == 2 + 3  # header, rule, three rows
     assert "3 of 120" in proc.stderr and "--all" in proc.stderr
-    untruncated = barca(project, "list", "pipeline.py")
+    untruncated = barca(project, "list", "pipeline.py", "--pretty")
     assert untruncated.stderr == ""
 
 
@@ -115,7 +116,7 @@ def test_history_json_envelope_reports_truncation(project):
     every = ok(barca(project, "history", "--json", "--all"))
     assert len(every["runs"]) == 3 and every["truncated"] is False and "hint" not in every
 
-    table = barca(project, "history", "-l", "1")
+    table = barca(project, "history", "-l", "1", "--pretty")
     assert table.returncode == 0
     assert "1 of 3" in table.stderr
 
@@ -178,3 +179,33 @@ def test_fields_with_non_json_output_is_a_usage_error(project):
     proc = barca(project, "get", "total", "pipeline.py", "-o", "pretty", "--fields", "id")
     assert proc.returncode == 2
     assert "--fields" in proc.stderr
+
+
+# ─── combined with TTY-aware output (#153) ────────────────────────────────────
+
+
+def test_python_history_reads_the_envelope(project, monkeypatch):
+    """barca.history() asks for JSON (#153), which is now the {runs, ...} envelope (#155)."""
+    import barca as api
+
+    for _ in range(3):
+        ok(barca(project, "get", "total", "pipeline.py"))
+    monkeypatch.chdir(project)
+    runs = api.history(2)
+    assert isinstance(runs, list) and len(runs) == 2
+    assert {"run_id", "status", "steps_executed"} <= set(runs[0])
+
+
+def test_fields_implies_json_on_get(project):
+    out = ok(barca(project, "get", "total", "pipeline.py", "--fields", "id"))
+    assert all(set(s) == {"id"} for s in out["steps"])
+
+
+def test_fields_with_pretty_is_a_usage_error(project):
+    for args in (
+        ("get", "total", "pipeline.py", "--pretty", "--fields", "id"),
+        ("list", "pipeline.py", "--pretty", "--fields", "id"),
+    ):
+        proc = barca(project, *args)
+        assert proc.returncode == 2, (args, proc.stderr)
+        assert "--fields applies to JSON output" in proc.stderr

@@ -221,7 +221,8 @@ def history(limit: int = 10) -> list[dict]:
         - finished_at: str | None
         - elapsed_seconds: float | None
     """
-    return _exec(["history", "--limit", str(limit), "--json"])
+    # `history --json` is an envelope {runs, total, truncated, hint?}; the API returns the runs.
+    return _exec(["history", "--limit", str(limit), "--json"])["runs"]
 
 
 def stats(target: str, file: str, *extra_files: str) -> dict:
