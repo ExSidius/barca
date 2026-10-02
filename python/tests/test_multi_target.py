@@ -70,7 +70,15 @@ def deep_check(d: dict) -> dict:
     return {"deep_ok": d["deeper"] == 4}
 """
 
-SINGLE_KEYS = {"run_id", "elapsed_seconds", "steps_executed", "phases", "final_output", "steps"}
+SINGLE_KEYS = {
+    "status",
+    "run_id",
+    "elapsed_seconds",
+    "steps_executed",
+    "phases",
+    "final_output",
+    "steps",
+}
 
 
 @pytest.fixture()
@@ -140,6 +148,15 @@ def test_a_failing_target_does_not_stop_the_others(project):
     assert failed["failed_step"] == "pipeline.py:boom"
     assert "check failed on purpose" in failed["error"]
     assert "boom" in proc.stderr
+    # The run reports failure on stdout, and the error envelope (#154) is the last stderr line.
+    assert out["status"] == "failed"
+    envelope = json.loads(proc.stderr.strip().splitlines()[-1])
+    assert envelope["kind"] == "step_failed" and envelope["node"] == "pipeline.py:boom"
+
+
+def test_all_targets_succeeding_reports_success(project):
+    out = ok(barca(project, "run", "check_a,check_b", "pipeline.py"))
+    assert out["status"] == "success"
 
 
 def test_a_failed_upstream_fails_only_the_targets_that_depend_on_it(project):
@@ -160,7 +177,7 @@ def test_a_failed_upstream_fails_only_the_targets_that_depend_on_it(project):
     assert by["needs_broken"]["reason"] == "upstream_failed"
     assert by["deep_check"]["status"] == "ran"
     assert out["steps_executed"] == 5  # the skipped step never executed
-    runs = ok(barca(project, "history", "--json"))
+    runs = ok(barca(project, "history", "--json"))["runs"]
     assert runs[0]["status"] == "failed"
 
 
@@ -204,7 +221,7 @@ def test_refresh_applies_to_the_union_of_cones(project):
     by = {s["id"].split(":")[-1]: s for s in out["steps"]}
     assert by["left"]["status"] == "ran" and by["left"]["reason"] == "refresh"
     bad = barca(project, "run", "check_a,check_b", "pipeline.py", "--refresh", "right")
-    assert bad.returncode == 1 and "no upstream asset named 'right'" in bad.stderr
+    assert bad.returncode == 2 and "no upstream asset named 'right'" in bad.stderr
 
 
 def test_value_output_is_keyed_by_target(project):
@@ -215,9 +232,9 @@ def test_value_output_is_keyed_by_target(project):
 
 def test_every_name_is_checked_before_anything_runs(project):
     unknown = barca(project, "run", "check_a,nope", "pipeline.py")
-    assert unknown.returncode == 1 and "nope" in unknown.stderr
+    assert unknown.returncode == 2 and "nope" in unknown.stderr
     wrong_kind = barca(project, "get", "left,check_a", "pipeline.py")
-    assert wrong_kind.returncode == 1 and "barca run" in wrong_kind.stderr
+    assert wrong_kind.returncode == 2 and "barca run" in wrong_kind.stderr
     assert src_runs(project) == 0
     empty = barca(project, "run", "check_a,,check_b", "pipeline.py")
     assert empty.returncode == 2 and "empty target name" in empty.stderr
@@ -226,5 +243,5 @@ def test_every_name_is_checked_before_anything_runs(project):
 
 def test_history_records_every_target(project):
     ok(barca(project, "run", "check_a,check_b", "pipeline.py"))
-    runs = ok(barca(project, "history", "--json"))
+    runs = ok(barca(project, "history", "--json"))["runs"]
     assert runs[0]["target"] == "check_a,check_b"

@@ -241,6 +241,11 @@ impl CliError {
         {
             return self;
         }
+        // A generic fallback remediation is replaced, not repeated, by the more specific hint.
+        if !self.prose_has_remediation {
+            self.remediation = Some(hint);
+            return self;
+        }
         self.remediation = Some(match self.remediation.take() {
             Some(r) => format!("{r}\n{hint}"),
             None => hint.clone(),
