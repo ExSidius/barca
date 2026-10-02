@@ -7,7 +7,7 @@ parses these statically from source without importing.
 
 from __future__ import annotations
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "asset",
@@ -25,6 +25,7 @@ __all__ = [
     "parallel",
     "parallel_map",
     "ParallelError",
+    "duckdb_connection",
     "get",
     "run",
     "plan",
@@ -273,6 +274,22 @@ def parallel_map(fn, items, **kwargs):
     from functools import partial
 
     return parallel(*(partial(fn, item, **kwargs) for item in items))
+
+
+# ─── DuckDB ───────────────────────────────────────────────────────────────────
+
+
+def duckdb_connection():
+    """The duckdb connection barca binds duckdb-typed inputs to (one per worker process).
+
+    Configure it once at import time of your asset module (``INSTALL``/``LOAD`` extensions,
+    credentials, ``SET`` options, macros); every duckdb input, and ``duckdb.sql(...)`` inside
+    your steps, runs on this same connection, so relations always combine. See
+    ``barca docs types``.
+    """
+    from barca import _duckdb
+
+    return _duckdb.connection()
 
 
 # ─── Python API ──────────────────────────────────────────────────────────────

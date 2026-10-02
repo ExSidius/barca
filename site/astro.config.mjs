@@ -14,10 +14,10 @@ export default defineConfig({
       description:
         'Rust plans it. Python runs it. You just write functions. Docs for the barca asset orchestrator.',
       social: [
-        { icon: 'github', label: 'GitHub', href: 'https://github.com/ExSidius/barca' },
+        { icon: 'github', label: 'GitHub', href: 'https://github.com/barca-orc/barca' },
       ],
       editLink: {
-        baseUrl: 'https://github.com/ExSidius/barca/edit/main/site/src/content/docs/',
+        baseUrl: 'https://github.com/barca-orc/barca/edit/main/site/src/content/docs/',
       },
       logo: {
         light: './src/assets/mark-dark.svg',

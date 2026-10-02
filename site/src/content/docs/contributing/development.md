@@ -8,7 +8,7 @@ How to install and develop barca from source.
 ## Quick start
 
 ```bash
-git clone https://github.com/ExSidius/barca.git
+git clone https://github.com/barca-orc/barca.git
 cd barca
 uv sync                              # Python dev deps (pytest, etc.)
 cargo build --release                # build the Rust binary

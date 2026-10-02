@@ -23,7 +23,6 @@ use std::process::Command;
 use std::time::Instant;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
-use turso::Builder;
 
 /// Format seconds as a fixed-width time string for progress display.
 /// Always 8 chars wide: "   5s   ", " 2m 30s ", " 1h 05m ", "2d 03h  "
@@ -39,6 +38,480 @@ fn fmt_eta(secs: f64) -> String {
         let d = s / 86400;
         format!("{d:>2}d {:02}h  ", (s % 86400) / 3600)
     }
+}
+
+/// The progress total, grown to cover steps the plan did not count (the children a `parallel()`
+/// call fans out to complete as extra steps). Keeps `completed <= total` for the counters and
+/// the ETA subtraction.
+fn reconcile_total(total_steps: usize, completed_steps: usize) -> usize {
+    total_steps.max(completed_steps)
+}
+
+/// Resolve the target name to a node id (or `None` for the whole DAG), enforcing that `barca get`
+/// targets assets and `barca run` targets tasks.
+fn resolve_target(
+    dag: &Dag,
+    target_name: Option<&str>,
+    command_label: &str,
+) -> Result<Option<String>, BarcaError> {
+    match target_name {
+        Some(name) => {
+            let id = dag
+                .topo_order()
+                .into_iter()
+                .find(|id| id.ends_with(&format!(":{name}")) || *id == name || id.ends_with(name))
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    let available: Vec<&str> = dag.topo_order();
+                    BarcaError::AssetNotFound(name.to_string(), available.join(", "))
+                })?;
+            // Enforce get/run semantics: `barca get` is for assets, `barca run` is for tasks.
+            if let Some(node) = dag.get_node(&id) {
+                let kind = node.kind();
+                if command_label == "get" && kind == crate::NodeKind::Task {
+                    return Err(BarcaError::Other(format!(
+                        "'{name}' is a task — use `barca run` instead"
+                    )));
+                }
+                if command_label == "run" && kind == crate::NodeKind::Asset {
+                    return Err(BarcaError::Other(format!(
+                        "'{name}' is an asset — use `barca get` instead"
+                    )));
+                }
+            }
+            Ok(Some(id))
+        }
+        None => Ok(None),
+    }
+}
+
+// ─── Cache decisions ─────────────────────────────────────────────────────────
+//
+// One function decides what happens to a step; a real run and `--dry-run` both call it, so the
+// dry run cannot drift from what a run would do.
+
+/// Why a step runs instead of being served from cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunReason {
+    Task,
+    Sensor,
+    NoCache,
+    Refresh,
+    RefreshAll,
+    NotMaterialized,
+}
+
+impl RunReason {
+    fn code(self) -> &'static str {
+        match self {
+            RunReason::Task => "task",
+            RunReason::Sensor => "sensor",
+            RunReason::NoCache => "no_cache",
+            RunReason::Refresh => "refresh",
+            RunReason::RefreshAll => "refresh_all",
+            RunReason::NotMaterialized => "not_materialized",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            RunReason::Task => "tasks always re-run",
+            RunReason::Sensor => "sensors always re-run",
+            RunReason::NoCache => "--no-cache",
+            RunReason::Refresh => "named in --refresh",
+            RunReason::RefreshAll => "--refresh-all",
+            RunReason::NotMaterialized => "no cached result for this code and these inputs",
+        }
+    }
+}
+
+enum Decision {
+    Run(RunReason),
+    Cached {
+        oref: OutputRef,
+        /// The refreshed asset this cached step depends on, if any.
+        stale_root: Option<String>,
+    },
+    Partitioned {
+        cached: Vec<(String, OutputRef)>,
+        missing: Vec<crate::model::PartitionKey>,
+    },
+}
+
+/// Per-run state the decisions accumulate: run hashes (also used to persist results), assets
+/// refreshed in this run, and cached assets downstream of a refreshed one.
+#[derive(Default)]
+struct DecideState {
+    run_hashes: HashMap<String, String>,
+    refreshed_ids: std::collections::HashSet<String>,
+    stale_cached: HashMap<String, String>,
+}
+
+async fn lookup_in(
+    cache: Option<&db::CacheReader>,
+    node_id: &str,
+    run_hash: &str,
+) -> Option<OutputRef> {
+    lookup_cached(cache?, node_id, run_hash).await
+}
+
+/// Decide what happens to `step`. Steps must be visited in plan order: in-phase upstream run
+/// hashes are already in `state` when a consumer is hashed, so check-time and persist-time hashes
+/// are identical. `cache` is `None` when there is no metadata DB yet (nothing is cached).
+async fn decide_step(
+    dag: &Dag,
+    policy: &CachePolicy,
+    no_cache: bool,
+    cache: Option<&db::CacheReader>,
+    state: &mut DecideState,
+    step: &crate::planner::StreamStep,
+) -> (crate::planner::StreamStep, Decision) {
+    let base_id = step.step_id.base_id();
+    let display_id = step.step_id.display();
+    let base_node = dag.get_node(base_id);
+    let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
+
+    // Run hashes for EVERY step (sensors, tasks, refreshed and partitioned steps too): they
+    // content-address artifacts and key persistence.
+    let mut step = step.clone();
+    if step.partition_keys.is_empty() {
+        let partition_key = if step.step_id.partition.is_empty() {
+            None
+        } else {
+            Some(step.step_id.partition.suffix())
+        };
+        let run_h = cache::compute_run_hash(
+            def_hash,
+            partition_key.as_deref(),
+            step.inputs.values(),
+            &state.run_hashes,
+        );
+        state.run_hashes.insert(display_id.clone(), run_h.clone());
+        step.run_hashes.insert(display_id.clone(), run_h);
+    } else {
+        for pk in &step.partition_keys {
+            let pdisplay = pk.display_id(&step.step_id.base);
+            let run_h = cache::compute_run_hash(
+                def_hash,
+                Some(&pk.suffix()),
+                step.inputs.values(),
+                &state.run_hashes,
+            );
+            state.run_hashes.insert(pdisplay.clone(), run_h.clone());
+            step.run_hashes.insert(pdisplay, run_h);
+        }
+    }
+
+    let kind = base_node.map(|n| n.kind());
+    // Sensors and tasks always re-run — never cached.
+    match kind {
+        Some(crate::NodeKind::Task) => return (step, Decision::Run(RunReason::Task)),
+        Some(crate::NodeKind::Sensor) => return (step, Decision::Run(RunReason::Sensor)),
+        _ => {}
+    }
+    if no_cache {
+        return (step, Decision::Run(RunReason::NoCache));
+    }
+
+    // Refresh policy (`barca run`): force-rerun assets in/named by the refresh set.
+    let is_asset = kind == Some(crate::NodeKind::Asset);
+    let refresh = match policy {
+        CachePolicy::CacheAware => None,
+        CachePolicy::RefreshAll => is_asset.then_some(RunReason::RefreshAll),
+        CachePolicy::RefreshSelective(names) => (is_asset
+            && names.iter().any(|name| refresh_name_matches(base_id, name)))
+        .then_some(RunReason::Refresh),
+    };
+    if let Some(reason) = refresh {
+        state.refreshed_ids.insert(base_id.to_string());
+        return (step, Decision::Run(reason));
+    }
+
+    // Partitioned steps are checked per key: each partition has its own run hash, so keys
+    // with a successful materialization are served from cache and only the rest execute.
+    if !step.partition_keys.is_empty() {
+        let mut cached = Vec::new();
+        let mut missing = Vec::new();
+        for pk in &step.partition_keys {
+            let pdisplay = pk.display_id(&step.step_id.base);
+            let run_h = step
+                .run_hashes
+                .get(&pdisplay)
+                .cloned()
+                .expect("partitioned step has a precomputed run hash per key");
+            match lookup_in(cache, &pdisplay, &run_h).await {
+                Some(oref) => cached.push((pdisplay, oref)),
+                None => missing.push(pk.clone()),
+            }
+        }
+        return (step, Decision::Partitioned { cached, missing });
+    }
+
+    let run_h = step
+        .run_hashes
+        .get(&display_id)
+        .cloned()
+        .expect("unpartitioned step has a precomputed run hash");
+    match lookup_in(cache, &display_id, &run_h).await {
+        None => (step, Decision::Run(RunReason::NotMaterialized)),
+        Some(oref) => {
+            // Cached, but does it depend on something refreshed in this run?
+            let stale_root = step.inputs.values().find_map(|up| {
+                let up_base = up.split('[').next().unwrap_or(up);
+                if state.refreshed_ids.contains(up_base) {
+                    Some(short_name(up_base).to_string())
+                } else {
+                    state.stale_cached.get(up_base).cloned()
+                }
+            });
+            if let Some(root) = &stale_root {
+                state.stale_cached.insert(base_id.to_string(), root.clone());
+            }
+            (step, Decision::Cached { oref, stale_root })
+        }
+    }
+}
+
+/// A partitioned asset plans one step per key; report it as one line with a partition summary.
+fn merge_partition_reports(reports: Vec<StepReport>) -> Vec<StepReport> {
+    let mut out: Vec<StepReport> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for r in reports {
+        let Some(p) = r.partitions.clone() else {
+            out.push(r);
+            continue;
+        };
+        match index.get(&r.id).copied() {
+            None => {
+                index.insert(r.id.clone(), out.len());
+                out.push(r);
+            }
+            Some(i) => {
+                let m = &mut out[i];
+                let mp = m.partitions.get_or_insert_with(PartitionSummary::default);
+                mp.total += p.total;
+                mp.cached += p.cached;
+                mp.will_run += p.will_run;
+                for k in p.will_run_keys {
+                    if mp.will_run_keys.len() < 20 {
+                        mp.will_run_keys.push(k);
+                    }
+                }
+                if m.reason.is_none() {
+                    m.reason = r.reason;
+                    m.detail = r.detail;
+                }
+            }
+        }
+    }
+    // Recompute the verdict of merged lines from their totals.
+    for r in &mut out {
+        let Some(p) = &r.partitions else { continue };
+        let verdict = |dry: bool| match (p.cached, p.will_run) {
+            (_, 0) => "cached",
+            (0, _) => {
+                if dry {
+                    "run"
+                } else {
+                    "ran"
+                }
+            }
+            _ => "partial",
+        };
+        if r.action.is_some() {
+            r.action = Some(verdict(true).to_string());
+        } else {
+            r.status = Some(verdict(false).to_string());
+        }
+    }
+    out
+}
+
+fn stale_warning(display_id: &str, root: &str, dry: bool) -> String {
+    let id = short_name(display_id);
+    let (served, reflect) = if dry {
+        ("will be served", "will not reflect")
+    } else {
+        ("was served", "does not reflect")
+    };
+    format!(
+        "'{id}' {served} from cache but depends on refreshed '{root}', so it {reflect} the \
+         refresh. Add it to --refresh (for example --refresh {root},{id}) or use --refresh-all."
+    )
+}
+
+fn kind_str(kind: Option<crate::NodeKind>) -> String {
+    match kind {
+        Some(crate::NodeKind::Asset) => "asset",
+        Some(crate::NodeKind::Task) => "task",
+        Some(crate::NodeKind::Sensor) => "sensor",
+        None => "unknown",
+    }
+    .to_string()
+}
+
+/// Build the report line for one decided step. `dry` selects the vocabulary: a dry run says what
+/// will happen (`action`), a real run says what happened (`status`).
+fn report_for(
+    dag: &Dag,
+    step: &crate::planner::StreamStep,
+    decision: &Decision,
+    dry: bool,
+) -> StepReport {
+    let display_id = step.step_id.display();
+    let base_id = step.step_id.base_id();
+    let mut r = StepReport {
+        id: base_id.to_string(),
+        kind: kind_str(dag.get_node(base_id).map(|n| n.kind())),
+        ..Default::default()
+    };
+    let (word_cached, word_run, word_partial) = if dry {
+        ("cached", "run", "partial")
+    } else {
+        ("cached", "ran", "partial")
+    };
+    let verdict = match decision {
+        Decision::Run(reason) => {
+            r.reason = Some(reason.code().to_string());
+            r.detail = Some(reason.detail().to_string());
+            r.run_hash = step.run_hashes.get(&display_id).cloned();
+            if step.partition_keys.is_empty() {
+                word_run
+            } else {
+                // A forced (task/refresh/no-cache) partitioned step runs every key.
+                r.partitions = Some(PartitionSummary {
+                    total: step.partition_keys.len(),
+                    cached: 0,
+                    will_run: step.partition_keys.len(),
+                    will_run_keys: step
+                        .partition_keys
+                        .iter()
+                        .take(20)
+                        .map(|k| k.suffix())
+                        .collect(),
+                });
+                word_run
+            }
+        }
+        Decision::Cached { oref, stale_root } => {
+            r.run_hash = step.run_hashes.get(&display_id).cloned();
+            r.artifact = Some(oref.path.clone());
+            if let Some(root) = stale_root {
+                r.warning = Some(stale_warning(&display_id, root, dry));
+            }
+            word_cached
+        }
+        Decision::Partitioned { cached, missing } => {
+            let total = cached.len() + missing.len();
+            r.partitions = Some(PartitionSummary {
+                total,
+                cached: cached.len(),
+                will_run: missing.len(),
+                will_run_keys: missing.iter().take(20).map(|k| k.suffix()).collect(),
+            });
+            if !missing.is_empty() {
+                r.reason = Some(RunReason::NotMaterialized.code().to_string());
+                r.detail = Some(RunReason::NotMaterialized.detail().to_string());
+            }
+            match (cached.is_empty(), missing.is_empty()) {
+                (_, true) => word_cached,
+                (true, false) => word_run,
+                (false, false) => word_partial,
+            }
+        }
+    };
+    if dry {
+        r.action = Some(verdict.to_string());
+    } else {
+        r.status = Some(verdict.to_string());
+    }
+    r
+}
+
+/// Print a note above the progress bar, or to stderr when no bar is visible. A hidden bar
+/// (stderr is not a terminal, as when an agent or CI drives barca) silently swallows
+/// `ProgressBar::println`, which used to make warnings vanish.
+fn note(pb: &Option<indicatif::ProgressBar>, msg: &str) {
+    match pb {
+        Some(bar) if !bar.is_hidden() => bar.println(msg),
+        _ => eprintln!("{msg}"),
+    }
+}
+
+/// Does a `--refresh` name (a function name, or a full `file.py:name` id) identify `node_id`?
+pub(crate) fn refresh_name_matches(node_id: &str, name: &str) -> bool {
+    node_id == name || node_id.ends_with(&format!(":{name}"))
+}
+
+/// The function name of a node id (`pipeline.py:src` -> `src`, `pipeline.py:p[k=v]` -> `p`).
+fn short_name(node_id: &str) -> &str {
+    let base = node_id.split('[').next().unwrap_or(node_id);
+    base.rsplit(':').next().unwrap_or(base)
+}
+
+/// Fail before running anything when `--refresh` names something that is not an upstream
+/// asset of the target: a typo must not be a silent no-op.
+fn validate_refresh_names(
+    dag: &Dag,
+    target_id: Option<&str>,
+    names: &[String],
+) -> Result<(), BarcaError> {
+    let cone: Vec<&str> = match target_id {
+        Some(tid) => dag.subgraph(tid),
+        None => dag.topo_order(),
+    };
+    let assets: Vec<&str> = cone
+        .into_iter()
+        .filter(|id| Some(*id) != target_id)
+        .filter(|id| {
+            dag.get_node(id)
+                .is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+        })
+        .collect();
+    for name in names {
+        if !assets.iter().any(|id| refresh_name_matches(id, name)) {
+            let valid: Vec<&str> = assets.iter().map(|id| short_name(id)).collect();
+            return Err(BarcaError::Other(format!(
+                "--refresh: no upstream asset named '{name}'{}.\n\
+                 Upstream assets you can refresh: {}\n\
+                 Pass several as a comma-separated list: --refresh {}",
+                target_id
+                    .map(|t| format!(" in the cone of '{}'", short_name(t)))
+                    .unwrap_or_default(),
+                if valid.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    valid.join(", ")
+                },
+                valid.iter().take(2).copied().collect::<Vec<_>>().join(","),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The most recent successful materialization of `node_id` with this run hash, if any.
+async fn lookup_cached(
+    cache: &db::CacheReader,
+    node_id: &str,
+    run_hash: &str,
+) -> Option<dispatch::OutputRef> {
+    let mut rows = cache
+        .conn()
+        .query(
+            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
+            [node_id.to_string(), run_hash.to_string()],
+        )
+        .await
+        .unwrap();
+    rows.next().await.unwrap().and_then(|row| {
+        Some(dispatch::OutputRef {
+            path: row.get::<String>(0).ok()?,
+            format: row.get::<String>(1).ok()?,
+            size_bytes: row.get::<i64>(2).ok()? as u64,
+            elapsed_seconds: None,
+        })
+    })
 }
 
 /// Total schedulable steps in a phase: 1 per unpartitioned step, `partition_keys.len()`
@@ -70,6 +543,69 @@ pub struct GetResult {
     pub steps_executed: usize,
     pub phases: usize,
     pub final_output: Option<OutputRef>,
+    /// What happened to each planned step in this run (ran / cached / partial, and why).
+    #[serde(default)]
+    pub steps: Vec<StepReport>,
+}
+
+/// How a step was (or, in a dry run, will be) treated.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct StepReport {
+    pub id: String,
+    /// `asset`, `task` or `sensor`.
+    pub kind: String,
+    /// Dry run only: `cached`, `run`, `partial` (some partition keys cached) or `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Real run only: `ran`, `cached` or `partial`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Why the step runs: `task`, `sensor`, `no_cache`, `refresh`, `refresh_all`,
+    /// `not_materialized`, or `partitions_unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The reason in words.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_hash: Option<String>,
+    /// The cached artifact, when the step is served from cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<String>,
+    /// Set when a cached step depends on an asset refreshed in the same run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partitions: Option<PartitionSummary>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct PartitionSummary {
+    pub total: usize,
+    pub cached: usize,
+    pub will_run: usize,
+    /// The keys that will (or did) run, capped at 20.
+    pub will_run_keys: Vec<String>,
+}
+
+/// What `--dry-run` reports: the same decisions a real run would make, without making them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExplainResult {
+    pub dry_run: bool,
+    pub command: String,
+    pub target: Option<String>,
+    pub steps: Vec<StepReport>,
+    pub summary: ExplainSummary,
+}
+
+/// Counted in steps: each partition key is one step.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExplainSummary {
+    pub will_run: usize,
+    pub cached: usize,
+    pub unknown: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,6 +800,154 @@ pub async fn run_streaming(
     .await
 }
 
+/// `barca get|run --dry-run` — report what the command would do, without doing it.
+///
+/// Plans exactly as a real run does and sends every step through [`decide_step`], so the
+/// prediction is the real run's decision. Nothing executes, no worker starts, and nothing is
+/// written: no `.barca` directory is created and no run is recorded. The one thing a dry run
+/// cannot know is the key set of a dynamic partition (`partitions_from`) whose source has to
+/// run first; those steps (and anything depending on them) are reported as `unknown`.
+pub async fn explain(
+    cfg: &crate::config::ResolvedConfig,
+    target_name: Option<&str>,
+    file_args: &[String],
+    python: &PathBuf,
+    policy: CachePolicy,
+    no_cache: bool,
+    command_label: &str,
+) -> Result<ExplainResult, BarcaError> {
+    let dag = build_dag(file_args, python).await?;
+    let target_id = resolve_target(&dag, target_name, command_label)?;
+    let pool_size = default_pool_size();
+    let config = ResourceConfig {
+        pool_size,
+        concurrency_groups: HashMap::new(),
+    };
+    let full_plan = planner::plan_from_dag(&dag, &config);
+    let exec_plan = if let Some(ref tid) = target_id {
+        let subgraph_ids = dag.subgraph(tid);
+        filter_plan_to_subgraph(full_plan, &subgraph_ids)
+    } else {
+        full_plan
+    };
+    if let CachePolicy::RefreshSelective(names) = &policy {
+        validate_refresh_names(&dag, target_id.as_deref(), names)?;
+    }
+
+    // Shared remote state: pull it like a real run, so the cache check sees every machine's
+    // materializations.
+    if cfg.state == crate::config::StateMode::Optimistic && cfg.state_uri.is_some() {
+        state_sync::pull_state(python, cfg).await?;
+    }
+
+    // No metadata DB yet means nothing is cached. Do not create one just to look.
+    let cache = if std::path::Path::new(&cfg.db_path).exists() {
+        Some(db::CacheReader::open(&cfg.db_path).await?)
+    } else {
+        None
+    };
+
+    let mut state = DecideState::default();
+    let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
+    let mut unknown_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut steps: Vec<StepReport> = Vec::new();
+    let mut summary = ExplainSummary::default();
+
+    let unknown_report = |dag: &Dag, base_id: &str, detail: String| StepReport {
+        id: base_id.to_string(),
+        kind: kind_str(dag.get_node(base_id).map(|n| n.kind())),
+        action: Some("unknown".to_string()),
+        reason: Some("partitions_unknown".to_string()),
+        detail: Some(detail),
+        ..Default::default()
+    };
+
+    for phase in &exec_plan.phases {
+        // Dynamic partitions need their source's output to know their keys. If the source is
+        // not available (it would have to run first) the step cannot be expanded.
+        let mut ready = phase.clone();
+        for stream in &mut ready.streams {
+            stream.steps.retain(|st| {
+                let missing_source = st.pending_partitions.values().find(|src| {
+                    !all_outputs
+                        .keys()
+                        .any(|k| k.ends_with(&format!(":{src}")) || k.as_str() == src.as_str())
+                });
+                match missing_source {
+                    Some(src) => {
+                        let base = st.step_id.base_id();
+                        steps.push(unknown_report(
+                            &dag,
+                            base,
+                            format!(
+                                "partition keys come from the output of '{src}', which is not \
+                                 available until it runs"
+                            ),
+                        ));
+                        unknown_ids.insert(base.to_string());
+                        summary.unknown += 1;
+                        false
+                    }
+                    None => true,
+                }
+            });
+        }
+
+        let expanded = dispatch::expand_pending_partitions(&ready, &all_outputs, pool_size);
+        let phase_ref = expanded.as_ref().unwrap_or(&ready);
+
+        for stream in &phase_ref.streams {
+            for step in &stream.steps {
+                let base = step.step_id.base_id();
+                let unknown_dep = step
+                    .inputs
+                    .values()
+                    .find(|up| unknown_ids.contains(up.split('[').next().unwrap_or(up.as_str())));
+                if let Some(up) = unknown_dep {
+                    steps.push(unknown_report(
+                        &dag,
+                        base,
+                        format!(
+                            "depends on '{}', whose partitions are not known until it runs",
+                            short_name(up)
+                        ),
+                    ));
+                    unknown_ids.insert(base.to_string());
+                    summary.unknown += 1;
+                    continue;
+                }
+
+                let (step, decision) =
+                    decide_step(&dag, &policy, no_cache, cache.as_ref(), &mut state, step).await;
+                steps.push(report_for(&dag, &step, &decision, true));
+                match decision {
+                    Decision::Run(_) => summary.will_run += step.partition_keys.len().max(1),
+                    Decision::Cached { oref, .. } => {
+                        summary.cached += 1;
+                        all_outputs.insert(step.step_id.display(), oref);
+                    }
+                    Decision::Partitioned { cached, missing } => {
+                        summary.cached += cached.len();
+                        summary.will_run += missing.len();
+                        for (pdisplay, oref) in cached {
+                            all_outputs.insert(pdisplay, oref);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    drop(cache);
+
+    Ok(ExplainResult {
+        dry_run: true,
+        command: command_label.to_string(),
+        target: target_id.as_deref().map(|t| short_name(t).to_string()),
+        steps: merge_partition_reports(steps),
+        summary,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     cfg: &crate::config::ResolvedConfig,
@@ -300,37 +984,7 @@ async fn execute(
     let dag = build_dag(file_args, python).await?;
     trace_point!("dag_built");
 
-    // Resolve target: if Some, find it and extract subgraph; if None, use full DAG.
-    let target_id: Option<String> = match target_name {
-        Some(name) => {
-            let id = dag
-                .topo_order()
-                .into_iter()
-                .find(|id| id.ends_with(&format!(":{name}")) || *id == name || id.ends_with(name))
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    let available: Vec<&str> = dag.topo_order();
-                    BarcaError::AssetNotFound(name.to_string(), available.join(", "))
-                })?;
-            // Enforce get/run semantics: `barca get` is for assets, `barca run` is for tasks.
-            if let Some(node) = dag.get_node(&id) {
-                let kind = node.kind();
-                if command_label == "get" && kind == crate::NodeKind::Task {
-                    return Err(BarcaError::Other(format!(
-                        "'{name}' is a task — use `barca run` instead"
-                    )));
-                }
-                if command_label == "run" && kind == crate::NodeKind::Asset {
-                    return Err(BarcaError::Other(format!(
-                        "'{name}' is an asset — use `barca get` instead"
-                    )));
-                }
-            }
-
-            Some(id)
-        }
-        None => None,
-    };
+    let target_id = resolve_target(&dag, target_name, command_label)?;
 
     let pool_size = default_pool_size();
     let config = ResourceConfig {
@@ -345,6 +999,10 @@ async fn execute(
         full_plan
     };
     trace_point!("planned");
+
+    if let CachePolicy::RefreshSelective(names) = &policy {
+        validate_refresh_names(&dag, target_id.as_deref(), names)?;
+    }
 
     db::ensure_env_dirs(&cfg.env)?;
     let db_path = cfg.db_path.clone();
@@ -382,20 +1040,13 @@ async fn execute(
     cost_model.seed(db::load_cost_estimates(&db_path).await?);
     trace_point!("cost_model_seeded");
 
-    let db = {
-        let _g = db::db_guard().await;
-        Builder::new_local(&db_path)
-            .build()
-            .await
-            .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))
-    }?;
-    let conn = db
-        .connect()
-        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-    trace_point!("db_connect");
-
     let mut cached_node_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut run_hashes: HashMap<String, String> = HashMap::new();
+    // Run hashes, assets refreshed in this run, and cached assets downstream of a refreshed one
+    // (run hashes cover definitions and upstream *hashes*, not outputs, so a refresh does not
+    // invalidate downstream caches; we say so when that happens). See `decide_step`.
+    let mut decide_state = DecideState::default();
+    // What happened to each planned step, for the result.
+    let mut step_reports: Vec<StepReport> = Vec::new();
     let mut phase_error: Option<String> = None;
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     // Captured user stdout (node_id, line), persisted to the DB after the run.
@@ -492,6 +1143,22 @@ async fn execute(
         storage_options_json: cfg.storage_options_json.clone(),
     };
     let mut pool = crate::io_loop::WorkerPool::start(io_config).map_err(BarcaError::Other)?;
+    {
+        // A step that runs for a while must not look hung: report it periodically.
+        let bar = pb.clone();
+        pool.on_running(Box::new(move |running| match &bar {
+            Some(bar) if !bar.is_hidden() => {
+                if let Some((id, secs)) = running.first() {
+                    bar.set_message(format!("{} running {}s", short_name(id), *secs as u64));
+                }
+            }
+            _ => {
+                for (id, secs) in running {
+                    eprintln!("[barca] still running ({}s): {id}", *secs as u64);
+                }
+            }
+        }));
+    }
     trace_point!("pool_started");
 
     for (phase_idx, phase) in exec_plan.phases.iter().enumerate() {
@@ -525,95 +1192,54 @@ async fn execute(
 
         let mut uncached_streams: Vec<crate::planner::WorkerStream> = Vec::new();
 
+        // Open the DB only for this phase's cache lookups and release it before any step
+        // runs, so other barca processes can use the metadata DB while Python executes.
+        let cache = db::CacheReader::open(&db_path).await?;
+
         for stream in &phase_ref.streams {
             let mut uncached_steps: Vec<crate::planner::StreamStep> = Vec::new();
 
             for step in &stream.steps {
-                let base_id = step.step_id.base_id();
+                let (step, decision) = decide_step(
+                    &dag,
+                    &policy,
+                    no_cache,
+                    Some(&cache),
+                    &mut decide_state,
+                    step,
+                )
+                .await;
+                step_reports.push(report_for(&dag, &step, &decision, false));
                 let display_id = step.step_id.display();
-                let base_node = dag.get_node(base_id);
-                let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
-
-                // Compute run hashes for EVERY step (including sensors, tasks,
-                // refreshed and partitioned steps that never cache-check): they
-                // content-address the artifacts and key persistence. Steps are
-                // visited in stream order, so in-phase upstream hashes are
-                // already present when a consumer is hashed — check-time and
-                // persist-time hashes are therefore identical.
-                let mut step = step.clone();
-                cache::assign_run_hashes(&mut step, def_hash, &mut run_hashes);
-                let step = &step;
-
-                // Sensors and tasks always re-run — never cached.
-                if base_node.is_some_and(|n| {
-                    matches!(n.kind(), crate::NodeKind::Sensor | crate::NodeKind::Task)
-                }) {
-                    uncached_steps.push(step.clone());
-                    continue;
-                }
-
-                // Skip cache lookups when no_cache is set.
-                if no_cache {
-                    uncached_steps.push(step.clone());
-                    continue;
-                }
-
-                // Refresh policy (`barca run`): force-rerun assets in/named by the
-                // refresh set, bypassing the cache. Tasks/sensors already re-ran above.
-                let refreshed = match &policy {
-                    CachePolicy::CacheAware => false,
-                    CachePolicy::RefreshAll => {
-                        base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+                match decision {
+                    Decision::Run(_) => uncached_steps.push(step),
+                    Decision::Cached { oref, stale_root } => {
+                        if let Some(root) = stale_root {
+                            note(
+                                &pb,
+                                &format!(
+                                    "[barca] warning: {}",
+                                    stale_warning(&display_id, &root, false)
+                                ),
+                            );
+                        }
+                        if agent_mode {
+                            eprintln!("[barca] step:{display_id} cached");
+                        }
+                        all_outputs.insert(display_id.clone(), oref);
+                        cached_node_ids.insert(display_id);
                     }
-                    CachePolicy::RefreshSelective(names) => {
-                        base_node.is_some_and(|n| n.kind() == crate::NodeKind::Asset)
-                            && names.iter().any(|name| {
-                                base_id == name || base_id.ends_with(&format!(":{name}"))
-                            })
+                    Decision::Partitioned { cached, missing } => {
+                        for (pdisplay, oref) in cached {
+                            all_outputs.insert(pdisplay.clone(), oref);
+                            cached_node_ids.insert(pdisplay);
+                        }
+                        if !missing.is_empty() {
+                            let mut partial = step.clone();
+                            partial.partition_keys = missing;
+                            uncached_steps.push(partial);
+                        }
                     }
-                };
-                if refreshed {
-                    uncached_steps.push(step.clone());
-                    continue;
-                }
-
-                // TODO: Partitioned steps with partition_keys skip cache for now.
-                // To cache-check these, we'd need to verify each partition key individually.
-                if !step.partition_keys.is_empty() {
-                    uncached_steps.push(step.clone());
-                    continue;
-                }
-
-                let run_h = step
-                    .run_hashes
-                    .get(&display_id)
-                    .cloned()
-                    .expect("unpartitioned step has a precomputed run hash");
-
-                let cached = {
-                    let _g = db::db_guard().await;
-                    let mut rows = conn
-                        .query(
-                            "SELECT artifact_path, artifact_format, artifact_size_bytes FROM materializations WHERE node_id = ?1 AND run_hash = ?2 AND status = 'success' ORDER BY id DESC LIMIT 1",
-                            [display_id.clone(), run_h.clone()],
-                        )
-                        .await
-                        .unwrap();
-                    rows.next().await.unwrap().and_then(|row| {
-                        Some(dispatch::OutputRef {
-                            path: row.get::<String>(0).ok()?,
-                            format: row.get::<String>(1).ok()?,
-                            size_bytes: row.get::<i64>(2).ok()? as u64,
-                            elapsed_seconds: None,
-                        })
-                    })
-                };
-
-                if let Some(oref) = cached {
-                    all_outputs.insert(display_id.clone(), oref);
-                    cached_node_ids.insert(display_id);
-                } else {
-                    uncached_steps.push(step.clone());
                 }
             }
 
@@ -625,6 +1251,7 @@ async fn execute(
             }
         }
 
+        drop(cache);
         trace_point!("phase{phase_idx}_cache_check_done");
 
         if uncached_streams.is_empty() {
@@ -684,11 +1311,7 @@ async fn execute(
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown error"),
                             );
-                            if let Some(ref bar) = pb {
-                                bar.println(&msg);
-                            } else {
-                                eprintln!("{msg}");
-                            }
+                            note(&pb, &msg);
                         }
                     }
                 }
@@ -697,13 +1320,22 @@ async fn execute(
                     elapsed_so_far += e;
                 }
                 completed_steps += 1;
+                // parallel() children complete as extra steps the plan didn't count: grow the
+                // total so the counters and the ETA never run past it.
+                let grown = reconcile_total(total_steps, completed_steps);
+                if grown != total_steps {
+                    total_steps = grown;
+                    if let Some(ref bar) = pb {
+                        bar.set_length(total_steps as u64);
+                    }
+                }
                 if let Some(ref bar) = pb {
                     bar.set_position(completed_steps as u64);
                     let remaining = if total_estimated > 0.0 {
                         (total_estimated - elapsed_so_far).max(0.0)
                     } else if completed_steps > 0 {
                         let avg = elapsed_so_far / completed_steps as f64;
-                        avg * (total_steps - completed_steps) as f64
+                        avg * total_steps.saturating_sub(completed_steps) as f64
                     } else {
                         0.0
                     };
@@ -842,7 +1474,7 @@ async fn execute(
         // with a known hash are plan steps; the rest are parallel() children,
         // which are never persisted.
         for (node_id, oref) in &phase_outputs {
-            if run_hashes.contains_key(node_id) {
+            if decide_state.run_hashes.contains_key(node_id) {
                 all_outputs.insert(node_id.clone(), oref.clone());
             }
         }
@@ -881,8 +1513,6 @@ async fn execute(
 
     // Drop the run-long cache connection before persistence: the state push
     // checkpoints the WAL, which requires no other open handles on the file.
-    drop(conn);
-    drop(db);
 
     let was_cancelled = cancel.is_cancelled();
 
@@ -915,7 +1545,7 @@ async fn execute(
         all_attempts: &all_attempts,
         all_timings: &all_timings,
         cached_node_ids: &cached_node_ids,
-        run_hashes: &run_hashes,
+        run_hashes: &decide_state.run_hashes,
         cost_snapshot: &cost_snapshot,
     };
     persist_run(&db_path, &ledger).await?;
@@ -994,6 +1624,7 @@ async fn execute(
         steps_executed,
         phases: exec_plan.phases.len(),
         final_output,
+        steps: merge_partition_reports(step_reports),
     })
 }
 
@@ -1029,13 +1660,7 @@ struct RunLedger<'a> {
 /// only against a database that doesn't already contain them.
 async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError> {
     let _g = db::db_guard().await;
-    let db = Builder::new_local(db_path)
-        .build()
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to open DB: {e}")))?;
-    let conn = db
-        .connect()
-        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
+    let (_db, conn) = db::open_conn(db_path).await?;
 
     conn.execute(
             "INSERT OR IGNORE INTO runs (run_id, command, files, target, status, steps_total) VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
@@ -1534,5 +2159,39 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
             node.partitions
                 .insert(dim, crate::model::PartitionSpec::Static { values });
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::reconcile_total;
+
+    #[test]
+    fn total_grows_to_cover_steps_the_plan_did_not_count() {
+        // parallel() children complete as extra steps beyond the plan.
+        assert_eq!(reconcile_total(2, 4), 4);
+        assert_eq!(reconcile_total(4, 2), 4);
+        assert_eq!(reconcile_total(3, 3), 3);
+        assert_eq!(reconcile_total(0, 0), 0);
+    }
+
+    #[test]
+    fn remaining_never_underflows() {
+        // The ETA math subtracts usizes; this used to panic in debug and wrap in release.
+        assert_eq!(2usize.saturating_sub(4), 0);
+    }
+}
+
+#[cfg(test)]
+mod refresh_name_tests {
+    use super::refresh_name_matches;
+
+    #[test]
+    fn matches_the_full_id_or_the_function_name() {
+        assert!(refresh_name_matches("pipeline.py:src", "src"));
+        assert!(refresh_name_matches("pipeline.py:src", "pipeline.py:src"));
+        assert!(!refresh_name_matches("pipeline.py:src", "rc"));
+        assert!(!refresh_name_matches("pipeline.py:source", "src"));
+        assert!(!refresh_name_matches("pipeline.py:src", "nope"));
     }
 }

@@ -8,10 +8,11 @@
 use barca_core::CancellationToken;
 use barca_core::asset_state::{AssetState, CacheState, StaleCause, asset_states};
 use barca_core::config::ResolvedConfig;
+use barca_core::{CronExpr, Freshness};
 use std::path::{Path, PathBuf};
 
 const PIPELINE: &str = r#"
-from barca import asset, task
+from barca import Schedule, asset, task
 
 @asset()
 def a() -> dict:
@@ -28,6 +29,10 @@ def c() -> dict:
 @task(inputs={"df": b})
 def validate_b(df: dict) -> None:
     assert df["n"] == 2
+
+@asset(freshness=Schedule("0 6 * * *"))
+def nightly() -> int:
+    return 1
 "#;
 
 const FAILING: &str = r#"
@@ -39,10 +44,14 @@ def boom() -> dict:
 "#;
 
 const PARTITIONED: &str = r#"
+import os
+
 from barca import asset, collect, partitions, partitions_from
 
 @asset(partitions={"k": partitions(["x", "y"])})
 def fetch(k: str) -> dict:
+    if k == "y" and os.path.exists(os.path.join(os.path.dirname(__file__), "fail_y")):
+        raise RuntimeError("y is down")
     return {"k": k}
 
 @asset(inputs={"data": collect(fetch)})
@@ -123,7 +132,9 @@ impl Project {
     }
 
     async fn states(&self) -> Vec<AssetState> {
-        asset_states(&self.cfg, &self.files()).await.unwrap()
+        asset_states(&self.cfg, &self.files(), &self.python)
+            .await
+            .unwrap()
     }
 
     fn rewrite(&self, from: &str, to: &str) {
@@ -251,21 +262,65 @@ async fn a_failed_run_is_reported_as_last_materialization() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn partitioned_assets_and_dynamic_descendants() {
+async fn partitioned_assets_are_cached_per_key() {
     let p = Project::new(PARTITIONED);
     p.get("combined").await.unwrap();
     let states = p.states().await;
 
-    // Statically-partitioned steps are never cache-checked by the executor —
-    // they always re-run — but their keys are static, so downstream still
-    // cache-checks normally.
-    assert_eq!(state(&states, "fetch").cache, CacheState::Partitioned);
+    assert_eq!(state(&states, "fetch").cache, CacheState::Fresh);
     assert_eq!(state(&states, "combined").cache, CacheState::Fresh);
+}
 
-    // Dynamic partitions only exist at run time: the dry run can't know the
-    // keys, so it can't know the cache keys of anything downstream either.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partially_failed_partition_run_is_partial() {
+    let p = Project::new(PARTITIONED);
+    // A marker file next to the pipeline makes key `y` fail. Creating it
+    // doesn't touch the source, so the asset's code hash is unchanged.
+    std::fs::write(p.dir.path().join("fail_y"), "").unwrap();
+    assert!(p.get("combined").await.is_err());
+    let states = p.states().await;
+
+    assert_eq!(
+        state(&states, "fetch").cache,
+        CacheState::Partial {
+            cached: 1,
+            total: 2
+        }
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dynamic_partitions_are_unknown_until_their_source_is_materialized() {
+    let p = Project::new(PARTITIONED);
+    let states = p.states().await;
+    // The source of `dyn`'s keys has never run: the keys, and so the cache
+    // keys of `dyn` and everything downstream, can't be known yet.
     assert_eq!(state(&states, "dyn").cache, CacheState::Unknown);
     assert_eq!(state(&states, "after_dyn").cache, CacheState::Unknown);
+
+    p.get("after_dyn").await.unwrap();
+    let states = p.states().await;
+    assert_eq!(state(&states, "universe").cache, CacheState::Fresh);
+    assert_eq!(state(&states, "dyn").cache, CacheState::Fresh);
+    assert_eq!(state(&states, "after_dyn").cache, CacheState::Fresh);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn durations_and_schedule_are_reported() {
+    let p = Project::new(PIPELINE);
+    p.get("b").await.unwrap();
+    let states = p.states().await;
+
+    let d = state(&states, "a").durations.as_ref().expect("durations");
+    assert_eq!(d.samples, 1);
+    assert!(d.median_seconds >= 0.0 && d.p95_seconds >= d.median_seconds);
+    assert!(state(&states, "c").durations.is_none(), "never ran");
+
+    assert_eq!(state(&states, "a").freshness, Freshness::Always);
+    assert_eq!(
+        state(&states, "nightly").freshness,
+        Freshness::Schedule(CronExpr("0 6 * * *".to_string()))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -1,54 +1,64 @@
-//! Asset-state dry run — for every node, would `barca get` reuse a cached
-//! artifact, recompute it, or is that unknowable before running?
+//! Asset state — for every node: would `barca get` reuse its cached artifact,
+//! what happened the last time it ran, and how long it usually takes.
 //!
-//! Computes the exact cache keys the executor would (via
-//! [`crate::cache::assign_run_hashes`], the same code path) and looks them up
-//! in the metadata DB. Nothing executes.
+//! The cache decision is [`commands::explain`] — the same `decide_step` a real
+//! run uses — so this can never disagree with what `barca get` would do. This
+//! module adds what a dry run doesn't say: whether a recompute is because the
+//! node was never materialized or because something changed (and what), the
+//! latest attempt (failures included), and typical durations.
 //!
-//! Strictly read-only: the DB is never opened in place. Its file (and WAL) are
-//! copied into a temp dir and the copy is queried, so the dry run can't create,
-//! migrate, or checkpoint a database another process is writing to.
+//! Strictly read-only: everything is read from a private copy of the metadata
+//! DB ([`db::DbSnapshot`]). A database another process is writing to is never
+//! opened, locked, created, or checkpointed.
 
-use crate::{BarcaError, NodeKind, StepId, cache, commands, planner};
+use crate::commands::{self, CachePolicy, StepReport};
+use crate::{BarcaError, Freshness, NodeKind, StepId, db};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+/// Successful materializations considered for typical durations.
+const DURATION_WINDOW: usize = 20;
 
 /// Would `barca get` reuse this node's cached artifact?
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum CacheState {
-    /// A successful materialization matches the current cache key — `get`
-    /// would reuse it.
+    /// The cached artifact matches the current code and inputs — `get` reuses it.
     Fresh,
-    /// Materialized before, but not under the current cache key — `get` would
-    /// recompute it.
+    /// Some partition keys are cached; the rest would run.
+    Partial {
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        cached: usize,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        total: usize,
+    },
+    /// Materialized before, but not for the current code and inputs — `get`
+    /// would recompute it.
     Stale { cause: StaleCause },
     /// Never successfully materialized.
     Missing,
     /// Tasks and sensors are never cached — they run every time.
     AlwaysRuns,
-    /// Statically-partitioned assets are not cache-checked — they re-run.
-    Partitioned,
-    /// Depends on dynamic partitions (`partitions_from`), whose keys only exist
-    /// at run time — the cache key can't be computed ahead of a run.
+    /// Depends on dynamic partitions (`partitions_from`) whose source hasn't
+    /// been materialized, so the keys — and the cache keys — aren't known yet.
     Unknown,
 }
 
-/// Why a [`CacheState::Stale`] node's cache key changed.
+/// Why a [`CacheState::Stale`] node would be recomputed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 #[serde(rename_all = "snake_case")]
 pub enum StaleCause {
-    /// Every upstream is fresh, so the node's own code (or its cone) changed.
+    /// Every upstream is cached, so the node's own code (or code it calls) changed.
     Code,
-    /// At least one upstream will be recomputed.
+    /// At least one upstream would be recomputed first.
     Upstream,
 }
 
-/// The most recent materialization attempt for a node (success or failure),
-/// regardless of whether it matches the current cache key.
+/// The most recent materialization attempt (success or failure), whether or
+/// not it matches the current cache key.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
 pub struct LastMaterialization {
@@ -60,6 +70,17 @@ pub struct LastMaterialization {
     pub error_message: Option<String>,
 }
 
+/// Typical wall time over the most recent successful materializations.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
+pub struct Durations {
+    pub median_seconds: f64,
+    pub p95_seconds: f64,
+    /// How many materializations these are computed from (at most 20).
+    #[cfg_attr(feature = "ts", ts(type = "number"))]
+    pub samples: usize,
+}
+
 /// One node's state.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "ts", derive(ts_rs::TS), ts(export))]
@@ -67,175 +88,194 @@ pub struct AssetState {
     /// Stable node id, e.g. `pipeline.py:fetch`.
     pub id: String,
     pub kind: NodeKind,
+    /// When the node is meant to run (always / manual / a cron schedule).
+    pub freshness: Freshness,
     pub cache: CacheState,
     pub last: Option<LastMaterialization>,
+    pub durations: Option<Durations>,
 }
 
 /// Compute every node's [`AssetState`], in topological order.
 pub async fn asset_states(
     cfg: &crate::config::ResolvedConfig,
     file_args: &[String],
+    python: &PathBuf,
 ) -> Result<Vec<AssetState>, BarcaError> {
-    // DAG analysis is pure static parsing — the interpreter path is unused.
-    let dag = commands::build_dag(file_args, &PathBuf::from("python3")).await?;
-    let plan = planner::plan_from_dag(
-        &dag,
-        &planner::ResourceConfig {
-            pool_size: 1,
-            concurrency_groups: HashMap::new(),
-        },
-    );
-    let mut steps: HashMap<String, planner::StreamStep> = plan
-        .phases
-        .into_iter()
-        .flat_map(|p| p.streams)
-        .flat_map(|s| s.steps)
-        .map(|st| (st.step_id.base_id().to_string(), st))
-        .collect();
+    let snapshot = db::DbSnapshot::take(&cfg.db_path).await?;
+    // Point the dry run at the copy. With no DB there is no copy: point it at
+    // a path that doesn't exist, which `explain` treats as "nothing cached"
+    // without creating anything.
+    let scratch = tempfile::tempdir()
+        .map_err(|e| BarcaError::Db(format!("failed to create scratch dir: {e}")))?;
+    let mut snap_cfg = cfg.clone();
+    snap_cfg.db_path = match &snapshot {
+        Some(s) => s.path().to_string(),
+        None => scratch.path().join("metadata.db").display().to_string(),
+    };
 
-    let history = load_history(&cfg.db_path).await?;
+    let explained = commands::explain(
+        &snap_cfg,
+        None,
+        file_args,
+        python,
+        CachePolicy::CacheAware,
+        false,
+        "get",
+    )
+    .await?;
+    let history = match &snapshot {
+        Some(s) => load_history(s.path()).await?,
+        None => History::default(),
+    };
+    let reports: HashMap<&str, &StepReport> =
+        explained.steps.iter().map(|r| (r.id.as_str(), r)).collect();
 
-    let mut run_hashes: HashMap<String, String> = HashMap::new();
+    let dag = commands::build_dag(file_args, python).await?;
     let mut states: HashMap<String, CacheState> = HashMap::new();
     let mut out = Vec::new();
-
-    // Topological order guarantees every upstream is hashed (and classified)
-    // before its consumers — the only ordering `assign_run_hashes` needs.
+    // Topological order: every upstream is classified before its consumers,
+    // which is what stale-cause attribution needs.
     for id in dag.topo_order() {
         let Some(node) = dag.get_node(id) else {
             continue;
         };
-        let kind = node.kind();
-        let Some(mut step) = steps.remove(id) else {
-            continue;
+        let cache = match reports.get(id) {
+            Some(report) => classify(report, &dag.upstream(id), &states, &history, id),
+            None => CacheState::Unknown,
         };
-        let upstream: Vec<&str> = step
-            .inputs
-            .values()
-            .map(|u| StepId::parse(u).base_id().to_string())
-            .filter_map(|u| dag.get_node(&u).map(|n| n.id.as_str()))
-            .collect();
-
-        let unknown = !step.pending_partitions.is_empty()
-            || upstream
-                .iter()
-                .any(|u| states.get(*u) == Some(&CacheState::Unknown));
-
-        let cache = if unknown {
-            CacheState::Unknown
-        } else {
-            cache::assign_run_hashes(&mut step, &node.definition_hash, &mut run_hashes);
-            match kind {
-                NodeKind::Task | NodeKind::Sensor => CacheState::AlwaysRuns,
-                _ if !step.partition_keys.is_empty() => CacheState::Partitioned,
-                _ => {
-                    let display = step.step_id.display();
-                    let key = &step.run_hashes[&display];
-                    if history.successes.contains(&(display.clone(), key.clone())) {
-                        CacheState::Fresh
-                    } else if !history.ever_succeeded.contains(&display) {
-                        CacheState::Missing
-                    } else if upstream.iter().any(|u| {
-                        matches!(
-                            states.get(*u),
-                            Some(CacheState::Stale { .. } | CacheState::Missing)
-                        )
-                    }) {
-                        CacheState::Stale {
-                            cause: StaleCause::Upstream,
-                        }
-                    } else {
-                        CacheState::Stale {
-                            cause: StaleCause::Code,
-                        }
-                    }
-                }
-            }
-        };
-
         states.insert(id.to_string(), cache.clone());
         out.push(AssetState {
             id: id.to_string(),
-            kind,
+            kind: node.kind(),
+            freshness: node.extracted.freshness.clone(),
             cache,
             last: history.latest.get(id).cloned(),
+            durations: history.durations(id),
         });
     }
     Ok(out)
 }
 
-/// Materialization history, flattened for cache lookups.
-#[derive(Default)]
-struct History {
-    /// `(node_id, run_hash)` pairs with a successful materialization.
-    successes: HashSet<(String, String)>,
-    /// Node ids (display ids) with at least one successful materialization.
-    ever_succeeded: HashSet<String>,
-    /// Latest attempt per base node id (partitions fold into their base).
-    latest: HashMap<String, LastMaterialization>,
+/// Turn one dry-run decision into a [`CacheState`].
+fn classify(
+    report: &StepReport,
+    upstream: &[&str],
+    states: &HashMap<String, CacheState>,
+    history: &History,
+    id: &str,
+) -> CacheState {
+    match report.action.as_deref() {
+        Some("cached") => CacheState::Fresh,
+        Some("partial") => {
+            let p = report.partitions.as_ref();
+            CacheState::Partial {
+                cached: p.map_or(0, |p| p.cached),
+                total: p.map_or(0, |p| p.total),
+            }
+        }
+        Some("unknown") => CacheState::Unknown,
+        _ => match report.reason.as_deref() {
+            Some("task" | "sensor") => CacheState::AlwaysRuns,
+            _ if !history.ever_succeeded.contains(id) => CacheState::Missing,
+            _ => {
+                let upstream_recomputes = upstream.iter().any(|u| {
+                    !matches!(
+                        states.get(*u),
+                        None | Some(CacheState::Fresh | CacheState::AlwaysRuns)
+                    )
+                });
+                CacheState::Stale {
+                    cause: if upstream_recomputes {
+                        StaleCause::Upstream
+                    } else {
+                        StaleCause::Code
+                    },
+                }
+            }
+        },
+    }
 }
 
-/// Read materialization history from a private copy of the DB. A missing DB
-/// is simply empty history — and stays missing.
-async fn load_history(db_path: &str) -> Result<History, BarcaError> {
-    let src = Path::new(db_path);
-    if !src.exists() {
-        return Ok(History::default());
-    }
+/// Materialization history, keyed by base node id (partitions fold into their
+/// base node).
+#[derive(Default)]
+struct History {
+    /// Base ids with at least one successful materialization.
+    ever_succeeded: HashSet<String>,
+    /// Latest attempt per base id.
+    latest: HashMap<String, LastMaterialization>,
+    /// Wall times of successful materializations per base id, oldest first.
+    elapsed: HashMap<String, Vec<f64>>,
+}
 
-    let snapshot = tempfile::tempdir()
-        .map_err(|e| BarcaError::Db(format!("failed to create snapshot dir: {e}")))?;
-    let copy = snapshot.path().join("metadata.db");
-    std::fs::copy(src, &copy).map_err(|e| BarcaError::Db(format!("failed to snapshot DB: {e}")))?;
-    let wal = PathBuf::from(format!("{db_path}-wal"));
-    if wal.exists() {
-        std::fs::copy(&wal, snapshot.path().join("metadata.db-wal"))
-            .map_err(|e| BarcaError::Db(format!("failed to snapshot DB WAL: {e}")))?;
-    }
-
-    let db = turso::Builder::new_local(&copy.to_string_lossy())
-        .build()
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to open DB snapshot: {e}")))?;
-    let conn = db
-        .connect()
-        .map_err(|e| BarcaError::Db(format!("failed to connect: {e}")))?;
-
-    let mut history = History::default();
-    // A DB created by an older barca may predate the table entirely.
-    let Ok(mut rows) = conn
-        .query(
-            "SELECT node_id, run_hash, status, created_at, elapsed_seconds, error_message \
-             FROM materializations ORDER BY id ASC",
-            (),
-        )
-        .await
-    else {
-        return Ok(history);
-    };
-    while let Some(row) = rows
-        .next()
-        .await
-        .map_err(|e| BarcaError::Db(format!("failed to read materialization: {e}")))?
-    {
-        let node_id = row.get::<String>(0).unwrap_or_default();
-        let status = row.get::<String>(2).unwrap_or_default();
-        if status == "success" {
-            if let Ok(run_hash) = row.get::<String>(1) {
-                history.successes.insert((node_id.clone(), run_hash));
-            }
-            history.ever_succeeded.insert(node_id.clone());
+impl History {
+    fn durations(&self, id: &str) -> Option<Durations> {
+        let all = self.elapsed.get(id)?;
+        let mut recent: Vec<f64> = all[all.len().saturating_sub(DURATION_WINDOW)..].to_vec();
+        if recent.is_empty() {
+            return None;
         }
-        // Rows are in insertion order, so the last write per node wins.
+        recent.sort_by(f64::total_cmp);
+        Some(Durations {
+            median_seconds: percentile(&recent, 0.5),
+            p95_seconds: percentile(&recent, 0.95),
+            samples: recent.len(),
+        })
+    }
+}
+
+/// Nearest-rank percentile over sorted values.
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    let rank = (q * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
+}
+
+async fn load_history(db_path: &str) -> Result<History, BarcaError> {
+    let mut history = History::default();
+    for row in db::materialization_history(db_path).await? {
+        let base = StepId::parse(&row.node_id).base_id().to_string();
+        if row.status == "success" {
+            history.ever_succeeded.insert(base.clone());
+            if let Some(e) = row.elapsed_seconds {
+                history.elapsed.entry(base.clone()).or_default().push(e);
+            }
+        }
+        // Rows arrive in insertion order, so the last write per node wins.
         history.latest.insert(
-            StepId::parse(&node_id).base_id().to_string(),
+            base,
             LastMaterialization {
-                status,
-                created_at: row.get::<String>(3).unwrap_or_default(),
-                elapsed_seconds: row.get::<f64>(4).ok(),
-                error_message: row.get::<String>(5).ok(),
+                status: row.status,
+                created_at: row.created_at,
+                elapsed_seconds: row.elapsed_seconds,
+                error_message: row.error_message,
             },
         );
     }
     Ok(history)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percentiles_use_nearest_rank() {
+        let v = [1.0, 2.0, 3.0, 4.0, 100.0];
+        assert_eq!(percentile(&v, 0.5), 3.0);
+        assert_eq!(percentile(&v, 0.95), 100.0);
+        assert_eq!(percentile(&[7.0], 0.95), 7.0);
+    }
+
+    #[test]
+    fn durations_use_the_most_recent_window() {
+        let mut h = History::default();
+        // 5 old fast runs, then 20 slow ones: the window only sees the slow ones.
+        let mut runs: Vec<f64> = vec![1.0; 5];
+        runs.extend(vec![10.0; 20]);
+        h.elapsed.insert("a".into(), runs);
+        let d = h.durations("a").unwrap();
+        assert_eq!(d.samples, 20);
+        assert_eq!(d.median_seconds, 10.0);
+        assert!(h.durations("missing").is_none());
+    }
 }

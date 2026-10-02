@@ -4,11 +4,10 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/ExSidius/barca/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/ExSidius/barca/ci.yml?branch=main&style=flat-square&label=CI" /></a>
   <a href="https://pypi.org/project/barca/"><img alt="PyPI" src="https://img.shields.io/pypi/v/barca?style=flat-square&color=3572A5" /></a>
   <img alt="Python" src="https://img.shields.io/badge/python-%E2%89%A53.12-3572A5?style=flat-square" />
   <img alt="Rust" src="https://img.shields.io/badge/rust-2024_edition-dea584?style=flat-square" />
-  <a href="https://github.com/ExSidius/barca/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/ExSidius/barca?style=flat-square" /></a>
+  <a href="https://github.com/barca-orc/barca/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/barca-orc/barca?style=flat-square" /></a>
 </p>
 
 ---
@@ -59,7 +58,7 @@ All in one wheel, built with [maturin](https://www.maturin.rs/). Requires Python
 ### From source
 
 ```bash
-git clone https://github.com/ExSidius/barca.git
+git clone https://github.com/barca-orc/barca.git
 cd barca
 uv sync
 cargo build --release
@@ -206,13 +205,19 @@ def prices(ticker: str) -> dict:
 
 ```
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware
+barca run <task> <file.py> ...             Run a task (always re-runs) and its cone
 barca plan <file.py> [file.py ...]         Emit execution plan as JSON
-barca list <file.py> [file.py ...]         List all definitions with deps
-barca history [--limit N]                    Show recent run history
-barca stats <target> <file.py> ...         Show timing/cache stats for an asset
+barca list <file.py> [--json]              List all definitions with deps
+barca history [--limit N] [--json]         Show recent run history
+barca stats <target> <file.py> [--json]    Show timing/cache stats for an asset
 barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
-barca --help                               Show help
+barca docs [topic] [--all] [--json]        Built-in manual: concepts, formats, examples
+barca --help                               Show help (every command ends with examples)
 ```
+
+`barca docs` is the manual, compiled into the binary: topics for types and output formats,
+caching, tasks, partitions, scheduling, runnable examples, and conventions for scripts and AI
+agents (`barca docs agents`). Results are JSON on stdout, progress and errors on stderr.
 
 Shorthand: `barca pipeline.py` works as `barca get pipeline.py` (all assets).
 
@@ -266,7 +271,7 @@ barca serve pipeline.py --timezone utc   # evaluate cron in UTC (default: local)
 Runs are async: `POST` returns a `run_id` immediately, then you poll `/status/{run_id}`.
 
 ```bash
-curl localhost:8274/health                       # {"status":"ok","version":"0.8.0"}
+curl localhost:8274/health                       # {"status":"ok","version":"0.9.0"}
 curl localhost:8274/assets                       # list assets + deps
 curl localhost:8274/plan                          # execution plan JSON
 curl -XPOST localhost:8274/run                    # → {"run_id":"…"}; poll /status/<id>
@@ -412,7 +417,7 @@ pyproject.toml              Maturin build config
 ## Development
 
 ```bash
-git clone https://github.com/ExSidius/barca.git
+git clone https://github.com/barca-orc/barca.git
 cd barca
 
 # Build

@@ -14,6 +14,25 @@ All notable changes to this project will be documented in this file.
 
 ### Features
 
+- `--dry-run` on `barca get` and `barca run`: reports, for the exact command and flags, which
+  steps are served from cache and which will run and why (`cached` / `run` / `partial` /
+  `unknown`), without executing or writing anything. Real runs now report the same per step in a
+  `steps` array (and `[barca] step:<id> cached` in `--agent` mode). The dry run and the real run
+  share one decision function, and tests check that the predicted `will_run` equals the real
+  run's `steps_executed`.
+- `barca docs`: a manual compiled into the binary (concepts, output formats, caching, tasks,
+  partitions, scheduling, runnable examples, conventions for scripts and AI agents). Every
+  command's `--help` now ends with runnable examples, and `list`, `history` and `stats` take
+  `--json`. Docs, help examples and JSON output are now part of the feature workflow
+  (see CLAUDE.md); tests execute the manual's examples.
+- DuckDB: steps returning a `DuckDBPyRelation` or a pyarrow `Table` are written as parquet
+  without `serializer="parquet"` (a relation used to crash with "cannot pickle", a Table was
+  silently pickled). Barca now owns one DuckDB connection per worker process and binds every
+  duckdb-typed input as a view named after its parameter for the step, so SQL by name works
+  in helpers without bind code; `barca.duckdb_connection()` exposes the connection for
+  one-time configuration (extensions, credentials, settings). Steps that mix relations from
+  their own `duckdb.connect()` with inputs still fail, but the failure now carries a `barca:`
+  note explaining the conflict and the fix instead of only DuckDB's cryptic message.
 - Sub-minute cron scheduling: `Schedule(...)` now accepts a 6-field cron with a
   leading seconds field (e.g. `*/15 * * * * *` — every 15 seconds); the `barca serve`
   scheduler evaluates at 1-second resolution. 5-field crons are unchanged (seconds
@@ -26,6 +45,24 @@ All notable changes to this project will be documented in this file.
   environment separation, and remote artifact storage (Azure/S3/GCS/R2 via fsspec)
   with the metadata DB pushed/pulled as a blob.
 - Minimal standalone scheduler example under `examples/scheduler`.
+
+### Bug Fixes
+
+- `--refresh` is no longer easy to misuse: a name that is not an upstream asset is an error that
+  lists the valid names (it used to silently do nothing), `--refresh a b` says to use a comma
+  instead of failing with "No such file", and barca warns when a refresh leaves cached assets
+  downstream of it stale (run hashes cover upstream hashes, not outputs, so they stay cached).
+- A step that runs for 15 s or more is now reported on stderr (`[barca] still running (45s): ...`,
+  `BARCA_PROGRESS_SECS` to tune) in every mode, so a slow step no longer looks hung.
+- Partitioned assets are now cached per key. Previously every partition re-executed on each
+  run (a `TODO` in the coordinator); now unchanged keys are served from cache and only new or
+  changed keys run, with the fan-in re-running only when its inputs change.
+- Concurrent barca processes in one project no longer fail with `Failed locking file
+  '.barca/metadata.db'. File is locked by another process`. Turso opens the DB
+  single-process (its multi-process mode is experimental), and `barca get`/`run` held the DB
+  open for the whole run. Barca now holds a short cross-process lock (`.barca/metadata.db.lock`)
+  only while it reads or writes the DB and releases it while your Python runs, so processes
+  queue instead of failing.
 
 ### Refactor
 

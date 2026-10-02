@@ -3,7 +3,7 @@
 Supports three formats:
   - json:    dicts, lists, primitives (stdlib json)
   - pickle:  arbitrary Python objects (stdlib pickle, protocol 5)
-  - parquet: pandas/polars DataFrames (requires pyarrow)
+  - parquet: pandas/polars DataFrames, pyarrow Tables, duckdb relations (requires pyarrow)
 
 Destinations may be local paths or remote URIs (abfss://, s3://, gs://, ...
 — see barca._storage). Every write is staged through a local temp file and
@@ -35,25 +35,42 @@ _FORMAT_EXTENSIONS = {
 _STAGING_DIR = ".barca/staging"
 
 
+def _frame_kind(value: Any) -> str | None:
+    """Classify a value as a frame-like type we can write to parquet, without imports.
+
+    Returns "pandas", "polars", "pyarrow", "duckdb", or None. Matching is by
+    type/module name so none of these libraries has to be importable here.
+    """
+    type_name = type(value).__name__
+    module = type(value).__module__ or ""
+
+    if type_name in ("DataFrame", "LazyFrame"):
+        if module.startswith("pandas"):
+            return "pandas"
+        if module.startswith("polars"):
+            return "polars"
+    if type_name == "Table" and module.startswith("pyarrow"):
+        return "pyarrow"
+    # The relation class lives in the `_duckdb` extension module.
+    if type_name == "DuckDBPyRelation" and module.lstrip("_").startswith("duckdb"):
+        return "duckdb"
+    return None
+
+
 def detect_format(value: Any, explicit: str | None = None) -> str:
     """Auto-detect the best serialization format for a value.
 
     Priority:
       1. Explicit override (if provided)
-      2. pandas/polars DataFrame → parquet
+      2. pandas/polars DataFrame, pyarrow Table, duckdb relation → parquet
       3. JSON-serializable → json
       4. Fallback → pickle
     """
     if explicit is not None:
         return explicit
 
-    # Check for DataFrame types without requiring the imports at module level.
-    type_name = type(value).__name__
-    module = type(value).__module__ or ""
-
-    if type_name in ("DataFrame", "LazyFrame") and (
-        module.startswith("pandas") or module.startswith("polars")
-    ):
+    # Check for frame types without requiring the imports at module level.
+    if _frame_kind(value) is not None:
         return "parquet"
 
     # Try JSON — must succeed without default=str to be considered safe.
@@ -71,8 +88,7 @@ def resolve_format(value: Any, fmt: str) -> str:
     """
     if fmt != "parquet":
         return fmt
-    module = type(value).__module__ or ""
-    if module.startswith("polars") or hasattr(value, "to_parquet"):
+    if _frame_kind(value) is not None or hasattr(value, "to_parquet"):
         return fmt
 
     import sys
@@ -170,13 +186,24 @@ def serialize(value: Any, path: "Path | str", fmt: str) -> int:
 
 
 def _write_parquet(value: Any, path: Path) -> None:
-    """Write a DataFrame to parquet. Handles pandas, polars, and polars LazyFrame."""
+    """Write a frame to parquet: pandas, polars (incl. LazyFrame), pyarrow Table, duckdb relation."""
     type_name = type(value).__name__
-    module = type(value).__module__ or ""
+    kind = _frame_kind(value)
 
-    if module.startswith("polars"):
+    if kind == "polars":
         if type_name == "LazyFrame":
             value = value.collect()
+        value.write_parquet(str(path))
+        return
+
+    if kind == "pyarrow":
+        import pyarrow.parquet as pq
+
+        pq.write_table(value, str(path))
+        return
+
+    if kind == "duckdb":
+        # Materializes the relation (runs its query) straight to the parquet file.
         value.write_parquet(str(path))
         return
 

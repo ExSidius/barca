@@ -67,8 +67,8 @@ Supported annotation shapes (statically parsed, no import):
 | `pd.DataFrame` / `pandas.DataFrame` | pandas |
 | `pl.DataFrame` / `polars.DataFrame` | polars |
 | `pl.LazyFrame` | polars (materialized on write; read back as `DataFrame`) |
-| `pyarrow.Table` | pyarrow |
-| `duckdb.DuckDBPyRelation` | duckdb (relation on read; materialized on write) |
+| `pyarrow.Table` | pyarrow (written with `pyarrow.parquet`) |
+| `duckdb.DuckDBPyRelation` | duckdb (relation on read; materialized to parquet on write) |
 
 ## Partitions
 
@@ -200,8 +200,9 @@ the right home for "do something" operations that don't produce cacheable data.
   feeding its output into a cacheable node would keep that node perpetually
   stale).
 
-Run a task with [`barca run`](/reference/cli/). By default `barca run` force-reruns
-every upstream asset; `--refresh a,b` re-runs only the named assets; `--refresh-all` re-runs all of them.
+Run a task with [`barca run`](/reference/cli/). Upstream assets are served from cache by
+default (like `barca get`); `--refresh a,b` re-materializes only the named assets, and
+`--refresh-all` (alias `--no-cache`) re-materializes all of them.
 
 ```python
 from barca import asset, task
