@@ -220,7 +220,10 @@ def _run_with_timeout(fn, kwargs, timeout_seconds):
         nonlocal result, exception
         try:
             result = fn(**kwargs) if kwargs else fn()
-        except Exception as e:
+        except BaseException as e:
+            # BaseException, not Exception: a SystemExit (sys.exit()) or KeyboardInterrupt
+            # raised by the step must fail it. Caught as Exception, they ended the thread
+            # silently and the step "succeeded" with a None result (issue #149).
             exception = e
 
     thread = threading.Thread(target=target)
@@ -689,6 +692,11 @@ def _run_daemon_step(step, modules, art_dir, lru):
         # fails, and that propagates to the caller.)
         wall = time.perf_counter() - t0
         message = str(exc)
+        if isinstance(exc, SystemExit):
+            message = (
+                f"{message} (the step called sys.exit(); a step must return a value or raise "
+                "an exception, and barca reports any sys.exit() as a failure)"
+            )
         note = _duckdb.explain_error(exc, bound_views)
         if note:
             message = f"{message}\n\n{note}"
