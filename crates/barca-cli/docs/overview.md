@@ -59,6 +59,7 @@ that; see `barca docs agents`.
 - `barca docs types` — how outputs are stored and read (json, pickle, parquet; pandas, polars, pyarrow, duckdb)
 - `barca docs tasks` — tasks and `barca run`
 - `barca docs cache` — what is cached, artifacts, `--refresh` / `--refresh-all`, environments
+- `barca docs remote` — share artifacts and state across machines (S3, Azure, GCS)
 - `barca docs partitions` — fan-out over keys, fan-in with `collect`
 - `barca docs sinks` — export outputs to local or remote paths
 - `barca docs scheduling` — freshness, cron schedules, `barca serve`

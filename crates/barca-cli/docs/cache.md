@@ -160,8 +160,8 @@ output, so the next `--dry-run` or `barca status` shows its consumers as stale.
 ```
 
 `<ext>` is `.json`, `.pkl` or `.parquet` (see `barca docs types`). Artifacts are
-content-addressed, so they can be shared between machines when remote state is configured
-(`barca.toml`; see https://barca.sh/reference/config/).
+content-addressed, so they can be shared between machines when remote storage is configured
+(see `barca docs remote`).
 
 ## Controlling the cache
 
