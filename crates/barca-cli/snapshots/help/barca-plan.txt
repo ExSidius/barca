@@ -1,18 +1,19 @@
 Parse source files and emit the execution plan as JSON
 
-Usage: barca plan [OPTIONS] <FILES>...
+Usage: barca plan <FILES>...
 
 Arguments:
   <FILES>...  Python source files containing @asset definitions
 
 Options:
-      --env <ENV>  Environment name (accepted for symmetry; planning uses no state)
-  -h, --help       Print help
+  -h, --help  Print help
 
 Examples:
   barca plan pipeline.py              # phases and steps that would run; nothing executes
   barca plan pipeline.py other.py     # several files form one DAG
 
 Output: always pretty-printed JSON {total_steps, phases: [{reason, streams: [{stream_id, steps}]}]}.
-Planning is static analysis: it never imports your code.
+`reason` is an object: {"type": "initial"} or {"type": "fan_in", "node_id": ...}.
+Planning is static analysis: it never imports your code or reads state, so it takes no --env.
+Experimental: the layout may change between releases (barca docs contract).
 More: barca docs agents

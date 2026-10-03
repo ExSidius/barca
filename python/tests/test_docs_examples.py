@@ -237,7 +237,8 @@ def test_tasks_topic_several_targets_example(binary, topics, tmp_path):
     (tmp_path / "pipeline.py").write_text(blocks(topics["tasks"], "python")[1])
     targets = "validate_registry,validate_names"
     dry = result(barca(binary, tmp_path, "run", targets, "pipeline.py", "--dry-run"))
-    assert dry["targets"] == ["validate_registry", "validate_names"]
+    assert list(dry["targets"]) == ["validate_registry", "validate_names"]
+    assert dry["targets"]["validate_names"]["summary"]["will_run"] == 2  # registry + the check
     assert dry["summary"]["will_run"] == 3
     first = result(barca(binary, tmp_path, "run", targets, "pipeline.py"))
     assert first["steps_executed"] == 3  # registry materializes once for both checks

@@ -45,7 +45,7 @@ You'll see output like:
 And on stderr, a one-line progress summary:
 
 ```
-[barca] 1/1 steps done in 0.0s
+[barca] 1/1 steps | done in 0.0s
 ```
 
 **What just happened?**
@@ -241,7 +241,7 @@ def write_to_s3(report: dict) -> None:
 
 Both tasks run in the same phase (they're independent of each other) after `daily_report` completes. Use `barca run` to execute tasks.
 
-`barca run` always re-runs the task, but serves upstream assets from cache when they are fresh (same as `barca get`) -- so `daily_report` is reused on `barca run send_slack_notification pipeline.py` if it's already materialized. Pass `--refresh report_name_a,report_name_b` to force re-materialize specific upstream assets and everything downstream of them (add `--no-cascade` to re-materialize only the named assets), or `--refresh-all` (alias `--no-cache`) to refresh the whole upstream cone.
+`barca run` always re-runs the task, but serves upstream assets from cache when they are fresh (same as `barca get`) -- so `daily_report` is reused on `barca run send_slack_notification pipeline.py` if it's already materialized. Pass `--refresh report_name_a,report_name_b` to force re-materialize specific upstream assets and everything downstream of them (add `--no-cascade` to re-materialize only the named assets), or `--refresh-all` to refresh the whole upstream cone. `barca get` takes the same `--refresh`, `--no-cascade` and `--refresh-all`.
 
 ## 7. Partitions
 
@@ -305,7 +305,7 @@ in `helpers.py` re-runs nothing. The pipeline path can be spelled any way (`pipe
 compute the same run hash. Not followed yet: class bodies, imports inside a function body, a
 module used as a value (`getattr(helpers, name)`), and modules above the pipeline's directory.
 Standard-library and installed packages are never hashed. In those cases recompute with
-`barca get <asset> pipeline.py --no-cache` (or `barca run <task> pipeline.py --refresh <asset>`).
+`barca get <asset> pipeline.py --refresh-all` (or `--refresh <asset>` on `get` or `run`).
 See `barca docs cache`.
 
 ## 9. Freshness markers
@@ -365,7 +365,7 @@ The plan shows:
 - **Phases**: groups of work that execute sequentially
 - **Streams**: parallel workers within a phase
 - **Steps**: individual asset functions within a stream
-- **Reason**: why a phase boundary exists (`Initial` for the first phase, or `FanIn` when a step needs outputs from multiple prior streams)
+- **Reason**: why a phase boundary exists: `{"type": "initial"}` for the first phase, or `{"type": "fan_in", "node_id": ...}` when a step needs outputs from multiple prior streams
 
 ## Putting it together
 

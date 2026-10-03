@@ -3,8 +3,7 @@ hint : string
 nodes : array
 nodes[] : object
 nodes[].env : array
-nodes[].freshness : object
-nodes[].freshness.type : string
+nodes[].freshness : string
 nodes[].id : string
 nodes[].inputs : array
 nodes[].kind : string

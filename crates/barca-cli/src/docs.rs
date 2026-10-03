@@ -48,7 +48,7 @@ pub const TOPICS: &[Topic] = &[
     topic!("tasks", "@task, ordering-only deps, barca run", "tasks.md"),
     topic!(
         "cache",
-        "Run hashes, artifacts, --no-cache / --refresh, environments",
+        "Run hashes, artifacts, --refresh / --refresh-all, environments",
         "cache.md"
     ),
     topic!(

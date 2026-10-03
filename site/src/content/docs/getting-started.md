@@ -39,7 +39,7 @@ uv run barca get pipeline.py
 In a terminal you'll see a progress line on stderr, then a short summary and the value:
 
 ```
-[barca] 1/1 steps done in 0.0s
+[barca] 1/1 steps | done in 0.0s
 Run b47d261f7ec0 | all assets in 0.206s (1 step, 1 phase)
 
 Value:

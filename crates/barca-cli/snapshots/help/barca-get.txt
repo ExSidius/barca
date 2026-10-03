@@ -25,8 +25,14 @@ Options:
       --pretty
           Emit human-readable output (the default when stdout is a terminal)
 
-      --no-cache
-          Skip cache — execute everything fresh
+      --refresh <REFRESH>
+          Assets to force re-materialize, as ONE comma-separated list (`--refresh a,b`, not `--refresh a b`); the target itself may be named. Every asset downstream of them in the target's cone re-materializes too (see --no-cascade)
+
+      --no-cascade
+          With --refresh: re-materialize only the named assets, not what is downstream of them. Cached downstream assets then do not reflect the refresh; barca warns
+
+      --refresh-all
+          Force re-materialize EVERY asset in the target's cone (nothing comes from cache)
 
       --dry-run
           Show what this command would do (each step cached or will-run, and why) without running or writing anything
@@ -50,7 +56,9 @@ Examples:
   barca get total pipeline.py              # one target and only its upstream cone
   barca get total,orders pipeline.py       # several targets in one run; shared upstream runs once
   barca get total pipeline.py other.py     # target defined across several files
-  barca get total pipeline.py --no-cache   # recompute everything in that cone
+  barca get total pipeline.py --refresh-all        # recompute everything in that cone
+  barca get total pipeline.py --refresh clean      # recompute clean and everything downstream of it
+  barca get total pipeline.py --refresh clean --no-cascade   # recompute only clean
   barca get total pipeline.py --dry-run    # what would run vs come from cache; changes nothing
   barca get total pipeline.py --json       # JSON even in a terminal (the default when piped)
   barca get total pipeline.py --pretty     # summary and value for humans (the default in a terminal)
@@ -69,8 +77,12 @@ secrets redacted). For parquet/pickle assets final_output is a pointer,
 {"_barca_artifact": {"path", "format", "size_bytes"}}; the Python API (barca.get)
 loads the value for you.
 Several targets (`a,b`, comma-separated, no spaces): final_output is replaced by `targets`, keyed by
-target, each {status: success, final_output} or {status: failed, failed_step, error}. Every target
+target, each {status: success, final_output} or {status: failed, failed_node, error}. Every target
 runs even if another fails; exit 1 if any failed.
+Refresh: the same vocabulary as `barca run`. --refresh takes ONE comma-separated list of assets in
+the cone (the target itself may be named) and also re-runs everything downstream of them;
+--no-cascade re-runs only the named ones. --refresh-all re-runs every asset in the cone.
+--no-cache is a deprecated spelling of --refresh-all: it still works and warns on stderr.
 Targets must be assets; use `barca run` for tasks. With no target, get materializes every asset and
 sensor and skips tasks (previously it ran tasks too); stderr names the skipped tasks and the
 `barca run` command. A file with only tasks gets nothing: exit 0, empty `steps`.

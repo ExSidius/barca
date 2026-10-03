@@ -48,5 +48,6 @@ summary.partial : integer
 summary.stale : integer
 summary.unknown : integer
 target : null
+targets : array
 total : integer
 truncated : boolean

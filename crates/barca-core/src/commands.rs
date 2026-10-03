@@ -857,7 +857,7 @@ pub struct StepReport {
     /// Real run only: `ran`, `cached`, `partial`, or `failed` (in a failed run's result).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// Why the step runs: `task`, `sensor`, `no_cache`, `refresh`, `refresh_all`,
+    /// Why the step runs: `task`, `sensor`, `refresh`, `refresh_cascade`, `refresh_all`,
     /// `not_materialized`, or `partitions_unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,

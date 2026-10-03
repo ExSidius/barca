@@ -220,14 +220,16 @@ def prices(ticker: str) -> dict:
 ```
 barca get [target] <file.py> [file.py ...] Get asset(s) — cache-aware; `a,b` gets several
 barca run <task> <file.py> [--refresh a,b] Run a task (always re-runs) and its cone; `a,b` runs
-                                           several; --refresh re-runs a, b and their downstream
-                                           (--no-cascade: only a, b)
-barca plan <file.py> [file.py ...]         Emit execution plan as JSON
+                                           several
+  get/run: --refresh a,b                   re-run a, b and their downstream (--no-cascade: only a, b)
+  get/run: --refresh-all                   re-run every asset in the cone
+barca plan <file.py> [file.py ...]         Emit execution plan as JSON (experimental)
 barca list <file.py> [--json|--pretty] [--limit N]  List all definitions with deps and declared env
-barca status [target] <file.py> [--json|--pretty]  Cache state, last run, artifact rows/columns per node
+barca status [target] <file.py> [--json|--pretty]  Cache state, last run, artifact rows/columns per
+                                           node; `a,b` shows several cones
 barca history [--limit N] [--json|--pretty] Show recent run history
 barca stats <target> <file.py> [--json|--pretty]  Timing/cache stats for an asset
-barca serve [file.py ...] [--port N]       Run the HTTP API server + cron scheduler
+barca serve <file.py> [file.py ...] [--port N]  Run the HTTP API server + cron scheduler
 barca docs [topic] [--all] [--json]        Built-in manual: concepts, formats, examples
 barca --help                               Show help (every command ends with examples)
 ```
@@ -373,12 +375,13 @@ Output is a JSON summary:
 }
 ```
 
-Use `--no-cache` to skip cache lookups and execute everything fresh.
+Use `--refresh-all` to skip cache lookups and execute everything fresh (`--refresh a,b` for
+chosen assets and what is downstream of them).
 
 Diagnostics go to stderr:
 
 ```
-[barca] 2/2 steps done in 0.0s
+[barca] 2/2 steps | done in 0.0s
 ```
 
 ## Benchmarks

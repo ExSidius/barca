@@ -14,7 +14,7 @@ under `.barca/`. Ask the `barca` CLI what exists, what is cached and what ran. F
 
 ```bash
 barca list pipeline.py                  # discover: every node, its kind, inputs, env
-barca status pipeline.py                # cached/stale/never-run and why, last run, rows/columns
+barca status pipeline.py                # cached/stale/never_run and why, last run, rows/columns
 barca get total pipeline.py --dry-run   # preview: what would run or come from cache; writes nothing
 barca get total pipeline.py             # execute an asset and its upstream cone
 barca run report pipeline.py            # execute a task (always re-runs; upstream assets cached)
@@ -40,15 +40,16 @@ Lists are comma-separated with no spaces:
 barca get src,total pipeline.py                   # one run; shared upstream runs once
 barca run report pipeline.py --refresh src,clean  # re-run these and everything downstream
 barca run report pipeline.py --refresh clean --no-cascade   # only clean
-barca get total pipeline.py --no-cache            # recompute an asset's whole cone
+barca get total pipeline.py --refresh-all         # recompute an asset's whole cone
 ```
 
 - `--refresh a b` is an error that tells you to write `--refresh a,b`.
 - `--refresh` cascades: downstream assets re-run too (reason `refresh_cascade`). With
   `--no-cascade` they stay cached, do not reflect the refresh, and barca warns.
-- `--refresh`, `--refresh-all` and `--no-cascade` are `run` flags; with `get`, use `--no-cache`.
-- Several targets: the result has `targets` (per name: `status`, then `final_output` or
-  `error`) instead of `final_output`. Every target runs even if another fails.
+- `get` and `run` take the same `--refresh`, `--no-cascade` and `--refresh-all`. `--no-cache` is
+  a deprecated spelling of `--refresh-all` (it warns); do not use it.
+- Several targets: the result has `targets` (per name: `status`, then `final_output`, or
+  `failed_node` and `error`) instead of `final_output`. Every target runs even if another fails.
 
 ## Output contract
 
@@ -96,7 +97,7 @@ barca run report pipeline.py | jq '.status'
 - **Never import the user's modules** to inspect outputs or predict a run: importing executes
   their code. Use `barca status total pipeline.py --sample 3` (state, artifact path, shape, sample
   rows) and `--dry-run`. In Python, `barca.get("total", "pipeline.py")` loads a value.
-- Never bust the cache by hand; use `--refresh` or `--no-cache`. After a failure, fix the code
+- Never bust the cache by hand; use `--refresh` or `--refresh-all`. After a failure, fix the code
   and re-run the same command.
 
 ## One way per task

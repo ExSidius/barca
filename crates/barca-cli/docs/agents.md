@@ -38,7 +38,7 @@ BARCA_OUTPUT=json barca get total pipeline.py
 
 - **stdout** carries the result: one JSON object for `get`/`run`, the plan JSON for `plan`, and
   JSON for `list`/`history`/`stats` (whenever the rule above picks JSON). It is safe to parse.
-- **stderr** carries progress (`[barca] 2/2 steps done in 0.0s`), your own `print` output from
+- **stderr** carries progress (`[barca] 2/2 steps | done in 0.0s`), your own `print` output from
   steps, warnings and errors. The progress bar draws only when stderr is a terminal; barca
   writes no ANSI colour or cursor codes to a stream that is not one. Use `--agent` for plain
   progress lines (`[barca] 1/2 ...`) on stderr instead of a progress bar.
@@ -67,7 +67,7 @@ In JSON output mode (whenever the output rule above picks JSON: piped or capture
 **one JSON line**, the last line on stderr:
 
 ```
-{"code":2,"error":"Asset 'nope' not found. Available: pipeline.py:src, pipeline.py:total, pipeline.py:clean","kind":"usage","remediation":"Run `barca list pipeline.py` to see every node and its kind."}
+{"code":2,"error":"Asset 'nope' not found. Available: pipeline.py:src, pipeline.py:total, pipeline.py:clean","kind":"usage","remediation":"Run `barca list pipeline.py` to see available assets and tasks."}
 ```
 
 | Field          | Always | Meaning                                                              |
@@ -118,19 +118,22 @@ calls. The output has the same run fields (`status` is `failed` when any target 
 ```json
 {"status": "failed", "run_id": "...", "elapsed_seconds": 0.2, "steps_executed": 5, "phases": 2, "steps": [...],
  "targets": {"check_a": {"status": "success", "final_output": {"a_ok": true}},
-             "boom": {"status": "failed", "failed_step": "pipeline.py:boom",
+             "boom": {"status": "failed", "failed_node": "pipeline.py:boom",
                       "error": "ValueError: check failed\n  File ..."}}}
 ```
 
 - Every target runs even if another fails; a failure skips only the steps that depend on it
-  (`"status": "skipped"`, reason `upstream_failed`, in `steps`). `failed_step` names the step that
-  raised: the target itself or something upstream of it.
+  (`"status": "skipped"`, reason `upstream_failed`, in `steps`). `failed_node` names the step that
+  raised: the target itself or something upstream of it (the same key a failed single-target run
+  uses).
 - Exit code 1 if any target failed. stdout carries the full JSON (so you see which targets
   passed); stderr has one `error: target '<name>' failed ...` line each, then the error envelope
   for the first failed target (`kind: "step_failed"`).
 - One target (or a repeated name, `a,a`) gives exactly the single-target output.
-- `--dry-run` with several targets reports the union once, with `"targets": [names]` in place of
-  `"target"`. `-o value` prints `{target: value}` (null for a failed target).
+- `--dry-run` with several targets reports the union once (`steps`, `summary`), and `targets`
+  in place of `target`: an object keyed by target name in the order given, like a real run, each
+  `{"summary": {"will_run", "cached", "unknown"}}` counted over that target's cone.
+  `-o value` prints `{target: value}` (null for a failed target).
 - Every name is checked before anything runs: an unknown name, a task passed to `get`, or an
   empty name (`a,,b`) is a usage error, exit 2, and nothing runs.
 
@@ -154,9 +157,12 @@ each later interval:
 [barca] still running (45s): pipeline.py:fetch_orders
 ```
 
-Set `BARCA_PROGRESS_SECS` to change the interval (`0` turns it off). A completed step appears as
-`[barca] step:<id> completed ...` in `--agent` mode. If neither a completion nor a "still running"
-line has appeared for much longer than your slowest step, the process is genuinely stuck.
+Set `BARCA_PROGRESS_SECS` to change the interval (`0` turns it off). In `--agent` mode a step
+appears as `[barca] step:<id> completed ...`, `cached`, or `failed: <first line of the error>`. If
+neither a completion nor a "still running" line has appeared for much longer than your slowest
+step, the process is genuinely stuck. The last progress line of a run that executed steps is the
+same with and without `--agent`: `[barca] N/M steps | done in Xs`, or `| failed in Xs` when a step
+failed (never "done").
 
 ## Environment variables
 
@@ -174,10 +180,15 @@ invisible to barca (`barca docs assets`).
 
 ## Refreshing: syntax and pitfalls
 
+`get` and `run` share one vocabulary: `--refresh a,b`, `--no-cascade`, `--refresh-all`.
+
 - Several assets are one comma-separated list: `--refresh a,b`. Never `--refresh a b`.
-- `--refresh a` re-runs `a` and every asset downstream of it in the task's cone (reason
+- `--refresh a` re-runs `a` and every asset downstream of it in the target's cone (reason
   `refresh_cascade`). `--no-cascade` re-runs only what you name; cached downstream assets then
   do not reflect the refresh and barca warns on stderr. Details: `barca docs cache`.
+- `--refresh-all` re-runs every asset in the cone. `--no-cache` is its deprecated spelling: it
+  still works, prints `[barca] warning: --no-cache is deprecated ...`, and will be removed.
+- On `get` the target itself may be named (`barca get total pipeline.py --refresh total`).
 - An unknown name is an error (exit 2, `kind: usage`) listing the valid upstream assets.
 
 ## Inspect before you run
@@ -197,10 +208,11 @@ materialization, and the artifact's row count and columns, without importing you
 ```bash
 barca status pipeline.py --json                 # every node: cache state, last run, shape
 barca status total pipeline.py --json --sample 3   # one cone, with 3 sample rows per artifact
+barca status total,orders pipeline.py --json    # several targets: the union of their cones
 ```
 
 ```bash
-barca list pipeline.py --json       # {nodes: [{id, kind, freshness, inputs, env}], total, truncated}
+barca list pipeline.py --json       # {nodes: [{id, kind, freshness, inputs, env}], total, truncated}; freshness: always|manual|schedule
 barca plan pipeline.py              # phases and steps that would run, nothing executes
 barca history --json                # {runs: [...], total, truncated}: the last 10 runs
 barca stats total pipeline.py --json  # timings and cache hit rate for one asset
@@ -271,7 +283,8 @@ raised on failure; for `get`/`run`/`plan` its `kind`, `code`, `remediation` (and
   tasks gets nothing and exits 0 with `"steps": []`.
 - `barca get name file.py [more.py ...]` gets one target; `name` can be the bare function name
   or the full id `file.py:name`. Cross-file inputs use `asset_ref("path.py:fn")`.
-- `barca get a,b file.py` / `barca run a,b file.py` take several targets in one run (see above).
+- `barca get a,b file.py` / `barca run a,b file.py` take several targets in one run (see above);
+  `barca status a,b file.py` shows the union of their cones.
 - `barca file.py` is shorthand for `barca get file.py`.
 - `get` is for assets and `run` is for tasks; using the wrong one exits 2 and says which to use.
 - The target comes before the files. If the first positional ends in `.py` and a later one does
@@ -288,7 +301,10 @@ raised on failure; for `get`/`run`/`plan` its `kind`, `code`, `remediation` (and
   ```
 
   With more than one non-`.py` name after a file it states the rule and does not guess. barca
-  never offers fuzzy "did you mean" suggestions; run `barca list <files>` to find a name.
+  never offers fuzzy "did you mean" suggestions, because a guess can read as confirmation: an
+  unknown target ends with ``Run `barca list <files>` to see available assets and tasks.`` on
+  every command, a mistyped flag is just an error, and an unknown `barca docs` topic lists every
+  valid topic.
 
 ## Editing a barca project: a safe loop
 
