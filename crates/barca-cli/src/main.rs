@@ -7,7 +7,7 @@ mod docs;
 mod error;
 mod output;
 
-use error::{CliError, Context, ErrorKind};
+use error::{CliError, Context, ErrorKind, shell_quote};
 
 use clap::builder::PossibleValuesParser;
 use clap::{Parser, ValueEnum};
@@ -460,31 +460,13 @@ enum Cli {
     Version,
 }
 
-/// The line every `get`/`run` usage error ends with: `barca list` is how you discover the
-/// assets and tasks a project defines.
+/// The line every usage error ends with (see [`error::list_hint`]: one wording everywhere).
 fn list_hint(files: &[PathBuf]) -> String {
-    let files = if files.is_empty() {
-        "<file.py>".to_string()
-    } else {
-        files
-            .iter()
-            .map(|f| shell_quote(&f.to_string_lossy()))
-            .collect::<Vec<_>>()
-            .join(" ")
-    };
-    format!("Run `barca list {files}` to see available assets and tasks.")
-}
-
-/// Quote a word for display in a copy-pasteable shell command.
-fn shell_quote(s: &str) -> String {
-    let plain = !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:,=@+%".contains(c));
-    if plain {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', r"'\''"))
-    }
+    let files: Vec<String> = files
+        .iter()
+        .map(|f| f.to_string_lossy().into_owned())
+        .collect();
+    error::list_hint(&files)
 }
 
 /// A `get`/`run` usage error (exit 2), ending with the `barca list` pointer.
@@ -2181,6 +2163,43 @@ mod tests {
         ] {
             let a = strings(args);
             assert!(wrong_order_error("run", &a, &a).is_none(), "{args:?}");
+        }
+    }
+
+    /// barca never offers fuzzy suggestions (`barca docs agents`): a guess can read as
+    /// confirmation. clap is built without its `suggestions` feature.
+    #[test]
+    fn argument_errors_carry_no_similar_argument_tip() {
+        for argv in [
+            "barca get total p.py --jsn",
+            "barca run t p.py --refesh a",
+            "barca lst p.py",
+        ] {
+            let Err(e) = Cli::try_parse_from(argv.split_whitespace()) else {
+                panic!("`{argv}` must not parse");
+            };
+            let text = CliError::from_clap(&e).render(true).to_lowercase();
+            assert!(!text.contains("similar"), "{argv}: {text}");
+            assert!(!text.contains("did you mean"), "{argv}: {text}");
+        }
+    }
+
+    #[test]
+    fn unknown_target_remediation_is_one_wording_on_every_command() {
+        let files = vec!["pipeline.py".to_string()];
+        for command in ["get", "run", "status", "stats"] {
+            let e = CliError::from_barca(
+                barca_core::BarcaError::AssetNotFound("nope".into(), "pipeline.py:a".into()),
+                &Context {
+                    command,
+                    files: files.clone(),
+                },
+            );
+            assert_eq!(
+                e.remediation.as_deref(),
+                Some("Run `barca list pipeline.py` to see available assets and tasks."),
+                "{command}"
+            );
         }
     }
 

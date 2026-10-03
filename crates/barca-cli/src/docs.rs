@@ -118,40 +118,6 @@ pub fn find(query: &str) -> Option<&'static Topic> {
     TOPICS.iter().find(|t| t.name == q)
 }
 
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut prev: Vec<usize> = (0..=b.len()).collect();
-    for (i, ca) in a.iter().enumerate() {
-        let mut cur = vec![i + 1];
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
-        }
-        prev = cur;
-    }
-    prev[b.len()]
-}
-
-/// Topic names close to `query`: substring matches, or within two edits of the name or of
-/// any `/`-separated part of it.
-pub fn suggestions(query: &str) -> Vec<&'static str> {
-    let q = normalize(query);
-    if q.is_empty() {
-        return Vec::new();
-    }
-    TOPICS
-        .iter()
-        .filter(|t| {
-            t.name.contains(&q)
-                || q.contains(t.name)
-                || edit_distance(&q, t.name) <= 2
-                || t.name.split('/').any(|part| edit_distance(&q, part) <= 2)
-        })
-        .map(|t| t.name)
-        .collect()
-}
-
 pub fn render_index() -> String {
     let width = TOPICS.iter().map(|t| t.name.len()).max().unwrap_or(0);
     let mut out = String::from(
@@ -223,12 +189,9 @@ pub fn run(topic: Option<&str>, all: bool, json: bool) -> Result<String, String>
                 body
             }),
             None => {
+                // No fuzzy "did you mean": a guess can read as confirmation. List every topic.
                 let mut msg = format!("error: unknown docs topic '{name}'");
-                let near = suggestions(name);
-                if !near.is_empty() {
-                    msg.push_str(&format!("\n\nDid you mean: {}?", near.join(", ")));
-                }
-                msg.push_str("\n\nAvailable topics (run `barca docs` for summaries):\n");
+                msg.push_str("\n\nValid topics (run `barca docs` for summaries):\n");
                 for t in TOPICS {
                     msg.push_str(&format!("  {}\n", t.name));
                 }
@@ -382,14 +345,6 @@ mod tests {
     }
 
     #[test]
-    fn suggestions_catch_typos_and_partials() {
-        assert!(suggestions("type").contains(&"types"));
-        assert!(suggestions("shedulng").contains(&"scheduling"));
-        assert!(suggestions("duckdb").contains(&"examples/duckdb"));
-        assert!(suggestions("zzzzzzzz").is_empty());
-    }
-
-    #[test]
     fn index_lists_every_topic_in_text_and_json() {
         let text = render_index();
         let json = index_json();
@@ -429,10 +384,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_topic_errors_with_suggestions_and_list() {
+    fn unknown_topic_lists_every_topic_without_guessing() {
         let err = run(Some("typs"), false, false).unwrap_err();
         assert!(err.contains("unknown docs topic 'typs'"));
-        assert!(err.contains("Did you mean: types"));
-        assert!(err.contains("examples/duckdb"));
+        assert!(!err.to_lowercase().contains("did you mean"), "{err}");
+        for t in TOPICS {
+            assert!(err.contains(&format!("\n  {}\n", t.name)), "{err}");
+        }
     }
 }
