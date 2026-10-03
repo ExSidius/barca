@@ -28,6 +28,7 @@ from barca._artifacts import (
     resolve_format,
     safe_node_id,
     serialize,
+    serialize_hashed,
 )
 
 _EXT_FORMATS = {
@@ -394,7 +395,13 @@ def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=Fa
     path = artifact_path(art_dir, node_id, fmt, run_hash)
     _ser_wall0 = time.perf_counter()
     _ser_cpu0 = time.process_time()
-    size = serialize(result, path, fmt)
+    # A sensor's output is hashed: the coordinator folds the hash into the run hash of every
+    # asset that reads the sensor, so a changed output re-runs them.
+    content_hash = None
+    if step.get("kind") == "sensor":
+        size, content_hash = serialize_hashed(result, path, fmt)
+    else:
+        size = serialize(result, path, fmt)
     elapsed += time.perf_counter() - _ser_wall0
     if timing and timing.get("cpu_seconds") is not None:
         timing = {
@@ -402,6 +409,8 @@ def _materialize(result, node_id, art_dir, step, elapsed, elapsed_in_artifact=Fa
             "cpu_seconds": timing["cpu_seconds"] + (time.process_time() - _ser_cpu0),
         }
     artifact = {"path": str(path), "format": fmt, "size_bytes": size}
+    if content_hash is not None:
+        artifact["content_hash"] = content_hash
     if elapsed_in_artifact:
         artifact["elapsed_seconds"] = elapsed
     if timing:

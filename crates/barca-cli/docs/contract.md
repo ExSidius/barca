@@ -318,8 +318,8 @@ Every schema below is stable unless its section says otherwise.
   (with no target, the last asset's), or `null` for a task that returned nothing.
 - `steps[]`: `status` is `ran`, `cached`, `partial` or `failed`; `reason` (why it ran) is one of
   `task`, `sensor`, `refresh`, `refresh_cascade`, `refresh_all`, `not_materialized`,
-  `partitions_unknown`, with `detail` in words. (`no_cache` is gone: `--no-cache` now reports
-  `refresh_all`.)
+  `partitions_unknown`, `sensor_output_unknown`, with `detail` in words. (`no_cache` is gone:
+  `--no-cache` now reports `refresh_all`.)
 - `get` and `run` share one refresh vocabulary: `--refresh a,b` (cascading downstream),
   `--no-cascade`, `--refresh-all`. `artifact` appears on cached steps, `run_hash`
   on unpartitioned steps, `warning` on a cached step whose upstream was refreshed without
@@ -496,8 +496,11 @@ failed, and the exit code is then 1. Steps skipped because an upstream failed ha
 ### Dry run
 
 `--dry-run` on `get` or `run` changes nothing and prints what would happen. `steps[].action` is
-`cached`, `run`, `partial` or `unknown` (in place of `status`). With one target the document
-has `target` (a name, or `null` for a whole file):
+`cached`, `run`, `partial` or `unknown` (in place of `status`). An `unknown` step has `reason`
+`partitions_unknown` (dynamic partitions whose source has not run) or `sensor_output_unknown` (it,
+or a step upstream of it, reads a sensor with no recorded output). A step that reads a sensor is
+predicted from the sensor's last recorded output, and `detail` says so. With one target the
+document has `target` (a name, or `null` for a whole file):
 
 <!-- BEGIN GENERATED schema get_dry_run -->
 | Key | Type | Present |
@@ -662,8 +665,8 @@ counts every node even when `nodes` is truncated.
 - `cache.state` is `cached`, `stale`, `never_run`, `partial`, `unknown` or `always_runs`: the
   same snake_case spelling as the `summary` keys (the human table prints `never-run`);
   `cache.reason` is `materialized`, `changed`, `upstream_stale`, `failed`, `no_record`,
-  `partitions_missing`, `partitions_unknown`, `task` or `sensor`. `cache.run_hash` and
-  `cache.artifact` appear when known (`artifact` only when cached).
+  `partitions_missing`, `partitions_unknown`, `sensor_output_unknown`, `task` or `sensor`.
+  `cache.run_hash` and `cache.artifact` appear when known (`artifact` only when cached).
 - `partitions` appears only on partitioned nodes. `last_materialization` is `null` when the node
   never ran; in it `partition` appears for a partitioned node and `error` for a failed run.
 - `shape` is `null` unless the last materialization succeeded, and is experimental: `type`, and

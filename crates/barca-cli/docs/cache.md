@@ -3,10 +3,11 @@
 ## What is cached
 
 Each asset step has a **run hash**: a hash of the function's definition, its inputs' run hashes,
-for partitioned assets the partition key, and the values of any environment variables it declares
-with `env=[...]`. If the hash matches a previous successful materialization, the artifact is
-reused and the function does not run. Change the function's code, any upstream, or a declared
-environment variable and the hash changes, so only the affected subgraph re-runs.
+the output of any sensor it reads, for partitioned assets the partition key, and the values of
+any environment variables it declares with `env=[...]`. If the hash matches a previous successful
+materialization, the artifact is reused and the function does not run. Change the function's
+code, any upstream, a sensor's output or a declared environment variable and the hash changes, so
+only the affected subgraph re-runs.
 
 ### What the definition covers
 
@@ -71,10 +72,85 @@ so upgrading does not invalidate existing caches.
 Tasks and sensors are never served from cache. Partitioned assets are cached per key (see
 `barca docs partitions`).
 
-A sensor's *output* is not part of its consumers' run hashes. A sensor has no inputs, so its run
-hash depends only on its code; when it returns a new value (a new blob etag, say), an asset that
-reads it keeps the same run hash and is served from cache with the old data. To pick up external
-data that changed in place, refresh the asset that reads it: `--refresh bronze` (below).
+## External data that changes in place
+
+A blob overwritten at the same path, a table updated in place, a file someone re-exports: the
+asset that reads it has the same code and the same inputs, so its run hash does not change and it
+is served from cache with the old data. Put a `@sensor` in front of it that returns something
+identifying the current version of the data (an etag, a last-modified time, a row count), and
+make the asset read the sensor:
+
+```python
+import hashlib
+from pathlib import Path
+from barca import asset, sensor
+
+
+@sensor()
+def orders_etag() -> tuple[bool, str]:
+    # Stands in for a blob's etag. With azure-storage-blob, for example:
+    #   BlobClient.from_blob_url(url, credential).get_blob_properties().etag
+    return True, hashlib.md5(Path("orders.csv").read_bytes()).hexdigest()
+
+
+@asset(inputs={"etag": orders_etag})
+def bronze(etag: str) -> list:
+    return Path("orders.csv").read_text().splitlines()
+
+
+@asset(inputs={"rows": bronze})
+def silver(rows: list) -> int:
+    return len(rows)
+```
+
+```bash
+barca get silver pipeline.py     # the sensor runs; bronze and silver run
+barca get silver pipeline.py     # the sensor runs, returns the same etag: bronze and silver cached
+barca get silver pipeline.py     # after orders.csv changes: a new etag, bronze and silver run
+```
+
+How it works:
+
+- A sensor always runs. Its output is serialized like any other (`barca docs types`), and the
+  SHA-256 of those bytes is folded into the run hash of every asset that reads the sensor
+  directly. Everything downstream of those assets changes with them, through their run hashes.
+  Assets that do not depend on the sensor are not affected.
+- The same output gives the same run hash, so the consumer is served from cache. Going back to
+  an earlier output (an etag that was current before) serves the materialization made then.
+- Sensors run in a phase of their own, before their consumers, so a consumer's cache decision
+  always uses the value the sensor returned in this run.
+- The `bool` in the sensor's `(update_detected, value)` return is not used for caching; only
+  `value` is hashed.
+- A partitioned asset that reads a sensor re-runs every key when the sensor's output changes.
+- `--refresh` (with its cascade), `--no-cascade` and `--refresh-all` work as before, on `get`
+  and `run`.
+
+**The trap: return only what identifies the data.** Every sensor's output is hashed, so a sensor
+whose value changes on every run (a timestamp, `datetime.now()`, a request id, a dict that
+includes the time it was fetched) makes every asset that reads it re-run every time:
+
+```python
+@sensor()
+def orders_etag() -> tuple[bool, dict]:
+    props = get_blob_properties()
+    return True, {"etag": props.etag, "checked_at": time.time()}   # re-runs bronze every time
+```
+
+Return `props.etag` alone. That is the intended meaning: an asset that reads a sensor depends on
+what the sensor returns.
+
+Upgrading: previously a sensor's output was not part of its consumers' run hashes, and an asset
+reading a sensor was served from cache whatever the sensor returned. Assets that read a sensor
+re-run once after upgrading (their run hash now includes the sensor's output). Pipelines without
+sensors keep exactly the same run hashes and caches.
+
+`--dry-run` and `barca status` execute nothing, so they cannot know what a sensor will return.
+They predict with the sensor's **last recorded output**, and the step's `detail` says so:
+`assumes sensor 'orders_etag' returns the same value as its last run`. If the sensor has no
+recorded output (it never ran, or last ran before this version), its consumers and everything
+downstream of them are `unknown` with `reason: "sensor_output_unknown"`. Running the sensor alone
+(`barca get orders_etag pipeline.py`, or a scheduled sensor under `barca serve`) records its
+output, so the next `--dry-run` or `barca status` shows its consumers as stale.
 
 ## Where things live
 
@@ -127,7 +203,8 @@ commands as a deprecated spelling of `--refresh-all`: it prints
   `warning: 'mid' was served from cache but depends on refreshed 'src' ...` when this happens.
   `--no-cascade` without `--refresh` is a usage error (exit 2).
 
-Use `--refresh` when external data changed in place (a blob overwritten at the same path): name
+For external data that changes in place (a blob overwritten at the same path), the canonical
+answer is a sensor (see "External data that changes in place" above). Without one, `--refresh`
 the asset that reads it, and everything built from it re-runs.
 
 ## Seeing what will happen: `--dry-run`
@@ -159,14 +236,15 @@ Each step has an `action`:
 | `cached` | Served from the cache (`artifact` is the file). |
 | `run` | Will execute; `reason` says why (below). |
 | `partial` | A partitioned asset where some keys are cached; `partitions` lists the counts and the keys that will run. |
-| `unknown` | Cannot be known without running: a dynamic partition (`partitions_from`) whose source has to run first to produce its keys, and anything that depends on it. |
+| `unknown` | Cannot be known without running: a dynamic partition (`partitions_from`) whose source has to run first to produce its keys (`reason: "partitions_unknown"`), or an asset reading a sensor with no recorded output (`reason: "sensor_output_unknown"`), and anything that depends on either. |
 
 `reason` is one of `task` and `sensor` (always run), `refresh` (named in `--refresh`),
 `refresh_cascade` (downstream of an asset named in `--refresh`), `refresh_all` (`--refresh-all`), or
-`not_materialized` (no cached result for this code and these inputs: never run, or the code or an
-upstream changed). Under `--no-cascade`, a cached step downstream of a refreshed asset carries a
-`warning` (see the refresh notes above). `summary` counts steps, one per partition
-key.
+`not_materialized` (no cached result for this code and these inputs: never run, or the code, an
+upstream or a sensor's output changed). Under `--no-cascade`, a cached step downstream of a
+refreshed asset carries a `warning` (see the refresh notes above). A step that reads a sensor is
+predicted from the sensor's last recorded output, and its `detail` says so. `summary` counts
+steps, one per partition key.
 
 A dry run makes the same decisions a real run makes (it calls the same code), and the test suite
 checks that `will_run` equals the real run's `steps_executed` across cold, warm, `--refresh`,

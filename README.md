@@ -150,6 +150,11 @@ def inbox_files() -> tuple[bool, list[str]]:
     return bool(files), [str(f) for f in files]
 ```
 
+A sensor always runs, and its returned value is part of the run hash of every asset that reads
+it: a new value re-runs those assets and everything downstream, the same value serves them from
+cache. Use one in front of data that changes in place (return the blob's etag); see
+`barca docs cache`.
+
 ### `@task`
 
 Workflow-management step — deploys, notifications, migrations, cache warming.

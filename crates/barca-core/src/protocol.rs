@@ -69,6 +69,10 @@ pub struct ArtifactRef {
     /// Outcomes of `@sink` writes performed alongside this artifact.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sinks: Vec<SinkOutcome>,
+    /// SHA-256 of the serialized artifact bytes. Sent for sensors only: their output is folded
+    /// into their consumers' run hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 /// Outcome of a single `@sink` write. Sink failures never fail the parent
@@ -179,6 +183,7 @@ mod tests {
                 elapsed_seconds: Some(0.42),
                 cpu_seconds: None,
                 max_rss_bytes: None,
+                content_hash: None,
                 sinks: Vec::new(),
             },
         };
@@ -249,6 +254,7 @@ mod tests {
                 elapsed_seconds: None,
                 cpu_seconds: None,
                 max_rss_bytes: None,
+                content_hash: None,
                 sinks: vec![
                     SinkOutcome {
                         path: "exports/out.parquet".to_string(),
@@ -405,6 +411,7 @@ mod tests {
                     elapsed_seconds: None,
                     cpu_seconds: None,
                     max_rss_bytes: None,
+                    content_hash: None,
                     sinks: Vec::new(),
                 },
             },

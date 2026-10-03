@@ -305,6 +305,35 @@ struct DecideState {
     /// upstream it cascaded from).
     cascade_roots: HashMap<String, String>,
     stale_cached: HashMap<String, String>,
+    /// Sensor step (display id) -> content hash of its output, folded into each consumer's run
+    /// hash (#183). A real run fills it as sensors finish (they run in an earlier phase than
+    /// their consumers); a dry run seeds it from each sensor's last recorded output.
+    sensor_outputs: HashMap<String, String>,
+}
+
+/// The sensors `step` reads directly (base ids).
+fn sensor_inputs<'a>(dag: &Dag, step: &'a crate::planner::StreamStep) -> Vec<&'a str> {
+    let mut out: Vec<&str> = step
+        .inputs
+        .values()
+        .map(|up| up.split('[').next().unwrap_or(up))
+        .filter(|up| {
+            dag.get_node(up)
+                .is_some_and(|n| n.kind() == crate::NodeKind::Sensor)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// True when `sensor` (a base id) has an output hash for this run (any partition of it).
+fn has_sensor_output(state: &DecideState, sensor: &str) -> bool {
+    let prefix = format!("{sensor}[");
+    state
+        .sensor_outputs
+        .keys()
+        .any(|k| k == sensor || k.starts_with(&prefix))
 }
 
 async fn lookup_in(
@@ -349,6 +378,7 @@ async fn decide_step(
             partition_key.as_deref(),
             step.inputs.values(),
             &state.run_hashes,
+            &state.sensor_outputs,
             env_input.as_deref(),
         );
         state.run_hashes.insert(display_id.clone(), run_h.clone());
@@ -361,6 +391,7 @@ async fn decide_step(
                 Some(&pk.suffix()),
                 step.inputs.values(),
                 &state.run_hashes,
+                &state.sensor_outputs,
                 env_input.as_deref(),
             );
             state.run_hashes.insert(pdisplay.clone(), run_h.clone());
@@ -412,6 +443,16 @@ async fn decide_step(
         state.refreshed_ids.insert(base_id.to_string());
         state.cascade_roots.insert(base_id.to_string(), root);
         return (step, Decision::Run(reason));
+    }
+
+    // A consumer of a sensor is only cache-checked against that sensor's output. The planner
+    // runs sensors in an earlier phase, and a dry run reports such a step as unknown before it
+    // gets here, so this is a safety net: without the output, never serve from cache.
+    if sensor_inputs(dag, &step)
+        .iter()
+        .any(|s| !has_sensor_output(state, s))
+    {
+        return (step, Decision::Run(RunReason::NotMaterialized));
     }
 
     // Partitioned steps are checked per key: each partition has its own run hash, so keys
@@ -858,7 +899,7 @@ pub struct StepReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// Why the step runs: `task`, `sensor`, `refresh`, `refresh_cascade`, `refresh_all`,
-    /// `not_materialized`, or `partitions_unknown`.
+    /// `not_materialized`, `partitions_unknown` or `sensor_output_unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The reason in words.
@@ -1222,9 +1263,11 @@ impl Executed {
 ///
 /// Plans exactly as a real run does and sends every step through [`decide_step`], so the
 /// prediction is the real run's decision. Nothing executes, no worker starts, and nothing is
-/// written: no `.barca` directory is created and no run is recorded. The one thing a dry run
-/// cannot know is the key set of a dynamic partition (`partitions_from`) whose source has to
-/// run first; those steps (and anything depending on them) are reported as `unknown`.
+/// written: no `.barca` directory is created and no run is recorded. A dry run cannot know
+/// the key set of a dynamic partition (`partitions_from`) whose source has to run first, nor
+/// what a sensor will return: a step reading a sensor is predicted from the sensor's last
+/// recorded output, and is `unknown` when there is none. Those steps (and anything depending on
+/// them) are reported as `unknown`.
 pub async fn explain(
     cfg: &crate::config::ResolvedConfig,
     target_names: &[String],
@@ -1289,16 +1332,33 @@ pub(crate) async fn explain_dag(
     };
 
     let mut state = DecideState::default();
+    // A dry run executes nothing, so it cannot know what a sensor will return. It predicts with
+    // each sensor's last recorded output (#183); a consumer of a sensor with none is unknown.
+    if let Some(cache) = &cache {
+        let sensors: Vec<&str> = exec_plan
+            .phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .filter(|st| st.kind == crate::NodeKind::Sensor)
+            .map(|st| st.step_id.base_id())
+            .collect();
+        state.sensor_outputs = db::last_output_hashes(cache, &sensors).await?;
+    }
     let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
-    let mut unknown_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Steps reported as unknown, by base id, with the reason code their dependents inherit.
+    let mut unknown_ids: HashMap<String, &'static str> = HashMap::new();
+    // Steps whose run hash cannot be predicted because a sensor upstream of them has no
+    // recorded output (a forced step, e.g. under --refresh, is still reported as `run`).
+    let mut hash_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut steps: Vec<StepReport> = Vec::new();
     let mut summary = ExplainSummary::default();
 
-    let unknown_report = |dag: &Dag, base_id: &str, detail: String| StepReport {
+    let unknown_report = |dag: &Dag, base_id: &str, reason: &str, detail: String| StepReport {
         id: base_id.to_string(),
         kind: kind_str(dag.get_node(base_id).map(|n| n.kind())),
         action: Some("unknown".to_string()),
-        reason: Some("partitions_unknown".to_string()),
+        reason: Some(reason.to_string()),
         detail: Some(detail),
         ..Default::default()
     };
@@ -1320,12 +1380,13 @@ pub(crate) async fn explain_dag(
                         steps.push(unknown_report(
                             dag,
                             base,
+                            "partitions_unknown",
                             format!(
                                 "partition keys come from the output of '{src}', which is not \
                                  available until it runs"
                             ),
                         ));
-                        unknown_ids.insert(base.to_string());
+                        unknown_ids.insert(base.to_string(), "partitions_unknown");
                         summary.unknown += 1;
                         false
                     }
@@ -1340,27 +1401,89 @@ pub(crate) async fn explain_dag(
         for stream in &phase_ref.streams {
             for step in &stream.steps {
                 let base = step.step_id.base_id();
+                let up_base = |up: &str| up.split('[').next().unwrap_or(up).to_string();
                 let unknown_dep = step
                     .inputs
                     .values()
-                    .find(|up| unknown_ids.contains(up.split('[').next().unwrap_or(up.as_str())));
+                    .find(|up| unknown_ids.get(&up_base(up)) == Some(&"partitions_unknown"));
                 if let Some(up) = unknown_dep {
                     steps.push(unknown_report(
                         dag,
                         base,
+                        "partitions_unknown",
                         format!(
                             "depends on '{}', whose partitions are not known until it runs",
                             short_name(up)
                         ),
                     ));
-                    unknown_ids.insert(base.to_string());
+                    unknown_ids.insert(base.to_string(), "partitions_unknown");
                     summary.unknown += 1;
                     continue;
                 }
 
+                // Sensors this step reads, and whether the dry run knows their output.
+                let read_sensors = sensor_inputs(dag, step);
+                let missing_sensor = read_sensors
+                    .iter()
+                    .find(|s| !has_sensor_output(&state, s))
+                    .map(|s| s.to_string());
+                let hash_unknown_dep = step
+                    .inputs
+                    .values()
+                    .find(|up| hash_unknown.contains(&up_base(up)))
+                    .cloned();
+
                 let (step, decision) =
                     decide_step(dag, &policy, no_cache, cache.as_ref(), &mut state, step).await;
-                steps.push(report_for(dag, &step, &decision, true));
+                // Forced to run whatever the cache holds (task, sensor, refresh, --no-cache).
+                let forced = matches!(
+                    &decision,
+                    Decision::Run(reason) if *reason != RunReason::NotMaterialized
+                );
+                if missing_sensor.is_some() || hash_unknown_dep.is_some() {
+                    hash_unknown.insert(base.to_string());
+                    if !forced {
+                        let detail = match (&missing_sensor, &hash_unknown_dep) {
+                            (Some(s), _) => format!(
+                                "reads sensor '{}', which has no recorded output: its value is \
+                                 not known until it runs",
+                                short_name(s)
+                            ),
+                            (None, Some(up)) => format!(
+                                "depends on '{}', whose inputs include a sensor with no \
+                                 recorded output",
+                                short_name(up)
+                            ),
+                            (None, None) => unreachable!(),
+                        };
+                        // A partitioned step split across streams is one line.
+                        if !steps.iter().any(|r| r.id == base) {
+                            steps.push(unknown_report(dag, base, "sensor_output_unknown", detail));
+                        }
+                        unknown_ids.insert(base.to_string(), "sensor_output_unknown");
+                        summary.unknown += step.partition_keys.len().max(1);
+                        continue;
+                    }
+                }
+
+                let mut report = report_for(dag, &step, &decision, true);
+                if !forced && !read_sensors.is_empty() {
+                    let note = read_sensors
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "assumes sensor '{}' returns the same value as its last run",
+                                short_name(s)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    report.detail = Some(match report.detail.take() {
+                        Some(d) => format!("{d}; {note}"),
+                        None => note,
+                    });
+                }
+                steps.push(report);
                 match decision {
                     Decision::Run(_) => summary.will_run += step.partition_keys.len().max(1),
                     Decision::Cached { oref, .. } => {
@@ -1922,6 +2045,18 @@ async fn execute(
             if cpu.is_some() || rss.is_some() {
                 all_timings.insert(node_id.clone(), (cpu, rss));
             }
+            // A sensor's output hash: its consumers, decided in a later phase, fold it into
+            // their run hashes (#183).
+            if dag
+                .get_node(item.step_id.base_id())
+                .is_some_and(|n| n.kind() == crate::NodeKind::Sensor)
+                && decide_state.run_hashes.contains_key(&node_id)
+                && let Some(h) = artifact_val.get("content_hash").and_then(|v| v.as_str())
+            {
+                decide_state
+                    .sensor_outputs
+                    .insert(node_id.clone(), h.to_string());
+            }
             phase_outputs.insert(node_id, oref);
         }
 
@@ -2049,6 +2184,7 @@ async fn execute(
         all_timings: &all_timings,
         cached_node_ids: &cached_node_ids,
         run_hashes: &decide_state.run_hashes,
+        output_hashes: &decide_state.sensor_outputs,
         cost_snapshot: &cost_snapshot,
     };
     persist_run(&db_path, &ledger).await?;
@@ -2188,6 +2324,8 @@ struct RunLedger<'a> {
     all_timings: &'a HashMap<String, (Option<f64>, Option<u64>)>,
     cached_node_ids: &'a std::collections::HashSet<String>,
     run_hashes: &'a HashMap<String, String>,
+    /// Sensor step -> content hash of the output it returned in this run.
+    output_hashes: &'a HashMap<String, String>,
     /// Run-end snapshot of the measured-cost EWMA, seeding the next run.
     cost_snapshot: &'a [(String, crate::cost::NodeEstimate)],
 }
@@ -2240,7 +2378,7 @@ async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError>
         let attempts = l.all_attempts.get(&base).copied().unwrap_or(1);
         let (cpu, rss) = l.all_timings.get(node_id).copied().unwrap_or((None, None));
         conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json, cpu_seconds, max_rss_bytes) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''), NULLIF(?9, ''), NULLIF(?10, ''))",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json, cpu_seconds, max_rss_bytes, output_hash) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''), NULLIF(?9, ''), NULLIF(?10, ''), NULLIF(?11, ''))",
                 [
                     node_id.clone(),
                     run_h.clone(),
@@ -2252,6 +2390,7 @@ async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError>
                     l.all_sinks.get(node_id).cloned().unwrap_or_default(),
                     cpu.map(|c| c.to_string()).unwrap_or_default(),
                     rss.map(|r| r.to_string()).unwrap_or_default(),
+                    l.output_hashes.get(node_id).cloned().unwrap_or_default(),
                 ],
             )
             .await

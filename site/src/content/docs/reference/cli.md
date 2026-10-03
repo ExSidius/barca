@@ -100,6 +100,16 @@ barca get pipeline.py -o value        # print just the final value (also: json |
 barca get pipeline.py --fields id,status   # trim each entry of `steps` in the JSON
 ```
 
+An asset that reads a `@sensor` is cached against the sensor's output: when the sensor returns a
+new value (a new blob etag, say), the asset and everything downstream of it re-run. Sensors run
+in a phase before their consumers so the decision uses this run's value. `--dry-run` predicts
+from the sensor's last recorded output and says so in `detail`; before the sensor ever ran, its
+consumers are `unknown` (`reason: "sensor_output_unknown"`).
+
+> **Behavior change:** a sensor's output previously did not reach its consumers' run hashes, so an
+> asset reading a sensor was served from cache whatever the sensor returned. Assets that read a
+> sensor re-run once after upgrading. Pipelines without sensors keep their run hashes.
+
 Each entry in the result's `steps` array says what happened to that step. A node that declares
 environment variables with `env=[...]` also carries `env`, the values the step was hashed with
 (`null` when unset, `<redacted>` for names like `*_TOKEN`), and its `--agent` progress line ends
