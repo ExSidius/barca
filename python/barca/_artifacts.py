@@ -94,7 +94,7 @@ def resolve_format(value: Any, fmt: str) -> str:
     import sys
 
     print(
-        f"[barca] Warning: parquet format requested but value is "
+        f"[barca] warning: parquet format requested but value is "
         f"{type(value).__name__}, falling back to pickle",
         file=sys.stderr,
     )

@@ -73,14 +73,14 @@ pub fn expand_pending_partitions(
                 if let Some(oref) = source_ref {
                     if oref.format != "json" {
                         eprintln!(
-                            "[barca] Error: partition source '{}' must be JSON format, got '{}'",
+                            "[barca] error: partition source '{}' must be JSON format, got '{}'",
                             source_name, oref.format
                         );
                         continue;
                     }
                     if oref.path.contains("://") {
                         eprintln!(
-                            "[barca] Error: dynamic partitions (partitions_from) require a \
+                            "[barca] error: dynamic partitions (partitions_from) require a \
                              local artifact store in v1 — partition source '{}' lives at \
                              '{}'. Unset BARCA_ARTIFACT_URI to use these.",
                             source_name, oref.path
@@ -92,7 +92,7 @@ pub fn expand_pending_partitions(
                         Ok(s) => s,
                         Err(e) => {
                             eprintln!(
-                                "[barca] Error: failed to read partition artifact '{}': {e}",
+                                "[barca] error: failed to read partition artifact '{}': {e}",
                                 oref.path
                             );
                             continue;
@@ -111,7 +111,7 @@ pub fn expand_pending_partitions(
                             .collect(),
                         _ => {
                             eprintln!(
-                                "[barca] Warning: partition source '{}' did not return an array",
+                                "[barca] warning: partition source '{}' did not return an array",
                                 source_name
                             );
                             continue;
@@ -120,7 +120,7 @@ pub fn expand_pending_partitions(
                     dim_values.insert(dim.clone(), values);
                 } else {
                     eprintln!(
-                        "[barca] Warning: partition source '{}' not found in outputs",
+                        "[barca] warning: partition source '{}' not found in outputs",
                         source_name
                     );
                 }
