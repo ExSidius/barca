@@ -32,7 +32,7 @@ def total(nums: list) -> dict:
 
 ```bash
 barca list pipeline.py           # discover nodes and dependencies
-barca get total pipeline.py      # run only what `total` needs; prints JSON on stdout
+barca get total pipeline.py      # run only what `total` needs; JSON on stdout when piped
 barca get total pipeline.py      # second time: everything is a cache hit
 ```
 
@@ -40,25 +40,34 @@ barca get total pipeline.py      # second time: everything is a cache hit
 
 | Command | Purpose |
 |---|---|
-| `barca get [target] files...` | Get asset value(s); cache-aware. `barca file.py` is shorthand. |
-| `barca run task files...` | Run a task (always re-runs) and its dependency cone. |
-| `barca list files...` | List nodes with kind, freshness and dependencies (`--json`). |
+| `barca get [target] files...` | Get asset value(s); cache-aware. No target: every asset and sensor, never tasks. `barca file.py` is shorthand. `a,b` gets several in one run. |
+| `barca run task files...` | Run a task (always re-runs) and its dependency cone. `a,b` runs several in one run. |
+| `barca list files...` | List nodes with kind, freshness and dependencies (`--json`, `--limit`/`--all`, `--fields`; `barca docs agents`). |
+| `barca status [target] files...` | Per node: cache state and why, last run, artifact rows/columns (`--json`, `--limit`/`--all`, `--fields`). |
 | `barca plan files...` | Emit the tiered execution plan as JSON. |
-| `barca history` / `barca stats` | Past runs; timing and cache statistics (`--json`). |
+| `barca history` / `barca stats` | Past runs; timing and cache statistics (`--json`, `--fields`; history takes `--limit`/`--all`). |
 | `barca serve files...` | HTTP API and cron scheduler. |
 | `barca docs [topic]` | This manual. |
+
+In a terminal, `get`/`run`/`list`/`history`/`stats` print human-readable output; piped or run
+from a program they print JSON. `--json` and `--pretty` (or `BARCA_OUTPUT=json|pretty`) override
+that; see `barca docs agents`.
 
 ## Topics
 
 - `barca docs assets` — decorators, inputs, freshness, retries
 - `barca docs types` — how outputs are stored and read (json, pickle, parquet; pandas, polars, pyarrow, duckdb)
 - `barca docs tasks` — tasks and `barca run`
-- `barca docs cache` — what is cached, artifacts, `--no-cache` / `--refresh`, environments
+- `barca docs cache` — what is cached, artifacts, `--refresh` / `--refresh-all`, environments
 - `barca docs remote` — share artifacts and state across machines (S3, Azure, GCS)
 - `barca docs partitions` — fan-out over keys, fan-in with `collect`
 - `barca docs sinks` — export outputs to local or remote paths
 - `barca docs scheduling` — freshness, cron schedules, `barca serve`
+- `barca docs status` — one view of cache state, last run and artifact shape per node
+- `barca docs skill` — the short agent skill (also `SKILL.md` in the repo): start here if you are an AI agent
 - `barca docs agents` — output contract, exit codes and workflows for scripts and AI agents
+- `barca docs contract` — the CLI contract: every command, flag, environment variable, exit code and
+  JSON schema, marked stable or experimental, and the policy for changing them
 - `barca docs examples` — runnable example pipelines (`examples/duckdb`, `examples/partitions`, ...)
 
 Run `barca docs` for one-line summaries of every topic.

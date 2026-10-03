@@ -863,7 +863,9 @@ async fn spawn_worker(
         .env("BARCA_WORKER", "1")
         .env("BARCA_WORKER_ID", worker_id.to_string())
         .env("BARCA_ARTIFACT_URI", &config.artifact_root)
-        .stdout(Stdio::inherit())
+        // A step's own print() output goes to barca's stderr, never stdout: stdout carries
+        // only barca's result, so `barca run ... | jq` works when steps print.
+        .stdout(Stdio::from(std::io::stderr()))
         .stderr(Stdio::inherit())
         .stdin(Stdio::null());
     if let Some(ref opts) = config.storage_options_json {

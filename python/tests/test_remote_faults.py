@@ -423,5 +423,5 @@ def test_cache_hit_with_missing_object_fails_fast_with_hint(tmp_path, backend, c
     b = Project(tmp_path / "b", backend, container, proxy.endpoint, state)
     proc, took = b.get()
     assert proc.returncode != 0, _explain(proc)
-    assert "could not fetch" in proc.stderr and "--no-cache" in proc.stderr, _explain(proc)
+    assert "could not fetch" in proc.stderr and "--refresh-all" in proc.stderr, _explain(proc)
     assert took < 30, f"missing object took {took:.1f}s — retried a permanent error?"

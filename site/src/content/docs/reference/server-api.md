@@ -39,7 +39,7 @@ All responses are JSON.
 | `GET`  | `/assets` | List every node with kind, freshness, and upstream inputs. |
 | `GET`  | `/assets/{name}` | One asset's summary joined with timing/cache stats. |
 | `GET`  | `/plan` | Execution plan (phases and streams) as JSON. |
-| `POST` | `/run` | Trigger a full run. Returns a `run_id` immediately. |
+| `POST` | `/run` | Get every asset and sensor, like `barca get <files>` with no target; tasks are skipped (use `/run/{target}`). Returns a `run_id` immediately. |
 | `POST` | `/run/{target}` | Trigger a task run. Returns a `run_id`. |
 | `POST` | `/get/{target}` | Trigger a run scoped to one target asset. Returns a `run_id`. |
 | `DELETE` | `/run/{run_id}` | Cancel an in-flight run (workers terminated, status → `cancelled`). |
@@ -105,7 +105,7 @@ GET /health
 ```
 
 ```json
-{ "status": "ok", "version": "0.9.0" }
+{ "status": "ok", "version": "0.11.0" }
 ```
 
 ### Assets
@@ -122,7 +122,7 @@ and cache hit rate.
 ### Plan
 
 ```
-GET /plan              → { total_steps, phases: [{ reason, streams: [{ stream_id, steps }] }] }
+GET /plan              → { total_steps, phases: [{ reason: {type, node_id?}, streams: [{ stream_id, steps }] }] }
 ```
 
 ## Scheduling
@@ -204,7 +204,7 @@ for job in c.schedules():         # GET /schedule
 `Client` methods map to the endpoints above: `health()`, `assets()`, `asset(name)`,
 `plan()`, `schedules()`, `status(run_id)`, `cancel(run_id)` (also available as
 `Run.cancel()`), plus the two trigger verbs that mirror the CLI —
-`get(target=None)` (`barca get [TARGET]`; omit the target for a full-DAG run) and
+`get(target=None)` (`barca get [TARGET]`; omit the target to get every asset and sensor, never tasks) and
 `run(target)` (`barca run TARGET`). The trigger methods return a `Run` whose `.wait()` blocks
 until the run reaches a terminal state. This complements `barca.api` (`barca.get`/`run`/…),
 which shells out to the binary for one-shot commands rather than talking to a server.

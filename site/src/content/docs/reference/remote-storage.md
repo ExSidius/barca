@@ -237,5 +237,5 @@ Cache rows record each artifact's location in the store. If you point a
 project at a different store, rows recorded against the old one are used
 only when the artifact is still on local disk; otherwise those steps simply
 recompute. A cache row whose object has been deleted from the current store
-fails the run with the missing object named — re-run with `--no-cache` to
+fails the run with the missing object named — re-run with `--refresh-all` to
 recompute it.

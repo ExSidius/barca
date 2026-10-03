@@ -99,13 +99,29 @@ command, flag, decorator, output format, or caching behavior ships with all of:
    `crates/barca-cli/src/docs.rs`. New topics go in `TOPICS` and must be linked from
    `overview.md` (or `examples.md`). The files live inside the crate so they ship in the sdist.
 3. **Machine-readable output** — results as JSON on stdout (inspection commands take `--json`),
-   progress and errors on stderr, exit codes 0 ok / 1 runtime failure / 2 usage error.
+   progress and errors on stderr, exit codes 0 ok / 1 a step failed / 2 usage error / 3 barca infra failure / 130 cancelled
+   (see `barca docs contract`).
 4. **Site docs** (`site/src/content/docs/`) and the README CLI table.
+5. **The CLI contract** — `crates/barca-cli/docs/contract.md` (`barca docs contract`) and its
+   snapshots. A change to the surface (a command, flag, environment variable, exit code, JSON
+   output key or type, the stderr error envelope, an `--agent` line) updates, in the same PR, the
+   snapshots (`scripts/update-cli-snapshots.sh`: `--help` in `crates/barca-cli/snapshots/help/`,
+   JSON schemas in `python/tests/snapshots/cli_contract/`, and the generated tables in
+   `contract.md`) and the hand-written parts of `contract.md` (stable vs experimental; a new
+   experimental flag or command also goes in `EXPERIMENTAL` in `crates/barca-cli/src/contract.rs`).
+   Review the snapshot diff: it is the contract change.
+   - **Pre-1.0**: breaking changes are allowed, with a minor bump and a "Breaking" line in the
+     release notes naming the change and its replacement.
+   - **From 1.0**: changes are additive only (new commands, flags, keys, enum values). A
+     deprecated flag keeps working for at least one minor release and prints a warning on stderr
+     naming its replacement.
 
 CI guards these: `cargo test -p barca` parses every `barca ...` line in `--help` examples and
 manual topics against the real CLI, and requires help text on every flag and examples on every
 documented command; `python/tests/test_docs_examples.py` executes the manual's example pipelines
-and asserts what the text claims. Document behavior you have run, and state known limitations
+and asserts what the text claims. `cargo test -p barca` (`crates/barca-cli/src/contract.rs`) and
+`python/tests/test_cli_contract.py` fail on any surface change that the snapshots and
+`contract.md` do not reflect. Document behavior you have run, and state known limitations
 plainly (e.g. partitioned steps are not cache-checked yet) rather than describing intended
 behavior.
 

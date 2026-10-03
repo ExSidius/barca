@@ -1,0 +1,42 @@
+Run a long-running HTTP server exposing the orchestrator as a JSON API
+
+Binds to 127.0.0.1 (local only, no auth). POST /run and /get trigger async runs; poll GET /status/<run_id> for results.
+
+Usage: barca serve [OPTIONS] <FILES>...
+
+Arguments:
+  <FILES>...
+          Python source files defining the DAG to serve
+
+Options:
+  -p, --port <PORT>
+          Port to bind on
+
+          [default: 8274]
+
+      --watch
+          Dev mode: re-parse the DAG when source files change
+
+      --no-schedule
+          Disable the cron scheduler (Schedule(...) assets will not auto-fire)
+
+      --timezone <TIMEZONE>
+          Timezone for cron evaluation: local (default), utc, or an IANA name
+
+          [default: local]
+
+      --env <ENV>
+          Environment name (separates cache/state per environment)
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Examples:
+  barca serve pipeline.py                    # HTTP API on 127.0.0.1:8274 plus the scheduler (files required)
+  barca serve pipeline.py --port 8400        # custom port
+  barca serve pipeline.py --watch            # dev: re-parse the DAG when files change
+  barca serve pipeline.py --no-schedule      # API only; Schedule(...) nodes do not fire
+  barca serve pipeline.py --timezone utc     # evaluate cron in UTC (default: local)
+
+Binds to localhost with no authentication.
+More: barca docs scheduling

@@ -52,7 +52,7 @@ exceeds `transfer_timeout` fails as stalled and is not retried.
   the next run. `barca stats target pipeline.py` shows the failure.
 - **Cached artifact missing from the store** (deleted, or a different bucket): the run exits
   1 with `could not fetch ... cached artifact(s)`. Recompute with
-  `barca get target pipeline.py --no-cache`.
+  `barca get target pipeline.py --refresh-all`.
 - **Stalled store**: lower `transfer_timeout` to fail faster; raise it if single artifacts
   legitimately take longer than 10 minutes to move.
 

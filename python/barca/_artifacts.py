@@ -12,6 +12,7 @@ then finalized with an atomic os.replace (local) or a chunked upload
 crash mid-write never leaves a partial artifact at the destination.
 """
 
+import hashlib
 import json
 import os
 import pickle
@@ -94,7 +95,7 @@ def resolve_format(value: Any, fmt: str) -> str:
     import sys
 
     print(
-        f"[barca] Warning: parquet format requested but value is "
+        f"[barca] warning: parquet format requested but value is "
         f"{type(value).__name__}, falling back to pickle",
         file=sys.stderr,
     )
@@ -168,10 +169,26 @@ def serialize(value: Any, path: "Path | str", fmt: str) -> int:
     Returns size in bytes. The caller is responsible for having resolved
     the format first (see resolve_format) so path and fmt agree.
     """
+    return _serialize(value, path, fmt, want_hash=False)[0]
+
+
+def serialize_hashed(value: Any, path: "Path | str", fmt: str) -> tuple[int, str]:
+    """Like serialize, and also return the SHA-256 (hex) of the bytes written.
+
+    Used for sensors: the coordinator folds the hash of a sensor's output into the run hash of
+    every asset that reads it, so a changed output re-runs them.
+    """
+    size, digest = _serialize(value, path, fmt, want_hash=True)
+    assert digest is not None
+    return size, digest
+
+
+def _serialize(value: Any, path: "Path | str", fmt: str, want_hash: bool) -> tuple[int, str | None]:
     if fmt not in ("json", "pickle", "parquet"):
         raise ValueError(f"Unknown format: {fmt}")
 
     size = 0
+    digest = None
     with _staged_write(path) as tmp:
         if fmt == "json":
             with open(tmp, "w") as f:
@@ -182,7 +199,13 @@ def serialize(value: Any, path: "Path | str", fmt: str) -> int:
         else:
             _write_parquet(value, tmp)
         size = tmp.stat().st_size
-    return size
+        if want_hash:
+            h = hashlib.sha256()
+            with open(tmp, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            digest = h.hexdigest()
+    return size, digest
 
 
 def _write_parquet(value: Any, path: Path) -> None:

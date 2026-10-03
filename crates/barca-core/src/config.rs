@@ -98,7 +98,7 @@ pub fn load_toml(cwd: &Path) -> Result<Option<BarcaToml>, BarcaError> {
     let text = std::fs::read_to_string(&path)
         .map_err(|e| BarcaError::Other(format!("failed to read {}: {e}", path.display())))?;
     let parsed: BarcaToml = toml::from_str(&text)
-        .map_err(|e| BarcaError::Other(format!("invalid {}: {e}", path.display())))?;
+        .map_err(|e| BarcaError::Usage(format!("invalid {}: {e}", path.display())))?;
     Ok(Some(parsed))
 }
 
@@ -137,7 +137,7 @@ pub fn resolve_in(cli_env: Option<&str>, cwd: &Path) -> Result<ResolvedConfig, B
         .or(file.default_env)
         .unwrap_or_else(|| DEFAULT_ENV.to_string());
     if !valid_env_name(&env) {
-        return Err(BarcaError::Other(format!(
+        return Err(BarcaError::Usage(format!(
             "invalid environment name '{env}' — allowed characters: A-Z a-z 0-9 . _ -"
         )));
     }
@@ -153,7 +153,7 @@ pub fn resolve_in(cli_env: Option<&str>, cwd: &Path) -> Result<ResolvedConfig, B
     let artifact_env_override = env_var("BARCA_ARTIFACT_URI");
     if artifact_env_override.is_some() && env != DEFAULT_ENV {
         eprintln!(
-            "[barca] Warning: BARCA_ARTIFACT_URI is set — it is used literally and \
+            "[barca] warning: BARCA_ARTIFACT_URI is set — it is used literally and \
              bypasses the '{env}' environment prefix for artifacts"
         );
     }
@@ -179,7 +179,7 @@ pub fn resolve_in(cli_env: Option<&str>, cwd: &Path) -> Result<ResolvedConfig, B
         Some("optimistic") => StateMode::Optimistic,
         Some("off") => StateMode::Off,
         Some(other) => {
-            return Err(BarcaError::Other(format!(
+            return Err(BarcaError::Usage(format!(
                 "invalid state mode '{other}' (expected \"optimistic\" or \"off\")"
             )));
         }
@@ -194,7 +194,7 @@ pub fn resolve_in(cli_env: Option<&str>, cwd: &Path) -> Result<ResolvedConfig, B
 
     let push_retries = match env_var("BARCA_PUSH_RETRIES") {
         Some(v) => v.parse::<u32>().map_err(|_| {
-            BarcaError::Other(format!(
+            BarcaError::Usage(format!(
                 "invalid BARCA_PUSH_RETRIES '{v}' (expected integer)"
             ))
         })?,
@@ -260,14 +260,14 @@ fn merge_storage_options(from_toml: Option<&toml::Table>) -> Result<Option<Strin
     if let Some(table) = from_toml {
         for (protocol, opts) in table {
             let toml::Value::Table(opts) = opts else {
-                return Err(BarcaError::Other(format!(
+                return Err(BarcaError::Usage(format!(
                     "[remote.storage_options.{protocol}] must be a table of options"
                 )));
             };
             let entry = merged.entry(protocol.clone()).or_default();
             for (k, v) in opts {
                 let json = serde_json::to_value(v.clone()).map_err(|e| {
-                    BarcaError::Other(format!("storage_options.{protocol}.{k}: {e}"))
+                    BarcaError::Usage(format!("storage_options.{protocol}.{k}: {e}"))
                 })?;
                 entry.insert(k.clone(), json);
             }
@@ -276,16 +276,16 @@ fn merge_storage_options(from_toml: Option<&toml::Table>) -> Result<Option<Strin
 
     if let Some(raw) = env_var("BARCA_STORAGE_OPTIONS") {
         let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-            BarcaError::Other(format!("BARCA_STORAGE_OPTIONS is not valid JSON: {e}"))
+            BarcaError::Usage(format!("BARCA_STORAGE_OPTIONS is not valid JSON: {e}"))
         })?;
         let serde_json::Value::Object(by_protocol) = parsed else {
-            return Err(BarcaError::Other(
+            return Err(BarcaError::Usage(
                 "BARCA_STORAGE_OPTIONS must be a JSON object keyed by protocol".to_string(),
             ));
         };
         for (protocol, opts) in by_protocol {
             let serde_json::Value::Object(opts) = opts else {
-                return Err(BarcaError::Other(format!(
+                return Err(BarcaError::Usage(format!(
                     "BARCA_STORAGE_OPTIONS[{protocol:?}] must be a JSON object"
                 )));
             };

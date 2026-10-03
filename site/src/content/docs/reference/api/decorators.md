@@ -19,6 +19,7 @@ Core decorators for defining assets, sensors, tasks, sinks, and related primitiv
     retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
+    env: list[str] | None = None,
 )
 ```
 
@@ -26,6 +27,9 @@ Declares a cacheable, provenance-tracked asset. The default freshness is `Always
 
 `retries` is the total number of attempts on failure (1 = no retry). `retry_backoff` is the base
 delay in seconds between attempts (delay grows linearly: `retry_backoff * attempt`).
+
+`env` declares the environment variables the function reads. See
+[Declared environment variables](#declared-environment-variables-env) below.
 
 ```python
 from barca import asset, Always, Manual, Schedule
@@ -70,6 +74,37 @@ Supported annotation shapes (statically parsed, no import):
 | `pyarrow.Table` | pyarrow (written with `pyarrow.parquet`) |
 | `duckdb.DuckDBPyRelation` | duckdb (relation on read; materialized to parquet on write) |
 
+### Declared environment variables (`env=`)
+
+```python
+import os
+from barca import asset
+
+@asset(env=["SOURCE_CSV", "API_TOKEN"])
+def raw() -> dict:
+    return {"source": os.environ.get("SOURCE_CSV", "default.csv")}
+```
+
+`env=` must be a literal list of string literals; barca reads it statically (a variable, tuple or
+computed name is a parse error). When it plans a run, barca reads each declared variable from its
+own environment (the workers inherit the same environment) and folds the name and value into
+the step's run hash:
+
+- Changing a declared variable re-materializes the asset and everything downstream of it. An
+  unset variable is its own value, distinct from an empty string.
+- Each step's entry in the JSON result carries `"env": {"API_TOKEN": null, "SOURCE_CSV": "b.csv"}`
+  (`null` = unset), and `--agent` step lines end with `env API_TOKEN=<unset> SOURCE_CSV=b.csv`.
+- Names ending in `_TOKEN`, `_SECRET`, `_KEY` or `_PASSWORD` (any case, or the bare word) are
+  hashed but shown as `<redacted>` in every output.
+- `barca list` shows declared names in an ENV column, and as `env` in `--json`.
+- Nodes that declare no `env` hash exactly as before, so existing caches stay valid.
+
+`env=` is also accepted on `@task` and `@sensor`. Those always run, so there it only records the
+values each run used.
+
+**Limitation:** environment variables your code reads without declaring them are invisible to
+barca. They are not part of the cache key, so changing one does not invalidate anything.
+
 ## Partitions
 
 ```python
@@ -100,9 +135,20 @@ def summary(prices: list[dict]) -> dict:
 
 `partitions(...)` accepts a literal list (extracted statically at parse time) or any other Python
 expression — e.g. a list comprehension or function call — which is evaluated by the Python runtime
-at plan time. `partitions_from(...)` derives an asset's partition keys from an upstream asset's own
-partitions, rather than declaring them again. `collect(...)`, used inside `inputs=`, aggregates
-every partition of an upstream asset into a single list delivered to the parameter.
+at plan time. `partitions_from(price)` on a partitioned `price` gives the asset the same keys
+(under the same dimension name, which must be its only dimension), and calls each key with the key
+and that key's output of `price`, as the parameter named after it: `signal(ticker="AAPL",
+price=<the AAPL output of price>)`. List the upstream in `inputs=` as well to receive it under
+another name (`inputs={"p": price}`). Each consumer key depends only on its own upstream key, so a
+new key of `price` runs only that key of `signal`. `partitions_from(tickers)` on an *unpartitioned*
+asset that returns a list uses the list's values as keys, known once `tickers` has run; the list is
+not passed to the function. `collect(...)`, used inside `inputs=`, aggregates every partition of an
+upstream asset into a single list delivered to the parameter. A partitioned asset in an
+unpartitioned asset's `inputs=` without `collect()` is a usage error (exit 2) that names both
+`collect(price)` and `partitions_from(price)`; up to 0.11 it silently behaved like `collect()`. An
+unpartitioned asset in a partitioned asset's `inputs=` is delivered whole to every key; it runs
+once, before any key, and its run hash is part of every key's run hash, so changing it (or
+`--refresh` on it) re-runs every key.
 
 `asset_ref("path/to/file.py:function_name")`, used inside `inputs=`, references a node by its
 canonical id (source file path + function name, or its explicit `name=`) instead of importing the
@@ -154,12 +200,22 @@ For partitioned assets, each partition writes its own sink file with the partiti
     retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
+    env: list[str] | None = None,
 )
 ```
 
-Declares an external-state observer. Sensors must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors (polling frequency must be declared explicitly). See `@asset` above for `retries` / `retry_backoff` semantics.
+Declares an external-state observer. Sensors must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors (polling frequency must be declared explicitly). See `@asset` above for `env`, `retries` and `retry_backoff` semantics.
 
-Sensors return `(update_detected: bool, output)` tuples. The full tuple is passed as input to downstream assets.
+Sensors return `(update_detected: bool, output)` tuples. The worker unpacks the tuple: a downstream asset receives `output` only. `update_detected` is not used for caching.
+
+A sensor's returned value is part of the run hash of every asset that reads it: when the value
+changes, those assets (and everything downstream of them) re-run; when it is the same, they are
+served from cache. That makes a sensor the way to track external data that changes in place, for
+example a sensor that returns a blob's etag in front of the asset that reads the blob. Return only
+what identifies the data: a value that changes on every run (a timestamp) re-runs the sensor's
+consumers every time. `--dry-run` and `barca status` assume a sensor returns its last recorded
+value, and report its consumers as `unknown` before it has ever run. See `barca docs cache`,
+"External data that changes in place".
 
 ```python
 from barca import sensor, Schedule
@@ -184,6 +240,7 @@ Sensors are source nodes only — they have no upstream inputs.
     retry_backoff: float = 0.0,
     description: str | None = None,
     tags: dict[str, str] | None = None,
+    env: list[str] | None = None,
 )
 ```
 
@@ -201,8 +258,9 @@ the right home for "do something" operations that don't produce cacheable data.
   stale).
 
 Run a task with [`barca run`](/reference/cli/). Upstream assets are served from cache by
-default (like `barca get`); `--refresh a,b` re-materializes only the named assets, and
-`--refresh-all` (alias `--no-cache`) re-materializes all of them.
+default (like `barca get`); `--refresh a,b` re-materializes the named assets and everything
+downstream of them (`--no-cascade` limits it to the named assets), and `--refresh-all` (alias
+`--no-cache`) re-materializes all of them.
 
 ```python
 from barca import asset, task

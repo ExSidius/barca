@@ -48,6 +48,45 @@ fn reconcile_total(total_steps: usize, completed_steps: usize) -> usize {
 }
 
 /// Resolve the target name to a node id (or `None` for the whole DAG), enforcing that `barca get`
+/// Does a target `name` identify node `id`? A name is a function name (`deploy`), a full id
+/// (`pipeline.py:deploy`), or a path-suffixed id (`p.py:deploy` for `sub/p.py:deploy`). It
+/// matches only at a `:` or `/` boundary, never as the tail of a longer name, so `deploy` does
+/// not select `prod_deploy`.
+pub(crate) fn target_name_matches(id: &str, name: &str) -> bool {
+    if id == name {
+        return true;
+    }
+    match id.strip_suffix(name) {
+        Some(prefix) => prefix.ends_with(':') || (name.contains(':') && prefix.ends_with('/')),
+        None => false,
+    }
+}
+
+/// The single node a target name identifies. No match is `AssetNotFound`; several matches (the
+/// same function name in two files) is a usage error that lists the full ids to choose from.
+fn find_target_id(dag: &Dag, name: &str) -> Result<String, BarcaError> {
+    let matches: Vec<&str> = dag
+        .topo_order()
+        .into_iter()
+        .filter(|id| target_name_matches(id, name))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => {
+            let available: Vec<&str> = dag.topo_order();
+            Err(BarcaError::AssetNotFound(
+                name.to_string(),
+                available.join(", "),
+            ))
+        }
+        many => Err(BarcaError::Usage(format!(
+            "'{name}' matches more than one node: {}. Name one by its full id, e.g. `{}`",
+            many.join(", "),
+            many[0]
+        ))),
+    }
+}
+
 /// targets assets and `barca run` targets tasks.
 fn resolve_target(
     dag: &Dag,
@@ -56,25 +95,17 @@ fn resolve_target(
 ) -> Result<Option<String>, BarcaError> {
     match target_name {
         Some(name) => {
-            let id = dag
-                .topo_order()
-                .into_iter()
-                .find(|id| id.ends_with(&format!(":{name}")) || *id == name || id.ends_with(name))
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    let available: Vec<&str> = dag.topo_order();
-                    BarcaError::AssetNotFound(name.to_string(), available.join(", "))
-                })?;
+            let id = find_target_id(dag, name)?;
             // Enforce get/run semantics: `barca get` is for assets, `barca run` is for tasks.
             if let Some(node) = dag.get_node(&id) {
                 let kind = node.kind();
                 if command_label == "get" && kind == crate::NodeKind::Task {
-                    return Err(BarcaError::Other(format!(
+                    return Err(BarcaError::Usage(format!(
                         "'{name}' is a task — use `barca run` instead"
                     )));
                 }
                 if command_label == "run" && kind == crate::NodeKind::Asset {
-                    return Err(BarcaError::Other(format!(
+                    return Err(BarcaError::Usage(format!(
                         "'{name}' is an asset — use `barca get` instead"
                     )));
                 }
@@ -85,42 +116,200 @@ fn resolve_target(
     }
 }
 
+/// Resolve several target names (`barca run a,b`) to node ids, each checked like a single
+/// target, before anything runs. Returns `(name as given, node id)` pairs; a name resolving to an
+/// id already listed is dropped, so `a,a` is one target.
+fn resolve_targets(
+    dag: &Dag,
+    names: &[String],
+    command_label: &str,
+) -> Result<Vec<(String, String)>, BarcaError> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for name in names {
+        if let Some(id) = resolve_target(dag, Some(name), command_label)?
+            && !out.iter().any(|(_, seen)| *seen == id)
+        {
+            out.push((name.clone(), id));
+        }
+    }
+    Ok(out)
+}
+
+/// The plan for these targets: the union of their cones, planned once, so an upstream step
+/// shared by several targets appears (and runs) once. No targets means everything the command
+/// covers: for `get`, every asset and sensor (tasks are skipped: get is for assets, run is for
+/// tasks); for anything else (`status`), the whole DAG.
+fn plan_for_targets(
+    dag: &Dag,
+    target_ids: &[&str],
+    config: &ResourceConfig,
+    command_label: &str,
+) -> ExecutionPlan {
+    let full_plan = planner::plan_from_dag(dag, config);
+    if !target_ids.is_empty() {
+        filter_plan_to_subgraph(full_plan, &dag.subgraph_many(target_ids))
+    } else if command_label == "get" {
+        // A task is never upstream of an asset or sensor, so this is closed under upstream.
+        let gettable: Vec<&str> = dag
+            .topo_order()
+            .into_iter()
+            .filter(|id| !is_task(dag, id))
+            .collect();
+        filter_plan_to_subgraph(full_plan, &gettable)
+    } else {
+        full_plan
+    }
+}
+
+fn is_task(dag: &Dag, id: &str) -> bool {
+    dag.get_node(id)
+        .is_some_and(|n| n.kind() == crate::NodeKind::Task)
+}
+
+/// The stderr note for `barca get <files>` with no target when the files define tasks: which
+/// tasks were skipped and how to run one. `None` when there is no task to mention.
+fn skipped_tasks_note(dag: &Dag, file_args: &[String]) -> Option<String> {
+    let order = dag.topo_order();
+    let tasks: Vec<&str> = order
+        .iter()
+        .filter(|id| is_task(dag, id))
+        .map(|id| short_name(id))
+        .collect();
+    let first = tasks.first()?;
+    let run_hint = format!("barca run {first} {}", file_args.join(" "));
+    let listed = tasks.join(", ");
+    Some(if tasks.len() == order.len() {
+        format!(
+            "[barca] nothing to get: no assets or sensors, only tasks ({listed}). \
+             `barca get` without a target never runs tasks; run one with: {run_hint}"
+        )
+    } else {
+        format!(
+            "[barca] skipped {} task{} ({listed}): `barca get` without a target materializes \
+             assets only. Run a task with: {run_hint}",
+            tasks.len(),
+            if tasks.len() == 1 { "" } else { "s" },
+        )
+    })
+}
+
+/// The failed node upstream of `base_id`, if any: it blocks `base_id` from running. Used when
+/// several targets run together, so a failure stops only the targets that need it.
+fn blocking_failure<'a>(
+    dag: &'a Dag,
+    base_id: &str,
+    failed: &std::collections::HashSet<String>,
+) -> Option<&'a str> {
+    if failed.is_empty() {
+        return None;
+    }
+    dag.subgraph(base_id)
+        .into_iter()
+        .find(|up| *up != base_id && failed.contains(*up))
+}
+
+/// The output of `target_id` in this run (the first partition, by key, for a partitioned one).
+fn output_for(target_id: &str, all_outputs: &HashMap<String, OutputRef>) -> Option<OutputRef> {
+    all_outputs.get(target_id).cloned().or_else(|| {
+        let prefix = format!("{target_id}[");
+        let mut matches: Vec<_> = all_outputs
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .collect();
+        matches.sort_by_key(|(k, _)| (*k).clone());
+        matches.first().map(|(_, v)| (*v).clone())
+    })
+}
+
+/// How each target of a multi-target run ended: `success` with its output, or `failed` with
+/// the step that failed (the target itself or something upstream of it) and its error.
+fn target_outcomes(
+    dag: &Dag,
+    targets: &[(String, String)],
+    all_outputs: &HashMap<String, OutputRef>,
+    failures: &[dispatch::StepFailure],
+) -> Vec<(String, TargetOutcome)> {
+    let base = |f: &dispatch::StepFailure| crate::StepId::parse(&f.node_id).base_id().to_string();
+    targets
+        .iter()
+        .map(|(name, tid)| {
+            // Prefer the target's own failure, then the first failed step upstream of it.
+            let failure = failures.iter().find(|f| base(f) == *tid).or_else(|| {
+                dag.subgraph(tid)
+                    .into_iter()
+                    .find_map(|id| failures.iter().find(|f| base(f) == id))
+            });
+            let outcome = match (failure, output_for(tid, all_outputs)) {
+                (Some(f), _) => TargetOutcome {
+                    status: "failed".to_string(),
+                    final_output: None,
+                    error: Some(f.error.message.clone()),
+                    failed_node: Some(f.node_id.clone()),
+                },
+                (None, Some(out)) => TargetOutcome {
+                    status: "success".to_string(),
+                    final_output: Some(out),
+                    error: None,
+                    failed_node: None,
+                },
+                (None, None) => TargetOutcome {
+                    status: "failed".to_string(),
+                    final_output: None,
+                    error: Some("did not run".to_string()),
+                    failed_node: None,
+                },
+            };
+            (name.clone(), outcome)
+        })
+        .collect()
+}
+
 // ─── Cache decisions ─────────────────────────────────────────────────────────
 //
 // One function decides what happens to a step; a real run and `--dry-run` both call it, so the
 // dry run cannot drift from what a run would do.
 
 /// Why a step runs instead of being served from cache.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RunReason {
     Task,
     Sensor,
     NoCache,
     Refresh,
+    /// Downstream of an asset named in `--refresh` (the cascade); `root` is that asset.
+    RefreshCascade {
+        root: String,
+    },
     RefreshAll,
     NotMaterialized,
 }
 
 impl RunReason {
-    fn code(self) -> &'static str {
+    fn code(&self) -> &'static str {
         match self {
             RunReason::Task => "task",
             RunReason::Sensor => "sensor",
             RunReason::NoCache => "no_cache",
             RunReason::Refresh => "refresh",
+            RunReason::RefreshCascade { .. } => "refresh_cascade",
             RunReason::RefreshAll => "refresh_all",
             RunReason::NotMaterialized => "not_materialized",
         }
     }
 
-    fn detail(self) -> &'static str {
+    fn detail(&self) -> String {
         match self {
-            RunReason::Task => "tasks always re-run",
-            RunReason::Sensor => "sensors always re-run",
-            RunReason::NoCache => "--no-cache",
-            RunReason::Refresh => "named in --refresh",
-            RunReason::RefreshAll => "--refresh-all",
-            RunReason::NotMaterialized => "no cached result for this code and these inputs",
+            RunReason::Task => "tasks always re-run".to_string(),
+            RunReason::Sensor => "sensors always re-run".to_string(),
+            RunReason::NoCache => "--no-cache".to_string(),
+            RunReason::Refresh => "named in --refresh".to_string(),
+            RunReason::RefreshCascade { root } => {
+                format!("downstream of refreshed '{root}'")
+            }
+            RunReason::RefreshAll => "--refresh-all".to_string(),
+            RunReason::NotMaterialized => {
+                "no cached result for this code and these inputs".to_string()
+            }
         }
     }
 }
@@ -144,7 +333,39 @@ enum Decision {
 struct DecideState {
     run_hashes: HashMap<String, String>,
     refreshed_ids: std::collections::HashSet<String>,
+    /// Refreshed asset -> the `--refresh` name it was refreshed for (itself, or the named
+    /// upstream it cascaded from).
+    cascade_roots: HashMap<String, String>,
     stale_cached: HashMap<String, String>,
+    /// Sensor step (display id) -> content hash of its output, folded into each consumer's run
+    /// hash (#183). A real run fills it as sensors finish (they run in an earlier phase than
+    /// their consumers); a dry run seeds it from each sensor's last recorded output.
+    sensor_outputs: HashMap<String, String>,
+}
+
+/// The sensors `step` reads directly (base ids).
+fn sensor_inputs<'a>(dag: &Dag, step: &'a crate::planner::StreamStep) -> Vec<&'a str> {
+    let mut out: Vec<&str> = step
+        .inputs
+        .values()
+        .map(|up| up.split('[').next().unwrap_or(up))
+        .filter(|up| {
+            dag.get_node(up)
+                .is_some_and(|n| n.kind() == crate::NodeKind::Sensor)
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// True when `sensor` (a base id) has an output hash for this run (any partition of it).
+fn has_sensor_output(state: &DecideState, sensor: &str) -> bool {
+    let prefix = format!("{sensor}[");
+    state
+        .sensor_outputs
+        .keys()
+        .any(|k| k == sensor || k.starts_with(&prefix))
 }
 
 async fn lookup_in(
@@ -170,6 +391,10 @@ async fn decide_step(
     let display_id = step.step_id.display();
     let base_node = dag.get_node(base_id);
     let def_hash = base_node.map(|n| n.definition_hash.as_str()).unwrap_or("");
+    // Declared env (`@asset(env=[...])`) is read now, at plan time, and folded into the run hash.
+    let env_input = base_node
+        .map(|n| crate::envdeps::hash_input(&crate::envdeps::resolve(&n.extracted.env)))
+        .unwrap_or(None);
 
     // Run hashes for EVERY step (sensors, tasks, refreshed and partitioned steps too): they
     // content-address artifacts and key persistence.
@@ -185,6 +410,8 @@ async fn decide_step(
             partition_key.as_deref(),
             step.inputs.values(),
             &state.run_hashes,
+            &state.sensor_outputs,
+            env_input.as_deref(),
         );
         state.run_hashes.insert(display_id.clone(), run_h.clone());
         step.run_hashes.insert(display_id.clone(), run_h);
@@ -196,6 +423,8 @@ async fn decide_step(
                 Some(&pk.suffix()),
                 step.inputs.values(),
                 &state.run_hashes,
+                &state.sensor_outputs,
+                env_input.as_deref(),
             );
             state.run_hashes.insert(pdisplay.clone(), run_h.clone());
             step.run_hashes.insert(pdisplay, run_h);
@@ -213,18 +442,49 @@ async fn decide_step(
         return (step, Decision::Run(RunReason::NoCache));
     }
 
-    // Refresh policy (`barca run`): force-rerun assets in/named by the refresh set.
+    // Refresh policy (`barca run`): force-rerun assets named in the refresh set and, when
+    // cascading, every asset downstream of one (plan order puts upstream steps first, so a
+    // refreshed upstream is already in `cascade_roots` when its consumers are decided).
     let is_asset = kind == Some(crate::NodeKind::Asset);
     let refresh = match policy {
         CachePolicy::CacheAware => None,
         CachePolicy::RefreshAll => is_asset.then_some(RunReason::RefreshAll),
-        CachePolicy::RefreshSelective(names) => (is_asset
-            && names.iter().any(|name| refresh_name_matches(base_id, name)))
-        .then_some(RunReason::Refresh),
+        CachePolicy::RefreshSelective { names, cascade } => {
+            if !is_asset {
+                None
+            } else if names.iter().any(|name| refresh_name_matches(base_id, name)) {
+                Some(RunReason::Refresh)
+            } else if *cascade {
+                step.inputs.values().find_map(|up| {
+                    let up_base = up.split('[').next().unwrap_or(up);
+                    state
+                        .cascade_roots
+                        .get(up_base)
+                        .map(|root| RunReason::RefreshCascade { root: root.clone() })
+                })
+            } else {
+                None
+            }
+        }
     };
     if let Some(reason) = refresh {
+        let root = match &reason {
+            RunReason::RefreshCascade { root } => root.clone(),
+            _ => short_name(base_id).to_string(),
+        };
         state.refreshed_ids.insert(base_id.to_string());
+        state.cascade_roots.insert(base_id.to_string(), root);
         return (step, Decision::Run(reason));
+    }
+
+    // A consumer of a sensor is only cache-checked against that sensor's output. The planner
+    // runs sensors in an earlier phase, and a dry run reports such a step as unknown before it
+    // gets here, so this is a safety net: without the output, never serve from cache.
+    if sensor_inputs(dag, &step)
+        .iter()
+        .any(|s| !has_sensor_output(state, s))
+    {
+        return (step, Decision::Run(RunReason::NotMaterialized));
     }
 
     // Partitioned steps are checked per key: each partition has its own run hash, so keys
@@ -336,8 +596,31 @@ fn stale_warning(display_id: &str, root: &str, dry: bool) -> String {
     };
     format!(
         "'{id}' {served} from cache but depends on refreshed '{root}', so it {reflect} the \
-         refresh. Add it to --refresh (for example --refresh {root},{id}) or use --refresh-all."
+         refresh. Drop --no-cascade, add it to --refresh (for example --refresh {root},{id}) or \
+         use --refresh-all."
     )
+}
+
+/// The declared env values of `base_id` as reported in output (secrets redacted, unset = null),
+/// or `None` when the node declares no env.
+fn env_report(
+    dag: &Dag,
+    base_id: &str,
+) -> Option<std::collections::BTreeMap<String, Option<String>>> {
+    let node = dag.get_node(base_id)?;
+    if node.extracted.env.is_empty() {
+        return None;
+    }
+    Some(crate::envdeps::report(&crate::envdeps::resolve(
+        &node.extracted.env,
+    )))
+}
+
+/// The `--agent` step-line suffix for `node_id`'s declared env (empty when none is declared).
+fn env_suffix(dag: &Dag, node_id: &str) -> String {
+    dag.get_node(crate::StepId::parse(node_id).base_id())
+        .map(|n| crate::envdeps::agent_suffix(&crate::envdeps::resolve(&n.extracted.env)))
+        .unwrap_or_default()
 }
 
 fn kind_str(kind: Option<crate::NodeKind>) -> String {
@@ -363,6 +646,7 @@ fn report_for(
     let mut r = StepReport {
         id: base_id.to_string(),
         kind: kind_str(dag.get_node(base_id).map(|n| n.kind())),
+        env: env_report(dag, base_id),
         ..Default::default()
     };
     let (word_cached, word_run, word_partial) = if dry {
@@ -373,7 +657,7 @@ fn report_for(
     let verdict = match decision {
         Decision::Run(reason) => {
             r.reason = Some(reason.code().to_string());
-            r.detail = Some(reason.detail().to_string());
+            r.detail = Some(reason.detail());
             r.run_hash = step.run_hashes.get(&display_id).cloned();
             if step.partition_keys.is_empty() {
                 word_run
@@ -411,7 +695,7 @@ fn report_for(
             });
             if !missing.is_empty() {
                 r.reason = Some(RunReason::NotMaterialized.code().to_string());
-                r.detail = Some(RunReason::NotMaterialized.detail().to_string());
+                r.detail = Some(RunReason::NotMaterialized.detail());
             }
             match (cached.is_empty(), missing.is_empty()) {
                 (_, true) => word_cached,
@@ -426,6 +710,36 @@ fn report_for(
         r.status = Some(verdict.to_string());
     }
     r
+}
+
+/// How a run ended, for its last stderr line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// The last progress line of a run that executed steps, with or without `--agent`:
+/// `[barca] N/M steps | done in Xs` (`failed in`, `cancelled after`).
+fn end_of_run_line(completed: usize, total: usize, secs: f64, outcome: RunOutcome) -> String {
+    let how = match outcome {
+        RunOutcome::Done => "done in",
+        RunOutcome::Failed => "failed in",
+        RunOutcome::Cancelled => "cancelled after",
+    };
+    format!("[barca] {completed}/{total} steps | {how} {secs:.1}s")
+}
+
+/// The `--agent` line for a step that raised: `[barca] step:<id> failed: <first line of the
+/// error>`, beside the `completed` and `cached` lines.
+fn failed_step_line(node_id: &str, error: &str) -> String {
+    let first = error
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("unknown error");
+    format!("[barca] step:{node_id} failed: {first}")
 }
 
 /// Print a note above the progress bar, or to stderr when no bar is visible. A hidden bar
@@ -450,19 +764,22 @@ fn short_name(node_id: &str) -> &str {
 }
 
 /// Fail before running anything when `--refresh` names something that is not an upstream
-/// asset of the target: a typo must not be a silent no-op.
+/// asset of the target: a typo must not be a silent no-op. `get` targets are assets, so with
+/// `include_targets` a target may name itself; `run` targets are tasks and never can.
 fn validate_refresh_names(
     dag: &Dag,
-    target_id: Option<&str>,
+    target_ids: &[&str],
     names: &[String],
+    include_targets: bool,
 ) -> Result<(), BarcaError> {
-    let cone: Vec<&str> = match target_id {
-        Some(tid) => dag.subgraph(tid),
-        None => dag.topo_order(),
+    let cone: Vec<&str> = if target_ids.is_empty() {
+        dag.topo_order()
+    } else {
+        dag.subgraph_many(target_ids)
     };
     let assets: Vec<&str> = cone
         .into_iter()
-        .filter(|id| Some(*id) != target_id)
+        .filter(|id| include_targets || !target_ids.contains(id))
         .filter(|id| {
             dag.get_node(id)
                 .is_some_and(|n| n.kind() == crate::NodeKind::Asset)
@@ -471,13 +788,21 @@ fn validate_refresh_names(
     for name in names {
         if !assets.iter().any(|id| refresh_name_matches(id, name)) {
             let valid: Vec<&str> = assets.iter().map(|id| short_name(id)).collect();
-            return Err(BarcaError::Other(format!(
+            return Err(BarcaError::Usage(format!(
                 "--refresh: no upstream asset named '{name}'{}.\n\
                  Upstream assets you can refresh: {}\n\
                  Pass several as a comma-separated list: --refresh {}",
-                target_id
-                    .map(|t| format!(" in the cone of '{}'", short_name(t)))
-                    .unwrap_or_default(),
+                match target_ids {
+                    [] => String::new(),
+                    [t] => format!(" in the cone of '{}'", short_name(t)),
+                    many => format!(
+                        " in the cones of {}",
+                        many.iter()
+                            .map(|t| format!("'{}'", short_name(t)))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                },
                 if valid.is_empty() {
                     "(none)".to_string()
                 } else {
@@ -694,7 +1019,7 @@ impl StoreSync {
             .collect();
         Err(format!(
             "could not fetch {} cached artifact(s) from the artifact store:\n{}\n\
-             Re-run with --no-cache to recompute them.",
+             Re-run with --refresh-all to recompute them.",
             report.failures.len(),
             detail.join("\n")
         ))
@@ -749,6 +1074,52 @@ pub struct GetResult {
     pub steps: Vec<StepReport>,
 }
 
+/// The result of `barca get|run a,b` (several targets): one run over the union of the targets'
+/// cones, with each target's outcome. A failed target does not stop the others.
+#[derive(Debug, Clone, Serialize)]
+pub struct MultiResult {
+    pub run_id: String,
+    pub elapsed_seconds: f64,
+    pub steps_executed: usize,
+    pub phases: usize,
+    /// What happened to each planned step (shared upstream steps appear once).
+    pub steps: Vec<StepReport>,
+    /// Each target by the name it was given, in the order given (serialized as a map).
+    #[serde(serialize_with = "serialize_targets")]
+    pub targets: Vec<(String, TargetOutcome)>,
+}
+
+fn serialize_targets<S: serde::Serializer>(
+    targets: &[(String, TargetOutcome)],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(targets.iter().map(|(k, v)| (k, v)))
+}
+
+impl MultiResult {
+    /// True when any target failed.
+    pub fn any_failed(&self) -> bool {
+        self.targets.iter().any(|(_, t)| t.status != "success")
+    }
+}
+
+/// How one target of a multi-target run ended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TargetOutcome {
+    /// `success` or `failed`.
+    pub status: String,
+    /// The target's output, when it succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_output: Option<OutputRef>,
+    /// The error of the step that failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The step that failed: the target itself, or a step upstream of it (`failed_node`, the
+    /// same key a failed single-target run uses).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_node: Option<String>,
+}
+
 /// How a step was (or, in a dry run, will be) treated.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StepReport {
@@ -758,11 +1129,11 @@ pub struct StepReport {
     /// Dry run only: `cached`, `run`, `partial` (some partition keys cached) or `unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub action: Option<String>,
-    /// Real run only: `ran`, `cached` or `partial`.
+    /// Real run only: `ran`, `cached`, `partial`, or `failed` (in a failed run's result).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// Why the step runs: `task`, `sensor`, `no_cache`, `refresh`, `refresh_all`,
-    /// `not_materialized`, or `partitions_unknown`.
+    /// Why the step runs: `task`, `sensor`, `refresh`, `refresh_cascade`, `refresh_all`,
+    /// `not_materialized`, `partitions_unknown` or `sensor_output_unknown`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// The reason in words.
@@ -778,6 +1149,10 @@ pub struct StepReport {
     pub warning: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub partitions: Option<PartitionSummary>,
+    /// Declared env values the step used (`@asset(env=[...])`): name -> value, `null` when unset,
+    /// `"<redacted>"` for secret-looking names. Absent when the node declares no env.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<std::collections::BTreeMap<String, Option<String>>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -790,13 +1165,76 @@ pub struct PartitionSummary {
 }
 
 /// What `--dry-run` reports: the same decisions a real run would make, without making them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Serialized with `target` (one target, or null for the whole file) or, when several targets
+/// were given, `targets` in its place: an object keyed by target name in the order given, like a
+/// real multi-target run, each `{"summary": {...}}` counted over that target's cone.
+#[derive(Debug, Clone)]
 pub struct ExplainResult {
     pub dry_run: bool,
     pub command: String,
     pub target: Option<String>,
+    /// Every target with its predicted summary when more than one was given; empty otherwise.
+    pub targets: Vec<(String, TargetPrediction)>,
     pub steps: Vec<StepReport>,
     pub summary: ExplainSummary,
+}
+
+/// One target of a multi-target dry run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetPrediction {
+    /// The dry-run summary counted over this target's cone only (shared upstream steps count
+    /// for every target that needs them).
+    pub summary: ExplainSummary,
+}
+
+impl ExplainResult {
+    /// The target names in scope: the several given, the one given, or none (whole file).
+    pub fn target_names(&self) -> Vec<String> {
+        if self.targets.is_empty() {
+            self.target.iter().cloned().collect()
+        } else {
+            self.targets.iter().map(|(n, _)| n.clone()).collect()
+        }
+    }
+}
+
+impl Serialize for ExplainResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        struct Targets<'a>(&'a [(String, TargetPrediction)]);
+        impl Serialize for Targets<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_map(self.0.iter().map(|(k, v)| (k, v)))
+            }
+        }
+        let mut s = serializer.serialize_struct("ExplainResult", 5)?;
+        s.serialize_field("dry_run", &self.dry_run)?;
+        s.serialize_field("command", &self.command)?;
+        if self.targets.len() > 1 {
+            s.serialize_field("targets", &Targets(&self.targets))?;
+        } else {
+            s.serialize_field("target", &self.target)?;
+        }
+        s.serialize_field("steps", &self.steps)?;
+        s.serialize_field("summary", &self.summary)?;
+        s.end()
+    }
+}
+
+impl ExplainSummary {
+    /// Add one (merged) dry-run step line: a partitioned line counts its keys.
+    fn add(&mut self, r: &StepReport) {
+        match (r.action.as_deref(), &r.partitions) {
+            (Some("unknown"), _) => self.unknown += 1,
+            (_, Some(p)) => {
+                self.cached += p.cached;
+                self.will_run += p.will_run;
+            }
+            (Some("cached"), None) => self.cached += 1,
+            _ => self.will_run += 1,
+        }
+    }
 }
 
 /// Counted in steps: each partition key is one step.
@@ -815,8 +1253,29 @@ pub struct PlanResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanPhase {
-    pub reason: String,
+    /// Why this phase starts: `{"type": "initial"}`, or `{"type": "fan_in", "node_id": ...}`
+    /// when it waits for a node that gathers several upstream results.
+    pub reason: PlanPhaseReason,
     pub streams: Vec<PlanStream>,
+}
+
+/// [`crate::planner::PhaseReason`] as `barca plan` prints it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlanPhaseReason {
+    Initial,
+    FanIn { node_id: String },
+}
+
+impl From<&crate::planner::PhaseReason> for PlanPhaseReason {
+    fn from(r: &crate::planner::PhaseReason) -> Self {
+        match r {
+            crate::planner::PhaseReason::Initial => PlanPhaseReason::Initial,
+            crate::planner::PhaseReason::FanIn { node_id } => PlanPhaseReason::FanIn {
+                node_id: node_id.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -836,6 +1295,9 @@ pub struct AssetSummary {
     pub freshness: crate::Freshness,
     /// Upstream node ids this node depends on (direct + collected), sorted.
     pub inputs: Vec<String>,
+    /// Declared environment variable names (`@asset(env=[...])`), in declaration order.
+    #[serde(default)]
+    pub env: Vec<String>,
 }
 
 // ─── Shared setup ────────────────────────────────────────────────────────────
@@ -880,15 +1342,15 @@ fn default_pool_size() -> usize {
 /// How the engine treats cached asset materializations for this invocation.
 #[derive(Debug, Clone)]
 pub enum CachePolicy {
-    /// Normal cache-aware behavior — reuse fresh asset artifacts (`barca get`).
+    /// Normal cache-aware behavior — reuse fresh asset artifacts.
     CacheAware,
-    /// Force-rerun every asset in the target's cone
-    /// (`barca run <task> --refresh-all` / `--no-cache`).
+    /// Force-rerun every asset in the target's cone (`barca get|run ... --refresh-all`).
     RefreshAll,
-    /// Force-rerun only the named assets; all others stay cache-aware
-    /// (`barca run <task> --refresh a,b`). A name matches when it equals the
-    /// node's base id exactly, or matches the trailing `:name` segment.
-    RefreshSelective(Vec<String>),
+    /// Force-rerun the named assets (`barca get|run ... --refresh a,b`). A name matches when it
+    /// equals the node's base id exactly, or matches the trailing `:name` segment. With
+    /// `cascade` (the default) every asset downstream of a named one in the target's cone
+    /// re-runs too; without it (`--no-cascade`) all other assets stay cache-aware.
+    RefreshSelective { names: Vec<String>, cascade: bool },
 }
 
 /// `barca get` — cache-aware execution of an asset (or all assets).
@@ -899,22 +1361,16 @@ pub async fn get(
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
-    no_cache: bool,
+    policy: CachePolicy,
     agent_mode: bool,
     cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
+    let names: Vec<String> = target_name.map(str::to_string).into_iter().collect();
     execute(
-        cfg,
-        target_name,
-        file_args,
-        python,
-        no_cache,
-        agent_mode,
-        CachePolicy::CacheAware,
-        "get",
-        cancel,
+        cfg, &names, file_args, python, false, agent_mode, policy, "get", cancel,
     )
-    .await
+    .await?
+    .into_single()
 }
 
 /// `barca run` — execute a task (and its cone). The task always re-runs;
@@ -930,7 +1386,60 @@ pub async fn run(
 ) -> Result<GetResult, BarcaError> {
     execute(
         cfg,
-        Some(target_name),
+        &[target_name.to_string()],
+        file_args,
+        python,
+        false,
+        agent_mode,
+        policy,
+        "run",
+        cancel,
+    )
+    .await?
+    .into_single()
+}
+
+/// `barca get a,b` — several assets in one run. The union of their cones is planned once, so a
+/// shared upstream asset materializes once. Every target is attempted: a failure stops only the
+/// targets downstream of it, and is reported in that target's outcome (not as an `Err`).
+pub async fn get_many(
+    cfg: &crate::config::ResolvedConfig,
+    target_names: &[String],
+    file_args: &[String],
+    python: &PathBuf,
+    policy: CachePolicy,
+    agent_mode: bool,
+    cancel: CancellationToken,
+) -> Result<MultiResult, BarcaError> {
+    execute(
+        cfg,
+        target_names,
+        file_args,
+        python,
+        false,
+        agent_mode,
+        policy,
+        "get",
+        cancel,
+    )
+    .await
+    .map(Executed::into_multi)
+}
+
+/// `barca run a,b` — several tasks in one run; see [`get_many`]. Every task always re-runs;
+/// upstream assets follow `policy`, applied to the union of the cones.
+pub async fn run_many(
+    cfg: &crate::config::ResolvedConfig,
+    target_names: &[String],
+    file_args: &[String],
+    python: &PathBuf,
+    policy: CachePolicy,
+    agent_mode: bool,
+    cancel: CancellationToken,
+) -> Result<MultiResult, BarcaError> {
+    execute(
+        cfg,
+        target_names,
         file_args,
         python,
         false,
@@ -940,18 +1449,62 @@ pub async fn run(
         cancel,
     )
     .await
+    .map(Executed::into_multi)
+}
+
+/// What `execute` produced: the run, each target's outcome, and the first step failure.
+/// Single-target runs turn that failure into an `Err`; multi-target runs report it per target.
+struct Executed {
+    result: GetResult,
+    targets: Vec<(String, TargetOutcome)>,
+    step_failure: Option<crate::FailedStep>,
+}
+
+impl Executed {
+    /// A step failure ends a single-target run: exit 1, with the node, its traceback, and what
+    /// the run did before it stopped (the failed step's status is `failed`).
+    fn into_single(self) -> Result<GetResult, BarcaError> {
+        match self.step_failure {
+            Some(mut failed) => {
+                let r = self.result;
+                failed.run = Some(Box::new(crate::PartialRun {
+                    run_id: r.run_id,
+                    elapsed_seconds: r.elapsed_seconds,
+                    steps_executed: r.steps_executed,
+                    phases: r.phases,
+                    steps: r.steps,
+                }));
+                Err(BarcaError::WorkerFailed(Box::new(failed)))
+            }
+            None => Ok(self.result),
+        }
+    }
+
+    fn into_multi(self) -> MultiResult {
+        let r = self.result;
+        MultiResult {
+            run_id: r.run_id,
+            elapsed_seconds: r.elapsed_seconds,
+            steps_executed: r.steps_executed,
+            phases: r.phases,
+            steps: r.steps,
+            targets: self.targets,
+        }
+    }
 }
 
 /// `barca get|run --dry-run` — report what the command would do, without doing it.
 ///
 /// Plans exactly as a real run does and sends every step through [`decide_step`], so the
 /// prediction is the real run's decision. Nothing executes, no worker starts, and nothing is
-/// written: no `.barca` directory is created and no run is recorded. The one thing a dry run
-/// cannot know is the key set of a dynamic partition (`partitions_from`) whose source has to
-/// run first; those steps (and anything depending on them) are reported as `unknown`.
+/// written: no `.barca` directory is created and no run is recorded. A dry run cannot know
+/// the key set of a dynamic partition (`partitions_from`) whose source has to run first, nor
+/// what a sensor will return: a step reading a sensor is predicted from the sensor's last
+/// recorded output, and is `unknown` when there is none. Those steps (and anything depending on
+/// them) are reported as `unknown`.
 pub async fn explain(
     cfg: &crate::config::ResolvedConfig,
-    target_name: Option<&str>,
+    target_names: &[String],
     file_args: &[String],
     python: &PathBuf,
     policy: CachePolicy,
@@ -959,21 +1512,44 @@ pub async fn explain(
     command_label: &str,
 ) -> Result<ExplainResult, BarcaError> {
     let dag = build_dag(file_args, python).await?;
-    let target_id = resolve_target(&dag, target_name, command_label)?;
+    if command_label == "get"
+        && target_names.is_empty()
+        && let Some(note) = skipped_tasks_note(&dag, file_args)
+    {
+        eprintln!("{note}");
+    }
+    explain_dag(
+        &dag,
+        cfg,
+        target_names,
+        python,
+        policy,
+        no_cache,
+        command_label,
+    )
+    .await
+}
+
+/// [`explain`] on an already-built DAG (`barca status` reuses its DAG for the node listing).
+pub(crate) async fn explain_dag(
+    dag: &Dag,
+    cfg: &crate::config::ResolvedConfig,
+    target_names: &[String],
+    python: &std::path::Path,
+    policy: CachePolicy,
+    no_cache: bool,
+    command_label: &str,
+) -> Result<ExplainResult, BarcaError> {
+    let targets = resolve_targets(dag, target_names, command_label)?;
+    let target_ids: Vec<&str> = targets.iter().map(|(_, id)| id.as_str()).collect();
     let pool_size = default_pool_size();
     let config = ResourceConfig {
         pool_size,
         concurrency_groups: HashMap::new(),
     };
-    let full_plan = planner::plan_from_dag(&dag, &config);
-    let exec_plan = if let Some(ref tid) = target_id {
-        let subgraph_ids = dag.subgraph(tid);
-        filter_plan_to_subgraph(full_plan, &subgraph_ids)
-    } else {
-        full_plan
-    };
-    if let CachePolicy::RefreshSelective(names) = &policy {
-        validate_refresh_names(&dag, target_id.as_deref(), names)?;
+    let exec_plan = plan_for_targets(dag, &target_ids, &config, command_label);
+    if let CachePolicy::RefreshSelective { names, .. } = &policy {
+        validate_refresh_names(dag, &target_ids, names, command_label == "get")?;
     }
 
     // Shared remote state: pull it like a real run, so the cache check sees every machine's
@@ -990,16 +1566,33 @@ pub async fn explain(
     };
 
     let mut state = DecideState::default();
+    // A dry run executes nothing, so it cannot know what a sensor will return. It predicts with
+    // each sensor's last recorded output (#183); a consumer of a sensor with none is unknown.
+    if let Some(cache) = &cache {
+        let sensors: Vec<&str> = exec_plan
+            .phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .filter(|st| st.kind == crate::NodeKind::Sensor)
+            .map(|st| st.step_id.base_id())
+            .collect();
+        state.sensor_outputs = db::last_output_hashes(cache, &sensors).await?;
+    }
     let mut all_outputs: HashMap<String, OutputRef> = HashMap::new();
-    let mut unknown_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Steps reported as unknown, by base id, with the reason code their dependents inherit.
+    let mut unknown_ids: HashMap<String, &'static str> = HashMap::new();
+    // Steps whose run hash cannot be predicted because a sensor upstream of them has no
+    // recorded output (a forced step, e.g. under --refresh, is still reported as `run`).
+    let mut hash_unknown: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut steps: Vec<StepReport> = Vec::new();
     let mut summary = ExplainSummary::default();
 
-    let unknown_report = |dag: &Dag, base_id: &str, detail: String| StepReport {
+    let unknown_report = |dag: &Dag, base_id: &str, reason: &str, detail: String| StepReport {
         id: base_id.to_string(),
         kind: kind_str(dag.get_node(base_id).map(|n| n.kind())),
         action: Some("unknown".to_string()),
-        reason: Some("partitions_unknown".to_string()),
+        reason: Some(reason.to_string()),
         detail: Some(detail),
         ..Default::default()
     };
@@ -1019,14 +1612,15 @@ pub async fn explain(
                     Some(src) => {
                         let base = st.step_id.base_id();
                         steps.push(unknown_report(
-                            &dag,
+                            dag,
                             base,
+                            "partitions_unknown",
                             format!(
                                 "partition keys come from the output of '{src}', which is not \
                                  available until it runs"
                             ),
                         ));
-                        unknown_ids.insert(base.to_string());
+                        unknown_ids.insert(base.to_string(), "partitions_unknown");
                         summary.unknown += 1;
                         false
                     }
@@ -1041,27 +1635,89 @@ pub async fn explain(
         for stream in &phase_ref.streams {
             for step in &stream.steps {
                 let base = step.step_id.base_id();
+                let up_base = |up: &str| up.split('[').next().unwrap_or(up).to_string();
                 let unknown_dep = step
                     .inputs
                     .values()
-                    .find(|up| unknown_ids.contains(up.split('[').next().unwrap_or(up.as_str())));
+                    .find(|up| unknown_ids.get(&up_base(up)) == Some(&"partitions_unknown"));
                 if let Some(up) = unknown_dep {
                     steps.push(unknown_report(
-                        &dag,
+                        dag,
                         base,
+                        "partitions_unknown",
                         format!(
                             "depends on '{}', whose partitions are not known until it runs",
                             short_name(up)
                         ),
                     ));
-                    unknown_ids.insert(base.to_string());
+                    unknown_ids.insert(base.to_string(), "partitions_unknown");
                     summary.unknown += 1;
                     continue;
                 }
 
+                // Sensors this step reads, and whether the dry run knows their output.
+                let read_sensors = sensor_inputs(dag, step);
+                let missing_sensor = read_sensors
+                    .iter()
+                    .find(|s| !has_sensor_output(&state, s))
+                    .map(|s| s.to_string());
+                let hash_unknown_dep = step
+                    .inputs
+                    .values()
+                    .find(|up| hash_unknown.contains(&up_base(up)))
+                    .cloned();
+
                 let (step, decision) =
-                    decide_step(&dag, &policy, no_cache, cache.as_ref(), &mut state, step).await;
-                steps.push(report_for(&dag, &step, &decision, true));
+                    decide_step(dag, &policy, no_cache, cache.as_ref(), &mut state, step).await;
+                // Forced to run whatever the cache holds (task, sensor, refresh, --no-cache).
+                let forced = matches!(
+                    &decision,
+                    Decision::Run(reason) if *reason != RunReason::NotMaterialized
+                );
+                if missing_sensor.is_some() || hash_unknown_dep.is_some() {
+                    hash_unknown.insert(base.to_string());
+                    if !forced {
+                        let detail = match (&missing_sensor, &hash_unknown_dep) {
+                            (Some(s), _) => format!(
+                                "reads sensor '{}', which has no recorded output: its value is \
+                                 not known until it runs",
+                                short_name(s)
+                            ),
+                            (None, Some(up)) => format!(
+                                "depends on '{}', whose inputs include a sensor with no \
+                                 recorded output",
+                                short_name(up)
+                            ),
+                            (None, None) => unreachable!(),
+                        };
+                        // A partitioned step split across streams is one line.
+                        if !steps.iter().any(|r| r.id == base) {
+                            steps.push(unknown_report(dag, base, "sensor_output_unknown", detail));
+                        }
+                        unknown_ids.insert(base.to_string(), "sensor_output_unknown");
+                        summary.unknown += step.partition_keys.len().max(1);
+                        continue;
+                    }
+                }
+
+                let mut report = report_for(dag, &step, &decision, true);
+                if !forced && !read_sensors.is_empty() {
+                    let note = read_sensors
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "assumes sensor '{}' returns the same value as its last run",
+                                short_name(s)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    report.detail = Some(match report.detail.take() {
+                        Some(d) => format!("{d}; {note}"),
+                        None => note,
+                    });
+                }
+                steps.push(report);
                 match decision {
                     Decision::Run(_) => summary.will_run += step.partition_keys.len().max(1),
                     Decision::Cached { oref, .. } => {
@@ -1081,11 +1737,32 @@ pub async fn explain(
     }
     drop(cache);
 
+    let steps = merge_partition_reports(steps);
+    // Per-target predictions: the same step lines, counted over each target's cone.
+    let per_target = if targets.len() > 1 {
+        targets
+            .iter()
+            .map(|(name, id)| {
+                let cone: std::collections::HashSet<&str> = dag.subgraph(id).into_iter().collect();
+                let mut s = ExplainSummary::default();
+                for r in steps.iter().filter(|r| cone.contains(r.id.as_str())) {
+                    s.add(r);
+                }
+                (name.clone(), TargetPrediction { summary: s })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(ExplainResult {
         dry_run: true,
         command: command_label.to_string(),
-        target: target_id.as_deref().map(|t| short_name(t).to_string()),
-        steps: merge_partition_reports(steps),
+        target: match target_ids.as_slice() {
+            [one] => Some(short_name(one).to_string()),
+            _ => None,
+        },
+        targets: per_target,
+        steps,
         summary,
     })
 }
@@ -1093,7 +1770,7 @@ pub async fn explain(
 #[allow(clippy::too_many_arguments)]
 async fn execute(
     cfg: &crate::config::ResolvedConfig,
-    target_name: Option<&str>,
+    target_names: &[String],
     file_args: &[String],
     python: &PathBuf,
     no_cache: bool,
@@ -1101,7 +1778,7 @@ async fn execute(
     policy: CachePolicy,
     command_label: &str,
     cancel: CancellationToken,
-) -> Result<GetResult, BarcaError> {
+) -> Result<Executed, BarcaError> {
     let t0 = Instant::now();
     // BARCA_TRACE_TIMING=1: emit a millisecond-resolution waterfall of every
     // major checkpoint in this run to stderr (DAG parse, planning, DB setup,
@@ -1143,24 +1820,37 @@ async fn execute(
     let dag = build_dag(file_args, python).await?;
     trace_point!("dag_built");
 
-    let target_id = resolve_target(&dag, target_name, command_label)?;
+    let targets = resolve_targets(&dag, target_names, command_label)?;
+    let target_ids: Vec<&str> = targets.iter().map(|(_, id)| id.as_str()).collect();
+    if command_label == "get"
+        && target_ids.is_empty()
+        && let Some(note) = skipped_tasks_note(&dag, file_args)
+    {
+        eprintln!("{note}");
+    }
+    // Several targets: a step failure stops only what depends on it, so every target that can
+    // still run does (one run reports every failure). One target keeps the stop-at-first-failure
+    // behavior: nothing else in its cone could produce its value.
+    let keep_going = targets.len() > 1;
+    // For the run record: the targets as given, comma-separated.
+    let target_label: Option<String> = (!targets.is_empty()).then(|| {
+        targets
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    });
 
     let pool_size = default_pool_size();
     let config = ResourceConfig {
         pool_size,
         concurrency_groups: HashMap::new(),
     };
-    let full_plan = planner::plan_from_dag(&dag, &config);
-    let exec_plan = if let Some(ref tid) = target_id {
-        let subgraph_ids = dag.subgraph(tid);
-        filter_plan_to_subgraph(full_plan, &subgraph_ids)
-    } else {
-        full_plan
-    };
+    let exec_plan = plan_for_targets(&dag, &target_ids, &config, command_label);
     trace_point!("planned");
 
-    if let CachePolicy::RefreshSelective(names) = &policy {
-        validate_refresh_names(&dag, target_id.as_deref(), names)?;
+    if let CachePolicy::RefreshSelective { names, .. } = &policy {
+        validate_refresh_names(&dag, &target_ids, names, command_label == "get")?;
     }
 
     db::ensure_env_dirs(&cfg.env)?;
@@ -1193,8 +1883,8 @@ async fn execute(
         &db_path,
         &run_id,
         command_label,
-        &file_args.join(" "),
-        target_name,
+        &db::encode_files(file_args),
+        target_label.as_deref(),
         Some(exec_plan.total_steps),
     )
     .await?;
@@ -1215,6 +1905,12 @@ async fn execute(
     // What happened to each planned step, for the result.
     let mut step_reports: Vec<StepReport> = Vec::new();
     let mut phase_error: Option<String> = None;
+    // The first step failure (a step raised, timed out or its worker died): (node, message).
+    // With one target it ends the run; with several (`keep_going`) the run continues around it.
+    let mut step_failure: Option<(String, String)> = None;
+    // Base ids of failed steps, and of steps not run because something upstream failed.
+    let mut failed_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut skipped_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut all_outputs: HashMap<String, dispatch::OutputRef> = HashMap::new();
     // Sink outcomes (JSON) per node, accumulated across phases for the DB.
     let mut all_sinks: HashMap<String, String> = HashMap::new();
@@ -1361,6 +2057,36 @@ async fn execute(
         }
         trace_point!("phase{phase_idx}_start");
 
+        // Multi-target run after a failure: drop the steps that depend on a failed step; the
+        // rest of the phase still runs.
+        let unblocked_phase;
+        let phase = if keep_going && !failed_bases.is_empty() {
+            let mut p = phase.clone();
+            for stream in &mut p.streams {
+                stream.steps.retain(|st| {
+                    let base = st.step_id.base_id();
+                    let Some(up) = blocking_failure(&dag, base, &failed_bases) else {
+                        return true;
+                    };
+                    step_reports.push(StepReport {
+                        id: base.to_string(),
+                        kind: kind_str(dag.get_node(base).map(|n| n.kind())),
+                        status: Some("skipped".to_string()),
+                        reason: Some("upstream_failed".to_string()),
+                        detail: Some(format!("depends on '{}', which failed", short_name(up))),
+                        ..Default::default()
+                    });
+                    skipped_bases.insert(base.to_string());
+                    false
+                });
+            }
+            p.streams.retain(|s| !s.steps.is_empty());
+            unblocked_phase = p;
+            &unblocked_phase
+        } else {
+            phase
+        };
+
         // `partitions_from` sources are read from disk during expansion.
         if let Some(s) = store.as_mut() {
             let sources: Vec<String> = dispatch::partition_sources(phase, &all_outputs)
@@ -1429,7 +2155,10 @@ async fn execute(
                             );
                         }
                         if agent_mode {
-                            eprintln!("[barca] step:{display_id} cached");
+                            eprintln!(
+                                "[barca] step:{display_id} cached{}",
+                                env_suffix(&dag, &display_id)
+                            );
                         }
                         all_outputs.insert(display_id.clone(), oref);
                         cached_node_ids.insert(display_id);
@@ -1581,11 +2310,12 @@ async fn execute(
                     bar.set_message(format!("{short_name} done"));
                 } else if agent_mode {
                     eprintln!(
-                        "[barca] step:{} completed {:.1}s ({}/{})",
+                        "[barca] step:{} completed {:.1}s ({}/{}){}",
                         node_id,
                         elapsed_s.unwrap_or(0.0),
                         completed_steps,
-                        total_steps
+                        total_steps,
+                        env_suffix(&dag, node_id)
                     );
                 }
             });
@@ -1643,13 +2373,25 @@ async fn execute(
             if cpu.is_some() || rss.is_some() {
                 all_timings.insert(node_id.clone(), (cpu, rss));
             }
+            // A sensor's output hash: its consumers, decided in a later phase, fold it into
+            // their run hashes (#183).
+            if dag
+                .get_node(item.step_id.base_id())
+                .is_some_and(|n| n.kind() == crate::NodeKind::Sensor)
+                && decide_state.run_hashes.contains_key(&node_id)
+                && let Some(h) = artifact_val.get("content_hash").and_then(|v| v.as_str())
+            {
+                decide_state
+                    .sensor_outputs
+                    .insert(node_id.clone(), h.to_string());
+            }
             phase_outputs.insert(node_id, oref);
         }
 
         // Collect failures — parallel branch failures (group members) are
         // contained within the group and surfaced as ParallelError to the parent,
         // so they should NOT abort the entire phase.
-        let mut first_non_group_failure: Option<String> = None;
+        let mut first_non_group_failure: Option<(String, String)> = None;
         for (item_id, error_msg) in coord.failed_items() {
             let item = coord.item(item_id);
             if item.group.is_some() {
@@ -1657,9 +2399,13 @@ async fn execute(
                 continue;
             }
             let node_id = item.step_id.display();
-            if first_non_group_failure.is_none() {
-                first_non_group_failure = Some(error_msg.to_string());
+            if agent_mode {
+                eprintln!("{}", failed_step_line(&node_id, error_msg));
             }
+            if first_non_group_failure.is_none() {
+                first_non_group_failure = Some((node_id.clone(), error_msg.to_string()));
+            }
+            failed_bases.insert(item.step_id.base_id().to_string());
             all_failures.push(dispatch::StepFailure {
                 node_id,
                 error: dispatch::StepError {
@@ -1671,11 +2417,21 @@ async fn execute(
             });
         }
 
-        // Propagate non-group failures into phase_error if not already set
-        if let Some(msg) = first_non_group_failure {
-            if phase_error.is_none() {
-                phase_error = Some(msg);
+        // Steps the coordinator skipped because an in-phase dependency failed.
+        // They never executed, so they do not count in `steps_executed`.
+        for item_id in coord.skipped_items() {
+            let item = coord.item(item_id);
+            if item.group.is_none() {
+                skipped_bases.insert(item.step_id.base_id().to_string());
+                steps_executed = steps_executed.saturating_sub(1);
             }
+        }
+
+        // Remember the first step failure (it does not overwrite an infrastructure error).
+        if let Some(msg) = first_non_group_failure
+            && step_failure.is_none()
+        {
+            step_failure = Some(msg);
         }
 
         // Run hashes were computed pre-dispatch for every plan step (including
@@ -1688,8 +2444,9 @@ async fn execute(
             }
         }
 
-        // If this phase had a worker failure, stop after collecting partial results.
-        if phase_error.is_some() {
+        // Stop after collecting partial results if the pool itself failed, or if a step failed
+        // and there is only one target (several targets keep going around the failure).
+        if phase_error.is_some() || (step_failure.is_some() && !keep_going) {
             break;
         }
     }
@@ -1699,111 +2456,73 @@ async fn execute(
     pool.shutdown().await;
     trace_point!("pool_shutdown");
 
-    // Finish progress bar.
+    // Finish progress bar. The end-of-run line is the same with and without --agent.
     if let Some(ref bar) = pb {
-        if steps_executed > 0 {
-            bar.finish_and_clear();
-            eprintln!(
-                "[barca] {}/{} steps done in {:.1}s",
-                completed_steps, total_steps, elapsed_so_far
-            );
+        bar.finish_and_clear();
+    }
+    if (pb.is_some() || agent_mode) && steps_executed > 0 {
+        let outcome = if cancel.is_cancelled() {
+            RunOutcome::Cancelled
+        } else if phase_error.is_some() || step_failure.is_some() {
+            RunOutcome::Failed
         } else {
-            bar.finish_and_clear();
-        }
-    } else if agent_mode && steps_executed > 0 {
+            RunOutcome::Done
+        };
         eprintln!(
-            "[barca] {}/{} steps | done in {:.1}s",
-            completed_steps, total_steps, elapsed_so_far
+            "{}",
+            end_of_run_line(completed_steps, total_steps, elapsed_so_far, outcome)
         );
     }
 
     let was_cancelled = cancel.is_cancelled();
 
-    // Determine final_output: use target if specified, otherwise last planned step.
-    let final_output = if let Some(ref tid) = target_id {
-        all_outputs.get(tid).cloned().or_else(|| {
-            // For partitioned targets, sort by key for deterministic output.
-            let prefix = format!("{tid}[");
-            let mut matches: Vec<_> = all_outputs
-                .iter()
-                .filter(|(k, _)| k.starts_with(&prefix))
-                .collect();
-            matches.sort_by_key(|(k, _)| (*k).clone());
-            matches.first().map(|(_, v)| (*v).clone())
-        })
-    } else {
-        // No target: return the last planned step's output.
-        let last_planned_id = exec_plan
-            .phases
-            .last()
-            .and_then(|p| p.streams.last())
-            .and_then(|s| s.steps.last())
-            .map(|s| s.step_id.display())
-            .unwrap_or_default();
-        all_outputs.get(&last_planned_id).cloned().or_else(|| {
-            let mut matches: Vec<_> = all_outputs
-                .iter()
-                .filter(|(k, _)| k.starts_with(&last_planned_id))
-                .collect();
-            matches.sort_by_key(|(k, _)| (*k).clone());
-            matches.first().map(|(_, v)| (*v).clone())
-        })
-    };
-
-    // Artifact store: make the final output readable here, then wait for
-    // every upload — rows are recorded only for artifacts confirmed in the
-    // store, so the metadata never points at a missing object.
-    if let Some(mut s) = store.take() {
-        if was_cancelled {
+    // Artifact store, before anything is recorded: wait for every upload. Rows are recorded
+    // only for artifacts confirmed in the store, so the metadata never points at a missing
+    // object. The transfer client stays up to fetch the final outputs below.
+    if was_cancelled {
+        if let Some(s) = store.take() {
             for node in s.client.abort().await {
                 all_outputs.remove(&node);
                 store_paths.remove(&node);
             }
-        } else {
-            if transfer_error.is_none()
-                && phase_error.is_none()
-                && let Some(ref out) = final_output
-                && let Err(e) = s.ensure_local([out.path.as_str()], None).await
-            {
-                transfer_error = Some(e);
+        }
+    } else if let Some(s) = store.as_mut() {
+        let queued = s.client.pending_uploads();
+        let t_drain = Instant::now();
+        let report = s.client.drain().await;
+        trace_point!("store_sync_drained ({queued} uploads)");
+        if report.transferred > 0 {
+            eprintln!(
+                "[barca] uploaded {} artifact{} ({}); waited {:.1}s at end of run",
+                report.transferred,
+                if report.transferred == 1 { "" } else { "s" },
+                fmt_bytes(report.bytes),
+                t_drain.elapsed().as_secs_f64()
+            );
+        }
+        if !report.failures.is_empty() {
+            let mut detail = Vec::new();
+            for f in &report.failures {
+                all_outputs.remove(&f.key);
+                store_paths.remove(&f.key);
+                failed_bases.insert(crate::StepId::parse(&f.key).base_id().to_string());
+                all_failures.push(dispatch::StepFailure {
+                    node_id: f.key.clone(),
+                    error: dispatch::StepError {
+                        error_type: "UploadError".to_string(),
+                        message: format!("upload to {} failed: {}", f.store, f.message),
+                        traceback: String::new(),
+                        attempts: f.attempts,
+                    },
+                });
+                detail.push(format!("  {} ({}): {}", f.key, f.store, f.message));
             }
-            let queued = s.client.pending_uploads();
-            let t_drain = Instant::now();
-            let report = s.client.drain().await;
-            s.client.shutdown().await;
-            trace_point!("store_sync_drained ({queued} uploads)");
-            if report.transferred > 0 {
-                eprintln!(
-                    "[barca] uploaded {} artifact{} ({}); waited {:.1}s at end of run",
-                    report.transferred,
-                    if report.transferred == 1 { "" } else { "s" },
-                    fmt_bytes(report.bytes),
-                    t_drain.elapsed().as_secs_f64()
-                );
-            }
-            if !report.failures.is_empty() {
-                let mut detail = Vec::new();
-                for f in &report.failures {
-                    all_outputs.remove(&f.key);
-                    store_paths.remove(&f.key);
-                    all_failures.push(dispatch::StepFailure {
-                        node_id: f.key.clone(),
-                        error: dispatch::StepError {
-                            error_type: "UploadError".to_string(),
-                            message: format!("upload to {} failed: {}", f.store, f.message),
-                            traceback: String::new(),
-                            attempts: f.attempts,
-                        },
-                    });
-                    detail.push(format!("  {} ({}): {}", f.key, f.store, f.message));
-                }
-                transfer_error.get_or_insert(format!(
-                    "{} artifact upload(s) failed — those steps were not recorded and \
-                     will recompute next run:\n{}",
-                    report.failures.len(),
-                    detail.join("\n")
-                ));
-            }
+            transfer_error.get_or_insert(format!(
+                "{} artifact upload(s) failed — those steps were not recorded and \
+                 will recompute next run:\n{}",
+                report.failures.len(),
+                detail.join("\n")
+            ));
         }
     }
 
@@ -1821,14 +2540,14 @@ async fn execute(
         run_id: &run_id,
         status: if was_cancelled {
             "cancelled"
-        } else if phase_error.is_some() || transfer_error.is_some() {
+        } else if phase_error.is_some() || step_failure.is_some() || transfer_error.is_some() {
             "failed"
         } else {
             "success"
         },
         command: command_label,
-        files: file_args.join(" "),
-        target: target_name,
+        files: db::encode_files(file_args),
+        target: target_label.as_deref(),
         steps_total: exec_plan.total_steps,
         steps_executed,
         steps_cached,
@@ -1840,6 +2559,7 @@ async fn execute(
         all_timings: &all_timings,
         cached_node_ids: &cached_node_ids,
         run_hashes: &decide_state.run_hashes,
+        output_hashes: &decide_state.sensor_outputs,
         store_paths: &store_paths,
         cost_snapshot: &cost_snapshot,
     };
@@ -1890,19 +2610,104 @@ async fn execute(
         return Err(BarcaError::Cancelled);
     }
     if let Some(error) = phase_error {
-        return Err(BarcaError::WorkerFailed(error));
+        // Only the pool itself (e.g. no worker could be spawned) sets `phase_error`; user step
+        // failures are in `step_failure`. Infra, not user code: exit 3.
+        return Err(BarcaError::Other(format!("Worker failed: {error}")));
     }
-    if let Some(error) = transfer_error {
+    if let Some(error) = transfer_error.take() {
         return Err(BarcaError::Other(error));
     }
 
-    Ok(GetResult {
-        run_id,
-        elapsed_seconds: elapsed,
-        steps_executed,
-        phases: exec_plan.phases.len(),
-        final_output,
-        steps: merge_partition_reports(step_reports),
+    // Steps reported as `ran` before dispatch that failed, or were skipped because something
+    // upstream failed, say so.
+    let mut step_reports = merge_partition_reports(step_reports);
+    for report in &mut step_reports {
+        if !matches!(report.status.as_deref(), Some("ran" | "partial")) {
+            continue;
+        }
+        let base = report.id.split('[').next().unwrap_or(&report.id);
+        if failed_bases.contains(base) {
+            report.status = Some("failed".to_string());
+        } else if skipped_bases.contains(base) {
+            report.status = Some("skipped".to_string());
+            report.reason = Some("upstream_failed".to_string());
+            report.detail = Some("a step it depends on failed".to_string());
+        }
+    }
+
+    let outcomes = target_outcomes(&dag, &targets, &all_outputs, &all_failures);
+
+    // Determine final_output: the target's output when there is exactly one, otherwise the last
+    // planned step's (no target). Several targets report theirs in `outcomes`.
+    let final_output = if let [tid] = target_ids.as_slice() {
+        // For partitioned targets, the first partition by key (deterministic).
+        output_for(tid, &all_outputs)
+    } else if keep_going {
+        None
+    } else {
+        // No target: return the last planned asset's output (a sensor's only when the plan
+        // has no asset).
+        let planned: Vec<&planner::StreamStep> = exec_plan
+            .phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .collect();
+        let last_planned_id = planned
+            .iter()
+            .rev()
+            .find(|st| {
+                dag.get_node(st.step_id.base_id())
+                    .is_some_and(|n| n.kind() == crate::NodeKind::Asset)
+            })
+            .or(planned.last())
+            .map(|s| s.step_id.display())
+            .unwrap_or_default();
+        all_outputs.get(&last_planned_id).cloned().or_else(|| {
+            let mut matches: Vec<_> = all_outputs
+                .iter()
+                .filter(|(k, _)| k.starts_with(&last_planned_id))
+                .collect();
+            matches.sort_by_key(|(k, _)| (*k).clone());
+            matches.first().map(|(_, v)| (*v).clone())
+        })
+    };
+
+    // Make the outputs this command returns readable here: a cache hit recorded by another
+    // machine is still only in the store. Then stop the transfer helper.
+    if let Some(mut s) = store.take() {
+        let paths: Vec<String> = final_output
+            .iter()
+            .chain(outcomes.iter().filter_map(|(_, o)| o.final_output.as_ref()))
+            .map(|o| o.path.clone())
+            .collect();
+        let fetched = s.ensure_local(paths.iter().map(String::as_str), None).await;
+        s.client.shutdown().await;
+        if let Err(e) = fetched {
+            return Err(BarcaError::Other(e));
+        }
+    }
+
+    Ok(Executed {
+        result: GetResult {
+            run_id,
+            elapsed_seconds: elapsed,
+            steps_executed,
+            phases: exec_plan.phases.len(),
+            final_output,
+            steps: step_reports,
+        },
+        targets: outcomes,
+        step_failure: step_failure.map(|(node, message)| crate::FailedStep {
+            artifact_dir: Some(format!(
+                "{}/{}",
+                cfg.artifact_root.trim_end_matches('/'),
+                crate::safe_node_id(&node)
+            )),
+            node,
+            message,
+            run: None,
+        }),
     })
 }
 
@@ -1928,6 +2733,8 @@ struct RunLedger<'a> {
     all_timings: &'a HashMap<String, (Option<f64>, Option<u64>)>,
     cached_node_ids: &'a std::collections::HashSet<String>,
     run_hashes: &'a HashMap<String, String>,
+    /// Sensor step -> content hash of the output it returned in this run.
+    output_hashes: &'a HashMap<String, String>,
     /// Artifact-store location of each uploaded output, recorded instead of
     /// its local path so cache hits resolve on every machine.
     store_paths: &'a HashMap<String, String>,
@@ -1983,7 +2790,7 @@ async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError>
         let attempts = l.all_attempts.get(&base).copied().unwrap_or(1);
         let (cpu, rss) = l.all_timings.get(node_id).copied().unwrap_or((None, None));
         conn.execute(
-                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json, cpu_seconds, max_rss_bytes) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''), NULLIF(?9, ''), NULLIF(?10, ''))",
+                "INSERT INTO materializations (node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, elapsed_seconds, status, attempts, sinks_json, cpu_seconds, max_rss_bytes, output_hash) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), 'success', ?7, NULLIF(?8, ''), NULLIF(?9, ''), NULLIF(?10, ''), NULLIF(?11, ''))",
                 [
                     node_id.clone(),
                     run_h.clone(),
@@ -1998,6 +2805,7 @@ async fn persist_run(db_path: &str, l: &RunLedger<'_>) -> Result<(), BarcaError>
                     l.all_sinks.get(node_id).cloned().unwrap_or_default(),
                     cpu.map(|c| c.to_string()).unwrap_or_default(),
                     rss.map(|r| r.to_string()).unwrap_or_default(),
+                    l.output_hashes.get(node_id).cloned().unwrap_or_default(),
                 ],
             )
             .await
@@ -2068,7 +2876,7 @@ pub async fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, 
             .phases
             .iter()
             .map(|p| PlanPhase {
-                reason: format!("{:?}", p.reason),
+                reason: PlanPhaseReason::from(&p.reason),
                 streams: p
                     .streams
                     .iter()
@@ -2084,13 +2892,17 @@ pub async fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, 
 
 // ─── history ──────────────────────────────────────────────────────────────────
 
+/// The most recent runs (newest first), at most `limit` of them (`None` = every run), plus the
+/// total number of recorded runs so callers can report truncation.
 pub async fn history(
     cfg: &crate::config::ResolvedConfig,
-    limit: usize,
-) -> Result<Vec<db::RunRecord>, BarcaError> {
+    limit: Option<usize>,
+) -> Result<(Vec<db::RunRecord>, usize), BarcaError> {
     db::ensure_env_dirs(&cfg.env)?;
     db::init_db(&cfg.db_path).await?;
-    db::get_recent_runs(&cfg.db_path, limit).await
+    let total = db::count_runs(&cfg.db_path).await?;
+    let runs = db::get_recent_runs(&cfg.db_path, limit.unwrap_or(total)).await?;
+    Ok((runs, total))
 }
 
 // ─── stats ────────────────────────────────────────────────────────────────────
@@ -2103,19 +2915,7 @@ pub async fn stats(
 ) -> Result<db::AssetStats, BarcaError> {
     let dag = build_dag(file_args, python).await?;
 
-    let target_id = dag
-        .topo_order()
-        .into_iter()
-        .find(|id| {
-            id.ends_with(&format!(":{target_name}"))
-                || *id == target_name
-                || id.ends_with(target_name)
-        })
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let available: Vec<&str> = dag.topo_order();
-            BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
-        })?;
+    let target_id = find_target_id(&dag, target_name)?;
 
     db::ensure_env_dirs(&cfg.env)?;
     db::init_db(&cfg.db_path).await?;
@@ -2149,6 +2949,7 @@ pub async fn list_assets(
                 kind: node.kind(),
                 freshness: node.extracted.freshness.clone(),
                 inputs,
+                env: node.extracted.env.clone(),
             }
         })
         .collect();
@@ -2220,7 +3021,25 @@ pub async fn build_dag(file_args: &[String], python: &PathBuf) -> Result<Dag, Ba
         .map_err(|e| BarcaError::Other(format!("DAG analysis task failed: {e}")))?
 }
 
-fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, BarcaError> {
+/// The directory a pipeline file lives in, as a path that can be read: the directory its helper
+/// modules are scanned from (static analysis), and the one `barca serve --watch` watches.
+///
+/// `Path::new("p.py").parent()` is `Some("")`, an empty path that `read_dir` cannot open, so a
+/// bare filename used to scan no helpers at all (#178). Every spelling of the same file must
+/// scan the same directory: `p.py` and `./p.py` give `.`, `sub/p.py` gives `sub`, and an
+/// absolute path gives its parent. Only what is scanned changes; node ids keep the spelling
+/// given on the command line.
+pub fn source_dir(file: &std::path::Path) -> PathBuf {
+    match file.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+pub(crate) fn build_dag_blocking(
+    file_args: &[String],
+    python: &PathBuf,
+) -> Result<Dag, BarcaError> {
     let paths: Vec<PathBuf> = file_args.iter().map(PathBuf::from).collect();
     let mut all_nodes = Vec::new();
     let mut file_sources: HashMap<String, String> = HashMap::new();
@@ -2230,7 +3049,7 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
 
     for path in &paths {
         let source = fs::read_to_string(path)
-            .map_err(|e| BarcaError::Other(format!("{}: {e}", path.display())))?;
+            .map_err(|e| BarcaError::Usage(format!("{}: {e}", path.display())))?;
         let file_str = path.to_string_lossy().to_string();
         let nodes =
             extract_nodes(&source, &file_str).map_err(|e| BarcaError::Parse(e.to_string()))?;
@@ -2240,7 +3059,9 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
             .to_string_lossy()
             .to_string();
         file_sources.insert(stem, source.clone());
-        if let Some(parent) = path.parent() {
+        {
+            let parent = source_dir(path);
+            let parent = parent.as_path();
             // Scan subdirectories FIRST — packages (__init__.py) take precedence
             // over same-named sibling .py files, matching Python's import semantics.
             scan_subdirectories(parent, parent, &mut file_sources, &mut packages);
@@ -2249,7 +3070,9 @@ fn build_dag_blocking(file_args: &[String], python: &PathBuf) -> Result<Dag, Bar
             if let Ok(entries) = std::fs::read_dir(parent) {
                 for entry in entries.flatten() {
                     let ep = entry.path();
-                    if ep.extension().map(|e| e == "py").unwrap_or(false) && ep != *path {
+                    if ep.extension().map(|e| e == "py").unwrap_or(false)
+                        && ep.file_name() != path.file_name()
+                    {
                         let estem = ep
                             .file_stem()
                             .unwrap_or_default()
@@ -2381,10 +3204,10 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
                 let module_path = std::path::Path::new(&node.source_file)
                     .canonicalize()
                     .unwrap_or_else(|_| PathBuf::from(&node.source_file));
-                let script = "import json, importlib.util, sys\n\
-                     _spec = importlib.util.spec_from_file_location('_m', sys.argv[1])\n\
-                     _mod = importlib.util.module_from_spec(_spec)\n\
-                     _spec.loader.exec_module(_mod)\n\
+                // Compile from source, never a cached .pyc, like the worker (#176).
+                let script = "import json, sys\n\
+                     from barca._source_import import load_source_module\n\
+                     _mod = load_source_module(sys.argv[1], '_m')\n\
                      _ns = vars(_mod); _ns['__builtins__'] = __builtins__\n\
                      print(json.dumps(eval(sys.argv[2], _ns)))\n"
                     .to_string();
@@ -2410,7 +3233,7 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     eprintln!(
-                        "Warning: failed to evaluate partition expression '{}' for {}: {}",
+                        "[barca] warning: failed to evaluate partition expression '{}' for {}: {}",
                         source_text,
                         node.function_name,
                         stderr.trim()
@@ -2474,6 +3297,389 @@ mod refresh_name_tests {
         assert!(!refresh_name_matches("pipeline.py:src", "rc"));
         assert!(!refresh_name_matches("pipeline.py:source", "src"));
         assert!(!refresh_name_matches("pipeline.py:src", "nope"));
+    }
+}
+
+#[cfg(test)]
+mod multi_target_tests {
+    use super::*;
+
+    const SRC: &str = r#"
+from barca import asset, task
+
+
+@asset()
+def src() -> int:
+    return 1
+
+
+@asset(inputs={"s": src})
+def left(s: int) -> int:
+    return s
+
+
+@asset(inputs={"l": left})
+def deeper(l: int) -> int:
+    return l
+
+
+@task(inputs={"s": src})
+def check_a(s: int) -> None:
+    pass
+
+
+@task(inputs={"d": deeper})
+def check_b(d: int) -> None:
+    pass
+
+
+@asset()
+def lone() -> int:
+    return 2
+"#;
+
+    fn dag() -> Dag {
+        let nodes = crate::parse::extract_nodes(SRC, "p.py").unwrap();
+        Dag::build(&nodes).unwrap()
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn failure(node_id: &str, message: &str) -> dispatch::StepFailure {
+        dispatch::StepFailure {
+            node_id: node_id.to_string(),
+            error: dispatch::StepError {
+                error_type: "WorkerError".to_string(),
+                message: message.to_string(),
+                traceback: String::new(),
+                attempts: 1,
+            },
+        }
+    }
+
+    fn oref(path: &str) -> OutputRef {
+        OutputRef {
+            path: path.to_string(),
+            format: "json".to_string(),
+            size_bytes: 1,
+            elapsed_seconds: None,
+        }
+    }
+
+    fn outcome(status: &str) -> TargetOutcome {
+        TargetOutcome {
+            status: status.to_string(),
+            final_output: None,
+            error: None,
+            failed_node: None,
+        }
+    }
+
+    #[test]
+    fn every_name_resolves_and_repeats_collapse() {
+        let dag = dag();
+        let got = resolve_targets(&dag, &names(&["check_a", "check_b", "check_a"]), "run").unwrap();
+        assert_eq!(
+            got,
+            vec![
+                ("check_a".to_string(), "p.py:check_a".to_string()),
+                ("check_b".to_string(), "p.py:check_b".to_string()),
+            ]
+        );
+        assert!(resolve_targets(&dag, &[], "get").unwrap().is_empty());
+    }
+
+    #[test]
+    fn one_bad_name_fails_the_whole_list() {
+        let dag = dag();
+        let err = resolve_targets(&dag, &names(&["check_a", "nope"]), "run").unwrap_err();
+        assert!(err.to_string().contains("nope"), "{err}");
+        let err = resolve_targets(&dag, &names(&["left", "check_a"]), "get").unwrap_err();
+        assert!(err.to_string().contains("barca run"), "{err}");
+    }
+
+    #[test]
+    fn the_plan_is_the_union_of_cones_with_shared_upstream_once() {
+        let dag = dag();
+        let config = ResourceConfig {
+            pool_size: 4,
+            concurrency_groups: HashMap::new(),
+        };
+        let plan = plan_for_targets(&dag, &["p.py:check_a", "p.py:check_b"], &config, "run");
+        let ids: Vec<String> = plan
+            .phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .map(|s| s.step_id.display())
+            .collect();
+        assert_eq!(ids.iter().filter(|i| *i == "p.py:src").count(), 1);
+        for want in ["p.py:left", "p.py:deeper", "p.py:check_a", "p.py:check_b"] {
+            assert!(ids.iter().any(|i| i == want), "{want} missing from {ids:?}");
+        }
+        assert!(!ids.iter().any(|i| i == "p.py:lone"));
+    }
+
+    fn planned_ids(plan: &ExecutionPlan) -> Vec<String> {
+        plan.phases
+            .iter()
+            .flat_map(|p| &p.streams)
+            .flat_map(|s| &s.steps)
+            .map(|s| s.step_id.display())
+            .collect()
+    }
+
+    #[test]
+    fn bare_get_plans_every_asset_and_no_task() {
+        let dag = dag();
+        let config = ResourceConfig {
+            pool_size: 4,
+            concurrency_groups: HashMap::new(),
+        };
+        let mut got = planned_ids(&plan_for_targets(&dag, &[], &config, "get"));
+        got.sort();
+        assert_eq!(got, ["p.py:deeper", "p.py:left", "p.py:lone", "p.py:src"]);
+        // status (inspection) still covers the whole file, tasks included.
+        let all = planned_ids(&plan_for_targets(&dag, &[], &config, "status"));
+        assert!(all.iter().any(|i| i == "p.py:check_a"), "{all:?}");
+    }
+
+    #[test]
+    fn skipped_tasks_note_names_the_tasks_and_the_run_command() {
+        let files = names(&["p.py"]);
+        let note = skipped_tasks_note(&dag(), &files).unwrap();
+        assert!(
+            note.contains("skipped 2 tasks (check_a, check_b)"),
+            "{note}"
+        );
+        assert!(note.contains("barca run check_a p.py"), "{note}");
+
+        let only = "from barca import task\n\n@task()\ndef deploy() -> None:\n    pass\n";
+        let only = Dag::build(&crate::parse::extract_nodes(only, "t.py").unwrap()).unwrap();
+        let note = skipped_tasks_note(&only, &names(&["t.py"])).unwrap();
+        assert!(note.contains("nothing to get"), "{note}");
+        assert!(note.contains("barca run deploy t.py"), "{note}");
+
+        let assets = "from barca import asset\n\n@asset()\ndef a() -> int:\n    return 1\n";
+        let assets = Dag::build(&crate::parse::extract_nodes(assets, "a.py").unwrap()).unwrap();
+        assert!(skipped_tasks_note(&assets, &names(&["a.py"])).is_none());
+    }
+
+    #[test]
+    fn refresh_names_may_come_from_any_targets_cone() {
+        let dag = dag();
+        let both = ["p.py:check_a", "p.py:check_b"];
+        validate_refresh_names(&dag, &both, &names(&["src", "deeper"]), false).unwrap();
+        let msg = validate_refresh_names(&dag, &both, &names(&["lone"]), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("in the cones of 'check_a', 'check_b'"),
+            "{msg}"
+        );
+        assert!(
+            validate_refresh_names(&dag, &["p.py:check_a"], &names(&["deeper"]), false).is_err()
+        );
+    }
+
+    #[test]
+    fn a_failure_blocks_only_what_depends_on_it() {
+        let dag = dag();
+        let failed: std::collections::HashSet<String> = ["p.py:left".to_string()].into();
+        assert_eq!(
+            blocking_failure(&dag, "p.py:check_b", &failed),
+            Some("p.py:left")
+        );
+        assert_eq!(blocking_failure(&dag, "p.py:check_a", &failed), None);
+        assert_eq!(blocking_failure(&dag, "p.py:left", &failed), None);
+    }
+
+    #[test]
+    fn each_target_reports_its_own_outcome() {
+        let dag = dag();
+        let targets = vec![
+            ("check_a".to_string(), "p.py:check_a".to_string()),
+            ("check_b".to_string(), "p.py:check_b".to_string()),
+            ("lone".to_string(), "p.py:lone".to_string()),
+        ];
+        let outputs: HashMap<String, OutputRef> =
+            [("p.py:check_a".to_string(), oref("a.json"))].into();
+        let failures = vec![failure("p.py:left", "boom")];
+        let out = target_outcomes(&dag, &targets, &outputs, &failures);
+        assert_eq!(out[0].0, "check_a");
+        assert_eq!(out[0].1.status, "success");
+        assert_eq!(out[0].1.final_output.as_ref().unwrap().path, "a.json");
+        assert_eq!(out[1].1.status, "failed");
+        assert_eq!(out[1].1.failed_node.as_deref(), Some("p.py:left"));
+        assert_eq!(out[1].1.error.as_deref(), Some("boom"));
+        assert_eq!(out[2].1.status, "failed");
+        assert_eq!(out[2].1.error.as_deref(), Some("did not run"));
+    }
+
+    #[test]
+    fn end_of_run_line_is_one_format_and_never_says_done_on_failure() {
+        assert_eq!(
+            end_of_run_line(3, 3, 1.26, RunOutcome::Done),
+            "[barca] 3/3 steps | done in 1.3s"
+        );
+        let failed = end_of_run_line(0, 3, 0.0, RunOutcome::Failed);
+        assert_eq!(failed, "[barca] 0/3 steps | failed in 0.0s");
+        assert!(!failed.contains("done"));
+        assert_eq!(
+            end_of_run_line(1, 3, 2.0, RunOutcome::Cancelled),
+            "[barca] 1/3 steps | cancelled after 2.0s"
+        );
+    }
+
+    #[test]
+    fn failed_step_line_names_the_step_and_the_first_error_line() {
+        assert_eq!(
+            failed_step_line(
+                "p.py:broken",
+                "\nValueError: boom\n  File \"p.py\", line 3, in broken"
+            ),
+            "[barca] step:p.py:broken failed: ValueError: boom"
+        );
+        assert_eq!(
+            failed_step_line("p.py:x", ""),
+            "[barca] step:p.py:x failed: unknown error"
+        );
+    }
+
+    #[test]
+    fn summary_add_counts_like_the_dry_run() {
+        let line = |action: &str, p: Option<(usize, usize)>| StepReport {
+            action: Some(action.to_string()),
+            partitions: p.map(|(cached, will_run)| PartitionSummary {
+                total: cached + will_run,
+                cached,
+                will_run,
+                will_run_keys: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let mut s = ExplainSummary::default();
+        for r in [
+            line("cached", None),
+            line("run", None),
+            line("unknown", None),
+            line("partial", Some((2, 3))),
+            line("run", Some((0, 4))),
+        ] {
+            s.add(&r);
+        }
+        assert_eq!(
+            s,
+            ExplainSummary {
+                will_run: 8,
+                cached: 3,
+                unknown: 1
+            }
+        );
+    }
+
+    #[test]
+    fn dry_run_json_names_one_target_or_lists_several() {
+        let mut r = ExplainResult {
+            dry_run: true,
+            command: "run".to_string(),
+            target: Some("a".to_string()),
+            targets: Vec::new(),
+            steps: Vec::new(),
+            summary: ExplainSummary::default(),
+        };
+        let one = serde_json::to_value(&r).unwrap();
+        assert_eq!(one["target"], "a");
+        assert!(one.get("targets").is_none());
+        r.target = None;
+        let predicted = |will_run| TargetPrediction {
+            summary: ExplainSummary {
+                will_run,
+                cached: 1,
+                unknown: 0,
+            },
+        };
+        r.targets = vec![
+            ("b".to_string(), predicted(2)),
+            ("a".to_string(), predicted(0)),
+        ];
+        assert_eq!(r.target_names(), names(&["b", "a"]));
+        let many = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            many["targets"],
+            serde_json::json!({
+                "b": {"summary": {"will_run": 2, "cached": 1, "unknown": 0}},
+                "a": {"summary": {"will_run": 0, "cached": 1, "unknown": 0}},
+            })
+        );
+        assert!(many.get("target").is_none());
+        // Keyed in the order given, like a real multi-target run.
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.find("\"b\"").unwrap() < s.find("\"a\"").unwrap(), "{s}");
+    }
+
+    #[test]
+    fn multi_result_targets_serialize_as_a_map_in_the_order_given() {
+        let r = MultiResult {
+            run_id: "r".to_string(),
+            elapsed_seconds: 0.0,
+            steps_executed: 0,
+            phases: 0,
+            steps: Vec::new(),
+            targets: vec![
+                ("zeta".to_string(), outcome("success")),
+                ("alpha".to_string(), outcome("failed")),
+            ],
+        };
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(
+            s.find("\"zeta\"").unwrap() < s.find("\"alpha\"").unwrap(),
+            "{s}"
+        );
+        assert!(r.any_failed());
+    }
+}
+
+#[cfg(test)]
+mod source_dir_tests {
+    use super::source_dir;
+    use std::path::{Path, PathBuf};
+
+    /// Every spelling of a pipeline file names a directory that can be read (#178): a bare
+    /// filename used to give an empty path, so no helper module was scanned or hashed.
+    #[test]
+    fn every_spelling_of_a_file_names_a_readable_directory() {
+        assert_eq!(source_dir(Path::new("p.py")), PathBuf::from("."));
+        assert_eq!(source_dir(Path::new("./p.py")), PathBuf::from("."));
+        assert_eq!(source_dir(Path::new("sub/p.py")), PathBuf::from("sub"));
+        assert_eq!(
+            source_dir(Path::new("/abs/sub/p.py")),
+            PathBuf::from("/abs/sub")
+        );
+        assert!(std::fs::read_dir(source_dir(Path::new("p.py"))).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod target_name_tests {
+    use super::target_name_matches;
+
+    #[test]
+    fn exact_names_and_ids_match() {
+        assert!(target_name_matches("p.py:deploy", "deploy"));
+        assert!(target_name_matches("p.py:deploy", "p.py:deploy"));
+        assert!(target_name_matches("sub/p.py:deploy", "p.py:deploy"));
+        assert!(target_name_matches("sub/p.py:deploy", "sub/p.py:deploy"));
+    }
+
+    #[test]
+    fn a_suffix_of_another_name_does_not_match() {
+        assert!(!target_name_matches("p.py:prod_deploy", "deploy"));
+        assert!(!target_name_matches("p.py:dyn_margin_all", "margin_all"));
+        assert!(!target_name_matches("subp.py:deploy", "p.py:deploy"));
+        assert!(!target_name_matches("sub/p.py:deploy", "/p.py:deploy_x"));
     }
 }
 
@@ -2591,6 +3797,7 @@ mod store_tests {
             all_timings: &HashMap::new(),
             cached_node_ids: &std::collections::HashSet::new(),
             run_hashes: &run_hashes,
+            output_hashes: &HashMap::new(),
             store_paths: &HashMap::new(),
             cost_snapshot: &[],
         };
@@ -2645,6 +3852,7 @@ mod store_tests {
             all_timings: &HashMap::new(),
             cached_node_ids: &std::collections::HashSet::new(),
             run_hashes: &run_hashes,
+            output_hashes: &HashMap::new(),
             store_paths: &store_paths,
             cost_snapshot: &[],
         };

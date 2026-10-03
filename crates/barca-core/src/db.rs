@@ -41,12 +41,29 @@ pub async fn db_guard() -> MutexGuard<'static, ()> {
     DB_LOCK.lock().await
 }
 
+/// The `runs.files` column: a JSON array of paths. Rows written before 0.12 hold the paths
+/// joined by spaces; those are split on whitespace.
+pub fn encode_files(files: &[String]) -> String {
+    serde_json::to_string(files).unwrap_or_default()
+}
+
+/// See [`encode_files`].
+pub fn decode_files(raw: &str) -> Vec<String> {
+    if raw.trim_start().starts_with('[')
+        && let Ok(files) = serde_json::from_str::<Vec<String>>(raw)
+    {
+        return files;
+    }
+    raw.split_whitespace().map(str::to_string).collect()
+}
+
 /// Record of a single run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
     pub command: String,
-    pub files: String,
+    /// The `.py` files the run was given.
+    pub files: Vec<String>,
     pub target: Option<String>,
     pub status: String,
     pub steps_total: Option<i64>,
@@ -285,6 +302,9 @@ pub async fn init_db(db_path: &str) -> Result<(), BarcaError> {
         "ALTER TABLE materializations ADD COLUMN sinks_json TEXT",
         "ALTER TABLE materializations ADD COLUMN cpu_seconds REAL",
         "ALTER TABLE materializations ADD COLUMN max_rss_bytes INTEGER",
+        // Content hash of a sensor's output (#183): folded into its consumers' run hashes, and
+        // what `--dry-run` / `barca status` assume the sensor returns next.
+        "ALTER TABLE materializations ADD COLUMN output_hash TEXT",
         "ALTER TABLE materializations ADD COLUMN error_type TEXT",
     ] {
         conn.execute(col, ()).await.ok();
@@ -380,6 +400,37 @@ pub async fn upsert_schedule_state(
     .await
     .map_err(|e| BarcaError::Db(format!("failed to upsert schedule_state: {e}")))?;
     Ok(())
+}
+
+/// The output hash of the latest successful materialization of each step of `base_ids` (the
+/// base id itself, or any of its partitions), keyed by display id. Steps never recorded with an
+/// output hash (never ran, or ran before barca recorded sensor outputs) are absent; so is
+/// everything when the database predates the `output_hash` column.
+pub async fn last_output_hashes(
+    cache: &CacheReader,
+    base_ids: &[&str],
+) -> Result<HashMap<String, String>, BarcaError> {
+    let mut out = HashMap::new();
+    for base in base_ids {
+        let Ok(mut rows) = cache
+            .conn()
+            .query(
+                "SELECT node_id, output_hash FROM materializations \
+                 WHERE (node_id = ?1 OR node_id LIKE ?2) AND status = 'success' \
+                 AND output_hash IS NOT NULL ORDER BY id",
+                [base.to_string(), format!("{base}[%")],
+            )
+            .await
+        else {
+            return Ok(HashMap::new());
+        };
+        while let Ok(Some(row)) = rows.next().await {
+            if let (Ok(id), Ok(h)) = (row.get::<String>(0), row.get::<String>(1)) {
+                out.insert(id, h);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub async fn persist_outputs(
@@ -574,7 +625,7 @@ pub async fn get_recent_runs(db_path: &str, limit: usize) -> Result<Vec<RunRecor
         records.push(RunRecord {
             run_id: row.get::<String>(0).unwrap_or_default(),
             command: row.get::<String>(1).unwrap_or_default(),
-            files: row.get::<String>(2).unwrap_or_default(),
+            files: decode_files(&row.get::<String>(2).unwrap_or_default()),
             target: {
                 let t = row.get::<String>(3).unwrap_or_default();
                 if t.is_empty() { None } else { Some(t) }
@@ -592,6 +643,23 @@ pub async fn get_recent_runs(db_path: &str, limit: usize) -> Result<Vec<RunRecor
         });
     }
     Ok(records)
+}
+
+/// Total number of recorded runs (for `barca history` truncation reporting).
+pub async fn count_runs(db_path: &str) -> Result<usize, BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM runs", ())
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to count runs: {e}")))?;
+    let n = rows
+        .next()
+        .await
+        .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+        .map(|r| r.get::<i64>(0).unwrap_or(0))
+        .unwrap_or(0);
+    Ok(n.max(0) as usize)
 }
 
 /// Get aggregated stats for a specific asset/node.
@@ -701,6 +769,93 @@ pub async fn get_asset_stats(db_path: &str, node_id: &str) -> Result<AssetStats,
         cache_hit_rate,
         recent_runs,
     })
+}
+
+/// One row of `materializations`, as `barca status` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MaterializationRecord {
+    /// Exact node id, including the partition suffix for a partitioned step.
+    pub node_id: String,
+    pub run_hash: Option<String>,
+    pub artifact_path: Option<String>,
+    pub artifact_format: Option<String>,
+    pub artifact_size_bytes: Option<i64>,
+    pub elapsed_seconds: Option<f64>,
+    /// `success` or `failed`.
+    pub status: String,
+    pub error_message: Option<String>,
+    pub created_at: String,
+}
+
+/// What the metadata DB knows about one node (all partition keys of a partitioned node).
+#[derive(Debug, Clone, Default)]
+pub struct NodeHistory {
+    /// The most recent materialization attempt, successful or not.
+    pub latest: Option<MaterializationRecord>,
+    /// Whether any attempt ever succeeded.
+    pub ever_succeeded: bool,
+}
+
+/// Latest materialization and success flag for each base node id. Rows of partitioned steps
+/// (`<base>[k=v]`) count toward their base id. Read-only; the caller ensures the DB exists.
+pub async fn node_histories(
+    db_path: &str,
+    base_ids: &[String],
+) -> Result<HashMap<String, NodeHistory>, BarcaError> {
+    let _g = db_guard().await;
+    let (_db, conn) = open_conn(db_path).await?;
+    let mut out = HashMap::new();
+    for base in base_ids {
+        let prefix = format!("{base}[");
+        let filter = "(node_id = ?1 OR substr(node_id, 1, length(?2)) = ?2)";
+        let mut h = NodeHistory::default();
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT node_id, run_hash, artifact_path, artifact_format, artifact_size_bytes, \
+                     elapsed_seconds, status, error_message, created_at FROM materializations \
+                     WHERE {filter} ORDER BY id DESC LIMIT 1"
+                ),
+                [base.clone(), prefix.clone()],
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query materializations: {e}")))?;
+        if let Some(row) = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+        {
+            let opt = |i: usize| row.get::<String>(i).ok().filter(|s| !s.is_empty());
+            h.latest = Some(MaterializationRecord {
+                node_id: row.get::<String>(0).unwrap_or_default(),
+                run_hash: opt(1),
+                artifact_path: opt(2),
+                artifact_format: opt(3),
+                artifact_size_bytes: row.get::<i64>(4).ok(),
+                elapsed_seconds: row.get::<f64>(5).ok(),
+                status: opt(6).unwrap_or_else(|| "success".to_string()),
+                error_message: opt(7),
+                created_at: row.get::<String>(8).unwrap_or_default(),
+            });
+        }
+        drop(rows);
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT 1 FROM materializations WHERE {filter} AND status = 'success' LIMIT 1"
+                ),
+                [base.clone(), prefix],
+            )
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to query materializations: {e}")))?;
+        h.ever_succeeded = rows
+            .next()
+            .await
+            .map_err(|e| BarcaError::Db(format!("failed to read row: {e}")))?
+            .is_some();
+        out.insert(base.clone(), h);
+    }
+    Ok(out)
 }
 
 /// Compute the p-th percentile from a sorted slice of values.
@@ -951,6 +1106,7 @@ mod tests {
         }
 
         assert_eq!(get_recent_runs(&db_path, 100).await.unwrap().len(), 8);
+        assert_eq!(count_runs(&db_path).await.unwrap(), 8);
         assert_eq!(get_schedule_state(&db_path).await.unwrap().len(), 8);
     }
 
