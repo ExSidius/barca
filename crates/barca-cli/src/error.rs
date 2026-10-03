@@ -215,10 +215,14 @@ impl CliError {
                 "Fix the Python syntax error, then run `{}` to confirm discovery.",
                 ctx.list_cmd()
             ),
-            BarcaError::Dag(_) => format!(
-                "Fix the inputs between definitions, then run `{}` to check each node's inputs.",
-                ctx.list_cmd()
-            ),
+            BarcaError::Dag(d) => match d.remediation() {
+                Some(fix) => fix,
+                None => format!(
+                    "Fix the inputs between definitions, then run `{}` to check each node's \
+                     inputs.",
+                    ctx.list_cmd()
+                ),
+            },
             BarcaError::Usage(_) => format!("See `{}`.", ctx.help_cmd()),
             BarcaError::Cancelled => "Re-run the same command; steps that finished before the \
                                       cancel are cached and will not re-run."

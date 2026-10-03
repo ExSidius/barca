@@ -135,9 +135,17 @@ def summary(prices: list[dict]) -> dict:
 
 `partitions(...)` accepts a literal list (extracted statically at parse time) or any other Python
 expression — e.g. a list comprehension or function call — which is evaluated by the Python runtime
-at plan time. `partitions_from(...)` derives an asset's partition keys from an upstream asset's own
-partitions, rather than declaring them again. `collect(...)`, used inside `inputs=`, aggregates
-every partition of an upstream asset into a single list delivered to the parameter. An
+at plan time. `partitions_from(price)` on a partitioned `price` gives the asset the same keys
+(under the same dimension name, which must be its only dimension), and calls each key with the key
+and that key's output of `price`, as the parameter named after it: `signal(ticker="AAPL",
+price=<the AAPL output of price>)`. List the upstream in `inputs=` as well to receive it under
+another name (`inputs={"p": price}`). Each consumer key depends only on its own upstream key, so a
+new key of `price` runs only that key of `signal`. `partitions_from(tickers)` on an *unpartitioned*
+asset that returns a list uses the list's values as keys, known once `tickers` has run; the list is
+not passed to the function. `collect(...)`, used inside `inputs=`, aggregates every partition of an
+upstream asset into a single list delivered to the parameter. A partitioned asset in an
+unpartitioned asset's `inputs=` without `collect()` is a usage error (exit 2) that names both
+`collect(price)` and `partitions_from(price)`; up to 0.11 it silently behaved like `collect()`. An
 unpartitioned asset in a partitioned asset's `inputs=` is delivered whole to every key; it runs
 once, before any key, and its run hash is part of every key's run hash, so changing it (or
 `--refresh` on it) re-runs every key.

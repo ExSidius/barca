@@ -275,6 +275,10 @@ def global_summary(sales: list[dict]) -> dict:
 - `global_summary` receives all three results at once
 - An unpartitioned asset passed in `inputs=` to a partitioned asset reaches every key unchanged;
   it runs once, before any key, and changing it (or `--refresh` on it) re-runs every key
+- `partitions_from(regional_sales)` gives another asset the same keys; each key receives that
+  key's `regional_sales` output as the parameter `regional_sales`
+- An unpartitioned asset cannot read a partitioned one without `collect()`: plain
+  `inputs={"sales": regional_sales}` is a usage error (exit 2)
 
 ## 8. Multi-file pipelines
 
@@ -382,7 +386,7 @@ Here's a complete pipeline that uses everything:
 
 ```python
 # pipeline.py
-from barca import asset, sensor, task, partitions, collect
+from barca import asset, sensor, task, partitions, partitions_from, collect
 
 TABLES = ["users", "events", "purchases"]
 
@@ -397,11 +401,11 @@ def check_data_lake() -> tuple[bool, dict]:
 def extract(table: str) -> dict:
     return {"table": table, "rows": 1000}
 
-# Transform (runs per partition — declares the same partition values as
-# extract so each transform(table=X) pairs with extract(table=X))
-@asset(inputs={"raw": extract}, partitions={"table": partitions(TABLES)})
-def transform(raw: dict, table: str) -> dict:
-    return {"table": raw["table"], "clean_rows": raw["rows"] - 10}
+# Transform (runs per partition — partitions_from(extract) reuses extract's keys,
+# and each transform(table=X) receives extract's output for table=X as `extract`)
+@asset(partitions={"table": partitions_from(extract)})
+def transform(table: str, extract: dict) -> dict:
+    return {"table": extract["table"], "clean_rows": extract["rows"] - 10}
 
 # Aggregate all partitions
 @asset(inputs={"tables": collect(transform)})
