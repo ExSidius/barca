@@ -120,6 +120,14 @@ planner. Mark code barca cannot reason about with `@unsafe` (silences purity war
 `@sensor` observes external state and returns `(update_detected: bool, value)`. Sensors have no
 inputs and must use `Manual` or `Schedule(...)` freshness, never `Always`.
 
+A sensor always runs, and its `value` is part of the run hash of every asset that reads it: when
+the value changes, those assets and everything downstream of them re-run; when it is the same,
+they are served from cache. This is how to track external data that changes in place: a sensor
+returns a blob's etag and the asset that reads the blob depends on the sensor (`barca docs cache`,
+"External data that changes in place"). Return only what identifies the data: a value that
+changes on every run, such as a timestamp, re-runs the sensor's consumers every time. The
+`update_detected` flag is not used for caching.
+
 `barca get <sensor> pipeline.py` observes one sensor. `barca get pipeline.py` (no target) observes
 every sensor, including one nothing depends on: a sensor is something `get` can target, and
 observing is read-only. Tasks are the only nodes a bare `get` skips.

@@ -58,7 +58,8 @@ pub struct CacheStatus {
     /// `cached`, `stale`, `never_run`, `partial`, `unknown` or `always_runs`.
     pub state: String,
     /// Machine-readable reason: `materialized`, `changed`, `upstream_stale`, `failed`,
-    /// `no_record`, `partitions_missing`, `partitions_unknown`, `task` or `sensor`.
+    /// `no_record`, `partitions_missing`, `partitions_unknown`, `sensor_output_unknown`, `task`
+    /// or `sensor`.
     pub reason: String,
     /// The reason in words.
     pub detail: String,
@@ -277,6 +278,16 @@ fn cache_status(
         }
         _ => not_cached(r, inputs, states, history),
     };
+    // A consumer of a sensor is predicted from the sensor's last recorded output (#183); keep
+    // that caveat from the dry run's detail.
+    if let Some(note) = r
+        .detail
+        .as_deref()
+        .and_then(|d| d.find("assumes sensor").map(|i| &d[i..]))
+        && !c.detail.contains(note)
+    {
+        c.detail = format!("{}; {note}", c.detail);
+    }
     c.run_hash = r.run_hash.clone();
     if c.state == "cached" {
         c.artifact = r.artifact.clone();

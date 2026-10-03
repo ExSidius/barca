@@ -68,12 +68,16 @@ two cannot disagree. In JSON the states are snake_case, spelled exactly like the
 | `stale` | it ran before, but `get` would run it again | `changed`, `upstream_stale`, `failed` |
 | `never_run` | no successful materialization is recorded | `no_record`, `failed` |
 | `partial` | a partitioned asset with some keys cached | `partitions_missing` |
-| `unknown` | dynamic partitions (`partitions_from`) whose source has not run yet | `partitions_unknown` |
+| `unknown` | dynamic partitions (`partitions_from`) whose source has not run yet, or an asset reading a sensor with no recorded output (and what depends on either) | `partitions_unknown`, `sensor_output_unknown` |
 | `always_runs` | tasks and sensors are never cached | `task`, `sensor` |
 
 - `changed`: the run hash differs from the last materialization, because this function's code or
   its upstream outputs changed. barca records the combined run hash, not the two parts, so it
   cannot say which.
+- A node that reads a `@sensor` is judged by the sensor's last recorded output: status runs
+  nothing, so it assumes the sensor returns the same value next time, and `detail` says so. If
+  the sensor recorded a new value since the node last ran (for example a scheduled sensor), the
+  node shows as `stale` (`barca docs cache`, "External data that changes in place").
 - `upstream_stale`: an input is itself not cached, so this node's inputs will change when it runs.
   `detail` names the input.
 - `failed`: the last attempt at exactly this code and these inputs raised; `detail` carries the

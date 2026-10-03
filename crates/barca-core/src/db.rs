@@ -302,6 +302,9 @@ pub async fn init_db(db_path: &str) -> Result<(), BarcaError> {
         "ALTER TABLE materializations ADD COLUMN sinks_json TEXT",
         "ALTER TABLE materializations ADD COLUMN cpu_seconds REAL",
         "ALTER TABLE materializations ADD COLUMN max_rss_bytes INTEGER",
+        // Content hash of a sensor's output (#183): folded into its consumers' run hashes, and
+        // what `--dry-run` / `barca status` assume the sensor returns next.
+        "ALTER TABLE materializations ADD COLUMN output_hash TEXT",
     ] {
         conn.execute(col, ()).await.ok();
     }
@@ -396,6 +399,37 @@ pub async fn upsert_schedule_state(
     .await
     .map_err(|e| BarcaError::Db(format!("failed to upsert schedule_state: {e}")))?;
     Ok(())
+}
+
+/// The output hash of the latest successful materialization of each step of `base_ids` (the
+/// base id itself, or any of its partitions), keyed by display id. Steps never recorded with an
+/// output hash (never ran, or ran before barca recorded sensor outputs) are absent; so is
+/// everything when the database predates the `output_hash` column.
+pub async fn last_output_hashes(
+    cache: &CacheReader,
+    base_ids: &[&str],
+) -> Result<HashMap<String, String>, BarcaError> {
+    let mut out = HashMap::new();
+    for base in base_ids {
+        let Ok(mut rows) = cache
+            .conn()
+            .query(
+                "SELECT node_id, output_hash FROM materializations \
+                 WHERE (node_id = ?1 OR node_id LIKE ?2) AND status = 'success' \
+                 AND output_hash IS NOT NULL ORDER BY id",
+                [base.to_string(), format!("{base}[%")],
+            )
+            .await
+        else {
+            return Ok(HashMap::new());
+        };
+        while let Ok(Some(row)) = rows.next().await {
+            if let (Ok(id), Ok(h)) = (row.get::<String>(0), row.get::<String>(1)) {
+                out.insert(id, h);
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub async fn persist_outputs(

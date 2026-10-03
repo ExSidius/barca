@@ -252,6 +252,50 @@ def test_tasks_topic_several_targets_example(binary, topics, tmp_path):
     assert second["steps_executed"] == 2  # registry from cache; the tasks always re-run
 
 
+def test_cache_topic_external_data_sensor_example(binary, topics, tmp_path):
+    """The etag sensor re-runs its consumers when the data changes in place, and only then; a
+    dry run predicts from the sensor's last output, and is `unknown` before it ever ran (#183)."""
+    (code,) = (
+        b for b in blocks(topics["cache"], "python") if "def orders_etag" in b and "@asset" in b
+    )
+    (tmp_path / "pipeline.py").write_text(code)
+    (tmp_path / "orders.csv").write_text("id,total\n1,10\n")
+
+    def get(*extra: str) -> dict:
+        return result(barca(binary, tmp_path, "get", "silver", "pipeline.py", *extra))
+
+    def by_name(r: dict) -> dict:
+        return {s["id"].split(":")[-1]: s for s in r["steps"]}
+
+    never = by_name(get("--dry-run"))
+    assert never["bronze"]["action"] == "unknown"
+    assert never["bronze"]["reason"] == "sensor_output_unknown"
+    assert never["silver"]["action"] == "unknown"
+
+    first = get()
+    assert first["steps_executed"] == 3 and first["final_output"] == 2
+
+    second = get()
+    assert second["steps_executed"] == 1, "only the sensor runs when the etag is unchanged"
+    assert by_name(second)["bronze"]["status"] == "cached"
+
+    (tmp_path / "orders.csv").write_text("id,total\n1,10\n2,20\n")
+    dry = by_name(get("--dry-run"))
+    assert dry["bronze"]["action"] == "cached"
+    assert (
+        "assumes sensor 'orders_etag' returns the same value as its last run"
+        in dry["bronze"]["detail"]
+    )
+    third = get()
+    assert third["steps_executed"] == 3 and third["final_output"] == 3
+    assert by_name(third)["bronze"]["status"] == "ran"
+    assert by_name(third)["silver"]["status"] == "ran"
+
+    # The trap block: a value that changes every run, flagged in the text.
+    (trap,) = (b for b in blocks(topics["cache"], "python") if "checked_at" in b)
+    assert "re-runs bronze every time" in trap
+
+
 def test_cache_topic_helper_module_example(binary, topics, tmp_path):
     """Editing a used helper re-runs the step, editing an unused one doesn't, and every spelling
     of the pipeline path computes the same run hash (#178)."""

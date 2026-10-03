@@ -217,6 +217,15 @@ def process_inbox(files: list[str]) -> dict:
 
 Sensors are never cached -- they always re-run. The worker unpacks the `(update_detected, output)` tuple automatically, so a downstream asset's kwarg receives just `output` (as in `files: list[str]` above), not the tuple.
 
+A sensor's returned value is part of the run hash of every asset that reads it: when the value
+changes, those assets (and everything downstream of them) re-run; when it is the same, they are
+served from cache. That makes a sensor the way to track external data that changes in place, for
+example a sensor that returns a blob's etag in front of the asset that reads the blob. Return only
+what identifies the data: a value that changes on every run (a timestamp) re-runs the sensor's
+consumers every time. `--dry-run` and `barca status` assume a sensor returns its last recorded
+value, and report its consumers as `unknown` before it has ever run. See `barca docs cache`,
+"External data that changes in place". Here, `process_inbox` re-runs when the list of files changes and is cached otherwise.
+
 ## 6. Tasks
 
 Tasks handle side effects -- deploying, notifying, writing to external systems. They always re-run and are never cached.

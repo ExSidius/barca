@@ -4,25 +4,36 @@ use std::collections::HashMap;
 
 /// Compute the run_hash for a step given its context. `env` is the step's declared env values
 /// ([`crate::envdeps::hash_input`]); `None` leaves the hash exactly as a node without `env=`.
+///
+/// `outputs` maps an upstream step (display id) to a content hash of its output. Only sensors
+/// have an entry: a consumer depends on what the sensor returned, so the output hash is folded
+/// in next to the sensor's run hash (which covers only the sensor's code). Upstreams without an
+/// entry contribute their run hash alone, so a pipeline without sensors hashes exactly as it did
+/// before sensor outputs were hashed.
 pub fn compute_run_hash(
     def_hash: &str,
     partition_key: Option<&str>,
     upstream_ids: impl Iterator<Item = impl AsRef<str>>,
     cached_run_hashes: &HashMap<String, String>,
+    outputs: &HashMap<String, String>,
     env: Option<&str>,
 ) -> String {
+    let token = |key: &str, h: &String| match outputs.get(key) {
+        Some(out) => format!("{h}+output:{out}"),
+        None => h.clone(),
+    };
     let mut upstream_hashes: Vec<String> = Vec::new();
     for uid in upstream_ids {
         let uid = uid.as_ref();
         if let Some(h) = cached_run_hashes.get(uid) {
-            upstream_hashes.push(h.clone());
+            upstream_hashes.push(token(uid, h));
             continue;
         }
         // Try partition-aligned lookup (same partition as current step).
         if let Some(pk) = partition_key {
             let aligned = format!("{uid}[{pk}]");
             if let Some(h) = cached_run_hashes.get(&aligned) {
-                upstream_hashes.push(h.clone());
+                upstream_hashes.push(token(&aligned, h));
                 continue;
             }
         }
@@ -34,8 +45,8 @@ pub fn compute_run_hash(
             .collect();
         if !partition_hashes.is_empty() {
             partition_hashes.sort_by_key(|(k, _)| (*k).clone());
-            for (_, h) in partition_hashes {
-                upstream_hashes.push(h.clone());
+            for (k, h) in partition_hashes {
+                upstream_hashes.push(token(k, h));
             }
         }
     }
@@ -87,6 +98,7 @@ mod tests {
             None,
             ["upstream".to_string()].iter(),
             &hashes,
+            &HashMap::new(),
             None,
         );
         let h2 = compute_run_hash(
@@ -94,6 +106,7 @@ mod tests {
             None,
             ["upstream".to_string()].iter(),
             &hashes,
+            &HashMap::new(),
             None,
         );
         assert_eq!(h1, h2);
@@ -111,6 +124,7 @@ mod tests {
                 None,
                 ["upstream".to_string()].iter(),
                 &hashes,
+                &HashMap::new(),
                 None
             ),
             "bc7c6531d8fe3452c9a9ac36fef43665103624231e112b5d87bf20376e2e9288"
@@ -120,6 +134,7 @@ mod tests {
                 "def_abc",
                 Some("t=X"),
                 std::iter::empty::<&String>(),
+                &HashMap::new(),
                 &HashMap::new(),
                 None
             ),
@@ -207,6 +222,7 @@ def downstream(x: int) -> int:
                 None,
                 dag.upstream(id).into_iter(),
                 &hashes,
+                &HashMap::new(),
                 None,
             );
             hashes.insert(id.to_string(), h.clone());
@@ -239,6 +255,7 @@ def downstream(x: int) -> int:
                 None,
                 std::iter::empty::<&String>(),
                 &hashes,
+                &HashMap::new(),
                 hash_input(&vals).as_deref(),
             )
         };
@@ -247,6 +264,7 @@ def downstream(x: int) -> int:
             None,
             std::iter::empty::<&String>(),
             &hashes,
+            &HashMap::new(),
             None,
         );
         assert_ne!(h(Some("/a.csv")), h(Some("/b.csv")));
@@ -267,6 +285,7 @@ def downstream(x: int) -> int:
             None,
             std::iter::empty::<&String>(),
             &hashes,
+            &HashMap::new(),
             None,
         );
         let h2 = compute_run_hash(
@@ -274,8 +293,60 @@ def downstream(x: int) -> int:
             Some("t=X"),
             std::iter::empty::<&String>(),
             &hashes,
+            &HashMap::new(),
             None,
         );
         assert_ne!(h1, h2);
+    }
+
+    /// A sensor's output hash is folded into its consumer's run hash; an upstream without an
+    /// output entry (every non-sensor) contributes exactly what it did before (#183).
+    #[test]
+    fn sensor_output_is_folded_into_the_consumer_run_hash() {
+        let mut hashes = HashMap::new();
+        hashes.insert("upstream".to_string(), "h_up".to_string());
+        let with = |out: Option<&str>| {
+            let outputs: HashMap<String, String> = out
+                .map(|o| HashMap::from([("upstream".to_string(), o.to_string())]))
+                .unwrap_or_default();
+            compute_run_hash(
+                "def_abc",
+                None,
+                ["upstream".to_string()].iter(),
+                &hashes,
+                &outputs,
+                None,
+            )
+        };
+        // No output entry: the pinned pre-#183 hash.
+        assert_eq!(
+            with(None),
+            "bc7c6531d8fe3452c9a9ac36fef43665103624231e112b5d87bf20376e2e9288"
+        );
+        assert_ne!(with(Some("etag_v1")), with(None));
+        assert_ne!(with(Some("etag_v1")), with(Some("etag_v2")));
+        assert_eq!(with(Some("etag_v1")), with(Some("etag_v1")));
+    }
+
+    #[test]
+    fn sensor_output_reaches_partitioned_consumers_and_fan_ins() {
+        let mut hashes = HashMap::new();
+        hashes.insert("s".to_string(), "h_s".to_string());
+        hashes.insert("p[k=a]".to_string(), "h_pa".to_string());
+        let out = |key: &str, v: &str| HashMap::from([(key.to_string(), v.to_string())]);
+        // A partitioned consumer of an unpartitioned sensor.
+        let keyed = |o: &HashMap<String, String>| {
+            compute_run_hash("d", Some("k=a"), ["s"].iter(), &hashes, o, None)
+        };
+        assert_ne!(keyed(&out("s", "1")), keyed(&out("s", "2")));
+        // Partition-aligned and fan-in lookups use the partition's own entry.
+        let aligned = |o: &HashMap<String, String>| {
+            compute_run_hash("d", Some("k=a"), ["p"].iter(), &hashes, o, None)
+        };
+        assert_ne!(aligned(&out("p[k=a]", "1")), aligned(&out("p[k=a]", "2")));
+        let fan_in = |o: &HashMap<String, String>| {
+            compute_run_hash("d", None, ["p"].iter(), &hashes, o, None)
+        };
+        assert_ne!(fan_in(&out("p[k=a]", "1")), fan_in(&HashMap::new()));
     }
 }

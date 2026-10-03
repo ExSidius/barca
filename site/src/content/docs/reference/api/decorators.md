@@ -198,7 +198,16 @@ For partitioned assets, each partition writes its own sink file with the partiti
 
 Declares an external-state observer. Sensors must use `Manual` or `Schedule` freshness — `Always` is not valid for sensors (polling frequency must be declared explicitly). See `@asset` above for `env`, `retries` and `retry_backoff` semantics.
 
-Sensors return `(update_detected: bool, output)` tuples. The full tuple is passed as input to downstream assets.
+Sensors return `(update_detected: bool, output)` tuples. The worker unpacks the tuple: a downstream asset receives `output` only. `update_detected` is not used for caching.
+
+A sensor's returned value is part of the run hash of every asset that reads it: when the value
+changes, those assets (and everything downstream of them) re-run; when it is the same, they are
+served from cache. That makes a sensor the way to track external data that changes in place, for
+example a sensor that returns a blob's etag in front of the asset that reads the blob. Return only
+what identifies the data: a value that changes on every run (a timestamp) re-runs the sensor's
+consumers every time. `--dry-run` and `barca status` assume a sensor returns its last recorded
+value, and report its consumers as `unknown` before it has ever run. See `barca docs cache`,
+"External data that changes in place".
 
 ```python
 from barca import sensor, Schedule
