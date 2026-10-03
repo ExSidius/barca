@@ -89,12 +89,12 @@ echo "── conflict replay: remote modified between B's pull and push survives
 make_machine "$TMP/machine-c"
 unset EXEC_LOG
 # Force new work on C so it actually pushes new rows: different env var
-# changes nothing structural, so instead re-run A with --no-cache to advance
+# changes nothing structural, so instead re-run A with --refresh-all to advance
 # the blob AFTER C pulled. Simulate by interleaving: C runs with a wrapper
 # that mutates the blob between pull and push via BARCA hooks is not
 # available, so approximate: A pushes run 2, then C runs (pulls fresh) — and
 # assert the blob accumulates run history monotonically.
-(cd "$TMP/machine-a" && $BARCA get pipeline.py --no-cache --agent > /dev/null 2>&1)
+(cd "$TMP/machine-a" && $BARCA get pipeline.py --refresh-all --agent > /dev/null 2>&1)
 (cd "$TMP/machine-c" && $BARCA get pipeline.py --agent > /dev/null 2>&1)
 RUNS=$(python3 -c "
 import sqlite3

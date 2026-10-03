@@ -41,12 +41,29 @@ pub async fn db_guard() -> MutexGuard<'static, ()> {
     DB_LOCK.lock().await
 }
 
+/// The `runs.files` column: a JSON array of paths. Rows written before 0.12 hold the paths
+/// joined by spaces; those are split on whitespace.
+pub fn encode_files(files: &[String]) -> String {
+    serde_json::to_string(files).unwrap_or_default()
+}
+
+/// See [`encode_files`].
+pub fn decode_files(raw: &str) -> Vec<String> {
+    if raw.trim_start().starts_with('[')
+        && let Ok(files) = serde_json::from_str::<Vec<String>>(raw)
+    {
+        return files;
+    }
+    raw.split_whitespace().map(str::to_string).collect()
+}
+
 /// Record of a single run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunRecord {
     pub run_id: String,
     pub command: String,
-    pub files: String,
+    /// The `.py` files the run was given.
+    pub files: Vec<String>,
     pub target: Option<String>,
     pub status: String,
     pub steps_total: Option<i64>,
@@ -573,7 +590,7 @@ pub async fn get_recent_runs(db_path: &str, limit: usize) -> Result<Vec<RunRecor
         records.push(RunRecord {
             run_id: row.get::<String>(0).unwrap_or_default(),
             command: row.get::<String>(1).unwrap_or_default(),
-            files: row.get::<String>(2).unwrap_or_default(),
+            files: decode_files(&row.get::<String>(2).unwrap_or_default()),
             target: {
                 let t = row.get::<String>(3).unwrap_or_default();
                 if t.is_empty() { None } else { Some(t) }

@@ -116,7 +116,7 @@ NAME_MAPS = {"steps[].env", "targets"}
 
 # `--agent` stderr lines, normalized: timings and counters become placeholders.
 AGENT_RUNS = [
-    ["get", "keys", "pipeline.py", "--agent", "--no-cache"],
+    ["get", "keys", "pipeline.py", "--agent", "--refresh-all"],
     ["get", "total", "pipeline.py", "--agent"],
     ["run", "broken", "pipeline.py", "--agent"],
 ]

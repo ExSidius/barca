@@ -212,19 +212,19 @@ fn target_outcomes(
                     status: "failed".to_string(),
                     final_output: None,
                     error: Some(f.error.message.clone()),
-                    failed_step: Some(f.node_id.clone()),
+                    failed_node: Some(f.node_id.clone()),
                 },
                 (None, Some(out)) => TargetOutcome {
                     status: "success".to_string(),
                     final_output: Some(out),
                     error: None,
-                    failed_step: None,
+                    failed_node: None,
                 },
                 (None, None) => TargetOutcome {
                     status: "failed".to_string(),
                     final_output: None,
                     error: Some("did not run".to_string()),
-                    failed_step: None,
+                    failed_node: None,
                 },
             };
             (name.clone(), outcome)
@@ -639,6 +639,36 @@ fn report_for(
     r
 }
 
+/// How a run ended, for its last stderr line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    Done,
+    Failed,
+    Cancelled,
+}
+
+/// The last progress line of a run that executed steps, with or without `--agent`:
+/// `[barca] N/M steps | done in Xs` (`failed in`, `cancelled after`).
+fn end_of_run_line(completed: usize, total: usize, secs: f64, outcome: RunOutcome) -> String {
+    let how = match outcome {
+        RunOutcome::Done => "done in",
+        RunOutcome::Failed => "failed in",
+        RunOutcome::Cancelled => "cancelled after",
+    };
+    format!("[barca] {completed}/{total} steps | {how} {secs:.1}s")
+}
+
+/// The `--agent` line for a step that raised: `[barca] step:<id> failed: <first line of the
+/// error>`, beside the `completed` and `cached` lines.
+fn failed_step_line(node_id: &str, error: &str) -> String {
+    let first = error
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("unknown error");
+    format!("[barca] step:{node_id} failed: {first}")
+}
+
 /// Print a note above the progress bar, or to stderr when no bar is visible. A hidden bar
 /// (stderr is not a terminal, as when an agent or CI drives barca) silently swallows
 /// `ProgressBar::println`, which used to make warnings vanish.
@@ -661,11 +691,13 @@ fn short_name(node_id: &str) -> &str {
 }
 
 /// Fail before running anything when `--refresh` names something that is not an upstream
-/// asset of the target: a typo must not be a silent no-op.
+/// asset of the target: a typo must not be a silent no-op. `get` targets are assets, so with
+/// `include_targets` a target may name itself; `run` targets are tasks and never can.
 fn validate_refresh_names(
     dag: &Dag,
     target_ids: &[&str],
     names: &[String],
+    include_targets: bool,
 ) -> Result<(), BarcaError> {
     let cone: Vec<&str> = if target_ids.is_empty() {
         dag.topo_order()
@@ -674,7 +706,7 @@ fn validate_refresh_names(
     };
     let assets: Vec<&str> = cone
         .into_iter()
-        .filter(|id| !target_ids.contains(id))
+        .filter(|id| include_targets || !target_ids.contains(id))
         .filter(|id| {
             dag.get_node(id)
                 .is_some_and(|n| n.kind() == crate::NodeKind::Asset)
@@ -807,9 +839,10 @@ pub struct TargetOutcome {
     /// The error of the step that failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The step that failed: the target itself, or a step upstream of it.
+    /// The step that failed: the target itself, or a step upstream of it (`failed_node`, the
+    /// same key a failed single-target run uses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failed_step: Option<String>,
+    pub failed_node: Option<String>,
 }
 
 /// How a step was (or, in a dry run, will be) treated.
@@ -859,33 +892,73 @@ pub struct PartitionSummary {
 /// What `--dry-run` reports: the same decisions a real run would make, without making them.
 ///
 /// Serialized with `target` (one target, or null for the whole file) or, when several targets
-/// were given, `targets` (their names) in its place.
-#[derive(Debug, Clone, Deserialize)]
+/// were given, `targets` in its place: an object keyed by target name in the order given, like a
+/// real multi-target run, each `{"summary": {...}}` counted over that target's cone.
+#[derive(Debug, Clone)]
 pub struct ExplainResult {
     pub dry_run: bool,
     pub command: String,
     pub target: Option<String>,
-    /// Every target when more than one was given; empty otherwise.
-    #[serde(default)]
-    pub targets: Vec<String>,
+    /// Every target with its predicted summary when more than one was given; empty otherwise.
+    pub targets: Vec<(String, TargetPrediction)>,
     pub steps: Vec<StepReport>,
     pub summary: ExplainSummary,
+}
+
+/// One target of a multi-target dry run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TargetPrediction {
+    /// The dry-run summary counted over this target's cone only (shared upstream steps count
+    /// for every target that needs them).
+    pub summary: ExplainSummary,
+}
+
+impl ExplainResult {
+    /// The target names in scope: the several given, the one given, or none (whole file).
+    pub fn target_names(&self) -> Vec<String> {
+        if self.targets.is_empty() {
+            self.target.iter().cloned().collect()
+        } else {
+            self.targets.iter().map(|(n, _)| n.clone()).collect()
+        }
+    }
 }
 
 impl Serialize for ExplainResult {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
+        struct Targets<'a>(&'a [(String, TargetPrediction)]);
+        impl Serialize for Targets<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                s.collect_map(self.0.iter().map(|(k, v)| (k, v)))
+            }
+        }
         let mut s = serializer.serialize_struct("ExplainResult", 5)?;
         s.serialize_field("dry_run", &self.dry_run)?;
         s.serialize_field("command", &self.command)?;
         if self.targets.len() > 1 {
-            s.serialize_field("targets", &self.targets)?;
+            s.serialize_field("targets", &Targets(&self.targets))?;
         } else {
             s.serialize_field("target", &self.target)?;
         }
         s.serialize_field("steps", &self.steps)?;
         s.serialize_field("summary", &self.summary)?;
         s.end()
+    }
+}
+
+impl ExplainSummary {
+    /// Add one (merged) dry-run step line: a partitioned line counts its keys.
+    fn add(&mut self, r: &StepReport) {
+        match (r.action.as_deref(), &r.partitions) {
+            (Some("unknown"), _) => self.unknown += 1,
+            (_, Some(p)) => {
+                self.cached += p.cached;
+                self.will_run += p.will_run;
+            }
+            (Some("cached"), None) => self.cached += 1,
+            _ => self.will_run += 1,
+        }
     }
 }
 
@@ -905,8 +978,29 @@ pub struct PlanResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanPhase {
-    pub reason: String,
+    /// Why this phase starts: `{"type": "initial"}`, or `{"type": "fan_in", "node_id": ...}`
+    /// when it waits for a node that gathers several upstream results.
+    pub reason: PlanPhaseReason,
     pub streams: Vec<PlanStream>,
+}
+
+/// [`crate::planner::PhaseReason`] as `barca plan` prints it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PlanPhaseReason {
+    Initial,
+    FanIn { node_id: String },
+}
+
+impl From<&crate::planner::PhaseReason> for PlanPhaseReason {
+    fn from(r: &crate::planner::PhaseReason) -> Self {
+        match r {
+            crate::planner::PhaseReason::Initial => PlanPhaseReason::Initial,
+            crate::planner::PhaseReason::FanIn { node_id } => PlanPhaseReason::FanIn {
+                node_id: node_id.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -973,12 +1067,11 @@ fn default_pool_size() -> usize {
 /// How the engine treats cached asset materializations for this invocation.
 #[derive(Debug, Clone)]
 pub enum CachePolicy {
-    /// Normal cache-aware behavior — reuse fresh asset artifacts (`barca get`).
+    /// Normal cache-aware behavior — reuse fresh asset artifacts.
     CacheAware,
-    /// Force-rerun every asset in the target's cone
-    /// (`barca run <task> --refresh-all` / `--no-cache`).
+    /// Force-rerun every asset in the target's cone (`barca get|run ... --refresh-all`).
     RefreshAll,
-    /// Force-rerun the named assets (`barca run <task> --refresh a,b`). A name matches when it
+    /// Force-rerun the named assets (`barca get|run ... --refresh a,b`). A name matches when it
     /// equals the node's base id exactly, or matches the trailing `:name` segment. With
     /// `cascade` (the default) every asset downstream of a named one in the target's cone
     /// re-runs too; without it (`--no-cascade`) all other assets stay cache-aware.
@@ -993,21 +1086,13 @@ pub async fn get(
     target_name: Option<&str>,
     file_args: &[String],
     python: &PathBuf,
-    no_cache: bool,
+    policy: CachePolicy,
     agent_mode: bool,
     cancel: CancellationToken,
 ) -> Result<GetResult, BarcaError> {
     let names: Vec<String> = target_name.map(str::to_string).into_iter().collect();
     execute(
-        cfg,
-        &names,
-        file_args,
-        python,
-        no_cache,
-        agent_mode,
-        CachePolicy::CacheAware,
-        "get",
-        cancel,
+        cfg, &names, file_args, python, false, agent_mode, policy, "get", cancel,
     )
     .await?
     .into_single()
@@ -1047,7 +1132,7 @@ pub async fn get_many(
     target_names: &[String],
     file_args: &[String],
     python: &PathBuf,
-    no_cache: bool,
+    policy: CachePolicy,
     agent_mode: bool,
     cancel: CancellationToken,
 ) -> Result<MultiResult, BarcaError> {
@@ -1056,9 +1141,9 @@ pub async fn get_many(
         target_names,
         file_args,
         python,
-        no_cache,
+        false,
         agent_mode,
-        CachePolicy::CacheAware,
+        policy,
         "get",
         cancel,
     )
@@ -1187,7 +1272,7 @@ pub(crate) async fn explain_dag(
     };
     let exec_plan = plan_for_targets(dag, &target_ids, &config, command_label);
     if let CachePolicy::RefreshSelective { names, .. } = &policy {
-        validate_refresh_names(dag, &target_ids, names)?;
+        validate_refresh_names(dag, &target_ids, names, command_label == "get")?;
     }
 
     // Shared remote state: pull it like a real run, so the cache check sees every machine's
@@ -1295,6 +1380,23 @@ pub(crate) async fn explain_dag(
     }
     drop(cache);
 
+    let steps = merge_partition_reports(steps);
+    // Per-target predictions: the same step lines, counted over each target's cone.
+    let per_target = if targets.len() > 1 {
+        targets
+            .iter()
+            .map(|(name, id)| {
+                let cone: std::collections::HashSet<&str> = dag.subgraph(id).into_iter().collect();
+                let mut s = ExplainSummary::default();
+                for r in steps.iter().filter(|r| cone.contains(r.id.as_str())) {
+                    s.add(r);
+                }
+                (name.clone(), TargetPrediction { summary: s })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     Ok(ExplainResult {
         dry_run: true,
         command: command_label.to_string(),
@@ -1302,12 +1404,8 @@ pub(crate) async fn explain_dag(
             [one] => Some(short_name(one).to_string()),
             _ => None,
         },
-        targets: if targets.len() > 1 {
-            targets.iter().map(|(name, _)| name.clone()).collect()
-        } else {
-            Vec::new()
-        },
-        steps: merge_partition_reports(steps),
+        targets: per_target,
+        steps,
         summary,
     })
 }
@@ -1377,7 +1475,7 @@ async fn execute(
     trace_point!("planned");
 
     if let CachePolicy::RefreshSelective { names, .. } = &policy {
-        validate_refresh_names(&dag, &target_ids, names)?;
+        validate_refresh_names(&dag, &target_ids, names, command_label == "get")?;
     }
 
     db::ensure_env_dirs(&cfg.env)?;
@@ -1402,7 +1500,7 @@ async fn execute(
         &db_path,
         &run_id,
         command_label,
-        &file_args.join(" "),
+        &db::encode_files(file_args),
         target_label.as_deref(),
         Some(exec_plan.total_steps),
     )
@@ -1838,6 +1936,9 @@ async fn execute(
                 continue;
             }
             let node_id = item.step_id.display();
+            if agent_mode {
+                eprintln!("{}", failed_step_line(&node_id, error_msg));
+            }
             if first_non_group_failure.is_none() {
                 first_non_group_failure = Some((node_id.clone(), error_msg.to_string()));
             }
@@ -1892,21 +1993,21 @@ async fn execute(
     pool.shutdown().await;
     trace_point!("pool_shutdown");
 
-    // Finish progress bar.
+    // Finish progress bar. The end-of-run line is the same with and without --agent.
     if let Some(ref bar) = pb {
-        if steps_executed > 0 {
-            bar.finish_and_clear();
-            eprintln!(
-                "[barca] {}/{} steps done in {:.1}s",
-                completed_steps, total_steps, elapsed_so_far
-            );
+        bar.finish_and_clear();
+    }
+    if (pb.is_some() || agent_mode) && steps_executed > 0 {
+        let outcome = if cancel.is_cancelled() {
+            RunOutcome::Cancelled
+        } else if phase_error.is_some() || step_failure.is_some() {
+            RunOutcome::Failed
         } else {
-            bar.finish_and_clear();
-        }
-    } else if agent_mode && steps_executed > 0 {
+            RunOutcome::Done
+        };
         eprintln!(
-            "[barca] {}/{} steps | done in {:.1}s",
-            completed_steps, total_steps, elapsed_so_far
+            "{}",
+            end_of_run_line(completed_steps, total_steps, elapsed_so_far, outcome)
         );
     }
 
@@ -1935,7 +2036,7 @@ async fn execute(
             "success"
         },
         command: command_label,
-        files: file_args.join(" "),
+        files: db::encode_files(file_args),
         target: target_label.as_deref(),
         steps_total: exec_plan.total_steps,
         steps_executed,
@@ -2224,7 +2325,7 @@ pub async fn plan(file_args: &[String], python: &PathBuf) -> Result<PlanResult, 
             .phases
             .iter()
             .map(|p| PlanPhase {
-                reason: format!("{:?}", p.reason),
+                reason: PlanPhaseReason::from(&p.reason),
                 streams: p
                     .streams
                     .iter()
@@ -2593,7 +2694,7 @@ fn resolve_dynamic_partitions(nodes: &mut [crate::model::ExtractedNode], python:
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     eprintln!(
-                        "Warning: failed to evaluate partition expression '{}' for {}: {}",
+                        "[barca] warning: failed to evaluate partition expression '{}' for {}: {}",
                         source_text,
                         node.function_name,
                         stderr.trim()
@@ -2733,7 +2834,7 @@ def lone() -> int:
             status: status.to_string(),
             final_output: None,
             error: None,
-            failed_step: None,
+            failed_node: None,
         }
     }
 
@@ -2831,15 +2932,17 @@ def lone() -> int:
     fn refresh_names_may_come_from_any_targets_cone() {
         let dag = dag();
         let both = ["p.py:check_a", "p.py:check_b"];
-        validate_refresh_names(&dag, &both, &names(&["src", "deeper"])).unwrap();
-        let msg = validate_refresh_names(&dag, &both, &names(&["lone"]))
+        validate_refresh_names(&dag, &both, &names(&["src", "deeper"]), false).unwrap();
+        let msg = validate_refresh_names(&dag, &both, &names(&["lone"]), false)
             .unwrap_err()
             .to_string();
         assert!(
             msg.contains("in the cones of 'check_a', 'check_b'"),
             "{msg}"
         );
-        assert!(validate_refresh_names(&dag, &["p.py:check_a"], &names(&["deeper"])).is_err());
+        assert!(
+            validate_refresh_names(&dag, &["p.py:check_a"], &names(&["deeper"]), false).is_err()
+        );
     }
 
     #[test]
@@ -2870,10 +2973,72 @@ def lone() -> int:
         assert_eq!(out[0].1.status, "success");
         assert_eq!(out[0].1.final_output.as_ref().unwrap().path, "a.json");
         assert_eq!(out[1].1.status, "failed");
-        assert_eq!(out[1].1.failed_step.as_deref(), Some("p.py:left"));
+        assert_eq!(out[1].1.failed_node.as_deref(), Some("p.py:left"));
         assert_eq!(out[1].1.error.as_deref(), Some("boom"));
         assert_eq!(out[2].1.status, "failed");
         assert_eq!(out[2].1.error.as_deref(), Some("did not run"));
+    }
+
+    #[test]
+    fn end_of_run_line_is_one_format_and_never_says_done_on_failure() {
+        assert_eq!(
+            end_of_run_line(3, 3, 1.26, RunOutcome::Done),
+            "[barca] 3/3 steps | done in 1.3s"
+        );
+        let failed = end_of_run_line(0, 3, 0.0, RunOutcome::Failed);
+        assert_eq!(failed, "[barca] 0/3 steps | failed in 0.0s");
+        assert!(!failed.contains("done"));
+        assert_eq!(
+            end_of_run_line(1, 3, 2.0, RunOutcome::Cancelled),
+            "[barca] 1/3 steps | cancelled after 2.0s"
+        );
+    }
+
+    #[test]
+    fn failed_step_line_names_the_step_and_the_first_error_line() {
+        assert_eq!(
+            failed_step_line(
+                "p.py:broken",
+                "\nValueError: boom\n  File \"p.py\", line 3, in broken"
+            ),
+            "[barca] step:p.py:broken failed: ValueError: boom"
+        );
+        assert_eq!(
+            failed_step_line("p.py:x", ""),
+            "[barca] step:p.py:x failed: unknown error"
+        );
+    }
+
+    #[test]
+    fn summary_add_counts_like_the_dry_run() {
+        let line = |action: &str, p: Option<(usize, usize)>| StepReport {
+            action: Some(action.to_string()),
+            partitions: p.map(|(cached, will_run)| PartitionSummary {
+                total: cached + will_run,
+                cached,
+                will_run,
+                will_run_keys: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let mut s = ExplainSummary::default();
+        for r in [
+            line("cached", None),
+            line("run", None),
+            line("unknown", None),
+            line("partial", Some((2, 3))),
+            line("run", Some((0, 4))),
+        ] {
+            s.add(&r);
+        }
+        assert_eq!(
+            s,
+            ExplainSummary {
+                will_run: 8,
+                cached: 3,
+                unknown: 1
+            }
+        );
     }
 
     #[test]
@@ -2890,10 +3055,30 @@ def lone() -> int:
         assert_eq!(one["target"], "a");
         assert!(one.get("targets").is_none());
         r.target = None;
-        r.targets = names(&["a", "b"]);
+        let predicted = |will_run| TargetPrediction {
+            summary: ExplainSummary {
+                will_run,
+                cached: 1,
+                unknown: 0,
+            },
+        };
+        r.targets = vec![
+            ("b".to_string(), predicted(2)),
+            ("a".to_string(), predicted(0)),
+        ];
+        assert_eq!(r.target_names(), names(&["b", "a"]));
         let many = serde_json::to_value(&r).unwrap();
-        assert_eq!(many["targets"], serde_json::json!(["a", "b"]));
+        assert_eq!(
+            many["targets"],
+            serde_json::json!({
+                "b": {"summary": {"will_run": 2, "cached": 1, "unknown": 0}},
+                "a": {"summary": {"will_run": 0, "cached": 1, "unknown": 0}},
+            })
+        );
         assert!(many.get("target").is_none());
+        // Keyed in the order given, like a real multi-target run.
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.find("\"b\"").unwrap() < s.find("\"a\"").unwrap(), "{s}");
     }
 
     #[test]

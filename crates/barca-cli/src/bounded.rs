@@ -14,7 +14,15 @@ use serde_json::{Map, Value};
 pub const LIST_DEFAULT_LIMIT: usize = 100;
 
 /// Item fields of `barca list --json` (`nodes[]`). `next_fire` appears only on scheduled nodes.
-pub const LIST_FIELDS: &[&str] = &["id", "kind", "freshness", "inputs", "env", "next_fire"];
+pub const LIST_FIELDS: &[&str] = &[
+    "id",
+    "kind",
+    "freshness",
+    "schedule",
+    "inputs",
+    "env",
+    "next_fire",
+];
 
 /// Item fields of `barca history --json` (`runs[]`).
 pub const HISTORY_FIELDS: &[&str] = &[
@@ -192,13 +200,15 @@ mod tests {
         let node = barca_core::commands::AssetSummary {
             id: "p.py:a".into(),
             kind: barca_core::NodeKind::Asset,
-            freshness: barca_core::Freshness::Always,
+            freshness: barca_core::Freshness::Schedule(barca_core::CronExpr("0 6 * * *".into())),
             inputs: vec![],
             env: vec![],
         };
-        let mut want = keys(&serde_json::to_value(node).unwrap());
-        want.insert("next_fire".into()); // added by `barca list` for scheduled nodes
-        assert_eq!(want, set(LIST_FIELDS));
+        let next = "2026-01-01 06:00".to_string();
+        let v = crate::list_node_json(&node, Some(&next));
+        assert_eq!(v["freshness"], "schedule");
+        assert_eq!(v["schedule"], "0 6 * * *");
+        assert_eq!(keys(&v), set(LIST_FIELDS));
     }
 
     #[test]
@@ -206,7 +216,7 @@ mod tests {
         let run = barca_core::db::RunRecord {
             run_id: String::new(),
             command: String::new(),
-            files: String::new(),
+            files: vec![],
             target: None,
             status: String::new(),
             steps_total: None,

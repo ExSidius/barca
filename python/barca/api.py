@@ -150,7 +150,26 @@ def _read_output(output_ref: Any) -> Any:
     return output_ref
 
 
-def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
+def _refresh_args(refresh: list[str] | None, refresh_all: bool, cascade: bool) -> list[str]:
+    """The refresh flags shared by ``get`` and ``run``."""
+    if refresh_all:
+        return ["--refresh-all"]
+    if refresh:
+        args = ["--refresh", ",".join(refresh)]
+        if not cascade:
+            args.append("--no-cascade")
+        return args
+    return []
+
+
+def get(
+    target_or_file: str,
+    *extra_files: str,
+    refresh: list[str] | None = None,
+    refresh_all: bool = False,
+    cascade: bool = True,
+    no_cache: bool = False,
+) -> Any:
     """Get asset value(s).
 
     If target_or_file ends in .py, gets every asset and sensor in the file and
@@ -158,11 +177,25 @@ def get(target_or_file: str, *extra_files: str, no_cache: bool = False) -> Any:
     with only tasks returns None.
     Otherwise, treats it as a target asset name and remaining args as files.
 
+    Assets come from cache when fresh. ``refresh=["asset", ...]`` re-materializes
+    those assets (the target may be one of them) and everything downstream of
+    them; ``cascade=False`` (``--no-cascade``) re-materializes only the named
+    ones. ``refresh_all=True`` re-materializes every asset in the cone.
+    ``no_cache=True`` is the deprecated spelling of ``refresh_all=True``.
+
     Returns the deserialized value of the target asset directly.
     """
-    args: list[str] = ["get", target_or_file, *extra_files, "--json"]
     if no_cache:
-        args.append("--no-cache")
+        import warnings
+
+        warnings.warn(
+            "barca.get(no_cache=True) is deprecated; use refresh_all=True",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        refresh_all = True
+    args: list[str] = ["get", target_or_file, *extra_files, "--json"]
+    args += _refresh_args(refresh, refresh_all, cascade)
     result = _exec(args)
     output = result.get("final_output")
     if output is not None:
@@ -188,12 +221,7 @@ def run(
     Returns the deserialized value of the target task directly (or ``None``).
     """
     args: list[str] = ["run", target, *files, "--json"]
-    if refresh_all:
-        args.append("--refresh-all")
-    elif refresh:
-        args += ["--refresh", ",".join(refresh)]
-        if not cascade:
-            args.append("--no-cascade")
+    args += _refresh_args(refresh, refresh_all, cascade)
     result = _exec(args)
     output = result.get("final_output")
     if output is not None:
@@ -218,7 +246,7 @@ def history(limit: int = 10) -> list[dict]:
     Returns a list of dicts, each with:
         - run_id: str
         - command: str
-        - files: str
+        - files: list[str]
         - target: str | None
         - status: str
         - steps_total: int | None
@@ -236,7 +264,7 @@ def stats(target: str, file: str, *extra_files: str) -> dict:
     """Return execution statistics for an asset.
 
     Returns a dict with:
-        - node_id: str
+        - id: str
         - total_runs: int
         - avg_elapsed_seconds: float | None
         - cache_hit_rate: float

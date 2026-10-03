@@ -251,7 +251,7 @@ fn spawn_run(state: AppState, kind: RunKind) -> String {
                         target.as_deref(),
                         &files,
                         &python,
-                        false,
+                        commands::CachePolicy::CacheAware,
                         true,
                         cancel.clone(),
                     )

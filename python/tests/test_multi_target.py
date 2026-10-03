@@ -145,7 +145,7 @@ def test_a_failing_target_does_not_stop_the_others(project):
     assert out["targets"]["check_a"] == {"status": "success", "final_output": {"a_ok": True}}
     failed = out["targets"]["boom"]
     assert failed["status"] == "failed"
-    assert failed["failed_step"] == "pipeline.py:boom"
+    assert failed["failed_node"] == "pipeline.py:boom"
     assert "check failed on purpose" in failed["error"]
     assert "boom" in proc.stderr
     # The run reports failure on stdout, and the error envelope (#154) is the last stderr line.
@@ -169,7 +169,7 @@ def test_a_failed_upstream_fails_only_the_targets_that_depend_on_it(project):
     }
     failed = out["targets"]["needs_broken"]
     assert failed["status"] == "failed"
-    assert failed["failed_step"] == "pipeline.py:broken"
+    assert failed["failed_node"] == "pipeline.py:broken"
     assert "broken upstream" in failed["error"]
     by = {s["id"].split(":")[-1]: s for s in out["steps"]}
     assert by["broken"]["status"] == "failed"
@@ -197,15 +197,24 @@ def test_a_repeated_name_is_one_target(project):
 def test_dry_run_with_several_targets_reports_the_union_once(project):
     dry = ok(barca(project, "run", "check_a,check_b", "pipeline.py", "--dry-run"))
     assert dry["dry_run"] is True and dry["command"] == "run"
-    assert dry["targets"] == ["check_a", "check_b"]
+    # Keyed by target like a real run (#180), each with its own predicted summary.
+    assert list(dry["targets"]) == ["check_a", "check_b"]
+    assert dry["targets"]["check_a"] == {"summary": {"will_run": 2, "cached": 0, "unknown": 0}}
     assert "target" not in dry
     assert sorted(ids(dry)) == ["check_a", "check_b", "src"]
     assert dry["summary"] == {"will_run": 3, "cached": 0, "unknown": 0}
     assert not (project / ".barca").exists()
     real = ok(barca(project, "run", "check_a,check_b", "pipeline.py"))
     assert real["steps_executed"] == 3
+    assert list(real["targets"]) == list(dry["targets"])
     warm = ok(barca(project, "run", "check_a,check_b", "pipeline.py", "--dry-run"))
     assert warm["summary"] == {"will_run": 2, "cached": 1, "unknown": 0}
+    assert warm["targets"]["check_b"]["summary"] == {"will_run": 1, "cached": 1, "unknown": 0}
+
+
+def test_dry_run_targets_keep_the_order_given(project):
+    dry = ok(barca(project, "get", "right,left", "pipeline.py", "--dry-run"))
+    assert list(dry["targets"]) == ["right", "left"]
 
 
 def test_single_target_dry_run_shape_is_unchanged(project):

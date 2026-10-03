@@ -62,7 +62,9 @@ Examples:
   barca get total pipeline.py              # one target and only its upstream cone
   barca get total,orders pipeline.py       # several targets in one run; shared upstream runs once
   barca get total pipeline.py other.py     # target defined across several files
-  barca get total pipeline.py --no-cache   # recompute everything in that cone
+  barca get total pipeline.py --refresh-all        # recompute everything in that cone
+  barca get total pipeline.py --refresh clean      # recompute clean and everything downstream of it
+  barca get total pipeline.py --refresh clean --no-cascade   # recompute only clean
   barca get total pipeline.py --dry-run    # what would run vs come from cache; changes nothing
   barca get total pipeline.py --json       # JSON even in a terminal (the default when piped)
   barca get total pipeline.py --pretty     # summary and value for humans (the default in a terminal)
@@ -81,8 +83,12 @@ secrets redacted). For parquet/pickle assets final_output is a pointer,
 {\"_barca_artifact\": {\"path\", \"format\", \"size_bytes\"}}; the Python API (barca.get)
 loads the value for you.
 Several targets (`a,b`, comma-separated, no spaces): final_output is replaced by `targets`, keyed by
-target, each {status: success, final_output} or {status: failed, failed_step, error}. Every target
+target, each {status: success, final_output} or {status: failed, failed_node, error}. Every target
 runs even if another fails; exit 1 if any failed.
+Refresh: the same vocabulary as `barca run`. --refresh takes ONE comma-separated list of assets in
+the cone (the target itself may be named) and also re-runs everything downstream of them;
+--no-cascade re-runs only the named ones. --refresh-all re-runs every asset in the cone.
+--no-cache is a deprecated spelling of --refresh-all: it still works and warns on stderr.
 Targets must be assets; use `barca run` for tasks. With no target, get materializes every asset and
 sensor and skips tasks (previously it ran tasks too); stderr names the skipped tasks and the
 `barca run` command. A file with only tasks gets nothing: exit 0, empty `steps`.
@@ -100,7 +106,6 @@ Examples:
   barca run deploy pipeline.py --refresh fetch,clean   # re-materialize these and everything downstream of them
   barca run deploy pipeline.py --refresh fetch --no-cascade   # re-materialize only fetch; downstream stays cached
   barca run deploy pipeline.py --refresh-all           # re-materialize every upstream asset
-  barca run deploy pipeline.py --no-cache              # same as --refresh-all
   barca run deploy pipeline.py --dry-run --refresh fetch   # preview: which steps run, which are cached
   barca run deploy pipeline.py --json                  # JSON even in a terminal (the default when piped)
   barca run deploy pipeline.py --pretty                # summary for humans (the default in a terminal)
@@ -116,8 +121,9 @@ target, instead of `final_output` (see barca get --help, barca docs agents).
 --refresh takes ONE comma-separated list (`--refresh a,b`), never `--refresh a b`. It re-runs the
 assets you name and every asset downstream of them in the task's cone (reason `refresh_cascade`),
 so fresh data reaches the task. --no-cascade re-runs only the named assets; cached assets
-downstream of them then do not reflect the refresh, and barca warns. (Previously --refresh did
-not cascade.) A name that is not an upstream asset is an error.
+downstream of them then do not reflect the refresh, and barca warns. A name that is not an
+upstream asset is an error. --no-cache is a deprecated spelling of --refresh-all: it still works
+and warns on stderr.
 The target must be a task; use `barca get` for assets. The target comes before the files:
 `barca run pipeline.py deploy` exits 2 and prints `barca run deploy pipeline.py`. Every usage
 error exits 2 and ends by pointing at `barca list <files>`.
@@ -133,7 +139,9 @@ Examples:
   barca plan pipeline.py other.py     # several files form one DAG
 
 Output: always pretty-printed JSON {total_steps, phases: [{reason, streams: [{stream_id, steps}]}]}.
-Planning is static analysis: it never imports your code.
+`reason` is an object: {\"type\": \"initial\"} or {\"type\": \"fan_in\", \"node_id\": ...}.
+Planning is static analysis: it never imports your code or reads state, so it takes no --env.
+Experimental: the layout may change between releases (barca docs contract).
 More: barca docs agents";
 
 const HISTORY_HELP: &str = "\
@@ -147,13 +155,14 @@ Examples:
   barca history --env dev      # runs recorded in another environment
 
 Newest first. When more runs exist than are shown, JSON says `\"truncated\": true` with the
-`total`, and the table prints a one-line note on stderr.
+`total`, and the table prints a one-line note on stderr. In JSON, `files` is an array: the .py
+files the run was given.
 More: barca docs agents, barca docs cache";
 
 const STATS_HELP: &str = "\
 Examples:
   barca stats total pipeline.py             # timing percentiles and cache hit rate
-  barca stats total pipeline.py --json      # the same as one JSON object, even in a terminal
+  barca stats total pipeline.py --json      # {id, total_runs, cache_hit_rate, ..., recent_runs}, even in a terminal
   barca stats total pipeline.py --pretty    # the text report, even when piped
   barca stats total pipeline.py --fields status,error_message   # JSON; trims recent_runs entries
 
@@ -161,7 +170,7 @@ More: barca docs cache";
 
 const SERVE_HELP: &str = "\
 Examples:
-  barca serve pipeline.py                    # HTTP API on 127.0.0.1:8274 plus the scheduler
+  barca serve pipeline.py                    # HTTP API on 127.0.0.1:8274 plus the scheduler (files required)
   barca serve pipeline.py --port 8400        # custom port
   barca serve pipeline.py --watch            # dev: re-parse the DAG when files change
   barca serve pipeline.py --no-schedule      # API only; Schedule(...) nodes do not fire
@@ -173,7 +182,7 @@ More: barca docs scheduling";
 const LIST_HELP: &str = "\
 Examples:
   barca list pipeline.py             # table of nodes (in a terminal; JSON when piped)
-  barca list pipeline.py --json      # {nodes: [{id, kind, freshness, inputs, env, next_fire?}], total, truncated}
+  barca list pipeline.py --json      # {nodes: [{id, kind, freshness, schedule?, inputs, env, next_fire?}], total, truncated}
   barca list pipeline.py --pretty    # the table, even when piped
   barca list pipeline.py --fields id,inputs   # JSON with only these keys per node
   barca list big.py --limit 20       # first 20 nodes (topological order)
@@ -181,7 +190,9 @@ Examples:
   barca list a.py b.py               # several files form one DAG
 
 An ENV column (and `env` in JSON) lists the environment variables each node declares with
-@asset(env=[...]); their values are part of the run hash.
+@asset(env=[...]); their values are part of the run hash. `freshness` is `always`, `manual` or
+`schedule`; a scheduled node also has `schedule` (the cron expression) and `next_fire`.
+`list` reads no state, so it takes no --env.
 
 Run this first to confirm barca discovered your nodes. When more nodes exist than are shown,
 JSON says `\"truncated\": true` with the `total`, and the table prints a note on stderr.
@@ -191,17 +202,20 @@ const STATUS_HELP: &str = "\
 Examples:
   barca status pipeline.py                 # table in a terminal (JSON when piped): kind, cache state, last run, shape
   barca status total pipeline.py           # only `total` and its upstream cone
-  barca status pipeline.py --json          # {target, nodes, summary, total, truncated}, even in a terminal
+  barca status total,orders pipeline.py    # several targets: the union of their cones
+  barca status pipeline.py --json          # {target, targets, nodes, summary, total, truncated}, even in a terminal
   barca status pipeline.py --pretty        # the table, even when piped
   barca status pipeline.py --fields id,cache   # JSON with only these keys per node
   barca status big.py --limit 20           # first 20 nodes (default: at most 100); the summary counts all
   barca status total pipeline.py --json --sample 5   # add up to 5 sample rows per json/parquet artifact
   barca status pipeline.py --env dev       # state recorded in another environment
 
-Cache state per node: cached, stale (ran before; code or inputs changed), never-run, partial
-(some partition keys cached), unknown (dynamic partitions not yet known) or always-runs (tasks,
-sensors), with a reason. It is the same decision `--dry-run` makes. Read-only: never imports your
-code, never writes. Shape (rows, columns, type) is read from the artifact file only.
+Cache state per node: cached, stale (ran before; code or inputs changed), never_run, partial
+(some partition keys cached), unknown (dynamic partitions not yet known) or always_runs (tasks,
+sensors), with a reason. JSON spells the states in snake_case, the same as the `summary` keys
+(the table prints never-run, always-runs). It is the same decision `--dry-run` makes.
+Read-only: never imports your code, never writes. Shape (rows, columns, type) is read from the
+artifact file only.
 More: barca docs status, barca docs agents";
 
 const DOCS_HELP: &str = "\
@@ -253,8 +267,20 @@ enum Cli {
         output: Option<OutputMode>,
         #[command(flatten)]
         format: FormatFlags,
-        /// Skip cache — execute everything fresh
+        /// Assets to force re-materialize, as ONE comma-separated list (`--refresh a,b`, not
+        /// `--refresh a b`); the target itself may be named. Every asset downstream of them in
+        /// the target's cone re-materializes too (see --no-cascade)
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["refresh_all", "no_cache"])]
+        refresh: Option<Vec<String>>,
+        /// With --refresh: re-materialize only the named assets, not what is downstream of
+        /// them. Cached downstream assets then do not reflect the refresh; barca warns
+        #[arg(long, requires = "refresh")]
+        no_cascade: bool,
+        /// Force re-materialize EVERY asset in the target's cone (nothing comes from cache)
         #[arg(long)]
+        refresh_all: bool,
+        /// Deprecated spelling of --refresh-all (prints a warning; removed in a future minor)
+        #[arg(long, hide = true, conflicts_with = "refresh_all")]
         no_cache: bool,
         /// Show what this command would do (each step cached or will-run, and why) without
         /// running or writing anything
@@ -275,8 +301,7 @@ enum Cli {
     ///
     /// The task always re-runs. Upstream assets are served from cache when fresh
     /// (same as `barca get`). Use `--refresh` to force re-materialize specific
-    /// upstream assets, or `--refresh-all` / `--no-cache` to refresh the entire
-    /// upstream cone.
+    /// upstream assets, or `--refresh-all` to refresh the entire upstream cone.
     #[command(after_help = RUN_HELP)]
     Run {
         /// TARGET[,TARGET...] file.py [file.py ...] — one or more target tasks, comma-separated
@@ -285,15 +310,18 @@ enum Cli {
         /// Upstream assets to force re-materialize, as ONE comma-separated list
         /// (`--refresh a,b`, not `--refresh a b`). Every asset downstream of them in the
         /// task's cone re-materializes too (see --no-cascade)
-        #[arg(long, value_delimiter = ',', conflicts_with = "refresh_all")]
+        #[arg(long, value_delimiter = ',', conflicts_with_all = ["refresh_all", "no_cache"])]
         refresh: Option<Vec<String>>,
         /// With --refresh: re-materialize only the named assets, not what is downstream of
         /// them. Cached downstream assets then do not reflect the refresh; barca warns
         #[arg(long, requires = "refresh")]
         no_cascade: bool,
-        /// Force re-materialize ALL upstream assets in the task's cone
-        #[arg(long, alias = "no-cache")]
+        /// Force re-materialize EVERY asset in the task's cone (nothing comes from cache)
+        #[arg(long)]
         refresh_all: bool,
+        /// Deprecated spelling of --refresh-all (prints a warning; removed in a future minor)
+        #[arg(long, hide = true, conflicts_with = "refresh_all")]
+        no_cache: bool,
         /// Show what this command would do (each step cached or will-run, and why) without
         /// running or writing anything
         #[arg(long)]
@@ -320,9 +348,6 @@ enum Cli {
         /// Python source files containing @asset definitions
         #[arg(required = true)]
         files: Vec<PathBuf>,
-        /// Environment name (accepted for symmetry; planning uses no state)
-        #[arg(long)]
-        env: Option<String>,
     },
     /// Show recent run history
     #[command(after_help = HISTORY_HELP)]
@@ -411,10 +436,11 @@ enum Cli {
     ///
     /// One aggregated view: what `barca list`, `--dry-run`, `barca history` and a look inside the
     /// artifact would each tell you. If the first positional arg ends in .py, all args are files;
-    /// otherwise the first is a target and only its upstream cone is shown.
+    /// otherwise the first is a target (or several, comma-separated: `a,b`) and only the
+    /// upstream cones of the targets are shown.
     #[command(after_help = STATUS_HELP)]
     Status {
-        /// [TARGET] file.py [file.py ...] — target is optional
+        /// [TARGET[,TARGET...]] file.py [file.py ...] — target is optional
         #[arg(required = true)]
         args: Vec<String>,
         #[command(flatten)]
@@ -476,7 +502,36 @@ fn usage_error(msg: &str, files: &[PathBuf]) -> CliError {
 
 /// Usage line for `barca get` / `barca run`.
 fn usage_line(sub: &str) -> &'static str {
-    if sub == "run" { RUN_USAGE } else { GET_USAGE }
+    match sub {
+        "run" => RUN_USAGE,
+        "status" => STATUS_USAGE,
+        _ => GET_USAGE,
+    }
+}
+
+/// The cache policy of `get` / `run`: one vocabulary on both (`--refresh a,b`, `--no-cascade`,
+/// `--refresh-all`). `--no-cache` is the deprecated spelling of `--refresh-all`.
+fn cache_policy(
+    refresh: Option<Vec<String>>,
+    no_cascade: bool,
+    refresh_all: bool,
+    no_cache: bool,
+) -> barca_core::commands::CachePolicy {
+    use barca_core::commands::CachePolicy;
+    if no_cache {
+        eprintln!(
+            "[barca] warning: --no-cache is deprecated and will be removed in a future minor \
+             release; use --refresh-all"
+        );
+    }
+    match (refresh_all || no_cache, refresh) {
+        (true, _) => CachePolicy::RefreshAll,
+        (false, Some(names)) => CachePolicy::RefreshSelective {
+            names,
+            cascade: !no_cascade,
+        },
+        (false, None) => CachePolicy::CacheAware,
+    }
 }
 
 /// Positionals in the wrong order: the first ends in `.py` and a later one does not. With
@@ -571,7 +626,9 @@ fn check_py_files(files: &[PathBuf], refresh: Option<&[String]>) -> Result<(), C
     Err(usage_error(&msg, &py))
 }
 
-const GET_USAGE: &str = "Usage: barca get [TARGET] <FILES>...";
+const GET_USAGE: &str =
+    "Usage: barca get [TARGET] <FILES>... [--refresh a,b [--no-cascade] | --refresh-all]";
+const STATUS_USAGE: &str = "Usage: barca status [TARGET] <FILES>...";
 const RUN_USAGE: &str = "Usage: barca run <TARGET> <FILES>... [--refresh a,b | --refresh-all]";
 
 /// Errors from a `get`/`run` that are the caller's mistake (unknown target, task/asset misuse,
@@ -854,6 +911,9 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             args,
             output,
             format,
+            refresh,
+            no_cascade,
+            refresh_all,
             no_cache,
             dry_run,
             agent,
@@ -863,7 +923,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             check_order("get", &args)?;
             let output = get_run_mode(output, format, fields.as_deref())?;
             let (target, files) = split_target_files(args);
-            check_py_files(&files, None)?;
+            check_py_files(&files, refresh.as_deref())?;
             if files.is_empty() {
                 let what = if target.is_none() {
                     "files"
@@ -877,13 +937,14 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             }
             let hint_files = files.clone();
             let targets = targets_arg(target.as_deref(), &files)?;
+            let policy = cache_policy(refresh, no_cascade, refresh_all, no_cache);
             get_cmd(
                 env.as_deref(),
                 targets,
                 files,
                 &python,
                 output,
-                no_cache,
+                policy,
                 dry_run,
                 agent,
                 fields.as_deref(),
@@ -896,6 +957,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             refresh,
             no_cascade,
             refresh_all,
+            no_cache,
             dry_run,
             output,
             format,
@@ -920,14 +982,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 ));
             }
             let hint_files = files.clone();
-            let policy = match (refresh_all, refresh) {
-                (true, _) => barca_core::commands::CachePolicy::RefreshAll,
-                (false, Some(names)) => barca_core::commands::CachePolicy::RefreshSelective {
-                    names,
-                    cascade: !no_cascade,
-                },
-                (false, None) => barca_core::commands::CachePolicy::CacheAware,
-            };
+            let policy = cache_policy(refresh, no_cascade, refresh_all, no_cache);
             let targets = targets_arg(Some(&target), &files)?;
             run_cmd(
                 env.as_deref(),
@@ -943,7 +998,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             .await
             .map_err(|e| get_run_error(e, ctx, &hint_files))
         }
-        Cli::Plan { files, env: _ } => plan_cmd(files, &python).await.map_err(engine),
+        Cli::Plan { files } => plan_cmd(files, &python).await.map_err(engine),
         Cli::History {
             limit,
             all,
@@ -999,18 +1054,21 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
             env,
         } => {
             let json = fields_json(format, fields.as_deref())?;
+            check_order("status", &args)?;
             let (target, files) = split_target_files(args);
             check_py_files(&files, None)?;
             if files.is_empty() {
                 return Err(usage_error(
-                    "error: no .py files provided\n\nUsage: barca status [TARGET] <FILES>...",
+                    &format!("error: no .py files provided\n\n{STATUS_USAGE}"),
                     &files,
                 ));
             }
+            let hint_files = files.clone();
+            let targets = targets_arg(target.as_deref(), &files)?;
             let limit = (!all).then_some(limit);
             status_cmd(
                 env.as_deref(),
-                target,
+                targets,
                 files,
                 StatusOpts {
                     json,
@@ -1021,7 +1079,7 @@ async fn run_cli(cli: Cli, ctx: &Context) -> Result<(), CliError> {
                 &python,
             )
             .await
-            .map_err(engine)
+            .map_err(|e| get_run_error(e, ctx, &hint_files))
         }
         Cli::Serve {
             files,
@@ -1059,7 +1117,7 @@ async fn get_cmd(
     files: Vec<PathBuf>,
     python: &PathBuf,
     mode: OutputMode,
-    no_cache: bool,
+    policy: barca_core::commands::CachePolicy,
     dry_run: bool,
     agent: bool,
     fields: Option<&[String]>,
@@ -1067,9 +1125,8 @@ async fn get_cmd(
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     if dry_run {
-        let policy = barca_core::commands::CachePolicy::CacheAware;
         return explain_cmd(
-            &cfg, &targets, &file_args, python, policy, no_cache, "get", mode, fields,
+            &cfg, &targets, &file_args, python, policy, "get", mode, fields,
         )
         .await;
     }
@@ -1079,7 +1136,7 @@ async fn get_cmd(
             &targets,
             &file_args,
             python,
-            no_cache,
+            policy,
             agent,
             cancel_on_ctrl_c(),
         )
@@ -1092,7 +1149,7 @@ async fn get_cmd(
         target.as_deref(),
         &file_args,
         python,
-        no_cache,
+        policy,
         agent,
         cancel_on_ctrl_c(),
     )
@@ -1158,7 +1215,7 @@ async fn run_cmd(
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     if dry_run {
         return explain_cmd(
-            &cfg, &targets, &file_args, python, policy, false, "run", mode, fields,
+            &cfg, &targets, &file_args, python, policy, "run", mode, fields,
         )
         .await;
     }
@@ -1234,26 +1291,42 @@ async fn explain_cmd(
     file_args: &[String],
     python: &PathBuf,
     policy: barca_core::commands::CachePolicy,
-    no_cache: bool,
     label: &str,
     mode: OutputMode,
     fields: Option<&[String]>,
 ) -> Result<(), barca_core::BarcaError> {
     let result =
-        barca_core::commands::explain(cfg, targets, file_args, python, policy, no_cache, label)
+        barca_core::commands::explain(cfg, targets, file_args, python, policy, false, label)
             .await?;
     match mode {
         OutputMode::Json => {
             let mut out = serde_json::to_value(&result).unwrap();
             bounded::project_key(&mut out, "steps", fields);
-            println!("{out}");
+            // `targets` (several targets) is keyed in the order given, like a real run; the
+            // other keys sort before it.
+            match out.as_object_mut().and_then(|o| o.remove("targets")) {
+                Some(_) => {
+                    let per_target: Vec<(String, serde_json::Value)> = result
+                        .targets
+                        .iter()
+                        .map(|(n, p)| (n.clone(), serde_json::to_value(p).unwrap()))
+                        .collect();
+                    let rest = out.to_string();
+                    println!(
+                        "{},\"targets\":{}}}",
+                        &rest[..rest.len() - 1],
+                        ordered_object(&per_target)
+                    );
+                }
+                None => println!("{out}"),
+            }
         }
         OutputMode::Value => println!("{}", serde_json::to_string_pretty(&result.steps).unwrap()),
         OutputMode::Pretty => {
             println!(
                 "Dry run: barca {label}{} (nothing executed, nothing written)\n",
                 if result.targets.len() > 1 {
-                    format!(" {}", result.targets.join(","))
+                    format!(" {}", result.target_names().join(","))
                 } else {
                     result
                         .target
@@ -1291,7 +1364,7 @@ fn ordered_object(pairs: &[(String, serde_json::Value)]) -> String {
 ///
 /// JSON: the run fields of a single-target run without `final_output`, plus `targets`, keyed by
 /// target name in the order given: `{"status": "success", "final_output": ...}` or
-/// `{"status": "failed", "failed_step": ..., "error": ...}`.
+/// `{"status": "failed", "failed_node": ..., "error": ...}`.
 /// Print a multi-target result. When any target failed this returns the first failure as a
 /// step failure (exit 1, and the error envelope on stderr), after the full result was printed.
 fn print_multi(
@@ -1314,8 +1387,8 @@ fn print_multi(
                     .unwrap_or(serde_json::Value::Null);
                 obj.insert("final_output".into(), value);
             }
-            if let Some(step) = &t.failed_step {
-                obj.insert("failed_step".into(), step.clone().into());
+            if let Some(step) = &t.failed_node {
+                obj.insert("failed_node".into(), step.clone().into());
             }
             if let Some(err) = &t.error {
                 obj.insert("error".into(), err.clone().into());
@@ -1374,7 +1447,7 @@ fn print_multi(
                     Some(v) => println!("{}", serde_json::to_string_pretty(v).unwrap()),
                     None => println!(
                         "  failed at {}",
-                        t["failed_step"].as_str().unwrap_or("(did not run)")
+                        t["failed_node"].as_str().unwrap_or("(did not run)")
                     ),
                 }
             }
@@ -1388,7 +1461,7 @@ fn print_multi(
                 continue;
             }
             let at = t
-                .failed_step
+                .failed_node
                 .as_deref()
                 .map(|s| format!(" (failed step: {s})"))
                 .unwrap_or_default();
@@ -1401,7 +1474,7 @@ fn print_multi(
         if let Some((name, t)) = result.targets.iter().find(|(_, t)| t.status != "success") {
             return Err(barca_core::BarcaError::WorkerFailed(Box::new(
                 barca_core::FailedStep {
-                    node: t.failed_step.clone().unwrap_or_else(|| name.clone()),
+                    node: t.failed_node.clone().unwrap_or_else(|| name.clone()),
                     message: t.error.clone().unwrap_or_else(|| "unknown error".into()),
                     artifact_dir: None,
                     run: None,
@@ -1462,6 +1535,35 @@ async fn plan_cmd(files: Vec<PathBuf>, python: &PathBuf) -> Result<(), barca_cor
     Ok(())
 }
 
+/// `freshness` as `barca list` prints it: lowercase, like `kind`.
+fn freshness_str(f: &barca_core::Freshness) -> &'static str {
+    match f {
+        barca_core::Freshness::Always => "always",
+        barca_core::Freshness::Manual => "manual",
+        barca_core::Freshness::Schedule(_) => "schedule",
+    }
+}
+
+/// One `nodes[]` entry of `barca list --json`: `freshness` is a flat lowercase string, with the
+/// cron expression in `schedule` and the next fire time in `next_fire` for scheduled nodes.
+/// (The HTTP API's `GET /assets` keeps the engine's own serialization.)
+fn list_node_json(
+    a: &barca_core::commands::AssetSummary,
+    next_fire: Option<&String>,
+) -> serde_json::Value {
+    let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("freshness".into(), freshness_str(&a.freshness).into());
+        if let barca_core::Freshness::Schedule(cron) = &a.freshness {
+            obj.insert("schedule".into(), cron.0.clone().into());
+        }
+        if let Some(t) = next_fire {
+            obj.insert("next_fire".into(), t.clone().into());
+        }
+    }
+    v
+}
+
 async fn list_cmd(
     files: Vec<PathBuf>,
     json: bool,
@@ -1487,13 +1589,7 @@ async fn list_cmd(
     if json || fields.is_some() {
         let mut nodes: Vec<serde_json::Value> = assets
             .iter()
-            .map(|a| {
-                let mut v = serde_json::to_value(a).unwrap_or(serde_json::Value::Null);
-                if let (Some(obj), Some(t)) = (v.as_object_mut(), next_fires.get(&a.id)) {
-                    obj.insert("next_fire".into(), serde_json::Value::String(t.clone()));
-                }
-                v
-            })
+            .map(|a| list_node_json(a, next_fires.get(&a.id)))
             .collect();
         if let Some(f) = fields {
             bounded::project(&mut nodes, f);
@@ -1536,18 +1632,10 @@ async fn list_cmd(
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| format!("{:?}", a.kind).to_lowercase());
-            let freshness = serde_json::to_value(&a.freshness)
-                .ok()
-                .and_then(|v| {
-                    let ty = v.get("type")?.as_str()?;
-                    if ty == "Schedule" {
-                        let cron = v.get("value").and_then(|c| c.as_str()).unwrap_or("?");
-                        Some(format!("cron: {cron}"))
-                    } else {
-                        Some(ty.to_lowercase())
-                    }
-                })
-                .unwrap_or_else(|| format!("{:?}", a.freshness).to_lowercase());
+            let freshness = match &a.freshness {
+                barca_core::Freshness::Schedule(cron) => format!("cron: {}", cron.0),
+                f => freshness_str(f).to_string(),
+            };
             let mut row = vec![a.id.clone(), kind, freshness];
             if has_schedule {
                 row.push(next_fires.get(&a.id).cloned().unwrap_or_else(|| "-".into()));
@@ -1610,22 +1698,15 @@ struct StatusOpts<'a> {
 
 async fn status_cmd(
     env: Option<&str>,
-    target: Option<String>,
+    targets: Vec<String>,
     files: Vec<PathBuf>,
     opts: StatusOpts<'_>,
     python: &PathBuf,
 ) -> Result<(), barca_core::BarcaError> {
     let cfg = barca_core::config::resolve(env)?;
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
-    let mut result = barca_core::status::status(
-        &cfg,
-        target.as_deref(),
-        &file_args,
-        python,
-        opts.sample,
-        true,
-    )
-    .await?;
+    let mut result =
+        barca_core::status::status(&cfg, &targets, &file_args, python, opts.sample, true).await?;
     // Bounded like `list`: the summary still counts every node; `nodes` is cut to the limit.
     let total = result.nodes.len();
     if let Some(limit) = opts.limit {
@@ -1697,7 +1778,8 @@ fn print_status_table(result: &barca_core::status::StatusResult) {
             [
                 n.name.clone(),
                 n.kind.clone(),
-                n.cache.state.clone(),
+                // Human form: `never-run`, `always-runs` (JSON says `never_run`, `always_runs`).
+                n.cache.state.replace('_', "-"),
                 why,
                 last,
                 n.shape
@@ -1837,6 +1919,18 @@ async fn history_cmd(
     Ok(())
 }
 
+/// `barca stats --json`: the node id is `id`, as on every other command. (The HTTP API's
+/// `GET /assets/<name>` keeps the engine's `node_id`.)
+fn stats_json(stats: &barca_core::db::AssetStats) -> serde_json::Value {
+    let mut out = serde_json::to_value(stats).unwrap();
+    if let Some(obj) = out.as_object_mut()
+        && let Some(id) = obj.remove("node_id")
+    {
+        obj.insert("id".into(), id);
+    }
+    out
+}
+
 async fn stats_cmd(
     env: Option<&str>,
     target: String,
@@ -1849,7 +1943,7 @@ async fn stats_cmd(
     let file_args: Vec<String> = files.iter().map(|p| p.display().to_string()).collect();
     let stats = barca_core::commands::stats(&cfg, &target, &file_args, python).await?;
     if json || fields.is_some() {
-        let mut out = serde_json::to_value(&stats).unwrap();
+        let mut out = stats_json(&stats);
         bounded::project_key(&mut out, "recent_runs", fields);
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         return Ok(());

@@ -152,7 +152,7 @@ def test_fields_trims_get_and_run_steps(project):
 def test_fields_trims_stats_recent_runs(project):
     ok(barca(project, "get", "total", "pipeline.py"))
     out = ok(barca(project, "stats", "total", "pipeline.py", "--fields", "status"))
-    assert out["node_id"] == "pipeline.py:total"
+    assert out["id"] == "pipeline.py:total"
     assert out["recent_runs"] and all(set(r) == {"status"} for r in out["recent_runs"])
 
 
