@@ -282,7 +282,9 @@ raised on failure; for `get`/`run`/`plan` its `kind`, `code`, `remediation` (and
   tasks (it used to): stderr names the skipped tasks and the `barca run` command. A file with only
   tasks gets nothing and exits 0 with `"steps": []`.
 - `barca get name file.py [more.py ...]` gets one target; `name` can be the bare function name
-  or the full id `file.py:name`. Cross-file inputs use `asset_ref("path.py:fn")`.
+  or the full id `file.py:name`. A name selects exactly that node: `deploy` never selects
+  `prod_deploy`. A function name defined in more than one file is a usage error (exit 2) that
+  lists the full ids to choose from. Cross-file inputs use `asset_ref("path.py:fn")`.
 - `barca get a,b file.py` / `barca run a,b file.py` take several targets in one run (see above);
   `barca status a,b file.py` shows the union of their cones.
 - `barca file.py` is shorthand for `barca get file.py`.

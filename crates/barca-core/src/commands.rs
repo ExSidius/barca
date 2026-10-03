@@ -47,6 +47,45 @@ fn reconcile_total(total_steps: usize, completed_steps: usize) -> usize {
 }
 
 /// Resolve the target name to a node id (or `None` for the whole DAG), enforcing that `barca get`
+/// Does a target `name` identify node `id`? A name is a function name (`deploy`), a full id
+/// (`pipeline.py:deploy`), or a path-suffixed id (`p.py:deploy` for `sub/p.py:deploy`). It
+/// matches only at a `:` or `/` boundary, never as the tail of a longer name, so `deploy` does
+/// not select `prod_deploy`.
+pub(crate) fn target_name_matches(id: &str, name: &str) -> bool {
+    if id == name {
+        return true;
+    }
+    match id.strip_suffix(name) {
+        Some(prefix) => prefix.ends_with(':') || (name.contains(':') && prefix.ends_with('/')),
+        None => false,
+    }
+}
+
+/// The single node a target name identifies. No match is `AssetNotFound`; several matches (the
+/// same function name in two files) is a usage error that lists the full ids to choose from.
+fn find_target_id(dag: &Dag, name: &str) -> Result<String, BarcaError> {
+    let matches: Vec<&str> = dag
+        .topo_order()
+        .into_iter()
+        .filter(|id| target_name_matches(id, name))
+        .collect();
+    match matches.as_slice() {
+        [one] => Ok((*one).to_string()),
+        [] => {
+            let available: Vec<&str> = dag.topo_order();
+            Err(BarcaError::AssetNotFound(
+                name.to_string(),
+                available.join(", "),
+            ))
+        }
+        many => Err(BarcaError::Usage(format!(
+            "'{name}' matches more than one node: {}. Name one by its full id, e.g. `{}`",
+            many.join(", "),
+            many[0]
+        ))),
+    }
+}
+
 /// targets assets and `barca run` targets tasks.
 fn resolve_target(
     dag: &Dag,
@@ -55,15 +94,7 @@ fn resolve_target(
 ) -> Result<Option<String>, BarcaError> {
     match target_name {
         Some(name) => {
-            let id = dag
-                .topo_order()
-                .into_iter()
-                .find(|id| id.ends_with(&format!(":{name}")) || *id == name || id.ends_with(name))
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    let available: Vec<&str> = dag.topo_order();
-                    BarcaError::AssetNotFound(name.to_string(), available.join(", "))
-                })?;
+            let id = find_target_id(dag, name)?;
             // Enforce get/run semantics: `barca get` is for assets, `barca run` is for tasks.
             if let Some(node) = dag.get_node(&id) {
                 let kind = node.kind();
@@ -2503,19 +2534,7 @@ pub async fn stats(
 ) -> Result<db::AssetStats, BarcaError> {
     let dag = build_dag(file_args, python).await?;
 
-    let target_id = dag
-        .topo_order()
-        .into_iter()
-        .find(|id| {
-            id.ends_with(&format!(":{target_name}"))
-                || *id == target_name
-                || id.ends_with(target_name)
-        })
-        .map(|s| s.to_string())
-        .ok_or_else(|| {
-            let available: Vec<&str> = dag.topo_order();
-            BarcaError::AssetNotFound(target_name.to_string(), available.join(", "))
-        })?;
+    let target_id = find_target_id(&dag, target_name)?;
 
     db::ensure_env_dirs(&cfg.env)?;
     db::init_db(&cfg.db_path).await?;
@@ -3259,5 +3278,26 @@ mod source_dir_tests {
             PathBuf::from("/abs/sub")
         );
         assert!(std::fs::read_dir(source_dir(Path::new("p.py"))).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod target_name_tests {
+    use super::target_name_matches;
+
+    #[test]
+    fn exact_names_and_ids_match() {
+        assert!(target_name_matches("p.py:deploy", "deploy"));
+        assert!(target_name_matches("p.py:deploy", "p.py:deploy"));
+        assert!(target_name_matches("sub/p.py:deploy", "p.py:deploy"));
+        assert!(target_name_matches("sub/p.py:deploy", "sub/p.py:deploy"));
+    }
+
+    #[test]
+    fn a_suffix_of_another_name_does_not_match() {
+        assert!(!target_name_matches("p.py:prod_deploy", "deploy"));
+        assert!(!target_name_matches("p.py:dyn_margin_all", "margin_all"));
+        assert!(!target_name_matches("subp.py:deploy", "p.py:deploy"));
+        assert!(!target_name_matches("sub/p.py:deploy", "/p.py:deploy_x"));
     }
 }

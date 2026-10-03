@@ -85,7 +85,9 @@ Positional rules (stable), for `get`, `run` and `status`:
   a file and there is no target (`run` then exits 2: it needs one). Otherwise the first
   positional is the target and the rest are files.
 - A target is one name or several, comma-separated without spaces (`a,b`), on all three. A name
-  is the function name or the full id `file.py:name`. An empty name (`a,,b`) is a usage error.
+  is the function name or the full id `file.py:name`, and selects exactly that node (`deploy`
+  never selects `prod_deploy`). A function name defined in more than one file, or an empty name
+  (`a,,b`), is a usage error.
 - An unknown target is a usage error (exit 2) on every command, with one remediation:
   ``Run `barca list <files>` to see available assets and tasks.``
 - barca never offers fuzzy suggestions: no "did you mean" for targets or `barca docs` topics (an
