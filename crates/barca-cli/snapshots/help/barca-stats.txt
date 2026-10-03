@@ -15,7 +15,7 @@ Options:
 
 Examples:
   barca stats total pipeline.py             # timing percentiles and cache hit rate
-  barca stats total pipeline.py --json      # the same as one JSON object, even in a terminal
+  barca stats total pipeline.py --json      # {id, total_runs, cache_hit_rate, ..., recent_runs}, even in a terminal
   barca stats total pipeline.py --pretty    # the text report, even when piped
   barca stats total pipeline.py --fields status,error_message   # JSON; trims recent_runs entries
 

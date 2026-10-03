@@ -32,7 +32,7 @@ Options:
           Print help (see a summary with '-h')
 
 Examples:
-  barca serve pipeline.py                    # HTTP API on 127.0.0.1:8274 plus the scheduler
+  barca serve pipeline.py                    # HTTP API on 127.0.0.1:8274 plus the scheduler (files required)
   barca serve pipeline.py --port 8400        # custom port
   barca serve pipeline.py --watch            # dev: re-parse the DAG when files change
   barca serve pipeline.py --no-schedule      # API only; Schedule(...) nodes do not fire

@@ -16,5 +16,9 @@ summary : object
 summary.cached : integer
 summary.unknown : integer
 summary.will_run : integer
-targets : array
-targets[] : string
+targets : object
+targets.<name> : object
+targets.<name>.summary : object
+targets.<name>.summary.cached : integer
+targets.<name>.summary.unknown : integer
+targets.<name>.summary.will_run : integer

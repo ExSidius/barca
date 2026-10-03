@@ -43,7 +43,6 @@ barca run send_email pipeline.py                      # task runs; upstream asse
 barca run send_email pipeline.py --refresh report     # re-materialize report and what is downstream of it
 barca run send_email pipeline.py --refresh report --no-cascade   # re-materialize only report
 barca run send_email pipeline.py --refresh-all        # re-materialize every upstream asset
-barca run send_email pipeline.py --no-cache           # same as --refresh-all
 ```
 
 `barca run` is cache-aware for upstream assets, exactly like `barca get`; only the task always
@@ -97,8 +96,8 @@ barca run validate_registry,validate_names pipeline.py --dry-run   # preview the
              "validate_names": {"status": "success", "final_output": {"lowercase": true}}}}
 ```
 
-  A failed target is `{"status": "failed", "failed_step": "pipeline.py:...", "error": "..."}`,
-  where `failed_step` is the target itself or the upstream step that failed. With one target the
+  A failed target is `{"status": "failed", "failed_node": "pipeline.py:...", "error": "..."}`,
+  where `failed_node` is the target itself or the upstream step that failed. With one target the
   output is unchanged. `--refresh` names may come from any target's cone. `barca get a,b` works
   the same way for assets.
 

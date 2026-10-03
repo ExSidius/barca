@@ -94,7 +94,9 @@ def test_docs_command_surface(binary, tmp_path):
     one = result(barca(binary, tmp_path, "docs", "types", "--json"))
     assert one["name"] == "types" and one["content"].startswith("# ")
     bad = barca(binary, tmp_path, "docs", "typs")
-    assert bad.returncode == 2 and "Did you mean: types" in bad.stderr
+    # No fuzzy guess (#180): the error lists every valid topic instead.
+    assert bad.returncode == 2 and "did you mean" not in bad.stderr.lower()
+    assert all(f"\n  {n}\n" in bad.stderr + "\n" for n in names), bad.stderr
     assert bad.stdout == ""
 
 
@@ -235,7 +237,8 @@ def test_tasks_topic_several_targets_example(binary, topics, tmp_path):
     (tmp_path / "pipeline.py").write_text(blocks(topics["tasks"], "python")[1])
     targets = "validate_registry,validate_names"
     dry = result(barca(binary, tmp_path, "run", targets, "pipeline.py", "--dry-run"))
-    assert dry["targets"] == ["validate_registry", "validate_names"]
+    assert list(dry["targets"]) == ["validate_registry", "validate_names"]
+    assert dry["targets"]["validate_names"]["summary"]["will_run"] == 2  # registry + the check
     assert dry["summary"]["will_run"] == 3
     first = result(barca(binary, tmp_path, "run", targets, "pipeline.py"))
     assert first["steps_executed"] == 3  # registry materializes once for both checks
@@ -325,5 +328,5 @@ def test_json_inspection_commands(binary, tmp_path):
     history = result(barca(binary, tmp_path, "history", "--json"))
     assert history["total"] == 1 and history["runs"][0]["status"] == "success"
     stats = result(barca(binary, tmp_path, "stats", "total", "pipeline.py", "--json"))
-    assert stats["node_id"] == "pipeline.py:total"
+    assert stats["id"] == "pipeline.py:total"
     assert barca(binary, tmp_path, "get", "total", "pipeline.py").stdout.count("\n") == 1

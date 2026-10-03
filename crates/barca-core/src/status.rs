@@ -15,8 +15,12 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResult {
-    /// The target name, when status was scoped to one node's upstream cone.
+    /// The target name, when status was scoped to one node's upstream cone (`null` for the
+    /// whole DAG or for several targets).
     pub target: Option<String>,
+    /// Every target the status was scoped to, in the order given (empty for the whole DAG).
+    #[serde(default)]
+    pub targets: Vec<String>,
     /// Every node in scope, in dependency order.
     pub nodes: Vec<NodeStatus>,
     /// Node counts per cache state.
@@ -51,7 +55,7 @@ pub struct NodeStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheStatus {
-    /// `cached`, `stale`, `never-run`, `partial`, `unknown` or `always-runs`.
+    /// `cached`, `stale`, `never_run`, `partial`, `unknown` or `always_runs`.
     pub state: String,
     /// Machine-readable reason: `materialized`, `changed`, `upstream_stale`, `failed`,
     /// `no_record`, `partitions_missing`, `partitions_unknown`, `task` or `sensor`.
@@ -105,23 +109,22 @@ pub struct StatusSummary {
     pub always_runs: usize,
 }
 
-/// Gather status for every node in scope (the target's upstream cone, or the whole DAG).
-/// `sample` > 0 adds up to that many sample rows to json/parquet shapes; `shape` = false skips
-/// the artifact reader entirely.
+/// Gather status for every node in scope (the targets' upstream cones, or the whole DAG when
+/// `target_names` is empty). `sample` > 0 adds up to that many sample rows to json/parquet
+/// shapes; `shape` = false skips the artifact reader entirely.
 pub async fn status(
     cfg: &crate::config::ResolvedConfig,
-    target_name: Option<&str>,
+    target_names: &[String],
     file_args: &[String],
     python: &PathBuf,
     sample: usize,
     shape: bool,
 ) -> Result<StatusResult, BarcaError> {
     let dag = commands::build_dag(file_args, python).await?;
-    let target_names: Vec<String> = target_name.map(str::to_string).into_iter().collect();
     let explained = commands::explain_dag(
         &dag,
         cfg,
-        &target_names,
+        target_names,
         python,
         CachePolicy::CacheAware,
         false,
@@ -136,7 +139,7 @@ pub async fn status(
     let ids: Vec<&str> = dag
         .topo_order()
         .into_iter()
-        .filter(|id| target_name.is_none() || in_scope.contains(id))
+        .filter(|id| target_names.is_empty() || in_scope.contains(id))
         .collect();
 
     // History, without creating a DB that does not exist yet.
@@ -211,13 +214,14 @@ pub async fn status(
         match n.cache.state.as_str() {
             "cached" => summary.cached += 1,
             "stale" => summary.stale += 1,
-            "never-run" => summary.never_run += 1,
+            "never_run" => summary.never_run += 1,
             "partial" => summary.partial += 1,
-            "always-runs" => summary.always_runs += 1,
+            "always_runs" => summary.always_runs += 1,
             _ => summary.unknown += 1,
         }
     }
     Ok(StatusResult {
+        targets: explained.target_names(),
         target: explained.target,
         nodes,
         summary,
@@ -247,8 +251,8 @@ fn cache_status(
     };
     let action = r.action.as_deref().unwrap_or("unknown");
     let mut c = match (action, r.reason.as_deref()) {
-        (_, Some("task")) => cache("always-runs", "task", "tasks always re-run"),
-        (_, Some("sensor")) => cache("always-runs", "sensor", "sensors always re-run"),
+        (_, Some("task")) => cache("always_runs", "task", "tasks always re-run"),
+        (_, Some("sensor")) => cache("always_runs", "sensor", "sensors always re-run"),
         ("unknown", _) => cache(
             "unknown",
             r.reason.as_deref().unwrap_or("unknown"),
@@ -280,7 +284,7 @@ fn cache_status(
     c
 }
 
-/// A node the dry run would execute: `stale` if it ever succeeded, else `never-run`, with the
+/// A node the dry run would execute: `stale` if it ever succeeded, else `never_run`, with the
 /// most specific reason the metadata can support.
 fn not_cached(
     r: &StepReport,
@@ -291,13 +295,13 @@ fn not_cached(
     let state = if history.ever_succeeded {
         "stale"
     } else {
-        "never-run"
+        "never_run"
     };
     let upstream_stale = inputs.iter().find(|up| {
         let base = up.split('[').next().unwrap_or(up);
         states
             .get(base)
-            .is_some_and(|s| matches!(s.as_str(), "stale" | "never-run" | "partial" | "unknown"))
+            .is_some_and(|s| matches!(s.as_str(), "stale" | "never_run" | "partial" | "unknown"))
     });
     // The last attempt at exactly this code and these inputs failed.
     let failed_here = history
@@ -452,7 +456,7 @@ mod tests {
         );
         assert_eq!(
             (c.state.as_str(), c.reason.as_str()),
-            ("never-run", "no_record")
+            ("never_run", "no_record")
         );
 
         let h = history(Some("success"), true);
@@ -485,12 +489,12 @@ mod tests {
         );
         assert_eq!(
             (c.state.as_str(), c.reason.as_str()),
-            ("never-run", "failed")
+            ("never_run", "failed")
         );
         assert!(c.detail.contains("boom"));
 
         let c = cache_status(Some(&report("run", Some("task"))), &[], &none, &h);
-        assert_eq!(c.state, "always-runs");
+        assert_eq!(c.state, "always_runs");
         let c = cache_status(Some(&report("cached", None)), &[], &none, &h);
         assert_eq!(c.state, "cached");
     }

@@ -48,17 +48,20 @@ outside the `GENERATED` blocks is written by hand.
 
 | Item | Why |
 |---|---|
-| `barca plan` and its JSON | prints the planner's internal phase/stream layout (`reason` is a debug string such as `FanIn { node_id: ... }`), which changes with scheduling work |
-| `barca plan --env` | accepted for symmetry but has no effect (planning reads no state) |
-| `barca serve` and all its flags | the HTTP API and scheduler are young: no auth, no shared remote state, routes may change |
+| `barca plan` and its JSON | prints the planner's internal phase/stream layout, which changes with scheduling work (`reason` is an object, `{"type": "initial"}` or `{"type": "fan_in", "node_id": ...}`) |
+| `barca serve` and all its flags | the HTTP API and scheduler are young: no auth, no shared remote state, routes may change. Its JSON is the engine's own serialization (for example `GET /assets` has `freshness: {"type": "Always"}` and `stats.node_id`), not the CLI's |
 | `get -o/--output`, `run -o/--output` | kept for compatibility; `--json` / `--pretty` are the canonical spelling |
-| `run --refresh-all` alias `--no-cache` | may be dropped: `get` spells the same idea `--no-cache`, `run` spells it `--refresh-all` |
+| `get --no-cache`, `run --no-cache` | deprecated (hidden): the old spelling of `--refresh-all`. Still works, prints `[barca] warning: --no-cache is deprecated ...` on stderr, and will be removed in a future minor release |
 | `status --sample` and `nodes[].shape` | read by a Python helper (`barca._inspect`) whose output may grow per format |
-| `list` `nodes[].freshness` | the raw serialization of the freshness enum (`{"type": "Always"}`, capitalized, `value` only for `Schedule`), unlike the lowercase `kind` |
-| `history` `runs[].files` | one string, not an array of files |
 | `BARCA_PROGRESS_SECS`, `BARCA_POOL_SIZE`, `BARCA_COMM_COST_SECONDS`, `BARCA_TRACE_TIMING` | tuning and benchmarking knobs |
 | `BARCA_ARTIFACT_URI` | 0.4.0 back-compat override, superseded by `BARCA_REMOTE_URI` / `[remote].artifacts_uri` |
-| `--agent` lines other than `step:` and `run failed:` | progress notes (`still running`, the `N/M steps \| done` summary, skipped tasks, warnings, `SINK FAILED`) whose wording may change |
+| `--agent` lines other than `step:`, the end-of-run line and `run failed:` | progress notes (`still running`, skipped tasks, the text of warnings, `SINK FAILED`) whose wording may change |
+
+### Accepted exceptions
+
+- `barca docs` prints markdown by default, even when piped, and has `--json` but no `--pretty`:
+  its output is a manual meant to be read or pasted into a model's context, so the terminal rule
+  does not apply. `--json` and `--fields` give the JSON index or topic.
 
 ## Commands
 
@@ -86,8 +89,13 @@ Positional rules (stable), for `get`, `run` and `status`:
 - The target comes before the files. If the first positional ends in `.py`, every positional is
   a file and there is no target (`run` then exits 2: it needs one). Otherwise the first
   positional is the target and the rest are files.
-- A target is one name or several, comma-separated without spaces (`a,b`); `status` takes one.
-  A name is the function name or the full id `file.py:name`.
+- A target is one name or several, comma-separated without spaces (`a,b`), on all three. A name
+  is the function name or the full id `file.py:name`. An empty name (`a,,b`) is a usage error.
+- An unknown target is a usage error (exit 2) on every command, with one remediation:
+  ``Run `barca list <files>` to see available assets and tasks.``
+- barca never offers fuzzy suggestions: no "did you mean" for targets or `barca docs` topics (an
+  unknown topic lists every valid topic), and argument errors carry no "a similar argument
+  exists" tip. A guess can read as confirmation.
 - `--refresh` and `--fields` take one comma-separated list (`--refresh a,b`).
 
 ## Arguments
@@ -110,7 +118,10 @@ default, and any aliases.
 | `-o, --output` | `json\|value\|pretty` | - | experimental: kept for compatibility; --json / --pretty are the canonical spelling | Output format (kept for compatibility; --json / --pretty are the canonical spelling) |
 | `--json` | - | default `false` | stable | Emit JSON on stdout (the default when stdout is not a terminal) |
 | `--pretty` | - | default `false` | stable | Emit human-readable output (the default when stdout is a terminal) |
-| `--no-cache` | - | default `false` | stable | Skip cache — execute everything fresh |
+| `--refresh` | comma-separated names | - | stable | Assets to force re-materialize, as ONE comma-separated list (`--refresh a,b`, not `--refresh a b`); the target itself may be named. Every asset downstream of them in the target's cone re-materializes too (see --no-cascade) |
+| `--no-cascade` | - | default `false` | stable | With --refresh: re-materialize only the named assets, not what is downstream of them. Cached downstream assets then do not reflect the refresh; barca warns |
+| `--refresh-all` | - | default `false` | stable | Force re-materialize EVERY asset in the target's cone (nothing comes from cache) |
+| `--no-cache` | - | default `false`; hidden from `--help` | experimental: deprecated: the old spelling of --refresh-all; warns on stderr and will be removed | Deprecated spelling of --refresh-all (prints a warning; removed in a future minor) |
 | `--dry-run` | - | default `false` | stable | Show what this command would do (each step cached or will-run, and why) without running or writing anything |
 | `--agent` | - | default `false` | stable | Agent-friendly output: plain structured progress lines instead of visual progress bar |
 | `--fields` | comma-separated: `id`, `kind`, `action`, `status`, `reason`, `detail`, `run_hash`, `artifact`, `warning`, `partitions`, `env` | - | stable | Keep only these keys (comma-separated) on each entry of `steps` in the JSON output. Not valid with -o value/pretty. An unknown key is a usage error listing the valid ones |
@@ -123,7 +134,8 @@ default, and any aliases.
 | `<ARGS>...` | - | required | stable | TARGET[,TARGET...] file.py [file.py ...] — one or more target tasks, comma-separated |
 | `--refresh` | comma-separated names | - | stable | Upstream assets to force re-materialize, as ONE comma-separated list (`--refresh a,b`, not `--refresh a b`). Every asset downstream of them in the task's cone re-materializes too (see --no-cascade) |
 | `--no-cascade` | - | default `false` | stable | With --refresh: re-materialize only the named assets, not what is downstream of them. Cached downstream assets then do not reflect the refresh; barca warns |
-| `--refresh-all` | - | default `false`; alias `--no-cache` | experimental: its hidden alias --no-cache may be dropped: get spells the same idea --no-cache | Force re-materialize ALL upstream assets in the task's cone |
+| `--refresh-all` | - | default `false` | stable | Force re-materialize EVERY asset in the task's cone (nothing comes from cache) |
+| `--no-cache` | - | default `false`; hidden from `--help` | experimental: deprecated: the old spelling of --refresh-all; warns on stderr and will be removed | Deprecated spelling of --refresh-all (prints a warning; removed in a future minor) |
 | `--dry-run` | - | default `false` | stable | Show what this command would do (each step cached or will-run, and why) without running or writing anything |
 | `-o, --output` | `json\|value\|pretty` | - | experimental: kept for compatibility; --json / --pretty are the canonical spelling | Output format (kept for compatibility; --json / --pretty are the canonical spelling) |
 | `--json` | - | default `false` | stable | Emit JSON on stdout (the default when stdout is not a terminal) |
@@ -137,7 +149,6 @@ default, and any aliases.
 | Argument | Value | Notes | Stability | Description |
 |---|---|---|---|---|
 | `<FILES>...` | - | required | experimental (with the command) | Python source files containing @asset definitions |
-| `--env` | `ENV` | - | experimental: accepted for symmetry but has no effect (planning reads no state) | Environment name (accepted for symmetry; planning uses no state) |
 
 #### barca history
 
@@ -181,13 +192,13 @@ default, and any aliases.
 | `--pretty` | - | default `false` | stable | Emit human-readable output (the default when stdout is a terminal) |
 | `-l, --limit` | `LIMIT` | default `100` | stable | Maximum number of nodes to show, in topological order |
 | `--all` | - | default `false` | stable | Show every node (no limit) |
-| `--fields` | comma-separated: `id`, `kind`, `freshness`, `inputs`, `env`, `next_fire` | - | stable | Output JSON with only these keys (comma-separated) on each entry of `nodes`. Implies --json. An unknown key is a usage error listing the valid ones |
+| `--fields` | comma-separated: `id`, `kind`, `freshness`, `schedule`, `inputs`, `env`, `next_fire` | - | stable | Output JSON with only these keys (comma-separated) on each entry of `nodes`. Implies --json. An unknown key is a usage error listing the valid ones |
 
 #### barca status
 
 | Argument | Value | Notes | Stability | Description |
 |---|---|---|---|---|
-| `<ARGS>...` | - | required | stable | [TARGET] file.py [file.py ...] — target is optional |
+| `<ARGS>...` | - | required | stable | [TARGET[,TARGET...]] file.py [file.py ...] — target is optional |
 | `--json` | - | default `false` | stable | Emit JSON on stdout (the default when stdout is not a terminal) |
 | `--pretty` | - | default `false` | stable | Emit human-readable output (the default when stdout is a terminal) |
 | `-l, --limit` | `LIMIT` | default `100` | stable | Maximum number of nodes to show, in topological order |
@@ -311,8 +322,11 @@ Every schema below is stable unless its section says otherwise.
 - `steps_executed` is 0 when everything came from cache. `final_output` is the target's value
   (with no target, the last asset's), or `null` for a task that returned nothing.
 - `steps[]`: `status` is `ran`, `cached`, `partial` or `failed`; `reason` (why it ran) is one of
-  `task`, `sensor`, `no_cache`, `refresh`, `refresh_cascade`, `refresh_all`, `not_materialized`,
-  `partitions_unknown`, with `detail` in words. `artifact` appears on cached steps, `run_hash`
+  `task`, `sensor`, `refresh`, `refresh_cascade`, `refresh_all`, `not_materialized`,
+  `partitions_unknown`, with `detail` in words. (`no_cache` is gone: `--no-cache` now reports
+  `refresh_all`.)
+- `get` and `run` share one refresh vocabulary: `--refresh a,b` (cascading downstream),
+  `--no-cascade`, `--refresh-all`. `artifact` appears on cached steps, `run_hash`
   on unpartitioned steps, `warning` on a cached step whose upstream was refreshed without
   cascading, `env` on nodes that declare `env=[...]` (`null` for an unset variable,
   `"<redacted>"` for secret-looking names).
@@ -425,8 +439,8 @@ envelope goes to stderr:
 ### get and run: several targets
 
 With `a,b`, `final_output` is replaced by `targets`, keyed by target name in the order given.
-A successful target has `final_output`; a failed one has `failed_step` (the step that raised:
-the target or something upstream) and `error`. Top-level `status` is `failed` if any target
+A successful target has `final_output`; a failed one has `failed_node` (the step that raised:
+the target or something upstream; the same key as a failed single-target run) and `error`. Top-level `status` is `failed` if any target
 failed, and the exit code is then 1. Steps skipped because an upstream failed have `status`
 `skipped` and `reason` `upstream_failed`.
 
@@ -479,7 +493,7 @@ failed, and the exit code is then 1. Steps skipped because an upstream failed ha
 | `targets` | object | always |
 | `targets.<name>` | object | always |
 | `targets.<name>.error` | string | sometimes |
-| `targets.<name>.failed_step` | string | sometimes |
+| `targets.<name>.failed_node` | string | sometimes |
 | `targets.<name>.final_output` | `<user value>` | sometimes |
 | `targets.<name>.status` | string | always |
 <!-- END GENERATED schema run_multi_target_failed -->
@@ -512,7 +526,9 @@ has `target` (a name, or `null` for a whole file):
 | `target` | string | always |
 <!-- END GENERATED schema get_dry_run -->
 
-With several targets, `targets` (an array of names) replaces `target`:
+With several targets, `targets` replaces `target`: an object keyed by target name in the order
+given (like a real multi-target run), each `{"summary": {...}}` counted over that target's cone.
+The top-level `summary` counts the union once.
 
 <!-- BEGIN GENERATED schema run_dry_run_multi_target -->
 | Key | Type | Present |
@@ -534,8 +550,12 @@ With several targets, `targets` (an array of names) replaces `target`:
 | `summary.cached` | integer | always |
 | `summary.unknown` | integer | always |
 | `summary.will_run` | integer | always |
-| `targets` | array | always |
-| `targets[]` | string | always |
+| `targets` | object | always |
+| `targets.<name>` | object | always |
+| `targets.<name>.summary` | object | always |
+| `targets.<name>.summary.cached` | integer | always |
+| `targets.<name>.summary.unknown` | integer | always |
+| `targets.<name>.summary.will_run` | integer | always |
 <!-- END GENERATED schema run_dry_run_multi_target -->
 
 ### list
@@ -550,8 +570,7 @@ appears only when `truncated` is true. `--fields` keeps only the named keys on e
 | `nodes[]` | object | always |
 | `nodes[].env` | array | always |
 | `nodes[].env[]` | string | always |
-| `nodes[].freshness` | object | always |
-| `nodes[].freshness.type` | string | always |
+| `nodes[].freshness` | string | always |
 | `nodes[].id` | string | always |
 | `nodes[].inputs` | array | always |
 | `nodes[].inputs[]` | string | always |
@@ -569,8 +588,7 @@ Truncated (`--limit 1`):
 | `nodes` | array | always |
 | `nodes[]` | object | always |
 | `nodes[].env` | array | always |
-| `nodes[].freshness` | object | always |
-| `nodes[].freshness.type` | string | always |
+| `nodes[].freshness` | string | always |
 | `nodes[].id` | string | always |
 | `nodes[].inputs` | array | always |
 | `nodes[].kind` | string | always |
@@ -578,13 +596,16 @@ Truncated (`--limit 1`):
 | `truncated` | boolean | always |
 <!-- END GENERATED schema list_truncated -->
 
-`nodes[].kind` is `asset`, `task` or `sensor`. `next_fire` (string, local time) appears only on
-scheduled nodes. `freshness` is experimental (see above).
+`nodes[].kind` is `asset`, `task` or `sensor`; `nodes[].freshness` is `always`, `manual` or
+`schedule`, lowercase like `kind`. A scheduled node also has `schedule` (the cron expression) and
+`next_fire` (string, local time). `list` reads no state, so it takes no `--env`.
 
 ### status
 
 The status document: the same envelope keys as `list` (`total`, `truncated`, `hint`) beside
-`target`, `nodes` and `summary`. `summary` counts every node even when `nodes` is truncated.
+`target`, `targets`, `nodes` and `summary`. `target` is the one target given (`null` for the whole
+file or several targets); `targets` lists every target given (`[]` for the whole file). `summary`
+counts every node even when `nodes` is truncated.
 
 <!-- BEGIN GENERATED schema status -->
 | Key | Type | Present |
@@ -638,11 +659,13 @@ The status document: the same envelope keys as `list` (`total`, `truncated`, `hi
 | `summary.stale` | integer | always |
 | `summary.unknown` | integer | always |
 | `target` | null | always |
+| `targets` | array | always |
 | `total` | integer | always |
 | `truncated` | boolean | always |
 <!-- END GENERATED schema status -->
 
-- `cache.state` is `cached`, `stale`, `never-run`, `partial`, `unknown` or `always-runs`;
+- `cache.state` is `cached`, `stale`, `never_run`, `partial`, `unknown` or `always_runs`: the
+  same snake_case spelling as the `summary` keys (the human table prints `never-run`);
   `cache.reason` is `materialized`, `changed`, `upstream_stale`, `failed`, `no_record`,
   `partitions_missing`, `partitions_unknown`, `task` or `sensor`. `cache.run_hash` and
   `cache.artifact` appear when known (`artifact` only when cached).
@@ -662,7 +685,8 @@ The status document: the same envelope keys as `list` (`total`, `truncated`, `hi
 | `runs[]` | object | always |
 | `runs[].command` | string | always |
 | `runs[].elapsed_seconds` | number | always |
-| `runs[].files` | string | always |
+| `runs[].files` | array | always |
+| `runs[].files[]` | string | always |
 | `runs[].finished_at` | string | always |
 | `runs[].run_id` | string | always |
 | `runs[].started_at` | string | always |
@@ -675,8 +699,9 @@ The status document: the same envelope keys as `list` (`total`, `truncated`, `hi
 | `truncated` | boolean | always |
 <!-- END GENERATED schema history -->
 
-Newest first. `target`, `steps_total`, `finished_at` and `elapsed_seconds` can be `null` (no
-target; a run still in progress). `files` is experimental (see above).
+Newest first. `files` is an array of the `.py` files the run was given. `target`,
+`steps_total`, `finished_at` and `elapsed_seconds` can be `null` (no target; a run still in
+progress).
 
 ### stats
 
@@ -685,9 +710,9 @@ target; a run still in progress). `files` is experimental (see above).
 |---|---|---|
 | `avg_elapsed_seconds` | number | always |
 | `cache_hit_rate` | number | always |
+| `id` | string | always |
 | `max_elapsed_seconds` | number | always |
 | `median_elapsed_seconds` | number | always |
-| `node_id` | string | always |
 | `p95_elapsed_seconds` | number | always |
 | `recent_runs` | array | always |
 | `recent_runs[]` | object | always |
@@ -699,17 +724,23 @@ target; a run still in progress). `files` is experimental (see above).
 | `total_runs` | integer | always |
 <!-- END GENERATED schema stats -->
 
-The timing fields are `null` when the asset never ran; `recent_runs[].error_message` is a string
-for failed runs.
+`id` is the node id (`file.py:name`), the same key every other command uses. The timing fields
+are `null` when the asset never ran; `recent_runs[].error_message` is a string for failed runs.
 
 ### plan (experimental)
+
+`phases[].reason` is `{"type": "initial"}` for the first phase or `{"type": "fan_in", "node_id":
+"<id>"}` for a phase that waits on a node gathering several upstream results. `plan` reads no
+state and takes no `--env`.
 
 <!-- BEGIN GENERATED schema plan -->
 | Key | Type | Present |
 |---|---|---|
 | `phases` | array | always |
 | `phases[]` | object | always |
-| `phases[].reason` | string | always |
+| `phases[].reason` | object | always |
+| `phases[].reason.node_id` | string | sometimes |
+| `phases[].reason.type` | string | always |
 | `phases[].streams` | array | always |
 | `phases[].streams[]` | object | always |
 | `phases[].streams[].steps` | array | always |
@@ -799,7 +830,9 @@ placeholders:
 <!-- BEGIN GENERATED agent-lines -->
 ```
 [barca] <n>/<total> steps | done in <secs>s
+[barca] <n>/<total> steps | failed in <secs>s
 [barca] run failed: step 'pipeline.py:broken' failed (exit 1)
+[barca] step:pipeline.py:broken failed: ValueError: contract fixture failure
 [barca] step:pipeline.py:keys completed <secs>s (<n>/<total>)
 [barca] step:pipeline.py:numbers cached
 [barca] step:pipeline.py:per_key[k=a] completed <secs>s (<n>/<total>)
@@ -812,11 +845,12 @@ placeholders:
 |---|---|---|
 | `[barca] step:<id> completed <secs>s (<n>/<total>)[ env NAME=VALUE ...]` | a step finished; `<id>` includes `[key=value]` for a partition | stable |
 | `[barca] step:<id> cached[ env NAME=VALUE ...]` | a step was served from cache | stable |
+| `[barca] step:<id> failed: <first line of the error>` | a step raised | stable |
 | `[barca] run failed: step '<id>' failed (exit <code>)` | just before the error envelope of a failed step (every mode) | stable |
-| `[barca] <n>/<total> steps \| done in <secs>s` | end of a run that executed steps; printed even when a step failed | experimental |
+| `[barca] <n>/<total> steps \| done in <secs>s` | end of a run that executed steps, with or without `--agent`; `failed in` when a step failed, `cancelled after` on Ctrl-C (never `done` then) | stable |
 | `[barca] still running (<n>s): <id>` | a step in flight for `BARCA_PROGRESS_SECS` (every mode) | experimental |
 | `[barca] skipped N task(s) ...`, `[barca] nothing to get ...` | `get` with no target skipped tasks | experimental |
-| `[barca] warning: ...`, `[barca] SINK FAILED: ...` | warnings and failed sinks | experimental |
+| `[barca] warning: ...`, `[barca] SINK FAILED: ...` | warnings (always this lowercase prefix; the text after it may change) and failed sinks | experimental |
 
 `env` values: `<unset>` for an unset variable, `<redacted>` for secret-looking names (`*_TOKEN`,
 `*_SECRET`, `*_KEY`, `*_PASSWORD`), double quotes around values with spaces. With several targets

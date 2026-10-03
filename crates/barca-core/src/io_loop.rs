@@ -801,7 +801,7 @@ impl WorkerPool {
                                     if fmt == "json" && !path.is_empty() {
                                         if path.contains("://") {
                                             eprintln!(
-                                                "[barca] Warning: parallel() result values require \
+                                                "[barca] warning: parallel() result values require \
                                                  a local artifact store in v1 — artifact '{path}' \
                                                  is remote; the parent receives null. Unset \
                                                  BARCA_ARTIFACT_URI to use parallel() results."

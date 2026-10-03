@@ -135,11 +135,11 @@ def test_status_on_a_fresh_project_reports_never_run_and_writes_nothing(project)
     assert by["src"]["kind"] == "asset" and by["src"]["inputs"] == []
     assert by["mid"]["inputs"] == ["pipeline.py:src"]
     assert by["src"]["partitioned"] is False
-    assert by["src"]["cache"]["state"] == "never-run"
+    assert by["src"]["cache"]["state"] == "never_run"
     assert by["src"]["cache"]["reason"] == "no_record"
     assert by["src"]["last_materialization"] is None
     assert by["report"]["kind"] == "task"
-    assert by["report"]["cache"]["state"] == "always-runs"
+    assert by["report"]["cache"]["state"] == "always_runs"
     assert result["summary"]["never_run"] == 2
     assert not (project / ".barca").exists(), "status must not create .barca"
 
@@ -202,14 +202,40 @@ def test_status_agrees_with_dry_run(project):
 def test_target_scopes_status_to_the_upstream_cone(project):
     result = status(project, "mid", "pipeline.py")
     assert result["target"] == "mid"
+    assert result["targets"] == ["mid"]
     assert list(nodes(result)) == ["src", "mid"]
+
+
+def test_several_targets_scope_status_to_the_union_of_their_cones(project):
+    # The same `a,b` parsing as get and run (#180).
+    result = status(project, "mid,report", "pipeline.py")
+    assert result["target"] is None
+    assert result["targets"] == ["mid", "report"]
+    assert list(nodes(result)) == ["src", "mid", "report"]
+    whole = status(project, "pipeline.py")
+    assert whole["target"] is None and whole["targets"] == []
+    bad = barca(project, "status", "mid,,report", "pipeline.py", "--json")
+    assert bad.returncode == 2 and "empty target name" in bad.stderr
+
+
+def test_cache_states_use_one_spelling_in_state_and_summary(project):
+    # `cache.state` values are exactly the `summary` keys (#180): snake_case everywhere.
+    result = status(project, "pipeline.py")
+    states = {n["cache"]["state"] for n in result["nodes"]}
+    assert states <= set(result["summary"]), (states, result["summary"])
+    assert "never_run" in states and "always_runs" in states
 
 
 def test_an_unknown_target_is_an_error(project):
     proc = barca(project, "status", "nope", "pipeline.py", "--json")
     assert proc.returncode == 2  # usage error (#154)
     assert "nope" in proc.stderr
-    assert json.loads(proc.stderr.strip().splitlines()[-1])["kind"] == "usage"
+    err = json.loads(proc.stderr.strip().splitlines()[-1])
+    assert err["kind"] == "usage"
+    # One remediation wording on every command (#180).
+    assert err["remediation"] == "Run `barca list pipeline.py` to see available assets and tasks."
+    got = barca(project, "get", "nope", "pipeline.py", "--json")
+    assert json.loads(got.stderr.strip().splitlines()[-1])["remediation"] == err["remediation"]
 
 
 def test_parquet_shape_reports_rows_and_schema(project):
@@ -253,7 +279,7 @@ def test_a_failed_last_attempt_is_reported(project):
     proc = barca(project, "get", "failing.py")
     assert proc.returncode != 0
     boom = nodes(status(project, "failing.py"))["boom"]
-    assert boom["cache"]["state"] == "never-run"
+    assert boom["cache"]["state"] == "never_run"
     assert boom["cache"]["reason"] == "failed"
     last = boom["last_materialization"]
     assert last["status"] == "failed" and "kaboom" in last["error"]

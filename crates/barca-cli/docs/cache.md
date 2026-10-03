@@ -42,14 +42,14 @@ does not. `from helpers import clean` + `clean(...)`, `import pkg.mod as m` + `m
 `import pkg.mod` + `pkg.mod.f()` and `from pkg import mod` + `mod.f()` hash exactly the same
 way: only the definitions the step uses, never the whole module. Modules outside the project
 (the standard library, installed packages) are not hashed: after upgrading one, recompute with
-`--no-cache` or `--refresh` (below).
+`--refresh-all` or `--refresh` (below).
 
 The pipeline file can be named any way on the command line: `barca get rows pipeline.py`,
 `./pipeline.py`, an absolute path, and `barca get rows project/pipeline.py` from the parent
 directory all compute the same run hash. Node ids keep the spelling you typed (`pipeline.py:rows`
 vs `./pipeline.py:rows`), as before.
 
-Not followed yet (an edit there does not change the hash; recompute with `--no-cache` or
+Not followed yet (an edit there does not change the hash; recompute with `--refresh-all` or
 `--refresh`):
 
 - classes (`from helpers import Model`): the import is recorded, but not the class body;
@@ -92,7 +92,9 @@ content-addressed, so they can be shared between machines when remote state is c
 | Goal | Command |
 |---|---|
 | Normal, cache-aware | `barca get target pipeline.py` |
-| Recompute everything in the cone | `barca get target pipeline.py --no-cache` |
+| Recompute everything in the cone | `barca get target pipeline.py --refresh-all` |
+| Recompute chosen assets and everything downstream of them | `barca get target pipeline.py --refresh a,b` |
+| Recompute only the chosen assets | `barca get target pipeline.py --refresh a,b --no-cascade` |
 | Run a task, cached upstream | `barca run task pipeline.py` |
 | Run a task, refresh chosen upstream assets and everything downstream of them | `barca run task pipeline.py --refresh a,b` |
 | Run a task, refresh only the chosen assets | `barca run task pipeline.py --refresh a,b --no-cascade` |
@@ -104,13 +106,18 @@ content-addressed, so they can be shared between machines when remote state is c
 Previously `--refresh` did not cascade: it re-ran only the named assets and left their downstream
 assets cached. It now cascades by default; `--no-cascade` keeps the old behavior.
 
+`barca get` takes the same three flags as `barca run` (it used to have only `--no-cache`). On
+`get` the target is an asset, so `--refresh` may name it too. `--no-cache` still works on both
+commands as a deprecated spelling of `--refresh-all`: it prints
+`[barca] warning: --no-cache is deprecated ...` and will be removed in a future minor release.
+
 ### Exactly what `--refresh` does
 
 - `--refresh a,b` re-materializes the assets you name **and every asset downstream of them** in
-  the task's cone (the cascade), so the refreshed data reaches the task. A step re-run by the
+  the target's cone (the cascade), so the refreshed data reaches the target. A step re-run by the
   cascade reports `reason: "refresh_cascade"` and a `detail` naming the asset it cascaded from.
 - It takes one comma-separated list; `--refresh a b` is an error ("'b' is not a .py file"). A
-  name that is not an upstream asset of the task is an error that lists the valid names, so a
+  name that is not an asset in the target's cone is an error that lists the valid names, so a
   typo never silently does nothing.
 - It does **not** rebuild the upstream of what you name, or assets in the cone that do not depend
   on it. Those keep serving from cache.
@@ -133,7 +140,7 @@ nothing: no `.barca` directory is created and no run is recorded.
 barca run report pipeline.py --dry-run --json          # JSON on one line
 barca run report pipeline.py --dry-run --pretty        # a table for humans
 barca run report pipeline.py --dry-run --refresh src   # preview a refresh and its cascade
-barca get total pipeline.py --dry-run --no-cache
+barca get total pipeline.py --dry-run --refresh-all
 ```
 
 ```json
@@ -154,8 +161,8 @@ Each step has an `action`:
 | `partial` | A partitioned asset where some keys are cached; `partitions` lists the counts and the keys that will run. |
 | `unknown` | Cannot be known without running: a dynamic partition (`partitions_from`) whose source has to run first to produce its keys, and anything that depends on it. |
 
-`reason` is one of `task` and `sensor` (always run), `no_cache` (`--no-cache`), `refresh` (named in
-`--refresh`), `refresh_cascade` (downstream of an asset named in `--refresh`), `refresh_all`, or
+`reason` is one of `task` and `sensor` (always run), `refresh` (named in `--refresh`),
+`refresh_cascade` (downstream of an asset named in `--refresh`), `refresh_all` (`--refresh-all`), or
 `not_materialized` (no cached result for this code and these inputs: never run, or the code or an
 upstream changed). Under `--no-cascade`, a cached step downstream of a refreshed asset carries a
 `warning` (see the refresh notes above). `summary` counts steps, one per partition

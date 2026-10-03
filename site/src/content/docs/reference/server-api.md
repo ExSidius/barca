@@ -122,7 +122,7 @@ and cache hit rate.
 ### Plan
 
 ```
-GET /plan              → { total_steps, phases: [{ reason, streams: [{ stream_id, steps }] }] }
+GET /plan              → { total_steps, phases: [{ reason: {type, node_id?}, streams: [{ stream_id, steps }] }] }
 ```
 
 ## Scheduling

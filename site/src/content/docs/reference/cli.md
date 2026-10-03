@@ -12,15 +12,16 @@ code and JSON output schema, marked stable or experimental, with the policy for 
 ## Commands
 
 ```
-barca get [target[,target...]] <file.py> [file.py ...]   Get asset value(s) — cache-aware
+barca get [target[,target...]] <file.py> [file.py ...] [--refresh a,b [--no-cascade] | --refresh-all]
+                                               Get asset value(s) — cache-aware
 barca run <task[,task...]> <file.py> [--refresh a,b [--no-cascade] | --refresh-all]  Run task(s) (always re-run)
-barca plan <file.py> [file.py ...]           Emit the execution plan as JSON
+barca plan <file.py> [file.py ...]           Emit the execution plan as JSON (experimental)
 barca history [-l N | --all] [--json|--pretty]  Show recent run history
 barca stats <target> <file.py> [file.py ...]  Show timing/cache stats for an asset
-barca serve [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
+barca serve <file.py> [file.py ...] [--port N] [--watch] [--no-schedule] [--timezone TZ]
                                                Run the HTTP API server
 barca list <file.py> ... [-l N | --all] [--json]  List discovered definitions and their deps
-barca status [target] <file.py> [--json] [--sample N]
+barca status [target[,target...]] <file.py> [--json] [--sample N]
                                                Cache state, last run and artifact shape per node
 barca docs [topic] [--all] [--json]           Built-in manual
 barca version                                 Print version
@@ -82,14 +83,16 @@ has only one valid reading, so it exits 2 and prints the corrected command,
 `barca get summary pipeline.py`, instead of running. Every `get`/`run` usage error (wrong order,
 missing target or files, unknown target, using `get` on a task or `run` on an asset, an unknown
 `--refresh` name) exits 2 and ends with
-``Run `barca list <files>` to see available assets and tasks.`` There is no fuzzy "did you mean"
-matching.
+``Run `barca list <files>` to see available assets and tasks.`` (the same remediation `status`
+and `stats` give). There is no fuzzy "did you mean" matching anywhere, and a mistyped flag gets no
+"a similar argument exists" tip: a guess can read as confirmation.
 
 ```bash
 barca get pipeline.py                 # all assets and sensors (never tasks)
 barca get summary pipeline.py         # a specific target
 barca get summary,orders pipeline.py  # several targets in one run (see "Several targets" below)
-barca get pipeline.py --no-cache      # execute everything fresh
+barca get pipeline.py --refresh-all   # execute everything fresh
+barca get summary pipeline.py --refresh orders   # re-run orders and everything downstream of it
 barca get pipeline.py --agent         # plain progress lines instead of a progress bar
 barca get pipeline.py --json          # JSON even in a terminal (the default when piped)
 barca get pipeline.py --pretty        # summary and value (the default in a terminal)
@@ -107,8 +110,10 @@ with `env NAME=value ...`. See [Decorators](/reference/api/decorators/#declared-
 Execute a task and its dependency cone. Tasks always re-run (they are never cached). Upstream
 assets are cache-aware by default, exactly like `barca get`. Use `--refresh` to force
 re-materialize named upstream assets and every asset downstream of them in the task's cone, add
-`--no-cascade` to re-materialize only the named assets, or use `--refresh-all` (alias `--no-cache`)
-to refresh every upstream asset in the cone.
+`--no-cascade` to re-materialize only the named assets, or use `--refresh-all` to refresh every
+upstream asset in the cone. `barca get` takes the same three flags (on `get` the target asset may
+be named in `--refresh`). `--no-cache` is the deprecated spelling of `--refresh-all` on both
+commands: it still works, warns on stderr, and will be removed in a future minor release.
 
 ```bash
 barca run deploy pipeline.py                          # run task, upstream assets from cache
@@ -116,7 +121,6 @@ barca run deploy pipeline.py --refresh fetch,transform  # re-materialize these a
 barca run deploy pipeline.py --refresh fetch --no-cascade  # re-materialize only fetch
 barca run deploy pipeline.py --dry-run --refresh fetch  # preview the cascade
 barca run deploy pipeline.py --refresh-all            # re-materialize all upstream assets
-barca run deploy pipeline.py --no-cache               # same as --refresh-all
 ```
 
 Unlike `barca get`, which targets assets and respects the cache, `barca run` is for tasks that
@@ -159,13 +163,17 @@ barca get summary,orders pipeline.py                               # several ass
              "validate_names": {"status": "success", "final_output": {"lowercase": true}}}}
 ```
 
-A failed target is `{"status": "failed", "failed_step": "pipeline.py:...", "error": "..."}`, where
-`failed_step` is the target itself or the upstream step that failed. `--dry-run` with several
-targets reports `"targets": [names]` in place of `"target"`; `-o value` prints `{target: value}`.
+A failed target is `{"status": "failed", "failed_node": "pipeline.py:...", "error": "..."}`, where
+`failed_node` is the target itself or the upstream step that failed (the same key a failed
+single-target run uses). `--dry-run` with several targets reports `targets` in place of `target`:
+an object keyed by target name in the order given, each `{"summary": {"will_run", "cached",
+"unknown"}}` counted over that target's cone. `-o value` prints `{target: value}`.
 
 ## plan
 
 Parse the source files and emit the tiered execution plan as JSON, without running anything.
+Experimental: the layout follows the planner. Each phase's `reason` is `{"type": "initial"}` or
+`{"type": "fan_in", "node_id": "..."}`. Planning reads no state, so `plan` takes no `--env`.
 
 ```bash
 barca plan pipeline.py
@@ -185,7 +193,8 @@ barca history --fields run_id,status   # JSON with only these keys per run
 ```
 
 When more runs exist than are shown, the JSON has `"truncated": true`, the `total`, and a `hint`;
-the table prints the same hint as one line on stderr. See [Bounded output](#bounded-output).
+the table prints the same hint as one line on stderr. See [Bounded output](#bounded-output). Each
+run's `files` is an array of the `.py` files it was given.
 
 ## stats
 
@@ -194,7 +203,7 @@ percentiles (avg / median / p95 / max), cache hit rate, and recent runs.
 
 ```bash
 barca stats summary pipeline.py
-barca stats summary pipeline.py --json     # the same as one JSON object
+barca stats summary pipeline.py --json     # the same as one JSON object; the node id is `id`
 barca stats summary pipeline.py --pretty   # the text report, even when piped
 barca stats summary pipeline.py --fields status,error_message   # JSON; trims recent_runs entries
 ```
@@ -229,12 +238,15 @@ second, so sub-minute schedules are legible).
 
 ```bash
 barca list pipeline.py
-barca list pipeline.py --json     # {"nodes": [{id, kind, freshness, inputs, env, next_fire?}], "total", "truncated"}
+barca list pipeline.py --json     # {"nodes": [{id, kind, freshness, schedule?, inputs, env, next_fire?}], "total", "truncated"}
 barca list pipeline.py --pretty   # the table, even when piped
 barca list pipeline.py --limit 20   # first 20 nodes in topological order
 barca list pipeline.py --all        # every node (default: at most 100)
 barca list pipeline.py --fields id,inputs   # JSON with only these keys per node
 ```
+
+In JSON, `freshness` is `always`, `manual` or `schedule` (lowercase, like `kind`); a scheduled node
+also has `schedule`, its cron expression. `list` reads no state, so it takes no `--env`.
 
 `list` prints at most 100 nodes by default, which covers typical pipelines; larger DAGs are cut
 off in topological order and say so (`"truncated": true` in JSON, a note on stderr for the table).
@@ -274,7 +286,8 @@ round trip through `list`, `--dry-run`, `history` and a one-off script that open
 ```bash
 barca status pipeline.py                         # table in a terminal, JSON when piped
 barca status total pipeline.py                   # only `total` and its upstream cone
-barca status pipeline.py --json                  # {target, nodes, summary, total, truncated}
+barca status total,notify pipeline.py            # several targets: the union of their cones
+barca status pipeline.py --json                  # {target, targets, nodes, summary, total, truncated}
 barca status pipeline.py --pretty                # the table, even when piped
 barca status pipeline.py --fields id,cache       # JSON with only these keys per node
 barca status pipeline.py --json --sample 5       # plus up to 5 sample rows per json/parquet artifact
@@ -289,16 +302,18 @@ notify  task   always-runs  task          -                                  -  
 2 cached, 0 stale, 0 never run, 0 partial, 0 unknown, 1 always run
 ```
 
-**Cache state** (`cache.state`) is the decision `--dry-run` makes, from the same code path:
+**Cache state** (`cache.state`) is the decision `--dry-run` makes, from the same code path. JSON
+spells it in snake_case, exactly like the `summary` keys; the table prints `never-run` and
+`always-runs`:
 
 | state | meaning | reasons |
 |---|---|---|
 | `cached` | a successful result matches this code and these inputs | `materialized` |
 | `stale` | ran before, but would run again | `changed`, `upstream_stale`, `failed` |
-| `never-run` | no successful materialization recorded | `no_record`, `failed` |
+| `never_run` | no successful materialization recorded | `no_record`, `failed` |
 | `partial` | partitioned, some keys cached | `partitions_missing` |
 | `unknown` | dynamic partitions whose source has not run | `partitions_unknown` |
-| `always-runs` | tasks and sensors | `task`, `sensor` |
+| `always_runs` | tasks and sensors | `task`, `sensor` |
 
 `changed` means the run hash differs from the last materialization: this function's code or its
 upstream outputs changed. barca stores only the combined hash, so it cannot say which.

@@ -155,7 +155,7 @@ def test_dry_run_with_no_cascade_names_the_reason_and_warns_about_stale_downstre
     assert "--refresh src,mid" in by["mid"]["warning"]
 
 
-def test_dry_run_with_refresh_all_and_no_cache(project):
+def test_dry_run_with_refresh_all_on_get_and_run(project):
     ok(barca(project, "run", "report", "pipeline.py"))
     refreshed = steps_by_name(
         ok(barca(project, "run", "report", "pipeline.py", "--dry-run", "--refresh-all"))
@@ -163,10 +163,60 @@ def test_dry_run_with_refresh_all_and_no_cache(project):
     assert (
         refreshed["src"]["reason"] == "refresh_all" and refreshed["mid"]["reason"] == "refresh_all"
     )
+    # One spelling on both commands (#180).
     forced = steps_by_name(
-        ok(barca(project, "get", "mid", "pipeline.py", "--dry-run", "--no-cache"))
+        ok(barca(project, "get", "mid", "pipeline.py", "--dry-run", "--refresh-all"))
     )
-    assert forced["src"]["reason"] == "no_cache" and forced["mid"]["reason"] == "no_cache"
+    assert forced["src"]["reason"] == "refresh_all" and forced["mid"]["reason"] == "refresh_all"
+
+
+@pytest.mark.parametrize("command,target", [("get", "mid"), ("run", "report")])
+def test_no_cache_is_a_deprecated_spelling_of_refresh_all(project, command, target):
+    ok(barca(project, "run", "report", "pipeline.py"))
+    proc = barca(project, command, target, "pipeline.py", "--dry-run", "--no-cache")
+    by = steps_by_name(ok(proc))
+    assert by["src"]["reason"] == "refresh_all"
+    assert "[barca] warning: --no-cache is deprecated" in proc.stderr
+    assert "--refresh-all" in proc.stderr
+    # Hidden from the --help options list: one canonical spelling is shown.
+    options = barca(project, command, "--help").stdout.splitlines()
+    assert not [o for o in options if o.startswith("  ") and o.strip().startswith("--no-cache")]
+
+
+def test_get_takes_refresh_with_cascade_like_run(project):
+    ok(barca(project, "get", "mid", "pipeline.py"))
+    by = steps_by_name(
+        ok(barca(project, "get", "mid", "pipeline.py", "--dry-run", "--refresh", "src"))
+    )
+    assert by["src"]["reason"] == "refresh" and by["mid"]["reason"] == "refresh_cascade"
+    no_cascade = steps_by_name(
+        ok(
+            barca(
+                project,
+                "get",
+                "mid",
+                "pipeline.py",
+                "--dry-run",
+                "--refresh",
+                "src",
+                "--no-cascade",
+            )
+        )
+    )
+    assert no_cascade["src"]["action"] == "run" and no_cascade["mid"]["action"] == "cached"
+    # A get target is an asset, so it may name itself.
+    itself = steps_by_name(
+        ok(barca(project, "get", "mid", "pipeline.py", "--dry-run", "--refresh", "mid"))
+    )
+    assert itself["mid"]["reason"] == "refresh" and itself["src"]["action"] == "cached"
+    # A real run does what the dry run said.
+    real = ok(barca(project, "get", "mid", "pipeline.py", "--refresh", "src"))
+    assert real["steps_executed"] == 2
+
+
+def test_get_rejects_an_unknown_refresh_name(project):
+    proc = barca(project, "get", "mid", "pipeline.py", "--refresh", "nope")
+    assert proc.returncode == 2 and "no upstream asset named 'nope'" in proc.stderr
 
 
 def test_dry_run_rejects_an_unknown_refresh_name_like_a_real_run(project):

@@ -18,6 +18,6 @@ steps_executed : integer
 targets : object
 targets.<name> : object
 targets.<name>.error : string  (optional)
-targets.<name>.failed_step : string  (optional)
+targets.<name>.failed_node : string  (optional)
 targets.<name>.final_output : <user value>  (optional)
 targets.<name>.status : string

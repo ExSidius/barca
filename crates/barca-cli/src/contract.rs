@@ -40,10 +40,6 @@ pub const EXPERIMENTAL: &[(&str, &str)] = &[
         "prints the planner's internal phase/stream layout, which changes with scheduling work",
     ),
     (
-        "plan --env",
-        "accepted for symmetry but has no effect (planning reads no state)",
-    ),
-    (
         "serve",
         "the HTTP API and scheduler are young: no auth, no shared remote state, routes may change",
     ),
@@ -56,8 +52,12 @@ pub const EXPERIMENTAL: &[(&str, &str)] = &[
         "kept for compatibility; --json / --pretty are the canonical spelling",
     ),
     (
-        "run --refresh-all",
-        "its hidden alias --no-cache may be dropped: get spells the same idea --no-cache",
+        "get --no-cache",
+        "deprecated: the old spelling of --refresh-all; warns on stderr and will be removed",
+    ),
+    (
+        "run --no-cache",
+        "deprecated: the old spelling of --refresh-all; warns on stderr and will be removed",
     ),
     (
         "status --sample",
@@ -298,6 +298,9 @@ fn arg_notes(arg: &clap::Arg) -> String {
         .collect();
     if !defaults.is_empty() {
         notes.push(format!("default `{}`", defaults.join(",")));
+    }
+    if arg.is_hide_set() {
+        notes.push("hidden from `--help`".to_string());
     }
     if let Some(aliases) = arg.get_all_aliases() {
         for a in aliases {

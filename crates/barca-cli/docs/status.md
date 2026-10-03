@@ -28,6 +28,7 @@ def notify(t: dict) -> None:
 barca get total pipeline.py
 barca status pipeline.py --pretty               # table (the default in a terminal)
 barca status total pipeline.py                  # only `total` and its upstream cone
+barca status total,notify pipeline.py           # several targets: the union of their cones
 barca status pipeline.py --json                 # one JSON document (the default when piped)
 barca status pipeline.py --fields id,cache      # JSON with only these keys per node
 barca status pipeline.py --json --sample 2      # plus up to 2 sample rows per json/parquet artifact
@@ -45,7 +46,10 @@ notify  task   always-runs  task          -                                  -  
 Status never imports your code and never writes: no `.barca` directory is created, no run is
 recorded. Like every inspection command, the result goes to stdout (a table in a terminal, JSON
 when piped; `--json` / `--pretty` override) and errors to stderr; an unknown target is a usage
-error (exit 2).
+error (exit 2) that ends with ``Run `barca list <files>` to see available assets and tasks.``,
+the same remediation as `get` and `run`. A target is one name or several, comma-separated with no
+spaces (`a,b`), parsed exactly as `get` and `run` parse them; the JSON names them in `targets`
+(and the single one in `target`).
 
 Like `list`, status shows at most 100 nodes unless you pass `--limit N` or `--all`. The
 `summary` still counts every node, and the JSON adds `total` and `truncated` (with a `hint` when
@@ -55,16 +59,17 @@ truncated). Each node also lists `env`, the environment variables it declares wi
 ## Cache state
 
 `cache.state` is the same decision `barca get --dry-run` makes (both call one function), so the
-two cannot disagree.
+two cannot disagree. In JSON the states are snake_case, spelled exactly like the `summary` keys
+(`never_run`, `always_runs`); the table prints them as `never-run` and `always-runs`.
 
 | state | meaning | `reason` |
 |---|---|---|
 | `cached` | a successful result matches this code and these inputs; `get` serves it | `materialized` |
 | `stale` | it ran before, but `get` would run it again | `changed`, `upstream_stale`, `failed` |
-| `never-run` | no successful materialization is recorded | `no_record`, `failed` |
+| `never_run` | no successful materialization is recorded | `no_record`, `failed` |
 | `partial` | a partitioned asset with some keys cached | `partitions_missing` |
 | `unknown` | dynamic partitions (`partitions_from`) whose source has not run yet | `partitions_unknown` |
-| `always-runs` | tasks and sensors are never cached | `task`, `sensor` |
+| `always_runs` | tasks and sensors are never cached | `task`, `sensor` |
 
 - `changed`: the run hash differs from the last materialization, because this function's code or
   its upstream outputs changed. barca records the combined run hash, not the two parts, so it
@@ -110,7 +115,7 @@ files), or a file that no longer exists.
 
 A partitioned asset is one node with a `partitions` summary: `total`, `cached`, `missing` and up
 to 20 `missing_keys`. Its state is `cached` when every key is, `partial` when some are, and
-`stale`/`never-run` when none are. `last_materialization` is the most recent key that ran, named
+`stale`/`never_run` when none are. `last_materialization` is the most recent key that ran, named
 in its `partition` field (for example `k=a`), and `shape` describes that one key's artifact.
 
 ## JSON
@@ -118,6 +123,7 @@ in its `partition` field (for example `k=a`), and `shape` describes that one key
 ```json
 {
   "target": "total",
+  "targets": ["total"],
   "nodes": [
     {
       "id": "pipeline.py:orders",

@@ -80,13 +80,40 @@ pub struct Context {
     pub files: Vec<String>,
 }
 
+/// Quote a word for display in a copy-pasteable shell command.
+pub fn shell_quote(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_./:,=@+%".contains(c));
+    if plain {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+
+/// `barca list <files>`, quoted for the shell (`<file.py>` when no file is known).
+pub fn list_cmd(files: &[String]) -> String {
+    if files.is_empty() {
+        "barca list <file.py>".to_string()
+    } else {
+        let quoted: Vec<String> = files.iter().map(|f| shell_quote(f)).collect();
+        format!("barca list {}", quoted.join(" "))
+    }
+}
+
+/// The one remediation for an unknown target or a misused name, on every command: `barca list`
+/// is how you discover the assets, tasks and sensors a project defines.
+pub fn list_hint(files: &[String]) -> String {
+    format!(
+        "Run `{}` to see available assets and tasks.",
+        list_cmd(files)
+    )
+}
+
 impl Context {
     fn list_cmd(&self) -> String {
-        if self.files.is_empty() {
-            "barca list <file.py>".to_string()
-        } else {
-            format!("barca list {}", self.files.join(" "))
-        }
+        list_cmd(&self.files)
     }
 
     fn help_cmd(&self) -> String {
@@ -183,9 +210,7 @@ impl CliError {
             };
         }
         let fallback = match &e {
-            BarcaError::AssetNotFound(..) => {
-                format!("Run `{}` to see every node and its kind.", ctx.list_cmd())
-            }
+            BarcaError::AssetNotFound(..) => list_hint(&ctx.files),
             BarcaError::Parse(_) => format!(
                 "Fix the Python syntax error, then run `{}` to confirm discovery.",
                 ctx.list_cmd()

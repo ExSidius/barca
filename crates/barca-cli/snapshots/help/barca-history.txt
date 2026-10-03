@@ -21,5 +21,6 @@ Examples:
   barca history --env dev      # runs recorded in another environment
 
 Newest first. When more runs exist than are shown, JSON says `"truncated": true` with the
-`total`, and the table prints a one-line note on stderr.
+`total`, and the table prints a one-line note on stderr. In JSON, `files` is an array: the .py
+files the run was given.
 More: barca docs agents, barca docs cache
