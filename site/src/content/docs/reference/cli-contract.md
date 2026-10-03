@@ -278,7 +278,9 @@ Each error `kind` has exactly one exit code (stable):
 <!-- END GENERATED exit-codes -->
 
 `step_failed`: one of your steps raised (fix the code). `usage`: bad arguments, unknown target,
-task/asset misuse, a `.py` file that does not parse, invalid `--env` or `barca.toml`. `infra`:
+task/asset misuse, a `.py` file that does not parse, a DAG that cannot be built (an input that
+names no definition, a cycle, a partitioned asset in an unpartitioned asset's `inputs=` without
+`collect()`, a `partitions_from()` the asset cannot mirror), invalid `--env` or `barca.toml`. `infra`:
 barca or its environment failed (metadata DB, workers, remote state, I/O); retrying may help.
 `cancelled`: interrupted with Ctrl-C.
 

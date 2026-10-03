@@ -588,10 +588,20 @@ impl Coordinator {
                             continue;
                         }
                         let aligned_id = pk.display_id(upstream_id);
-                        if let Some(pi) = provided
-                            .get(&aligned_id)
-                            .or_else(|| provided.get(upstream_id))
-                        {
+                        // The upstream's own id is the fallback for an unpartitioned upstream
+                        // only. When this phase produces the aligned key, `provided` may still
+                        // hold the upstream's base id as a list of its *cached* keys (the
+                        // collect() fallback in `build_provided_inputs`); taking it would hand
+                        // this key a list instead of its own key's output (#189: a new upstream
+                        // key, run in the same phase as its consumer key).
+                        let in_phase = node_to_item.contains_key(&aligned_id);
+                        if let Some(pi) = provided.get(&aligned_id).or_else(|| {
+                            if in_phase {
+                                None
+                            } else {
+                                provided.get(upstream_id)
+                            }
+                        }) {
                             match pi {
                                 crate::dispatch::ProvidedInput::Single(oref) => {
                                     spec.dag_inputs

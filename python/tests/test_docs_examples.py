@@ -130,6 +130,61 @@ def test_example_partitions(binary, topics, tmp_path):
     assert (tmp_path / ".barca" / "artifacts" / "pipeline.py--sales_region_emea").is_dir()
 
 
+def test_partitions_topic_example(binary, topics, tmp_path):
+    """The partitions topic's main example, as written (#189): `partitions_from(sales)` gives
+    `margin` the keys of `sales`, and each key receives the key and that key's `sales` output."""
+    write_example(topics, "partitions", tmp_path)
+    plan = result(barca(binary, tmp_path, "plan", "pipeline.py"))
+    steps = [s for p in plan["phases"] for st in p["streams"] for s in st["steps"]]
+    assert steps.count("pipeline.py:sales") == 3
+    assert steps.count("pipeline.py:margin") == 3
+    assert steps.count("pipeline.py:summary") == 1
+
+    margin = result(barca(binary, tmp_path, "get", "margin", "pipeline.py"))
+    assert margin["steps_executed"] == 6  # three sales keys, then three margin keys
+    arts = tmp_path / ".barca" / "artifacts"
+    for region in ("emea", "amer", "apac"):
+        (art,) = (arts / f"pipeline.py--margin_region_{region}").glob("*.json")
+        assert json.loads(art.read_text()) == {"region": region, "margin": 80.0}
+
+    summary = result(barca(binary, tmp_path, "get", "summary", "pipeline.py"))
+    assert summary["steps_executed"] == 1  # every partition of sales comes from cache
+    assert summary["final_output"] == {"total": 1200}
+    assert result(barca(binary, tmp_path, "get", "pipeline.py"))["steps_executed"] == 0
+
+
+def test_overview_topic_example(binary, topics, tmp_path):
+    write_example(topics, "overview", tmp_path)
+    nodes = result(barca(binary, tmp_path, "list", "pipeline.py", "--json"))["nodes"]
+    assert {n["id"] for n in nodes} == {"pipeline.py:numbers", "pipeline.py:total"}
+    first = result(barca(binary, tmp_path, "get", "total", "pipeline.py"))
+    assert first["steps_executed"] == 2 and first["final_output"] == {"total": 6}
+    assert result(barca(binary, tmp_path, "get", "total", "pipeline.py"))["steps_executed"] == 0
+
+
+def test_assets_topic_example(binary, topics, tmp_path):
+    write_example(topics, "assets", tmp_path)
+    clean = result(barca(binary, tmp_path, "get", "clean", "pipeline.py"))
+    assert clean["steps_executed"] == 2 and clean["final_output"] == {"x": 2}
+    assert result(barca(binary, tmp_path, "get", "pinned", "pipeline.py"))["final_output"] == {
+        "x": 0
+    }
+    # A Schedule asset still materializes on `barca get`; the schedule fires only under serve.
+    assert result(barca(binary, tmp_path, "get", "daily", "pipeline.py"))["final_output"] == {
+        "x": 2
+    }
+
+
+def test_scheduling_topic_example(binary, topics, tmp_path):
+    write_example(topics, "scheduling", tmp_path)
+    nodes = result(barca(binary, tmp_path, "list", "pipeline.py", "--json"))["nodes"]
+    assert {n["id"] for n in nodes} == {"pipeline.py:daily_report", "pipeline.py:heartbeat"}
+    report = result(barca(binary, tmp_path, "get", "daily_report", "pipeline.py"))
+    assert report["final_output"] == {"rows": 1}
+    beat = barca(binary, tmp_path, "run", "heartbeat", "pipeline.py")
+    assert result(beat)["status"] == "success"
+
+
 def test_example_deploy_task(binary, topics, tmp_path):
     write_example(topics, "examples/deploy-task", tmp_path)
     assert result(barca(binary, tmp_path, "run", "deploy", "pipeline.py"))["steps_executed"] == 2

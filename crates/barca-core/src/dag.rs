@@ -48,11 +48,187 @@ pub enum DagError {
 
     #[error("sensor '{sensor}' cannot have inputs")]
     SensorWithInputs { sensor: String },
+
+    /// `inputs={"x": upstream}` where `upstream` is partitioned and the consumer is not (#189).
+    /// This used to pass every partition as a list, a second spelling of `collect(upstream)`.
+    #[error(
+        "input '{param}' on '{node}' reads partitioned asset '{upstream}', but '{node}' is not \
+         partitioned"
+    )]
+    PartitionedInputToUnpartitioned {
+        node: String,
+        param: String,
+        upstream: String,
+    },
+
+    /// `partitions_from(upstream)` on a partitioned upstream that the consumer cannot mirror.
+    #[error("'{node}': partitions_from({upstream}) {problem}")]
+    PartitionsFrom {
+        node: String,
+        upstream: String,
+        problem: String,
+        fix: String,
+    },
+}
+
+impl DagError {
+    /// The fix, when this error has one more specific than "check each node's inputs".
+    pub fn remediation(&self) -> Option<String> {
+        match self {
+            DagError::PartitionedInputToUnpartitioned {
+                param, upstream, ..
+            } => {
+                let name = upstream.rsplit(':').next().unwrap_or(upstream);
+                Some(format!(
+                    "Use `inputs={{\"{param}\": collect({name})}}` to receive every partition of \
+                     '{name}' as one list, or `partitions={{\"<key>\": partitions_from({name})}}` \
+                     to run once per partition of '{name}' with that partition's output."
+                ))
+            }
+            DagError::PartitionsFrom { fix, .. } => Some(fix.clone()),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve `partitions_from(upstream)` where `upstream` is itself partitioned (#189).
+///
+/// The consumer takes the upstream's partition spec (so the same keys, static or resolved at
+/// run time), and each key reads that key of the upstream under the upstream's name, unless an
+/// `inputs=` entry already names the upstream (then it arrives under that parameter). Both
+/// steps are then partitioned by the same dimension, so the coordinator wires each consumer key
+/// to the producer key with the same partition key, as for any partition-aligned input.
+///
+/// `partitions_from(<unpartitioned asset>)` is left alone: its keys are the values of the list
+/// that asset returns, read at dispatch time (`dispatch::expand_pending_partitions`).
+fn resolve_partitions_from(nodes: &[ExtractedNode]) -> Result<Vec<ExtractedNode>, DagError> {
+    use crate::model::{DeclaredInput, NodeRef, PartitionSpec};
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Todo,
+        Active,
+        Done,
+    }
+
+    fn resolve(
+        i: usize,
+        nodes: &mut [ExtractedNode],
+        by_name: &HashMap<String, usize>,
+        state: &mut [State],
+    ) -> Result<(), DagError> {
+        if state[i] != State::Todo {
+            return Ok(()); // done, or a cycle (reported by `Dag::build`)
+        }
+        state[i] = State::Active;
+        let derived: Vec<(String, String)> = nodes[i]
+            .partitions
+            .iter()
+            .filter_map(|(dim, spec)| match spec {
+                PartitionSpec::DerivedFrom { source_ref } => {
+                    Some((dim.clone(), source_ref.resolution_name().to_string()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (dim, source) in derived {
+            let Some(&j) = by_name.get(&source) else {
+                continue;
+            };
+            resolve(j, nodes, by_name, state)?;
+            if nodes[j].partitions.is_empty() {
+                continue; // keys come from the list the source returns
+            }
+            let node = nodes[i].continuity_key();
+            let err = |problem: String, fix: String| DagError::PartitionsFrom {
+                node: node.clone(),
+                upstream: source.clone(),
+                problem,
+                fix,
+            };
+            if nodes[j].partitions.len() != 1 {
+                let mut dims: Vec<&String> = nodes[j].partitions.keys().collect();
+                dims.sort();
+                return Err(err(
+                    format!(
+                        "is not supported: '{source}' has {} partition dimensions ({})",
+                        dims.len(),
+                        dims.iter()
+                            .map(|d| d.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    format!(
+                        "Declare the partitions of '{}' explicitly with partitions([...]).",
+                        nodes[i].function_name
+                    ),
+                ));
+            }
+            let (src_dim, src_spec) = nodes[j]
+                .partitions
+                .iter()
+                .next()
+                .map(|(d, s)| (d.clone(), s.clone()))
+                .expect("one dimension");
+            if src_dim != dim {
+                return Err(err(
+                    format!(
+                        "is declared under dimension '{dim}', but '{source}' is partitioned by \
+                         '{src_dim}'"
+                    ),
+                    format!(
+                        "Use the upstream's dimension name: \
+                         `partitions={{\"{src_dim}\": partitions_from({source})}}`, with a \
+                         parameter named '{src_dim}'."
+                    ),
+                ));
+            }
+            if nodes[i].partitions.len() != 1 {
+                return Err(err(
+                    "must be the asset's only partition dimension".to_string(),
+                    format!(
+                        "Remove the other dimensions from '{}', or declare its keys explicitly \
+                         with partitions([...]).",
+                        nodes[i].function_name
+                    ),
+                ));
+            }
+            let consumer = &mut nodes[i];
+            consumer.partitions.insert(dim, src_spec);
+            let named = consumer
+                .inputs
+                .iter()
+                .any(|inp| !inp.collected && inp.upstream.resolution_name() == source);
+            if !named {
+                consumer.inputs.push(DeclaredInput {
+                    param_name: source.clone(),
+                    upstream: NodeRef::FunctionName(source.clone()),
+                    collected: false,
+                });
+            }
+        }
+        state[i] = State::Done;
+        Ok(())
+    }
+
+    let mut out = nodes.to_vec();
+    let by_name: HashMap<String, usize> = out
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.function_name.clone(), i))
+        .collect();
+    let mut state = vec![State::Todo; out.len()];
+    for i in 0..out.len() {
+        resolve(i, &mut out, &by_name, &mut state)?;
+    }
+    Ok(out)
 }
 
 impl Dag {
     /// Build a DAG from extracted nodes. Validates all constraints.
     pub fn build(nodes: &[ExtractedNode]) -> Result<Self, DagError> {
+        let resolved = resolve_partitions_from(nodes)?;
+        let nodes = resolved.as_slice();
         let mut graph = DiGraph::new();
         let mut index: HashMap<String, NodeIndex> = HashMap::new();
 
@@ -137,6 +313,19 @@ impl Dag {
                             downstream_kind,
                         });
                     }
+                }
+
+                // A partitioned upstream read whole by an unpartitioned consumer: say which of
+                // the two meanings was intended instead of guessing one (#189).
+                if !input.collected
+                    && node.partitions.is_empty()
+                    && !graph[upstream_idx].extracted.partitions.is_empty()
+                {
+                    return Err(DagError::PartitionedInputToUnpartitioned {
+                        node: downstream_key.clone(),
+                        param: input.param_name.clone(),
+                        upstream: upstream_key.clone(),
+                    });
                 }
 
                 let edge_kind = if input.collected {
@@ -340,6 +529,128 @@ mod tests {
             parallel_calls: Vec::new(),
             env: Vec::new(),
         }
+    }
+
+    fn build_src(src: &str) -> Result<Dag, DagError> {
+        Dag::build(&crate::parse::extract_nodes(src, "t.py").unwrap())
+    }
+
+    const SALES: &str = "from barca import asset, collect, partitions, partitions_from\n\n\
+@asset(partitions={\"region\": partitions([\"emea\", \"amer\"])})\n\
+def sales(region: str) -> dict:\n    return {}\n\n";
+
+    #[test]
+    fn partitions_from_a_partitioned_asset_takes_its_keys_and_reads_it_per_key() {
+        let dag = build_src(&format!(
+            "{SALES}@asset(partitions={{\"region\": partitions_from(sales)}})\n\
+def margin(region: str, sales: dict) -> dict:\n    return sales\n\n\
+@asset(partitions={{\"region\": partitions_from(margin)}})\n\
+def pct(region: str, margin: dict) -> dict:\n    return margin\n"
+        ))
+        .unwrap();
+        let sales = &dag.get_node("t.py:sales").unwrap().extracted.partitions;
+        for (id, upstream) in [("t.py:margin", "sales"), ("t.py:pct", "margin")] {
+            let n = dag.get_node(id).unwrap();
+            assert_eq!(&n.extracted.partitions, sales, "{id} has the keys of sales");
+            assert_eq!(
+                n.resolved_inputs.get(upstream).map(String::as_str),
+                Some(format!("t.py:{upstream}").as_str()),
+                "{id} reads {upstream} under its name"
+            );
+        }
+    }
+
+    #[test]
+    fn partitions_from_an_inputs_entry_names_the_parameter() {
+        let dag = build_src(&format!(
+            "{SALES}@asset(inputs={{\"s\": sales}}, partitions={{\"region\": partitions_from(sales)}})\n\
+def margin(region: str, s: dict) -> dict:\n    return s\n"
+        ))
+        .unwrap();
+        let n = dag.get_node("t.py:margin").unwrap();
+        assert_eq!(n.resolved_inputs.len(), 1);
+        assert_eq!(n.resolved_inputs["s"], "t.py:sales");
+    }
+
+    #[test]
+    fn partitions_from_a_list_asset_is_unchanged() {
+        let dag = build_src(
+            "from barca import asset, partitions_from\n\n\
+@asset()\ndef keys() -> list:\n    return []\n\n\
+@asset(partitions={\"k\": partitions_from(keys)})\ndef part(k: str) -> str:\n    return k\n",
+        )
+        .unwrap();
+        let n = dag.get_node("t.py:part").unwrap();
+        assert!(n.resolved_inputs.is_empty());
+        assert!(matches!(
+            n.extracted.partitions["k"],
+            crate::model::PartitionSpec::DerivedFrom { .. }
+        ));
+    }
+
+    #[test]
+    fn partitions_from_under_another_dimension_name_is_an_error() {
+        let err = build_src(&format!(
+            "{SALES}@asset(partitions={{\"r\": partitions_from(sales)}})\n\
+def margin(r: str, sales: dict) -> dict:\n    return sales\n"
+        ))
+        .unwrap_err();
+        assert!(matches!(err, DagError::PartitionsFrom { .. }), "{err}");
+        assert!(err.to_string().contains("'region'"), "{err}");
+        assert!(
+            err.remediation()
+                .unwrap()
+                .contains("partitions_from(sales)")
+        );
+    }
+
+    #[test]
+    fn partitions_from_needs_one_dimension_on_both_sides() {
+        let several = build_src(
+            "from barca import asset, partitions, partitions_from\n\n\
+@asset(partitions={\"a\": partitions([\"x\"]), \"b\": partitions([\"y\"])})\n\
+def grid(a: str, b: str) -> str:\n    return a\n\n\
+@asset(partitions={\"a\": partitions_from(grid)})\n\
+def down(a: str, grid: str) -> str:\n    return grid\n",
+        )
+        .unwrap_err();
+        assert!(
+            several
+                .to_string()
+                .contains("2 partition dimensions (a, b)"),
+            "{several}"
+        );
+        let mixed = build_src(&format!(
+            "{SALES}@asset(partitions={{\"region\": partitions_from(sales), \"tier\": partitions([\"1\"])}})\n\
+def margin(region: str, tier: str, sales: dict) -> dict:\n    return sales\n"
+        ))
+        .unwrap_err();
+        assert!(
+            mixed.to_string().contains("only partition dimension"),
+            "{mixed}"
+        );
+    }
+
+    #[test]
+    fn partitioned_input_to_unpartitioned_consumer_is_an_error() {
+        let err = build_src(&format!(
+            "{SALES}@asset(inputs={{\"xs\": sales}})\ndef total(xs: list) -> int:\n    return 0\n"
+        ))
+        .unwrap_err();
+        assert!(
+            matches!(err, DagError::PartitionedInputToUnpartitioned { .. }),
+            "{err}"
+        );
+        let fix = err.remediation().unwrap();
+        assert!(
+            fix.contains("collect(sales)") && fix.contains("partitions_from(sales)"),
+            "{fix}"
+        );
+        // collect() is the way to read every partition.
+        build_src(&format!(
+            "{SALES}@asset(inputs={{\"xs\": collect(sales)}})\ndef total(xs: list) -> int:\n    return 0\n"
+        ))
+        .unwrap();
     }
 
     #[test]

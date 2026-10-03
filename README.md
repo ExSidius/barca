@@ -216,7 +216,7 @@ def prices(ticker: str) -> dict:
 | Function | Purpose |
 |----------|---------|
 | `partitions(values)` | Static list of partition keys |
-| `partitions_from(source)` | Derive partitions from upstream asset |
+| `partitions_from(source)` | Same keys as `source`; each key also receives that key's output of a partitioned `source` |
 | `collect(asset_fn)` | Aggregate all partitions of an upstream |
 | `asset_ref(ref_string)` | Canonical asset reference |
 
